@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vcam-protocol",
+    "crates/vcam-source",
+    "crates/vcam-tool",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+rust-version = "1.82"
+
+[workspace.dependencies]
+windows = "0.62"
+windows-core = "0.62"
+vcam-protocol = { path = "crates/vcam-protocol" }
+
+# The DLL relies on unwinding: every export runs inside catch_unwind. Never set panic = "abort".
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"

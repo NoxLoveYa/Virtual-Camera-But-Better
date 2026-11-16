@@ -1,0 +1,9 @@
+[package]
+name = "vcam-protocol"
+description = "Constants shared by the Better Cam virtual camera DLL, the tool and (later) the app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
