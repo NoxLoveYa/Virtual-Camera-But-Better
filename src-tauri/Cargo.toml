@@ -1,0 +1,17 @@
+[package]
+name = "better-cam"
+description = "Better Cam: webcam filter chain with its own virtual camera"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri-plugin-autostart = "2.7.0"
+tauri-plugin-single-instance = "2.5.2"

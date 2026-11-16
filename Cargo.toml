@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "src-tauri",
     "crates/vcam-protocol",
     "crates/vcam-source",
     "crates/vcam-tool",
@@ -24,3 +25,6 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 debug = "line-tables-only"
+
+[profile.dev]
+opt-level = 2
