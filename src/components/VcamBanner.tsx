@@ -15,8 +15,8 @@ export function VcamBanner() {
     <div className="banner warn" role="status">
       <span>
         {missing
-          ? "Better Cam's virtual camera isn't installed. Installing asks for administrator rights."
-          : "The virtual camera needs an update."}
+          ? "Better Cam's virtual camera isn't installed. Installing asks for administrator rights and sets the camera up for this Windows account."
+          : "The virtual camera needs an update. It will then work for this Windows account."}
       </span>
       <button className="primary" disabled={busy !== null} onClick={() => void runVcam(action)}>
         {working ? (missing ? "Installing…" : "Updating…") : missing ? "Install virtual camera" : "Update virtual camera"}

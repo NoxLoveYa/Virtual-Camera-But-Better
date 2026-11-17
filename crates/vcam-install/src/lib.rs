@@ -15,6 +15,7 @@ pub mod camera;
 pub mod datadir;
 pub mod elevate;
 pub mod install;
+pub mod lock;
 pub mod log;
 pub mod machine;
 pub mod registry;

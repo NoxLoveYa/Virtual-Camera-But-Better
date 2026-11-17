@@ -714,3 +714,130 @@ elevated (`vcam_install`, `vcam_protocol`, `vcam_tool` test binaries as administ
   file through the same verified open and ignores a file that is older than the run (another run's text).
 * `better-cam.exe` (the app) can no longer create `frames.bin`: an app started on a machine without the installed
   camera does not create the folder; "Start" says the virtual camera is not installed.
+
+
+# P-hardening 3: locks, link roots and the last permissions (second review fixes)
+
+A second review of the DLL, the frame-file helpers and the installer found three medium and nine small faults, plus
+a test that could not fail. All fixed, each with a test (the ones that could be run against the old behaviour were,
+see "Check results"). No change to the
+frame-file layout or `PROTOCOL_VERSION`, no change to the helper's command line except that `--user-sid` is now
+required for an install; exit codes 0, 1, 2, 5, 10 as before and one new one, **11** ("another install, repair or
+removal is running"). `crates/vcam-source` changed (M1, L3, L4): the machine needs one new registration, done by
+Update.
+
+## What changed
+
+| # | Finding | Fix | Tests |
+|---|---|---|---|
+| M1 | An open waited for as long as a program held an opportunistic lock on the file (a standard user can take one on `frames.bin`, which they may read) | every open goes through `NtCreateFile` with `FILE_COMPLETE_IF_OPLOCKED` (`secure::open_with`, one choke point; also the installer's); a break in progress is a `refused` open ("show the slate" / "skip"). The log prune deletes through such a handle too (`secure::remove_plain_file`). The `LOG` mutex no longer covers an open or a prune: one thread claims the open (`begin_open`), the others drop their line meanwhile. The user has no access to `vcam-*.log` at all (see the table below), so only the service account could ever lock one | `secure::tests::an_open_does_not_wait_for_a_program_that_holds_an_oplock` (a real `FSCTL_REQUEST_OPLOCK`, no elevation; a plain open on a control thread is shown to block; the checked opens, read and write, pinned or not, and the delete return within 2 s, the old code hangs), `frames::tests::a_frame_file_with_somebody_elses_oplock_gives_the_slate_at_once` (activation read, mapping, pump polls), `log::tests::a_log_file_that_somebody_holds_an_oplock_on_is_not_waited_for`, `pruning_does_not_wait_for_a_locked_log_file`, `only_one_thread_opens_the_log_and_the_others_do_not_wait` |
+| M2 | A `%ProgramData%` that is a junction or symbolic link made everything refuse (root opened as a link, files below it resolved to the real place, the comparison failed) | `canonical_dir` opens the root *following* links (an administrator's folder); everything below it is still never followed | `secure::tests::a_root_that_is_a_junction_is_followed_and_links_below_it_are_not`, `datadir::tests::a_program_data_that_is_a_junction_prepares_checks_and_logs` (prepare, kept on the second run, the app's writer, the helper's log and its tail; with the old open it fails with exactly the reviewer's "opened ...moved..., expected ...ProgramData..." message) |
+| M3 | A failed preparation of the data folder lost its `ERROR:` line (the log was let go of, the line waited for a file, the process ended); the app then showed an earlier line | `Log::flush`, called on every way out and on drop of `FileLog`; `install_with` makes the log ready again before it returns the error; the app shows a reason only from an `ERROR:` line | `install::tests::the_error_of_a_failed_preparation_reaches_install_log`, `lines_that_wait_for_a_file_are_written_when_the_log_is_dropped`, `vcam_admin::tests::a_log_without_an_error_line_gives_no_reason` |
+| L1 | Objects existed with inherited permissions for a moment; an old folder kept the user's inheritable modify right | a new object is created with its final protected DACL in the create call (`create_dir_with_sd`, `open_with_sd`, `acl::SecurityDescriptor`); the data folder is locked first, then `logs`, `frames.bin`, `install.log`; `logs` is swept of entries that are not owned by SYSTEM, Administrators or LOCAL SERVICE | `datadir::tests::a_new_object_has_its_final_permissions_from_the_create_call` (the DACL read back right after the create call, no `lock` call), `the_data_folder_is_locked_before_anything_below_it_is_made` (starts from an older folder with an inheritable user right), `entries_of_logs_that_are_not_owned_by_a_trusted_account_are_removed` |
+| L2 | `BetterCam.old-*` next to the data folder was never deleted | `datadir::sweep_data_asides` runs in install and in uninstall, deletes without following links, touches no other name; an old copy that is still in use is reported by uninstall | `datadir::tests::moved_aside_data_folders_next_to_betercam_are_swept_without_following_links`, `install::tests::an_install_and_an_uninstall_delete_the_data_folders_that_were_moved_aside`, `an_old_data_folder_that_cannot_be_deleted_is_reported_by_uninstall` |
+| L3 | A detached pump could post a stale sample | `post_sample`: `stop` is checked again under the pump's lock, the one `stop` takes, immediately before the sample is queued | `stream::tests::a_pump_that_is_stopped_while_a_sample_is_ready_posts_nothing` (with a control that does post) |
+| L4 | A failed log truncation caused a reopen on every line | `next_try` is set on that path | `log::tests::a_failed_truncation_waits_before_the_next_open` (the file is mapped by "another process", error 1224; counts opens) |
+| L5 | LOCAL SERVICE could modify `install.log` | its own protected DACL (SYSTEM, Administrators full; the user read); created with it, or rewritten when an older file is kept | `acl::tests::the_install_log_is_not_writable_by_the_service_and_readable_by_the_user`, `datadir::tests::the_install_log_loses_the_modify_right_the_service_would_inherit_from_logs` |
+| L6 | The busy claim worked only inside one app process | the helper takes a machine-wide lock before anything else (`vcam_install::lock`): a mutex in a *private namespace* whose boundary is the Administrators group, so a standard user can neither hold nor squat it (a plain `Global\` name could be created beforehand by anybody); the existence of the object is the lock, so a helper that dies frees it; busy = exit 11, shown by the app as a sentence; `vcam-tool` takes the same lock | `lock::tests::a_second_helper_finds_the_lock_taken_and_the_next_one_gets_it_after_the_first_ends`, `the_end_of_the_holding_process_frees_the_lock` (a second process), `a_boundary_that_is_not_enabled_in_the_token_cannot_make_the_lock`, `vcam_admin::tests::a_helper_that_found_another_one_running_says_so`; live below |
+| L7 | The `vcam-tool` result file refused a link only in its last component | no result file at all: the elevated child reports through `install.log` (its own verified, admin-owned file, readable by the user) and the exit code; the parent prints the lines after the child's marker line. `--result` is refused | `vcam-tool util::tests::the_parent_prints_only_what_the_last_elevated_run_wrote`, `a_log_that_this_run_did_not_write_says_nothing`, `a_link_in_place_of_the_log_is_not_read`, `main::tests::the_elevated_copy_takes_no_result_path` |
+| L8 | Without `--user-sid` the helper used the elevated account | the helper (and the app's helper call) require it; the app refuses to start a helper when it cannot read its own SID, with a sentence and no prompt; `vcam-tool` passes it always and falls back to the current account only when run directly in an elevated shell or with `--current-user`. **Repair by a second Windows user:** the frame file belongs to one account at a time; the install replaces the user ACE, so the virtual camera works for the account that installed or repaired last and the earlier one repairs it again to get it back. The app says so (banner, button hint, the message after the install) | `vcam_admin::tests::an_install_without_the_users_sid_is_a_usage_error`, `without_the_users_sid_no_helper_is_started_and_the_message_says_why`, `the_app_gives_the_helper_the_users_sid`, `main::tests::the_elevated_step_must_be_told_whose_camera_it_is` |
+| L9 | `frames.bin` gave `FILE_WRITE_ATTRIBUTES` and `FILE_WRITE_EA` (hard link from a user's folder, read-only, sparse) | mask `0x12008f`; every open of the file asks for `FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES` and nothing more (`secure::ACCESS_READ_WRITE`, `Writer`, `MappedFile`); a frame file that is read-only, sparse, compressed or encrypted, or hard-linked, is replaced by the next Repair | `acl::tests::the_frame_file_acl_denies_hard_links_and_attributes_but_not_a_read_write_mapping` (real files; the control with the old mask `0x12019f` shows both attacks work), `datadir::tests::a_read_only_or_sparse_frame_file_is_replaced`, `a_frame_file_with_attributes_the_users_of_an_older_version_could_set_is_replaced`, `the_frame_file_acl_is_read_and_write_without_delete` |
+| 8 | The test of "no second helper until the first exited" could not fail | `elevate::wait_for_exit` is the only wait and has no timeout: it asks for `WAIT_FOREVER`, and anything but "the process ended" is a `Failed` | `elevate::tests::the_wait_returns_only_when_the_process_has_exited` (a real child that runs 3 s; the wait ends with its exit code, not before), `the_wait_has_no_timeout` (the wait function is given a recording stand-in for `WaitForSingleObject`) |
+| - | Launch hygiene | `lpDirectory` is the System32 folder (`util::system_dir`, the shell's known folder) | `elevate::tests::the_elevated_process_starts_in_the_system_folder` |
+| - | Installer mode | `bundle.targets` is `["nsis"]`, `bundle.windows.nsis.installMode` is `perMachine` (both keys checked against `node_modules/@tauri-apps/cli/config.schema.json`); no installer was built | `npm run tauri build -- --no-bundle` passes |
+
+## The permission design now
+
+Same rules as in P-hardening 2 (protected DACLs, owner Administrators, applied through verified handles). Changed rows
+are marked. Everything below is the machine after the live update (`icacls`, owners read back).
+
+| object | owner | ACEs |
+|---|---|---|
+| `BetterCam` | Administrators | SYSTEM and Administrators `(F)`; LOCAL SERVICE `(RX)`; user `(RX)`; this folder only |
+| `logs` | Administrators | SYSTEM and Administrators `(OI)(CI)(F)`; LOCAL SERVICE `(RX,WD)` here and `(OI)(IO)(M)` for the files it makes; user `(RX)` here **(changed: no right on the files in it)** |
+| `frames.bin` | Administrators | SYSTEM and Administrators `(F)`; LOCAL SERVICE and user `(R,WD,AD)` = `0x12008f` **(changed: no write of attributes or extended attributes)** |
+| `logs\install.log` | Administrators | **(new)** SYSTEM and Administrators `(F)`; user `(R)`; protected, so nothing from `logs` reaches it |
+
+As the standard user (medium integrity), live: creating a file or a folder in `BetterCam` or in `logs`, deleting or
+renaming `logs` or `frames.bin`, deleting or writing `install.log`, `mklink /H <own folder>\x.bin frames.bin`
+(`Access is denied`), `attrib +R frames.bin` (`Access denied`), `fsutil sparse setflag` (`Error 5`), opening
+`frames.bin` with `WriteAttributes`, `Delete` or `ChangePermissions`, and reading any `vcam-*.log` are all denied. Reading
+`install.log`, listing both folders, and opening `frames.bin` with exactly `ReadData | WriteData | ReadAttributes` work.
+Note that an open with `GENERIC_WRITE` (a plain .NET `FileAccess.ReadWrite`) is now denied too: it includes the right that
+the file no longer gives. The app, the DLL and `vcam-tool` ask for the specific rights.
+
+## Things found only by running it
+
+* **`SetSecurityInfo` on a folder walks its children.** With the data folder locked first (the L1 order), the elevated
+  helper changed the permissions of a file a user had hard-linked into the folder under the name `frames.bin` (the
+  file is somewhere else too): the old test `a_hard_linked_frame_file_is_replaced_and_the_other_name_is_left_alone` failed.
+  `acl::apply` now sets owner and DACL with `SetKernelObjectSecurity`, one `NtSetSecurityObject` on the handle that was
+  opened and verified, so the helper changes that object and nothing else.
+* **File tunneling.** A file made under a name within seconds of the deletion of the file that had it gets the old
+  file's creation time back, so "the file was replaced" cannot be tested through `created()`; the tests put a marker in
+  the old file and look for it.
+* **A private namespace alias is bound once per process.** A second `CreatePrivateNamespace` or `OpenPrivateNamespace`
+  of the same alias in the same process fails with `ERROR_DUP_NAME` (52); it only happens in one process with two
+  callers (tests), and means "the lock is held here": `lock::open_namespace` answers busy.
+* `attrib` prints `Access denied` and still exits 0; the denial list above reads the attribute back instead.
+* **The linker stamps a build time into the PE header.** A relink of an unchanged DLL has another content tag, so the
+  app calls the registered one outdated. The machine was updated once more at the end with the final build; do not
+  rebuild the release DLL between the last test and the registration.
+* The frame file cannot be locked by a test while the app runs: the app's engine keeps its handle for as long as it
+  exists. The oplock check of the live file therefore ran with the app closed (see below).
+
+## Check results
+
+```
+cargo test --workspace      better-cam 311 passed (+2 in main.rs), vcam-install 89 passed, vcam-protocol 61, vcam-source 57, vcam-tool 17; 0 failed.
+                            1 ignored in better-cam (earlier) and 1 in vcam-install (`lock::tests::holder`, the child process of
+                            another test). Tests that need the privilege to make a symbolic link, or an elevated token, print
+                            "skipped" and pass without it (this run was not elevated)
+cargo clippy --workspace --all-targets     0 warnings
+cargo fmt --check -p vcam-protocol -p vcam-source -p vcam-install -p vcam-tool     clean (src-tauri is not rustfmt-managed: the
+                            files there, vcam_admin.rs included, differ from rustfmt's default at HEAD already, so that file keeps its style)
+npm run build               exit 0
+npm run tauri build -- --no-bundle     exit 0 (twice: the second after the last code change; the DLL was not relinked)
+```
+
+Each of the new tests that can have the old behaviour put back by hand was run that way, one at a time, and failed:
+M1 (the open waits; the test fails after its 2 s bound), M2 (the reviewer's message), M3 (no `ERROR:` line in the file),
+L2 (old copies stay), L3 ("a sample was posted after the stop"), L4 (the next open is not delayed), and the hard-link
+fix above (a regression that the new order caused). The tests of L1, L5, L6, L7, L8, L9 and item 8 test new code
+(new functions, new ACEs, new exit code, new argument rules); the L9 test has its own control that shows the attacks
+work with the old mask.
+
+Live, on this machine (Windows 11 build 26200, elevation without a prompt), driven from the app through the DevTools
+protocol:
+
+```
+Update from the banner      2.5 s; install.log: data folder kept and locked, logs replaced ("other permissions"; Frame Server stopped once),
+                            install.log created with its own DACL, new DLL registered, old one retired
+app LIVE, consumer          234 frames in 8.0 s, max gap 52 ms, video 234, not-running 0;
+                            vcam-tool stats: consumer_active 1 (the service writes its header fields through the new mask);
+                            a fresh vcam-<pid>.log appears and grows (LOCAL SERVICE creates and writes in the new logs folder)
+oplock on frames.bin        app closed, no other handle; a read-write-handle oplock taken through a read-only handle, held 14 s:
+                              vcam-tool status 0.11 s; vcam-tool stats refuses in 0.02 s ("another program holds a lock on the file");
+                              a consumer opens the camera and gets slate frames from t=0.00 (146 frames in 5 s, not-running slate)
+                            after the release: Start -> LIVE, consumer reads video
+Remove, then Install        status missing (not listed, no key, no folders), then ok; Start went LIVE without restarting the app; consumer video
+second helper               a holder (elevated) kept the machine-wide lock: the helper by hand `--vcam-install --user-sid ...` exited 11,
+                            `--vcam-uninstall` exited 11, `vcam-tool register` and `unregister` exited 11 with the message; install.log and the
+                            registry unchanged
+```
+
+One slip during the run, said here because it changed the machine for a moment: the first attempt at the second-helper
+check started its holder with a broken command line, so the "second" helpers really ran (an install, a removal and
+`vcam-tool register`). The last one reinstalled the camera at once and nothing was lost; the check was then redone with the
+holder shown to be alive before anything else was started. A real install started 0.35 s after the click of the UI
+button was too late to meet the first helper (the helper finishes in under a second): the two ran one after the other
+and the log shows them not interleaved.
+
+## Notes for packaging
+
+* `installMode: perMachine` installs under `Program Files`; the installer asks for administrator rights, and the app
+  that it installs asks for them again for the virtual camera (one prompt). Nothing was built or run for it here.
+* The helper's `--user-sid` is always given by the app; an installer that runs the helper must give the SID of the
+  user who will run the app (it is checked to be a user account).
+* Not done on purpose (decided by the owner later): refusing a helper or DLL source in a folder a user can write to, and
+  signature checks.

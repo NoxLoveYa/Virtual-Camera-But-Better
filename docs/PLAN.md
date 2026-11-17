@@ -1469,3 +1469,4 @@ Video Effects 0.7.6 is the current release for RTX 20–50 on NVIDIA's resources
 7. **Camera when Better Cam is closed:** other apps see the "Better Cam is not running" slate.
 8. **Background behind removed backgrounds:** solid color only in v1.
 9. **Default output:** "Same as camera", plus 720p and 360p.
+10. **Portable install risk accepted.** The elevated helper installs the camera DLL found next to its own exe. From a user-writable folder (a portable zip, a dev build) another program running as that user could swap that DLL before the install, and it would then run inside the camera service. The owner accepts this for the portable build; the installer is per-machine. No code-signature check and no refusal of user-writable sources in v1.

@@ -6,16 +6,23 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# `secure::oplock`: take an oplock on a file, for tests of the crates that depend on this one
+test-support = []
+
 [dependencies]
 
 [target.'cfg(windows)'.dependencies.windows]
 workspace = true
 features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_IO",
+    "Win32_System_Ioctl",
     "Win32_System_Memory",
     "Win32_System_Performance",
     "Win32_System_Threading",

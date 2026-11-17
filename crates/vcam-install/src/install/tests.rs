@@ -710,3 +710,119 @@ fn a_half_installed_state_is_cleaned_up_although_remove_says_there_is_no_camera(
         log.0
     );
 }
+
+// ---- M3: the error of a failed run reaches install.log
+
+/// The helper writes `ERROR: <why>` as its last act and exits; the app shows that line. When preparing the data
+/// folder failed, the log had been let go of (so that the folder can be moved), the line waited for a file, and the
+/// process ended with it: the app then showed an earlier line of the same run as the reason.
+#[test]
+fn the_error_of_a_failed_preparation_reaches_install_log() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let (s, mut m) = installed("error-line");
+    let mut flog = crate::log::FileLog::with_paths_and_principals(s.paths.clone(), s.p.clone());
+    assert!(flog.attached());
+    // frames.bin is a folder that somebody holds open: it cannot be moved out of the way, so preparing fails
+    std::fs::remove_file(s.paths.frames()).unwrap();
+    std::fs::create_dir(s.paths.frames()).unwrap();
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS
+        .open(s.paths.frames())
+        .unwrap();
+    let dll = fake_dll(&s.root.join("src2"), 2);
+    let started = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
+    let err = install_with(
+        &opts(),
+        &dll,
+        &s.paths,
+        Some(s.p.clone()),
+        &mut m,
+        &mut flog,
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot move"), "{err}");
+    // what the helper does next, and then ends (the log is dropped with the process)
+    flog.line(&format!("ERROR: {err}"));
+    drop(flog);
+    drop(held);
+    let tail = crate::log::tail_of(&s.paths, started, 5);
+    let last = tail.last().expect("install.log has no line of this run");
+    assert!(
+        last.contains("ERROR: ") && last.contains("cannot move"),
+        "the last line is not the error: {tail:?}"
+    );
+    // and the lines before it are there too, once
+    let text = std::fs::read_to_string(s.paths.install_log()).unwrap();
+    assert_eq!(text.matches("ERROR: ").count(), 1, "{text}");
+    assert!(text.contains("it is not a file; moving it aside"), "{text}");
+}
+
+/// A log that is dropped without anybody asking for a flush still writes what waited (a helper that returns early).
+#[test]
+fn lines_that_wait_for_a_file_are_written_when_the_log_is_dropped() {
+    let (s, _m) = installed("drop-flush");
+    let mut flog = crate::log::FileLog::with_paths_and_principals(s.paths.clone(), s.p.clone());
+    flog.release_folder();
+    flog.line("written while the folder was let go of");
+    assert!(!flog.attached());
+    drop(flog);
+    let text = std::fs::read_to_string(s.paths.install_log()).unwrap();
+    assert!(
+        text.contains("written while the folder was let go of"),
+        "{text}"
+    );
+}
+
+// ---- L2: data folders that were moved aside are deleted by the next install and by uninstall
+
+#[test]
+fn an_install_and_an_uninstall_delete_the_data_folders_that_were_moved_aside() {
+    let (s, mut m) = installed("old-data");
+    let dll = fake_dll(&s.root.join("src2"), 2);
+    let pd = &s.paths.program_data;
+    let mk = |n: &str| {
+        let d = pd.join(n);
+        std::fs::create_dir_all(d.join("logs")).unwrap();
+        std::fs::write(d.join("frames.bin"), b"old").unwrap();
+        d
+    };
+    let a = mk("BetterCam.old-1-0");
+    let mut log = VecLog::default();
+    do_install(&s, &dll, &mut m, &mut log).unwrap();
+    assert!(
+        !a.exists(),
+        "the next install leaves the old copy: {:?}",
+        log.0
+    );
+    assert!(
+        s.paths.frames().is_file(),
+        "the live data folder is untouched"
+    );
+
+    let b = mk("BetterCam.old-2-0");
+    let mut log = VecLog::default();
+    uninstall_with(&s.paths, &mut m, &mut log).unwrap();
+    assert!(!b.exists(), "uninstall leaves the old copy: {:?}", log.0);
+    assert!(!s.paths.data.exists());
+}
+
+/// An old copy that is still in use at uninstall is reported, not claimed as gone.
+#[test]
+fn an_old_data_folder_that_cannot_be_deleted_is_reported_by_uninstall() {
+    let (s, mut m) = installed("old-data-busy");
+    let d = s.paths.program_data.join("BetterCam.old-5-0");
+    std::fs::create_dir_all(&d).unwrap();
+    let f = d.join("vcam-1.log");
+    std::fs::write(&f, b"x").unwrap();
+    use std::os::windows::fs::OpenOptionsExt;
+    let _held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&f)
+        .unwrap();
+    let err = uninstall_with(&s.paths, &mut m, &mut VecLog::default()).unwrap_err();
+    assert!(err.contains("old copy of the data folder"), "{err}");
+    assert!(d.exists());
+}

@@ -12,17 +12,24 @@ mod status;
 mod util;
 
 use std::path::PathBuf;
+use std::time::SystemTime;
 
-use util::Out;
-use vcam_install::{InstallOutcome, LaunchOutcome, Launcher, ShellLauncher, UninstallOutcome};
+use vcam_install::lock::{self, Acquired};
+use vcam_install::{
+    FileLog, InstallOutcome, LaunchOutcome, Launcher, Log, ShellLauncher, UninstallOutcome,
+};
 
 /// Exit code when the UAC prompt was declined.
 const EXIT_DECLINED: i32 = 3;
 /// Exit code when it worked but takes effect only after the camera service or Windows restarts.
 const EXIT_PENDING: i32 = 10;
+/// Exit code when another install, repair or removal is running (the same as the app's helper).
+const EXIT_BUSY: i32 = 11;
 
 const USAGE: &str = "usage: vcam-tool <command>
-  register [--dshow-class]   install DLL + registry + virtual camera (asks for elevation)
+  register [--dshow-class] [--user-sid <SID> | --current-user]
+                             install DLL + registry + virtual camera (asks for elevation); the account that gets
+                             access to the frame file is the one that runs this command
   unregister                 remove the virtual camera, registry keys and DLL (asks for elevation)
   status                     is Better Cam listed by Media Foundation and DirectShow?
   capture-test [--frames N] [--format nv12|rgb32] [--size WxH] [--fps N]
@@ -35,16 +42,17 @@ const USAGE: &str = "usage: vcam-tool <command>
 
 struct ElevatedArgs {
     elevated: bool,
-    result: Option<PathBuf>,
     user_sid: Option<String>,
+    /// Explicitly: the account that runs this process is the user of the camera.
+    current_user: bool,
     dshow_class: bool,
 }
 
 fn parse_elevated(args: &[String]) -> Result<ElevatedArgs, String> {
     let mut a = ElevatedArgs {
         elevated: false,
-        result: None,
         user_sid: None,
+        current_user: false,
         dshow_class: false,
     };
     let mut it = args.iter();
@@ -52,15 +60,39 @@ fn parse_elevated(args: &[String]) -> Result<ElevatedArgs, String> {
         match k.as_str() {
             "--elevated" => a.elevated = true,
             "--dshow-class" => a.dshow_class = true,
-            "--result" => a.result = Some(it.next().ok_or("--result needs a path")?.into()),
+            "--current-user" => a.current_user = true,
             "--user-sid" => a.user_sid = Some(it.next().ok_or("--user-sid needs a value")?.clone()),
+            // the elevated copy used to write into a result file named by the parent: a path in the user's %TEMP%
+            // that the user can rearrange; its report goes to install.log now
+            "--result" => {
+                return Err("--result is gone: the report is read from install.log".into())
+            }
             other => return Err(format!("unknown argument '{other}'")),
         }
+    }
+    if a.user_sid.is_some() && a.current_user {
+        return Err("--user-sid and --current-user cannot be combined".into());
     }
     Ok(a)
 }
 
-/// Parent side: relaunch elevated, wait, print the child's result file.
+/// The account that gets access to the frame file. The elevated copy started by `elevate_self` must be told
+/// (`--user-sid`): the administrator who answers the prompt may be another account than the user who ran the
+/// command, and falling back to "whoever I run as" would give the camera to the wrong one. Run directly in an
+/// elevated shell, the current account is the one who typed the command.
+fn user_sid_for(args: &ElevatedArgs) -> Result<String, String> {
+    if let Some(sid) = &args.user_sid {
+        return Ok(sid.clone());
+    }
+    if args.current_user || !args.elevated {
+        return vcam_install::current_user_sid().map_err(|e| {
+            format!("cannot tell which account this is ({e}); pass --user-sid <SID>")
+        });
+    }
+    Err("the elevated step needs --user-sid <SID> (or --current-user)".into())
+}
+
+/// Parent side: relaunch elevated, wait, print what the child wrote to `install.log`.
 fn elevate_self(verb: &str, args: &ElevatedArgs) -> i32 {
     let exe = match std::env::current_exe() {
         Ok(p) => p.to_string_lossy().into_owned(),
@@ -69,30 +101,41 @@ fn elevate_self(verb: &str, args: &ElevatedArgs) -> i32 {
             return 1;
         }
     };
-    let result = std::env::temp_dir().join(format!("better-cam-{verb}-{}.log", std::process::id()));
-    let _ = std::fs::remove_file(&result);
-    let sid = vcam_install::current_user_sid().unwrap_or_default();
+    // never omitted: the administrator who answers the prompt may be another account
+    let sid = match &args.user_sid {
+        Some(s) => s.clone(),
+        None => vcam_install::current_user_sid().unwrap_or_default(),
+    };
+    if sid.is_empty() {
+        eprintln!(
+            "cannot tell which Windows account this is, so nothing was started; pass --user-sid <SID>"
+        );
+        return 1;
+    }
     let mut child_args = vec![
         verb.to_string(),
         "--elevated".into(),
-        "--result".into(),
-        result.to_string_lossy().into_owned(),
+        "--user-sid".into(),
+        sid,
     ];
-    if !sid.is_empty() {
-        child_args.push("--user-sid".into());
-        child_args.push(sid);
-    }
     if args.dshow_class {
         child_args.push("--dshow-class".into());
     }
     println!("requesting elevation for '{verb}' (UAC prompt)...");
+    let started = SystemTime::now();
     // waits until the elevated child has exited, however long the prompt stays open
     let outcome = ShellLauncher.run_elevated(&exe, &child_args);
-    if let Ok(text) = std::fs::read_to_string(&result) {
-        print!("{text}");
+    let exited = |c: &u32| *c as i32;
+    if !matches!(&outcome, LaunchOutcome::Exited(c) if exited(c) == EXIT_BUSY) {
+        for line in util::run_output_here(verb, started) {
+            println!("{line}");
+        }
     }
-    let _ = std::fs::remove_file(&result);
     match outcome {
+        LaunchOutcome::Exited(c) if exited(&c) == EXIT_BUSY => {
+            eprintln!("{}", lock::BUSY_MESSAGE);
+            EXIT_BUSY
+        }
         LaunchOutcome::Exited(c) => c as i32,
         LaunchOutcome::Cancelled => {
             eprintln!("elevation declined (UAC prompt cancelled)");
@@ -121,26 +164,37 @@ fn dll_next_to_exe() -> Result<PathBuf, String> {
 
 /// Elevated side of `register` / `unregister`.
 fn do_elevated(verb: &str, args: &ElevatedArgs) -> i32 {
-    let mut out = match Out::new(args.result.as_deref()) {
-        Ok(o) => o,
+    // one install, repair or removal at a time on the machine: before anything is touched
+    let _lock = match lock::acquire() {
+        Ok(Acquired::Held(l)) => l,
+        Ok(Acquired::Busy) => {
+            eprintln!("{}", lock::BUSY_MESSAGE);
+            return EXIT_BUSY;
+        }
         Err(e) => {
-            // the console of the elevated child is hidden; the parent prints what is in the result file
             eprintln!("{e}");
             return 1;
         }
     };
+    let sid = match user_sid_for(args) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    // the report goes to install.log (and the console); the parent reads it from there when it is done
+    let mut out = FileLog::open_for(Some(&sid));
     out.line(&format!(
-        "{verb}: running elevated: {}",
+        "{} (running elevated: {}, user {sid})",
+        util::marker(verb),
         vcam_install::is_elevated()
     ));
     let r: Result<i32, String> = if verb == "register" {
         dll_next_to_exe().and_then(|dll| {
             vcam_install::install(
                 &vcam_install::InstallOptions {
-                    user_sid: args
-                        .user_sid
-                        .clone()
-                        .or_else(|| vcam_install::current_user_sid().ok()),
+                    user_sid: Some(sid.clone()),
                     dshow_class: args.dshow_class,
                 },
                 &dll,
@@ -157,13 +211,16 @@ fn do_elevated(verb: &str, args: &ElevatedArgs) -> i32 {
             UninstallOutcome::PendingReboot => EXIT_PENDING,
         })
     };
-    match r {
+    let code = match r {
         Ok(code) => code,
         Err(e) => {
             out.line(&format!("ERROR: {e}"));
             1
         }
-    }
+    };
+    // lines that still wait for a file go in before the process ends
+    out.flush();
+    code
 }
 
 fn main() {
@@ -193,4 +250,55 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    const SID: &str = "S-1-5-21-1004336348-1177238915-682003330-1001";
+
+    /// The result file named by the unelevated parent is gone: nothing a user can rearrange is written by the
+    /// elevated child.
+    #[test]
+    fn the_elevated_copy_takes_no_result_path() {
+        assert!(parse_elevated(&args(&[
+            "--elevated",
+            "--result",
+            r"C:\Users\x\AppData\Local\Temp\r.log"
+        ]))
+        .is_err());
+        assert!(parse_elevated(&args(&["--result"])).is_err());
+        let a = parse_elevated(&args(&["--elevated", "--user-sid", SID])).unwrap();
+        assert!(a.elevated && a.user_sid.as_deref() == Some(SID));
+    }
+
+    #[test]
+    fn the_elevated_step_must_be_told_whose_camera_it_is() {
+        // started by the parent: the SID is required, no fallback to the administrator who answered the prompt
+        let a = parse_elevated(&args(&["--elevated"])).unwrap();
+        let e = user_sid_for(&a).unwrap_err();
+        assert!(e.contains("--user-sid"), "{e}");
+        assert_eq!(
+            user_sid_for(&parse_elevated(&args(&["--elevated", "--user-sid", SID])).unwrap())
+                .unwrap(),
+            SID
+        );
+        // an explicit choice, or a command typed in an elevated shell, is the current account
+        let me = vcam_install::current_user_sid().unwrap();
+        assert_eq!(
+            user_sid_for(&parse_elevated(&args(&["--elevated", "--current-user"])).unwrap())
+                .unwrap(),
+            me
+        );
+        assert_eq!(
+            user_sid_for(&parse_elevated(&args(&["--dshow-class"])).unwrap()).unwrap(),
+            me
+        );
+        assert!(parse_elevated(&args(&["--user-sid", SID, "--current-user"])).is_err());
+    }
 }

@@ -7,6 +7,7 @@ use std::time::SystemTime;
 use vcam_protocol::secure;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
+use crate::acl::{self, Object, Principals};
 use crate::util::{werr, Paths, Res};
 
 /// Receives one line per step of an install or uninstall.
@@ -18,6 +19,10 @@ pub trait Log {
 
     /// The data folder is about to be deleted: close the file that lives in it.
     fn release_folder(&mut self) {}
+
+    /// Write out what is still waiting for a file (a log that was let go of waits for the folder to be ready again).
+    /// Call it on every way out of a run: a line that never reaches the file is a reason nobody can read.
+    fn flush(&mut self) {}
 }
 
 /// A sink that drops everything.
@@ -53,8 +58,13 @@ const MAX_PENDING: usize = 400;
 /// one hard link, the exact place below `%ProgramData%`), and it is written through that one handle, never by path
 /// again. Until a good file is open (a first install has no folder yet) the lines are kept and written when it
 /// opens; if it never does they are only echoed.
+///
+/// Lines that wait for a file are written when the log is dropped ([`Log::flush`]): an `ERROR:` line that the helper
+/// writes just before it exits is what the app shows the user, and it must not be lost with the process.
 pub struct FileLog {
     paths: Paths,
+    /// Whom a new `install.log` gives read access (see [`acl::expected`] for `Object::InstallLog`).
+    principals: Principals,
     file: Option<File>,
     /// Every line of this run (up to a limit): replayed into a new, empty file when the folder was replaced.
     history: Vec<String>,
@@ -64,15 +74,27 @@ pub struct FileLog {
 
 impl FileLog {
     /// A log for this machine's folder. Opens the file when the folder is there and acceptable; never creates
-    /// anything.
+    /// the folder. A new `install.log` is readable by the administrators only; use [`FileLog::open_for`] when the
+    /// user who runs the app should read it.
     pub fn open() -> FileLog {
         Self::with_paths(Paths::system())
     }
 
+    /// [`FileLog::open`] for the install of the user `user_sid`: a new `install.log` can be read by that user.
+    pub fn open_for(user_sid: Option<&str>) -> FileLog {
+        Self::with_paths_and_principals(Paths::system(), Principals::machine(user_sid))
+    }
+
     /// [`FileLog::open`] for other folders (tests).
     pub fn with_paths(paths: Paths) -> FileLog {
+        Self::with_paths_and_principals(paths, Principals::machine(None))
+    }
+
+    /// [`FileLog::with_paths`] with the accounts a new `install.log` is made for (tests).
+    pub fn with_paths_and_principals(paths: Paths, principals: Principals) -> FileLog {
         let mut l = FileLog {
             paths,
+            principals,
             file: None,
             history: Vec::new(),
             pending: Vec::new(),
@@ -117,14 +139,21 @@ impl FileLog {
         secure::verify_dir(secure::raw(&dir), Some(&expect_dir))
             .map_err(|e| werr("log folder", e))?;
         let expect_file = secure::expected_path(root, &path).map_err(|e| werr("install.log", e))?;
-        let h = secure::open_with(
-            &path,
-            GENERIC_READ | GENERIC_WRITE,
-            secure::SHARE_ALL,
-            secure::DISP_OPEN_ALWAYS,
-            false,
-            0,
-        )
+        // a file that does not exist yet is created with its own protected DACL (the service can not write it, the
+        // user can read it); one that exists is opened as it is and gets its DACL from `datadir::prepare`
+        let sd = acl::SecurityDescriptor::for_object(Object::InstallLog, &self.principals)?;
+        // SAFETY: `sd` outlives the call and holds a valid descriptor.
+        let h = unsafe {
+            secure::open_with_sd(
+                &path,
+                GENERIC_READ | GENERIC_WRITE,
+                secure::SHARE_ALL,
+                secure::DISP_OPEN_ALWAYS,
+                false,
+                0,
+                Some(sd.as_ptr()),
+            )
+        }
         .map_err(|e| werr("install.log", e))?;
         secure::verify_file(secure::raw(&h), Some(&expect_file))
             .map_err(|e| werr("install.log", e))?;
@@ -179,6 +208,22 @@ impl Log for FileLog {
 
     fn release_folder(&mut self) {
         self.file = None;
+    }
+
+    fn flush(&mut self) {
+        // lines wait only while no file is open: open it now (if the folder is acceptable) and they are written
+        if self.file.is_none() && !self.pending.is_empty() {
+            let _ = self.attach();
+        }
+        if let Some(f) = self.file.as_mut() {
+            let _ = f.flush();
+        }
+    }
+}
+
+impl Drop for FileLog {
+    fn drop(&mut self) {
+        Log::flush(self);
     }
 }
 
@@ -293,6 +338,8 @@ mod tests {
         prepare(&s.paths, &s.p, &mut || false, &mut crate::log::NullLog).unwrap();
         let victim = s.root.join("victim.txt");
         std::fs::write(&victim, "precious").unwrap();
+        // `prepare` made install.log: put the hard link in its place
+        std::fs::remove_file(s.paths.install_log()).unwrap();
         std::fs::hard_link(&victim, s.paths.install_log()).unwrap();
         let mut log = FileLog::with_paths(s.paths.clone());
         assert!(!log.attached());

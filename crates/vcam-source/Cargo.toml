@@ -15,6 +15,10 @@ crate-type = ["cdylib", "rlib"]
 vcam-protocol.workspace = true
 windows-core.workspace = true
 
+[dev-dependencies]
+# `secure::oplock`: the tests hold an oplock on a file the DLL must not wait for
+vcam-protocol = { workspace = true, features = ["test-support"] }
+
 [dependencies.windows]
 workspace = true
 features = [

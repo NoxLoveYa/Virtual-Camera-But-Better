@@ -7,7 +7,9 @@ use windows::Win32::Media::MediaFoundation::{MFShutdown, MFStartup, MFSTARTUP_FU
 use windows::Win32::System::Com::{
     CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED,
 };
-use windows::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath, KNOWN_FOLDER_FLAG};
+use windows::Win32::UI::Shell::{
+    FOLDERID_ProgramFiles, FOLDERID_System, SHGetKnownFolderPath, KNOWN_FOLDER_FLAG,
+};
 use windows_core::PCWSTR;
 
 /// Error type of the install code: a sentence that can be shown to a person.
@@ -90,6 +92,26 @@ pub fn program_files_dir() -> PathBuf {
                 }
             }
             Err(_) => PathBuf::from(r"C:\Program Files"),
+        }
+    })
+    .clone()
+}
+
+/// The system folder (`C:\Windows\System32`) from the shell's known folder database. Falls back to that path.
+pub fn system_dir() -> PathBuf {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let known = unsafe { SHGetKnownFolderPath(&FOLDERID_System, KNOWN_FOLDER_FLAG(0), None) };
+        match known {
+            Ok(p) => {
+                let s = unsafe { p.to_string() };
+                unsafe { CoTaskMemFree(Some(p.0 as *const core::ffi::c_void)) };
+                match s {
+                    Ok(s) if !s.is_empty() => PathBuf::from(s),
+                    _ => PathBuf::from(r"C:\Windows\System32"),
+                }
+            }
+            Err(_) => PathBuf::from(r"C:\Windows\System32"),
         }
     })
     .clone()

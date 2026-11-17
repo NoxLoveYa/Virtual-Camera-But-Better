@@ -1,7 +1,8 @@
 //! Elevation: ask for administrator rights (`runas`), wait for the elevated process, and tell the caller what
 //! happened. The launcher is a trait so the callers can be tested with a fake that refuses.
 
-use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, HANDLE, WAIT_OBJECT_0};
+use crate::util::{pcwstr, wide};
+use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, HANDLE, WAIT_EVENT, WAIT_OBJECT_0};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{
     GetTokenInformation, TokenElevation, TokenUser, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
@@ -11,9 +12,6 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
-use windows_core::PCWSTR;
-
-use crate::util::{pcwstr, wide};
 
 /// How an attempt to run a program elevated ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,22 +118,67 @@ pub fn outcome_for_shell_error(e: &windows_core::Error) -> LaunchOutcome {
     }
 }
 
+/// What `ShellExecuteExW` is asked for: the strings it points to live here.
+struct Request {
+    verb: Vec<u16>,
+    file: Vec<u16>,
+    params: Vec<u16>,
+    /// The working directory of the elevated process: the system folder, never whatever folder the caller happens to
+    /// be in (a folder the user can write to would put their files next to the helper's current directory).
+    dir: Vec<u16>,
+}
+
+impl Request {
+    fn new(exe: &str, args: &[String]) -> Request {
+        let params = args.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ");
+        Request {
+            verb: wide("runas"),
+            file: wide(exe),
+            params: wide(&params),
+            dir: wide(&crate::util::system_dir().to_string_lossy()),
+        }
+    }
+
+    fn info(&self) -> SHELLEXECUTEINFOW {
+        SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_NOCLOSEPROCESS,
+            lpVerb: pcwstr(&self.verb),
+            lpFile: pcwstr(&self.file),
+            lpParameters: pcwstr(&self.params),
+            lpDirectory: pcwstr(&self.dir),
+            nShow: SW_HIDE.0,
+            ..Default::default()
+        }
+    }
+}
+
+/// `WaitForSingleObject` time-out value that means "never give up".
+const WAIT_FOREVER: u32 = u32::MAX;
+
+fn wait_object(process: HANDLE, ms: u32) -> WAIT_EVENT {
+    unsafe { WaitForSingleObject(process, ms) }
+}
+
+/// Wait until `process` has exited and turn that into a [`LaunchOutcome`]. This is the only wait of
+/// [`run_elevated`], and it has no time-out: it asks for [`WAIT_FOREVER`], and anything but "the process ended"
+/// is a failure, never a reason to hand control back as if the helper were gone. `wait` is `WaitForSingleObject`
+/// (the tests put a recording one in its place).
+fn wait_for_exit(process: HANDLE, wait: fn(HANDLE, u32) -> WAIT_EVENT) -> LaunchOutcome {
+    if wait(process, WAIT_FOREVER) != WAIT_OBJECT_0 {
+        return LaunchOutcome::Failed("WaitForSingleObject failed".into());
+    }
+    let mut code = 0u32;
+    match unsafe { GetExitCodeProcess(process, &mut code) } {
+        Ok(()) => LaunchOutcome::Exited(code),
+        Err(e) => LaunchOutcome::Failed(format!("GetExitCodeProcess failed: {e}")),
+    }
+}
+
 /// Run `exe args...` elevated and wait until it has exited (see [`Launcher`]).
 pub fn run_elevated(exe: &str, args: &[String]) -> LaunchOutcome {
-    let params = args.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ");
-    let verb = wide("runas");
-    let file = wide(exe);
-    let params_w = wide(&params);
-    let mut info = SHELLEXECUTEINFOW {
-        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-        fMask: SEE_MASK_NOCLOSEPROCESS,
-        lpVerb: pcwstr(&verb),
-        lpFile: pcwstr(&file),
-        lpParameters: pcwstr(&params_w),
-        lpDirectory: PCWSTR::null(),
-        nShow: SW_HIDE.0,
-        ..Default::default()
-    };
+    let request = Request::new(exe, args);
+    let mut info = request.info();
     if let Err(e) = unsafe { ShellExecuteExW(&mut info) } {
         return outcome_for_shell_error(&e);
     }
@@ -143,17 +186,8 @@ pub fn run_elevated(exe: &str, args: &[String]) -> LaunchOutcome {
     if process.is_invalid() {
         return LaunchOutcome::Failed("ShellExecuteExW returned no process handle".into());
     }
-    // INFINITE: the process handle is kept until the helper has really exited
-    let wait = unsafe { WaitForSingleObject(process, u32::MAX) };
-    let result = if wait == WAIT_OBJECT_0 {
-        let mut code = 0u32;
-        match unsafe { GetExitCodeProcess(process, &mut code) } {
-            Ok(()) => LaunchOutcome::Exited(code),
-            Err(e) => LaunchOutcome::Failed(format!("GetExitCodeProcess failed: {e}")),
-        }
-    } else {
-        LaunchOutcome::Failed("WaitForSingleObject failed".into())
-    };
+    // the process handle is kept until the helper has really exited
+    let result = wait_for_exit(process, wait_object);
     unsafe {
         let _ = CloseHandle(process);
     }
@@ -164,6 +198,7 @@ pub fn run_elevated(exe: &str, args: &[String]) -> LaunchOutcome {
 mod tests {
     use super::*;
     use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_CANCELLED};
+    use windows_core::PCWSTR;
 
     #[test]
     fn a_declined_uac_prompt_is_a_cancel_and_nothing_else_is() {
@@ -182,5 +217,95 @@ mod tests {
         assert_eq!(quote("a"), "a");
         assert_eq!(quote("a b"), "\"a b\"");
         assert_eq!(quote(""), "\"\"");
+    }
+
+    /// The elevated process starts in the system folder, and the rest of the request is what was asked for.
+    #[test]
+    fn the_elevated_process_starts_in_the_system_folder() {
+        let r = Request::new(
+            r"C:\app\better-cam.exe",
+            &["--vcam-install".into(), "a b".into()],
+        );
+        let info = r.info();
+        let text = |p: PCWSTR| unsafe { p.to_string() }.unwrap();
+        assert_eq!(text(info.lpVerb), "runas");
+        assert_eq!(text(info.lpFile), r"C:\app\better-cam.exe");
+        assert_eq!(text(info.lpParameters), "--vcam-install \"a b\"");
+        let dir = std::path::PathBuf::from(text(info.lpDirectory));
+        assert!(dir.is_dir(), "{}", dir.display());
+        assert!(
+            dir.ends_with("System32") || dir.ends_with("system32"),
+            "{}",
+            dir.display()
+        );
+        assert_eq!(dir, crate::util::system_dir());
+        assert!(!info.lpDirectory.is_null());
+    }
+
+    fn child(script: &str) -> std::process::Child {
+        std::process::Command::new("cmd")
+            .args(["/c", script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn handle_of(c: &std::process::Child) -> HANDLE {
+        use std::os::windows::io::AsRawHandle;
+        HANDLE(c.as_raw_handle())
+    }
+
+    /// The real wait, on a real process (the elevation itself needs a person at a prompt; the wait does not): it
+    /// returns when the process has exited, with its exit code, and not before. A timeout put back into the wait
+    /// would end it early.
+    #[test]
+    fn the_wait_returns_only_when_the_process_has_exited() {
+        let c = child("ping -n 4 127.0.0.1 >nul & exit 7");
+        let began = std::time::Instant::now();
+        let outcome = wait_for_exit(handle_of(&c), wait_object);
+        assert_eq!(outcome, LaunchOutcome::Exited(7));
+        assert!(
+            began.elapsed() >= std::time::Duration::from_millis(2500),
+            "the wait ended after {:?}, before the process did",
+            began.elapsed()
+        );
+        let mut c = c;
+        assert!(c.try_wait().unwrap().is_some());
+    }
+
+    /// There is no timeout path: the wait asks for "forever", and an answer other than "the process ended" is a
+    /// failure that is reported, not a state to carry on from.
+    #[test]
+    fn the_wait_has_no_timeout() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static ASKED: AtomicU32 = AtomicU32::new(0);
+        fn ended(_: HANDLE, ms: u32) -> WAIT_EVENT {
+            ASKED.store(ms, Ordering::SeqCst);
+            WAIT_OBJECT_0
+        }
+        fn timed_out(_: HANDLE, ms: u32) -> WAIT_EVENT {
+            ASKED.store(ms, Ordering::SeqCst);
+            windows::Win32::Foundation::WAIT_TIMEOUT
+        }
+        let mut c = child("exit 3");
+        c.wait().unwrap();
+        assert_eq!(
+            wait_for_exit(handle_of(&c), ended),
+            LaunchOutcome::Exited(3)
+        );
+        assert_eq!(
+            ASKED.load(Ordering::SeqCst),
+            u32::MAX,
+            "the wait has a time limit"
+        );
+        // were it ever to answer "time is up", that is a failure, never an exit code
+        ASKED.store(0, Ordering::SeqCst);
+        assert!(matches!(
+            wait_for_exit(handle_of(&c), timed_out),
+            LaunchOutcome::Failed(_)
+        ));
+        assert_eq!(ASKED.load(Ordering::SeqCst), u32::MAX);
+        assert_eq!(WAIT_FOREVER, u32::MAX);
     }
 }

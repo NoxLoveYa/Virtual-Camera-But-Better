@@ -444,10 +444,12 @@ export const useStore = create<State>((set, get) => {
         // A Start that was refused for want of the camera left its error up; it is no longer true.
         if (get().error?.includes("virtual camera is not installed")) set({ error: null });
         const what = action === "repair" ? "repaired" : action === "update" ? "updated" : "installed";
+        // The frame file belongs to one Windows account at a time: this one, from now on (a repair by another
+        // account takes it over; that account repairs it again to get it back).
         say(
           result === "pending_restart"
-            ? `Virtual camera ${what}. It takes effect after the camera service restarts (close the apps that use a camera) or after Windows restarts.`
-            : `Virtual camera ${what}`,
+            ? `Virtual camera ${what} for this Windows account. It takes effect after the camera service restarts (close the apps that use a camera) or after Windows restarts.`
+            : `Virtual camera ${what}. It now works for this Windows account.`,
         );
       } catch (e) {
         say(String(e));

@@ -1301,6 +1301,69 @@ mod tests {
         let _ = std::fs::remove_dir(&link);
     }
 
+    /// A standard user may read `frames.bin`, and with that right they can hold an oplock on it that blocks every
+    /// other open. The DLL's three opens (the media types at activation, the stream's mapping, and its retries)
+    /// must not wait for them: the activation thread of the camera service would hang, and the pumps that wait in
+    /// an open pile up. They return at once, as "not usable now", which shows the "not running" slate, and the
+    /// camera works again as soon as the lock is gone.
+    #[test]
+    fn a_frame_file_with_somebody_elses_oplock_gives_the_slate_at_once() {
+        use vcam_protocol::secure::oplock::Oplock;
+        let path = temp_path("oplock.bin");
+        let _ = std::fs::remove_file(&path);
+        {
+            let w = Writer::create(&path).unwrap();
+            w.set_state(WriterState::Live);
+            w.set_advertised(&vcam_protocol::advertised_for_output(1280, 720, 30));
+            publish_pattern(&w, 320, 180, 1);
+        }
+        let Some(lock) = Oplock::take(&path).unwrap() else {
+            eprintln!("this file system grants no oplock: skipped");
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = path.clone();
+        std::thread::spawn(move || {
+            let t = Instant::now();
+            set_test_path(Some(p.clone()));
+            let adv = advertised();
+            let advertised_took = t.elapsed();
+            let mut src = FrameSource::new(p, nv12(320, 180, 30));
+            src.start();
+            let t = Instant::now();
+            let mut kinds = Vec::new();
+            while t.elapsed() < Duration::from_millis(400) {
+                kinds.push(next_ready(&mut src, Duration::from_secs(2)).kind);
+            }
+            src.stop();
+            set_test_path(None);
+            let _ = tx.send((adv, advertised_took, kinds, t.elapsed()));
+        });
+        let (adv, advertised_took, kinds, took) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("opening the frame file waited for the oplock holder");
+        assert!(
+            advertised_took < Duration::from_secs(1),
+            "{advertised_took:?}"
+        );
+        assert_eq!(adv, vcam_protocol::default_advertised());
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        assert!(
+            !kinds.is_empty()
+                && kinds
+                    .iter()
+                    .all(|k| *k == Kind::Slate(SlateKind::NotRunning)),
+            "{kinds:?}"
+        );
+        drop(lock);
+        // the lock is gone: the same file works
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        publish_pattern(&w, 320, 180, 2);
+        let kinds = run_source_for(&path, 150);
+        assert!(kinds.contains(&Kind::Live), "{kinds:?}");
+    }
+
     #[test]
     fn hostile_capture_times_are_clamped_and_never_break_the_stream() {
         let path = temp_path("captimes.bin");

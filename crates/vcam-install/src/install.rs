@@ -128,7 +128,12 @@ pub fn install_with(
         .filter(|r| Path::new(&r.dll).is_file());
 
     // 1. the data folder (no registration exists because of this step, nothing to undo)
-    datadir::prepare(paths, &principals, &mut || m.stop_frame_server(), log)?;
+    if let Err(e) = datadir::prepare(paths, &principals, &mut || m.stop_frame_server(), log) {
+        // The log was let go of while the folder was worked on: whatever the caller writes about this failure (the
+        // `ERROR:` line the app shows) must reach the file, so make it ready again before returning.
+        log.folder_ready();
+        return Err(e);
+    }
     log.folder_ready();
     log.line(&format!("data folder ready: {}", paths.data.display()));
 
@@ -402,6 +407,13 @@ pub fn uninstall_with(
         let why = format!("{} (a file in it is in use)", paths.data.display());
         log.line(&format!("could not remove {why}"));
         left.push(why);
+    }
+    // a data folder that an install moved out of the way lives next to `BetterCam`, not in it
+    if datadir::sweep_data_asides(paths, log) > 0 {
+        left.push(format!(
+            "an old copy of the data folder in {} (in use)",
+            paths.program_data.display()
+        ));
     }
 
     if left.is_empty() {

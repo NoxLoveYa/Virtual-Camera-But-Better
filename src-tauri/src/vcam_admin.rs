@@ -2,7 +2,7 @@
 //!
 //! Two halves in one exe:
 //!
-//! * The elevated helper: `better-cam.exe --vcam-install [--user-sid <SID>]` and `better-cam.exe --vcam-uninstall`.
+//! * The elevated helper: `better-cam.exe --vcam-install --user-sid <SID>` and `better-cam.exe --vcam-uninstall`.
 //!   `main()` runs [`parse_helper_args`] before the Tauri builder (so the single-instance plugin cannot swallow the
 //!   call) and, when it is a helper call, [`run_helper`] and exits: no window. The work itself is `vcam_install`, the
 //!   same code `vcam-tool` runs. Details go to `%ProgramData%\BetterCam\logs\install.log`.
@@ -11,10 +11,19 @@
 //!
 //! Helper exit codes: [`EXIT_OK`] 0, [`EXIT_FAILED`] 1 (see `install.log`), [`EXIT_USAGE`] 2 (bad arguments),
 //! [`EXIT_NOT_ELEVATED`] 5 (started without administrator rights), [`EXIT_PENDING`] 10 (done, but it takes effect
-//! only after the camera service restarts or Windows restarts).
+//! only after the camera service restarts or Windows restarts), [`EXIT_BUSY`] 11 (another install, repair or removal
+//! is running on this machine: the helper took no action).
 //!
 //! The app waits for the helper to *exit*, however long the Windows prompt stays open: there is no timeout, so the
-//! guard that refuses a second action is held for exactly as long as a helper may still be running.
+//! guard that refuses a second action is held for exactly as long as a helper may still be running. That guard lives
+//! in one app process; the helper itself takes a machine-wide lock (`vcam_install::lock`) before it touches
+//! anything, so an app restarted while a helper still runs, a second copy of the app and `vcam-tool` are refused too.
+//!
+//! **Whose camera it is.** The frame file belongs to *one* Windows account at a time: the helper is told which
+//! (`--user-sid`, always: the account that answers the administrator prompt may be another one, and guessing would
+//! hand the camera to the wrong account). Installing or repairing from another Windows account replaces the
+//! permissions, so the virtual camera works for that account from then on and no longer for the earlier one, until
+//! that account repairs it again. The windows of the app say so.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -35,12 +44,15 @@ pub const EXIT_USAGE: i32 = 2;
 pub const EXIT_NOT_ELEVATED: i32 = 5;
 /// Done, but the camera service still has the old build loaded (install) or a file waits for a restart (remove).
 pub const EXIT_PENDING: i32 = 10;
+/// Another install, repair or removal is running on this machine (see `vcam_install::lock`); nothing was done.
+pub const EXIT_BUSY: i32 = 11;
 
 /// What the helper was asked to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HelperCommand {
-    /// Install, update or repair; `user_sid` is the user who clicked (the elevated account may be another one).
-    Install { user_sid: Option<String> },
+    /// Install, update or repair; `user_sid` is the user who clicked (the elevated account may be another one). It
+    /// is not optional: without it the helper would have to guess, and the guess is the administrator's account.
+    Install { user_sid: String },
     Uninstall,
 }
 
@@ -80,6 +92,9 @@ fn parse_helper(args: &[String], install: bool, uninstall: bool) -> Result<Helpe
         }
         Ok(HelperCommand::Uninstall)
     } else {
+        // The app always gives it. A helper without it would use the account that is elevated, which with an
+        // over-the-shoulder prompt is the administrator's and not the user's.
+        let user_sid = user_sid.ok_or_else(|| format!("{ARG_INSTALL} needs {ARG_USER_SID} <SID>"))?;
         Ok(HelperCommand::Install { user_sid })
     }
 }
@@ -90,21 +105,36 @@ pub fn run_helper(cmd: HelperCommand) -> i32 {
         eprintln!("the virtual camera helper needs administrator rights");
         return EXIT_NOT_ELEVATED;
     }
+    let user_sid = match &cmd {
+        HelperCommand::Install { user_sid } => Some(user_sid.as_str()),
+        HelperCommand::Uninstall => None,
+    };
+    // One helper at a time on the machine, before anything is touched (or written to install.log, which belongs to
+    // the run that holds the lock).
+    let _lock = match vcam_install::lock::acquire() {
+        Ok(vcam_install::lock::Acquired::Held(l)) => l,
+        Ok(vcam_install::lock::Acquired::Busy) => {
+            eprintln!("{}", vcam_install::lock::BUSY_MESSAGE);
+            return EXIT_BUSY;
+        }
+        Err(e) => {
+            let mut log = vcam_install::FileLog::open_for(user_sid);
+            log.line(&format!("ERROR: {e}"));
+            return EXIT_FAILED;
+        }
+    };
     // Opens install.log only when the folder is already there and as it must be; the install makes it and the log
-    // follows (see `FileLog`). Nothing here creates or follows anything in the data folder.
-    let mut log = vcam_install::FileLog::open();
+    // follows (see `FileLog`). Nothing here creates or follows anything in the data folder. A log that is dropped
+    // writes what still waits for a file, so the `ERROR:` line below is in the file when the process ends.
+    let mut log = vcam_install::FileLog::open_for(user_sid);
     let result: Result<i32, String> = match cmd {
         HelperCommand::Install { user_sid } => {
-            let user_sid = user_sid.or_else(|| vcam_install::current_user_sid().ok());
-            log.line(&format!(
-                "---- install: elevated, user {}",
-                user_sid.as_deref().unwrap_or("unknown")
-            ));
+            log.line(&format!("---- install: elevated, user {user_sid}"));
             locate_dll().and_then(|dll| {
                 log.line(&format!("dll source: {}", dll.display()));
                 vcam_install::install(
                     &vcam_install::InstallOptions {
-                        user_sid,
+                        user_sid: Some(user_sid),
                         dshow_class: false,
                     },
                     &dll,
@@ -124,13 +154,15 @@ pub fn run_helper(cmd: HelperCommand) -> i32 {
             })
         }
     };
-    match result {
+    let code = match result {
         Ok(code) => code,
         Err(e) => {
             log.line(&format!("ERROR: {e}"));
             EXIT_FAILED
         }
-    }
+    };
+    log.flush();
+    code
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -212,14 +244,16 @@ impl Action {
     }
 }
 
-/// The arguments the app gives the helper.
-pub fn helper_args(action: Action, user_sid: &str) -> Vec<String> {
+/// What the app says when it cannot tell which Windows account runs it: the helper must be told, so nothing starts.
+pub const NO_ACCOUNT: &str = "Could not tell which Windows account is running Better Cam, so the virtual camera was not installed. Sign out of Windows and in again, then try once more.";
+
+/// The arguments the app gives the helper. An install always carries the user's SID: without one there is no
+/// helper to start (the helper would guess the account, see the module docs).
+pub fn helper_args(action: Action, user_sid: &str) -> Result<Vec<String>, String> {
     match action {
-        Action::Install if !user_sid.is_empty() => {
-            vec![ARG_INSTALL.into(), ARG_USER_SID.into(), user_sid.into()]
-        }
-        Action::Install => vec![ARG_INSTALL.into()],
-        Action::Uninstall => vec![ARG_UNINSTALL.into()],
+        Action::Install if user_sid.is_empty() => Err(NO_ACCOUNT.into()),
+        Action::Install => Ok(vec![ARG_INSTALL.into(), ARG_USER_SID.into(), user_sid.into()]),
+        Action::Uninstall => Ok(vec![ARG_UNINSTALL.into()]),
     }
 }
 
@@ -259,11 +293,15 @@ pub fn outcome_to_result(action: Action, outcome: &LaunchOutcome, log_tail: &[St
             if code == EXIT_NOT_ELEVATED {
                 return Err(format!("Windows did not give the {verb} step administrator rights."));
             }
+            if code == EXIT_BUSY {
+                return Err(vcam_install::lock::BUSY_MESSAGE.to_string());
+            }
+            // Only the helper's own `ERROR:` line is a reason. The last line of the log is not: it is whatever the
+            // helper happened to write before it stopped, and the real cause may never have reached the file.
             let why = log_tail
                 .iter()
                 .rev()
                 .find(|l| l.contains("ERROR:"))
-                .or(log_tail.last())
                 .map(|l| format!(": {}", strip_stamp(l)))
                 .unwrap_or_default();
             Err(format!("Could not {verb} the virtual camera (exit code {code}){why}"))
@@ -281,10 +319,12 @@ fn strip_stamp(line: &str) -> &str {
 /// Start the helper with `launcher`, wait, and read what happened. Blocks until the UAC prompt is answered and the
 /// helper has exited, however long that takes (see the module docs).
 pub fn run_action(launcher: &dyn Launcher, exe: &str, action: Action, user_sid: &str) -> Result<ActionDone, String> {
+    // before any prompt: an install that cannot say whose camera it is does not start
+    let args = helper_args(action, user_sid)?;
     let started = SystemTime::now();
-    let outcome = launcher.run_elevated(exe, &helper_args(action, user_sid));
+    let outcome = launcher.run_elevated(exe, &args);
     let tail = match &outcome {
-        LaunchOutcome::Exited(c) if *c as i32 == EXIT_OK || *c as i32 == EXIT_PENDING => Vec::new(),
+        LaunchOutcome::Exited(c) if *c as i32 == EXIT_OK || *c as i32 == EXIT_PENDING || *c as i32 == EXIT_BUSY => Vec::new(),
         // only what this run wrote: an older run's last lines say nothing about it
         _ => vcam_install::log::log_tail_since(started, 8),
     };
@@ -309,7 +349,9 @@ pub fn run_claimed(
 /// app without it never shows a prompt.
 pub fn install(svc: &Service, launcher: &dyn Launcher) -> Result<ActionDone, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    // no SID, no helper: the message says so (see `run_action`); nothing is released or started before that
     let sid = vcam_install::current_user_sid().unwrap_or_default();
+    helper_args(Action::Install, &sid)?;
     let _change = svc.begin_vcam_change(true)?;
     locate_dll()?;
     run_action(launcher, &exe.to_string_lossy(), Action::Install, &sid)
@@ -345,16 +387,21 @@ mod tests {
     fn install_takes_a_user_sid() {
         assert_eq!(
             parse_helper_args(&args(&["--vcam-install", "--user-sid", SID])),
-            Some(Ok(HelperCommand::Install { user_sid: Some(SID.into()) }))
+            Some(Ok(HelperCommand::Install { user_sid: SID.into() }))
         );
         assert_eq!(
             parse_helper_args(&args(&["--user-sid", SID, "--vcam-install"])),
-            Some(Ok(HelperCommand::Install { user_sid: Some(SID.into()) }))
+            Some(Ok(HelperCommand::Install { user_sid: SID.into() }))
         );
-        assert_eq!(
-            parse_helper_args(&args(&["--vcam-install"])),
-            Some(Ok(HelperCommand::Install { user_sid: None }))
-        );
+    }
+
+    /// L8: an install without the user's SID would use the elevated account's, which with an over-the-shoulder
+    /// prompt is the administrator's. The helper refuses to start instead.
+    #[test]
+    fn an_install_without_the_users_sid_is_a_usage_error() {
+        let e = parse_helper_args(&args(&["--vcam-install"])).unwrap().unwrap_err();
+        assert!(e.contains("--user-sid"), "{e}");
+        assert!(parse_helper_args(&args(&["--vcam-install", "--user-sid"])).unwrap().is_err());
     }
 
     #[test]
@@ -434,14 +481,52 @@ mod tests {
 
     #[test]
     fn the_app_gives_the_helper_the_users_sid() {
-        assert_eq!(helper_args(Action::Install, SID), args(&["--vcam-install", "--user-sid", SID]));
-        assert_eq!(helper_args(Action::Install, ""), args(&["--vcam-install"]));
-        assert_eq!(helper_args(Action::Uninstall, SID), args(&["--vcam-uninstall"]));
+        assert_eq!(helper_args(Action::Install, SID).unwrap(), args(&["--vcam-install", "--user-sid", SID]));
+        assert_eq!(helper_args(Action::Uninstall, SID).unwrap(), args(&["--vcam-uninstall"]));
         // what the app sends, the helper accepts
         assert_eq!(
-            parse_helper_args(&helper_args(Action::Install, SID)),
-            Some(Ok(HelperCommand::Install { user_sid: Some(SID.into()) }))
+            parse_helper_args(&helper_args(Action::Install, SID).unwrap()),
+            Some(Ok(HelperCommand::Install { user_sid: SID.into() }))
         );
+    }
+
+    /// L8: when the app cannot read its own user's SID it must not start a helper without one (the old code left
+    /// the argument out and the helper then used the elevated account). The user gets a clear sentence and no
+    /// prompt.
+    #[test]
+    fn without_the_users_sid_no_helper_is_started_and_the_message_says_why() {
+        assert_eq!(helper_args(Action::Install, "").unwrap_err(), NO_ACCOUNT);
+        let f = fake(LaunchOutcome::Exited(0));
+        let e = run_action(&f, r"C:\app\better-cam.exe", Action::Install, "").unwrap_err();
+        assert!(e.contains("which Windows account"), "{e}");
+        assert!(f.seen.borrow().is_empty(), "a helper was started without the user's SID");
+        // a removal needs no account
+        assert_eq!(
+            run_action(&f, r"C:\app\better-cam.exe", Action::Uninstall, ""),
+            Ok(ActionDone::Done)
+        );
+        // and the claim is not taken for nothing: `install` checks before it releases the engine
+        let svc = Service::new();
+        assert!(helper_args(Action::Install, "").is_err());
+        assert!(svc.begin_vcam_change(false).is_ok());
+    }
+
+    /// L6: a second helper exits with its own code and the app shows what that means, not "exit code 11".
+    #[test]
+    fn a_helper_that_found_another_one_running_says_so() {
+        assert_eq!(EXIT_BUSY, 11);
+        for action in [Action::Install, Action::Uninstall] {
+            let e = outcome_to_result(action, &LaunchOutcome::Exited(EXIT_BUSY as u32), &[]).unwrap_err();
+            assert!(e.contains("already running"), "{e}");
+            assert!(!e.contains("exit code"), "{e}");
+        }
+        // run through the launcher: the log is not even looked at (it belongs to the run that is still going)
+        let f = fake(LaunchOutcome::Exited(EXIT_BUSY as u32));
+        let e = run_action(&f, "x.exe", Action::Install, SID).unwrap_err();
+        assert!(e.contains("already running"), "{e}");
+        assert_ne!(EXIT_BUSY, EXIT_OK);
+        assert_ne!(EXIT_BUSY, EXIT_PENDING);
+        assert_ne!(EXIT_BUSY, EXIT_FAILED);
     }
 
     struct Fake {
@@ -494,6 +579,18 @@ mod tests {
         assert!(e.contains("exit code 1") && e.ends_with("MFCreateVirtualCamera: boom"), "{e}");
         let e = outcome_to_result(Action::Install, &LaunchOutcome::Exited(1), &[]).unwrap_err();
         assert!(e.contains("exit code 1"), "{e}");
+    }
+
+    /// M3: when the `ERROR:` line did not reach the log, the last line that did is not the reason (the old code
+    /// showed it as one: "Could not install ...: data folder: kept").
+    #[test]
+    fn a_log_without_an_error_line_gives_no_reason() {
+        let tail = vec![
+            "2026-11-17 01:02:03 C:\\ProgramData\\BetterCam: kept".to_string(),
+            "2026-11-17 01:02:04 C:\\ProgramData\\BetterCam\\logs: kept".to_string(),
+        ];
+        let e = outcome_to_result(Action::Install, &LaunchOutcome::Exited(1), &tail).unwrap_err();
+        assert_eq!(e, "Could not install the virtual camera (exit code 1)");
     }
 
     #[test]

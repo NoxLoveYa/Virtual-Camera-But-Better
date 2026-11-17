@@ -97,7 +97,9 @@ impl Service {
     /// Claim the right to change the virtual camera (install, repair, remove); one change at a time. With
     /// `release_engine` the engine is shut down first (camera and `frames.bin` released: the helper may have to
     /// replace the file) and cannot be created until the guard drops. The claim is held until the helper has really
-    /// exited (see `vcam_admin`), so nothing else starts meanwhile.
+    /// exited (see `vcam_admin`), so nothing else starts meanwhile. It covers this process only: a restarted app, a
+    /// second copy of it and `vcam-tool` are kept apart by the machine-wide lock the helper itself takes
+    /// (`vcam_install::lock`), which answers them with `EXIT_BUSY`.
     pub fn begin_vcam_change(&self, release_engine: bool) -> Result<VcamChange<'_>, String> {
         if self
             .vcam_busy

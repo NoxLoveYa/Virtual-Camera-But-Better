@@ -269,6 +269,43 @@ fn is_stopped(shared: &PumpShared) -> bool {
     shared.inner.lock_safe().stop
 }
 
+#[cfg(test)]
+type PostHook = Box<dyn FnOnce(&PumpShared)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs on the pump thread between "a sample is ready" and "the sample is posted" (tests: stop the pump there).
+    static BEFORE_POST_HOOK: std::cell::RefCell<Option<PostHook>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_before_post_hook(shared: &PumpShared) {
+    if let Some(f) = BEFORE_POST_HOOK.with(|h| h.borrow_mut().take()) {
+        f(shared);
+    }
+}
+
+/// Post `sample` to the consumer unless the pump has been stopped. `None`: stopped, nothing was posted.
+///
+/// The check and the post happen under the lock that [`Pump::stop`] takes to set the flag, so a sample is either
+/// posted before the stop (and so before the stream's stop event) or not at all. A check made only before the
+/// poll is not enough: the poll opens the frame file, and a pump that was detached after waiting for such an open
+/// for over two seconds would otherwise post a sample after the stop event, or after a restart of the stream.
+fn post_sample(
+    shared: &PumpShared,
+    queue: &IMFMediaEventQueue,
+    sample: &IMFSample,
+) -> Option<Result<()>> {
+    let g = shared.inner.lock_safe();
+    if g.stop {
+        return None;
+    }
+    let r =
+        unsafe { queue.QueueEventParamUnk(MEMediaSample.0 as u32, &GUID::zeroed(), S_OK, sample) };
+    drop(g);
+    Some(r)
+}
+
 fn pump_loop(
     shared: &PumpShared,
     queue: &IMFMediaEventQueue,
@@ -321,11 +358,12 @@ fn pump_loop(
         let ts = next_timestamp(emit.sample_qpc(), prev_ts);
         match make_sample(&fmt, src.data(), ts, token.map(|t| t.0)) {
             Ok(sample) => {
-                let r = unsafe {
-                    queue.QueueEventParamUnk(MEMediaSample.0 as u32, &GUID::zeroed(), S_OK, &sample)
-                };
-                match r {
-                    Ok(()) => {
+                #[cfg(test)]
+                run_before_post_hook(shared);
+                match post_sample(shared, queue, &sample) {
+                    // stopped while the poll (a file open) was under way: this sample is from before the stop
+                    None => break 'outer,
+                    Some(Ok(())) => {
                         prev_ts = ts;
                         src.finish_emit(emit, vcam_protocol::qpc_now());
                         let n = frames_out.fetch_add(1, Ordering::Relaxed) + 1;
@@ -333,7 +371,7 @@ fn pump_loop(
                             vlog!("sample #{n} {:?} ts={ts}", emit.kind);
                         }
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         vlog!("QueueEventParamUnk(MEMediaSample) failed: {e}");
                         break 'outer;
                     }
@@ -947,6 +985,74 @@ mod tests {
         );
         assert!(took < STOP_WAIT, "{took:?}");
         stream.shutdown();
+    }
+
+    /// A pump that runs the real loop on a frame file that does not exist (so it posts slates), with one token to
+    /// answer. `before_post` runs on the pump thread when the sample is ready and not yet posted.
+    fn run_one_sample(before_post: Option<PostHook>) -> (IMFMediaEventQueue, Pump) {
+        let q = queue();
+        let fmt = FrameFormat {
+            pixel: PixelFormat::Nv12,
+            width: 1280,
+            height: 720,
+            fps: 30,
+        };
+        // the closure must be Send: smuggle the hook through a Mutex of a pointer-sized Option
+        struct Hook(Option<PostHook>);
+        // SAFETY: the hook is moved into the pump thread once and used only there.
+        unsafe impl Send for Hook {}
+        let hook = Hook(before_post);
+        let pump = Pump::spawn_with(q.clone(), move |shared, queue| {
+            let hook = hook;
+            if let Some(h) = hook.0 {
+                BEFORE_POST_HOOK.with(|c| *c.borrow_mut() = Some(h));
+            }
+            pump_loop(
+                shared,
+                queue,
+                fmt,
+                &AtomicU64::new(0),
+                std::env::temp_dir()
+                    .join("bettercam-test-no-such-dir")
+                    .join("frames.bin"),
+            );
+        })
+        .unwrap();
+        pump.add_token(None);
+        (q, pump)
+    }
+
+    /// The old pump checked `stop` only before it polled the source. A poll that lasted (a file open that was
+    /// held up for over two seconds, after which the pump had been detached) then posted its sample after the
+    /// stop. Stopping while the sample is ready but not posted must post nothing.
+    #[test]
+    fn a_pump_that_is_stopped_while_a_sample_is_ready_posts_nothing() {
+        // control: nothing stops it, the sample arrives
+        let (q, mut pump) = run_one_sample(None);
+        assert!(
+            wait_for(&q, MEMediaSample.0 as u32, Duration::from_secs(5)).is_some(),
+            "the test setup posts no sample at all"
+        );
+        pump.stop_within(Duration::from_secs(2));
+
+        // the stop arrives between the poll and the post
+        let (q, mut pump) = run_one_sample(Some(Box::new(|shared: &PumpShared| {
+            shared.inner.lock_safe().stop = true;
+        })));
+        // the pump ends by itself: it saw the stop
+        let began = Instant::now();
+        while !*pump.done.flag.lock_safe() {
+            assert!(
+                began.elapsed() < Duration::from_secs(5),
+                "the pump never ended"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            wait_for(&q, MEMediaSample.0 as u32, Duration::from_millis(200)).is_none(),
+            "a sample was posted after the stop"
+        );
+        pump.stop_within(Duration::from_secs(2));
     }
 
     #[test]

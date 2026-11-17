@@ -13,23 +13,25 @@
 //!   logs are pruned;
 //! * a log that grows past the cap is truncated through its verified handle, never renamed or deleted by path;
 //! * pruning deletes only plain files named `vcam-*.log` and keeps the newest [`KEEP_LOGS`] plus every file whose
-//!   process is still running, so the number of files stays bounded however often processes start.
+//!   process is still running, so the number of files stays bounded however often processes start;
+//! * nothing slow happens while the `LOG` mutex is held: opening the file and pruning (which touch the disk and may
+//!   meet a file somebody else has locked) run outside it, claimed by one thread at a time ([`LogFile::begin_open`]);
+//!   the other callers' lines are dropped meanwhile instead of waiting. The opens and deletes never wait for
+//!   another program (`vcam_protocol::secure`). The user has no access to `vcam-*.log` at all, so only the service
+//!   account could ever hold such a lock.
 
 use std::fmt::Write as _;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Seek, SeekFrom, Write as _};
-use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use vcam_protocol::secure;
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED};
-use windows::Win32::Storage::FileSystem::{
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
-};
+use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 use windows::Win32::System::LibraryLoader::{
     GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
     GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -60,6 +62,21 @@ struct LogFile {
     max_bytes: u64,
     header_written: bool,
     next_try: Option<Instant>,
+    /// A thread is opening the file right now (outside the lock); nobody else starts a second open.
+    opening: bool,
+}
+
+/// What the thread that claimed the open does outside the lock.
+struct OpenJob {
+    root: PathBuf,
+    dir: PathBuf,
+    name: String,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread called [`open_log`] (tests: a failed truncation must not make every line open again).
+    static OPEN_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 static LOG: OnceLock<Mutex<LogFile>> = OnceLock::new();
@@ -75,6 +92,8 @@ pub fn log_dir() -> PathBuf {
 /// Open `dir\name` for appending, the safe way (see the module docs). The folder and the file are checked against
 /// `root`; the folder is created by nobody. Returns the file, positioned at its end, and its length.
 fn open_log(root: &Path, dir: &Path, name: &str) -> std::io::Result<(File, u64)> {
+    #[cfg(test)]
+    OPEN_CALLS.with(|c| c.set(c.get() + 1));
     let expect_dir = secure::expected_path(root, dir)?;
     // No delete sharing: while this handle is open the folder cannot be renamed, deleted or replaced by a link.
     let dir_handle = secure::open_no_follow(dir, false, true, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
@@ -82,13 +101,15 @@ fn open_log(root: &Path, dir: &Path, name: &str) -> std::io::Result<(File, u64)>
     prune(dir, KEEP_LOGS, name);
     let path = dir.join(name);
     let expect_file = secure::expected_path(root, &path)?;
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .share_mode(secure::SHARE_ALL.0)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
-        .open(&path)?;
+    // read and write, created when missing, a link in the last component is not followed, no waiting for a lock
+    let mut file = File::from(secure::open_with(
+        &path,
+        secure::ACCESS_GENERIC_READ | secure::ACCESS_GENERIC_WRITE,
+        secure::SHARE_ALL,
+        secure::DISP_OPEN_ALWAYS,
+        false,
+        0,
+    )?);
     secure::verify_file(secure::raw(&file), Some(&expect_file))?;
     let len = file.seek(SeekFrom::End(0))?;
     drop(dir_handle);
@@ -117,8 +138,8 @@ fn process_alive(pid: u32) -> bool {
 }
 
 /// Delete old `vcam-*.log` files in `dir`: keep the newest `keep`, `current`, and every file of a running process.
-/// Only plain files are touched: a link, a junction or a directory with such a name is left alone, and a name is
-/// removed with `remove_file`, which never follows a link.
+/// Only plain files are touched: a link, a junction or a directory with such a name is left alone, and a file is
+/// deleted through a handle that was opened without following a link ([`secure::remove_plain_file`]).
 pub fn prune(dir: &Path, keep: usize, current: &str) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -143,7 +164,8 @@ pub fn prune(dir: &Path, keep: usize, current: &str) {
         if pid_of(&name).is_some_and(process_alive) {
             continue;
         }
-        let _ = std::fs::remove_file(path);
+        // never waits for a program that holds a lock on the file: that file stays for the next prune
+        let _ = secure::remove_plain_file(&path);
     }
 }
 
@@ -210,27 +232,59 @@ impl LogFile {
             max_bytes: MAX_BYTES,
             header_written: false,
             next_try: None,
+            opening: false,
         }
     }
 
-    /// Open the file if it is closed and the last refusal is old enough. True when a file is open.
-    fn ensure_open(&mut self) -> bool {
-        if self.file.is_none() && self.next_try.is_none_or(|t| Instant::now() >= t) {
-            match open_log(&self.root, &self.dir, &self.name) {
-                Ok((f, len)) => {
-                    self.file = Some(f);
-                    self.written = len;
-                    self.next_try = None;
-                }
-                Err(_) => self.next_try = Some(Instant::now() + RETRY_AFTER),
+    /// Claim the opening of the file when it is closed, nobody else is opening it and the last refusal is old
+    /// enough. The caller opens with [`open_log`] *without holding the lock* and hands the result to
+    /// [`LogFile::finish_open`].
+    fn begin_open(&mut self) -> Option<OpenJob> {
+        if self.file.is_some() || self.opening || self.next_try.is_some_and(|t| Instant::now() < t)
+        {
+            return None;
+        }
+        self.opening = true;
+        Some(OpenJob {
+            root: self.root.clone(),
+            dir: self.dir.clone(),
+            name: self.name.clone(),
+        })
+    }
+
+    /// The result of the open that [`LogFile::begin_open`] claimed. A refusal makes the log wait [`RETRY_AFTER`].
+    fn finish_open(&mut self, result: std::io::Result<(File, u64)>) {
+        self.opening = false;
+        match result {
+            Ok((f, len)) => {
+                self.file = Some(f);
+                self.written = len;
+                self.next_try = None;
             }
+            Err(_) => self.next_try = Some(Instant::now() + RETRY_AFTER),
         }
-        self.file.is_some()
     }
 
-    /// Append `line`. Nothing happens (and nothing is created) while the log folder or file is not acceptable.
+    /// [`begin_open`](Self::begin_open), the open and [`finish_open`](Self::finish_open) in one go, for tests that
+    /// have no other thread.
+    #[cfg(test)]
+    fn open_now(&mut self) {
+        if let Some(job) = self.begin_open() {
+            let r = open_log(&job.root, &job.dir, &job.name);
+            self.finish_open(r);
+        }
+    }
+
+    /// [`open_now`](Self::open_now) and [`append`](Self::append).
+    #[cfg(test)]
     fn write_line(&mut self, line: &str) {
-        if !self.ensure_open() {
+        self.open_now();
+        self.append(line);
+    }
+
+    /// Append `line` to the open file; nothing happens while there is none. Never opens, never creates anything.
+    fn append(&mut self, line: &str) {
+        if self.file.is_none() {
             return;
         }
         if self.written > self.max_bytes {
@@ -243,7 +297,10 @@ impl LogFile {
                         self.written += note.len() as u64;
                     }
                 } else {
+                    // e.g. another process has the file mapped (error 1224): give the file up and wait before
+                    // the next open, or every line would prune, open and verify again
                     self.file = None;
+                    self.next_try = Some(Instant::now() + RETRY_AFTER);
                     return;
                 }
             }
@@ -277,7 +334,15 @@ fn header() -> String {
     s
 }
 
-/// Append one line. Never panics, never fails the caller.
+fn lock_log(cell: &Mutex<LogFile>) -> MutexGuard<'_, LogFile> {
+    match cell.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    }
+}
+
+/// Append one line. Never panics, never fails the caller, and never makes a caller wait for the disk: the open (and
+/// the prune that comes with it) runs outside the lock, on the one thread that found the file closed.
 pub fn log(msg: &str) {
     let _ = std::panic::catch_unwind(|| {
         let cell = LOG.get_or_init(|| {
@@ -288,17 +353,21 @@ pub fn log(msg: &str) {
                 format!("vcam-{pid}.log"),
             ))
         });
-        let mut inner = match cell.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        if !inner.header_written && inner.ensure_open() {
+        let job = lock_log(cell).begin_open();
+        if let Some(job) = job {
+            // a panic in here must not leave `opening` set for ever
+            let r = std::panic::catch_unwind(|| open_log(&job.root, &job.dir, &job.name))
+                .unwrap_or_else(|_| Err(std::io::Error::other("opening the log panicked")));
+            lock_log(cell).finish_open(r);
+        }
+        let mut inner = lock_log(cell);
+        if !inner.header_written && inner.file.is_some() {
             inner.header_written = true;
-            inner.write_line(&header());
+            inner.append(&header());
         }
         let tid = unsafe { GetCurrentThreadId() };
         let line = format!("{} [{}] {}\n", timestamp(), tid, msg);
-        inner.write_line(&line);
+        inner.append(&line);
     });
 }
 
@@ -537,6 +606,133 @@ mod tests {
         let text = std::fs::read_to_string(s.dir.join("vcam-1.log")).unwrap();
         assert!(text.contains("log truncated at the size cap"));
         assert!(text.contains("line 399 "));
+    }
+
+    fn open_calls() -> u32 {
+        OPEN_CALLS.with(|c| c.get())
+    }
+
+    /// A log that cannot be cut (another process has it mapped: error 1224) must not make every line open, verify
+    /// and prune again: the open waits like after any other refusal. The old code dropped the file without a
+    /// wait, so the next line opened it again, and so did every line after it.
+    #[test]
+    fn a_failed_truncation_waits_before_the_next_open() {
+        let s = sandbox("truncate-fails");
+        let mut l = LogFile::new(s.root.clone(), s.dir.clone(), "vcam-1.log".into());
+        // a log of a few KB (a mapping needs the header size at least), then a cap below it
+        for i in 0..80 {
+            l.write_line(&format!("line {i} {}\n", "x".repeat(60)));
+        }
+        let path = s.dir.join("vcam-1.log");
+        assert!(std::fs::metadata(&path).unwrap().len() > 4096);
+        let mapped = vcam_protocol::MappedFile::open(&path, vcam_protocol::Access::ReadOnly)
+            .expect("map the log like another process could");
+        l.max_bytes = 1000;
+        let before = open_calls();
+        l.write_line("the line that tries to truncate\n");
+        assert!(l.file.is_none(), "the file is given up");
+        assert!(l.next_try.is_some(), "and the next open waits");
+        // more lines: no new open, no prune, nothing written
+        for _ in 0..50 {
+            l.write_line("dropped\n");
+        }
+        assert_eq!(open_calls(), before, "every line opened the file again");
+        // after the wait, with the mapping gone, the log works again
+        drop(mapped);
+        l.next_try = Some(Instant::now());
+        l.write_line("back\n");
+        assert!(l.file.is_some());
+        assert!(std::fs::read_to_string(&path).unwrap().contains("back"));
+    }
+
+    /// Whoever holds an oplock on a log file must not stall the logging caller: the open is refused at once.
+    #[test]
+    fn a_log_file_that_somebody_holds_an_oplock_on_is_not_waited_for() {
+        use vcam_protocol::secure::oplock::Oplock;
+        let s = sandbox("oplock");
+        let path = s.dir.join("vcam-1.log");
+        std::fs::write(&path, "old\n").unwrap();
+        let Some(lock) = Oplock::take(&path).unwrap() else {
+            eprintln!("this file system grants no oplock: skipped");
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (root, dir) = (s.root.clone(), s.dir.clone());
+        std::thread::spawn(move || {
+            let mut l = LogFile::new(root, dir, "vcam-1.log".into());
+            l.write_line("hello\n");
+            let _ = tx.send((l.file.is_none(), l.next_try.is_some()));
+        });
+        let (no_file, waits) = rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("the log open waited for the oplock holder");
+        assert!(
+            no_file && waits,
+            "the open is a refusal that is retried later"
+        );
+        drop(lock);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\n");
+    }
+
+    /// The prune deletes through a handle and never waits for a lock either: a locked old log stays for the
+    /// next prune, the others are deleted, and this returns.
+    #[test]
+    fn pruning_does_not_wait_for_a_locked_log_file() {
+        use vcam_protocol::secure::oplock::Oplock;
+        let s = sandbox("prune-oplock");
+        for i in 0..4u32 {
+            make_old_log(
+                &s.dir,
+                &format!("vcam-{}.log", dead_pid(i)),
+                1000 + i as u64,
+            );
+        }
+        let locked = s.dir.join(format!("vcam-{}.log", dead_pid(3)));
+        let Some(lock) = Oplock::take(&locked).unwrap() else {
+            eprintln!("this file system grants no oplock: skipped");
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = s.dir.clone();
+        std::thread::spawn(move || {
+            prune(&dir, 0, "vcam-current.log");
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(3))
+            .expect("the prune waited for the oplock holder");
+        assert_eq!(logs_in(&s.dir), vec![format!("vcam-{}.log", dead_pid(3))]);
+        drop(lock);
+        prune(&s.dir, 0, "vcam-current.log");
+        assert!(logs_in(&s.dir).is_empty());
+    }
+
+    /// The open is claimed by one thread at a time and runs outside the lock: while it is under way every other
+    /// caller finds the file closed and simply drops its line (no second open, no waiting).
+    #[test]
+    fn only_one_thread_opens_the_log_and_the_others_do_not_wait() {
+        let s = sandbox("claim");
+        let mut l = LogFile::new(s.root.clone(), s.dir.clone(), "vcam-1.log".into());
+        let job = l.begin_open().expect("the first caller opens");
+        assert!(l.begin_open().is_none(), "a second open was handed out");
+        l.append("lost while the file is being opened\n");
+        assert!(l.file.is_none());
+        let r = open_log(&job.root, &job.dir, &job.name);
+        l.finish_open(r);
+        assert!(l.file.is_some() && l.begin_open().is_none());
+        l.append("kept\n");
+        assert_eq!(
+            std::fs::read_to_string(s.dir.join("vcam-1.log")).unwrap(),
+            "kept\n"
+        );
+        // a refused open waits, and nobody opens during the wait
+        std::fs::remove_dir_all(s.root.join("BetterCam")).unwrap();
+        let mut m = LogFile::new(s.root.clone(), s.dir.clone(), "vcam-2.log".into());
+        let job = m.begin_open().unwrap();
+        m.finish_open(open_log(&job.root, &job.dir, &job.name));
+        assert!(m.file.is_none() && m.next_try.is_some());
+        assert!(m.begin_open().is_none());
+        m.next_try = Some(Instant::now());
+        assert!(m.begin_open().is_some(), "after the wait it tries again");
     }
 
     #[test]

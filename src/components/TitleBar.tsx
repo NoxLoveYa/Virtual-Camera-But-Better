@@ -75,7 +75,11 @@ function VcamRow() {
         <small>{vcamText(state, busy)}</small>
       </span>
       <span className="row-actions">
-        <button disabled={busy !== null || state === undefined} onClick={() => void runVcam(state === "outdated" ? "update" : "repair")}>
+        <button
+          disabled={busy !== null || state === undefined}
+          title="Sets the virtual camera up for this Windows account. It works for one account at a time."
+          onClick={() => void runVcam(state === "outdated" ? "update" : "repair")}
+        >
           {state === "outdated" ? "Update" : "Repair"}
         </button>
         <button className="danger" disabled={busy !== null || state === undefined || state === "missing"} onClick={() => setConfirm(true)}>

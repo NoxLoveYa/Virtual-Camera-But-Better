@@ -5,7 +5,7 @@ use std::os::windows::io::IntoRawHandle;
 use std::path::{Path, PathBuf};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     GetFileSizeEx, SetEndOfFile, SetFilePointerEx, FILE_ATTRIBUTE_TEMPORARY, FILE_BEGIN,
 };
@@ -364,9 +364,10 @@ impl Writer {
             Some(root) => Some(secure::expected_path(root, path)?),
             None => None,
         };
+        // exactly the rights a read-write mapping needs: the file does not give its users more (see `secure`)
         let h = secure::open_with(
             path,
-            GENERIC_READ.0 | GENERIC_WRITE.0,
+            secure::ACCESS_READ_WRITE,
             secure::SHARE_ALL,
             disposition,
             false,

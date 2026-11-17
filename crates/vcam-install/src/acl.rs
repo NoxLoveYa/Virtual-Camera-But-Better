@@ -7,11 +7,19 @@
 //!
 //! | object | owner | ACE (all protected, no inheritance from `%ProgramData%`) |
 //! |---|---|---|
-//! | `BetterCam` | Administrators | SYSTEM, Administrators: full, inherited. LOCAL SERVICE, user: read and traverse, this folder only |
-//! | `logs` | Administrators | SYSTEM, Administrators: full, inherited. LOCAL SERVICE: read, traverse and create files here; modify on files created here. User: read and traverse here, read on the files in it |
-//! | `frames.bin` | Administrators | SYSTEM, Administrators: full. LOCAL SERVICE, user: read and write data (no delete, no change of permissions) |
+//! | `BetterCam` | Administrators | SYSTEM, Administrators: full, this folder only. LOCAL SERVICE, user: read and traverse, this folder only |
+//! | `logs` | Administrators | SYSTEM, Administrators: full, inherited. LOCAL SERVICE: read, traverse and create files here; modify on files created here (`vcam-<pid>.log`). User: read and traverse here, **no** access to the files in it |
+//! | `logs\install.log` | Administrators | SYSTEM, Administrators: full. User: read. Protected: nothing is inherited from `logs`, so LOCAL SERVICE cannot touch it |
+//! | `frames.bin` | Administrators | SYSTEM, Administrators: full. LOCAL SERVICE, user: read and write *data* (no delete, no change of permissions, no write of attributes or extended attributes) |
+//!
+//! The user has no access to `vcam-*.log` because a read right is all it takes to hold an opportunistic lock on a
+//! file that blocks every other open of it; and the frame file gives no `FILE_WRITE_ATTRIBUTES` because that right
+//! lets a user hard-link the file from a folder of their own or set it read-only or sparse, after which the DLL and
+//! the app refuse it until a Repair.
 //!
 //! Everything here is applied and read back through a handle that [`vcam_protocol::secure`] verified, never by path.
+//! A new object is created with its final DACL in the create call ([`SecurityDescriptor`]), so it never exists with
+//! the permissions it would inherit.
 
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
 
@@ -19,10 +27,10 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HANDLE, HLOCAL};
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    ConvertStringSidToSidW, GetSecurityInfo, SetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
+    ConvertStringSidToSidW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
-    EqualSid, GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl, LookupAccountSidW,
+    EqualSid, GetAce, GetSecurityDescriptorControl, LookupAccountSidW, SetKernelObjectSecurity,
     ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
     PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SID_NAME_USE,
 };
@@ -43,8 +51,11 @@ pub const READ_TRAVERSE: u32 = 0x0012_00a9;
 pub const READ_TRAVERSE_ADD_FILE: u32 = 0x0012_00ab;
 /// `FILE_GENERIC_READ`.
 pub const FILE_READ: u32 = 0x0012_0089;
-/// `FILE_GENERIC_READ | FILE_GENERIC_WRITE`: read and write data and attributes, no `DELETE`, no `WRITE_DAC`.
-pub const FILE_READ_WRITE: u32 = 0x0012_019f;
+/// What the frame file gives its two users: `SYNCHRONIZE | READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_READ_EA |
+/// FILE_APPEND_DATA | FILE_WRITE_DATA | FILE_READ_DATA`. A read-write mapping works with it. Missing on purpose:
+/// `FILE_WRITE_ATTRIBUTES` (hard-link the file from another folder, set read-only or sparse), `FILE_WRITE_EA`,
+/// `DELETE`, `WRITE_DAC`, `WRITE_OWNER`.
+pub const FRAMES_READ_WRITE: u32 = 0x0012_008f;
 /// Read, write, execute and `DELETE` (a file the service made may be deleted by the service).
 pub const FILE_MODIFY: u32 = 0x0013_01bf;
 
@@ -93,12 +104,14 @@ impl Principals {
     }
 }
 
-/// The three objects of the data folder.
+/// The objects of the data folder that get permissions of their own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Object {
     DataDir,
     LogsDir,
     FramesFile,
+    /// `logs\install.log`: the helper's own log, which the service must not be able to change.
+    InstallLog,
 }
 
 impl Object {
@@ -107,7 +120,13 @@ impl Object {
             Object::DataDir => "the data folder",
             Object::LogsDir => "the logs folder",
             Object::FramesFile => "frames.bin",
+            Object::InstallLog => "install.log",
         }
+    }
+
+    /// A file, not a folder.
+    pub fn is_file(self) -> bool {
+        matches!(self, Object::FramesFile | Object::InstallLog)
     }
 }
 
@@ -146,16 +165,25 @@ pub fn expected(obj: Object, p: &Principals) -> Vec<Ace> {
                 OBJECT_INHERIT | INHERIT_ONLY,
             ));
             if let Some(u) = &p.user {
+                // list and traverse the folder only: no right on `vcam-*.log` at all (an open for reading is
+                // enough to hold a lock on the file that makes every other open wait)
                 v.push(ace(u, READ_TRAVERSE, 0));
-                v.push(ace(u, FILE_READ, OBJECT_INHERIT | INHERIT_ONLY));
             }
         }
         Object::FramesFile => {
             v.push(ace(&p.system, FULL, 0));
             v.push(ace(&p.admins, FULL, 0));
-            v.push(ace(&p.local_service, FILE_READ_WRITE, 0));
+            v.push(ace(&p.local_service, FRAMES_READ_WRITE, 0));
             if let Some(u) = &p.user {
-                v.push(ace(u, FILE_READ_WRITE, 0));
+                v.push(ace(u, FRAMES_READ_WRITE, 0));
+            }
+        }
+        Object::InstallLog => {
+            // protected: LOCAL SERVICE's inheritable modify right on `logs` does not reach this file
+            v.push(ace(&p.system, FULL, 0));
+            v.push(ace(&p.admins, FULL, 0));
+            if let Some(u) = &p.user {
+                v.push(ace(u, FILE_READ, 0));
             }
         }
     }
@@ -269,10 +297,10 @@ pub fn confirm_user_account(sid: &str) -> Res<()> {
 }
 
 /// A SID converted from its text, freed on drop.
-struct SidBuf(PSID);
+pub(crate) struct SidBuf(PSID);
 
 impl SidBuf {
-    fn parse(text: &str) -> Res<SidBuf> {
+    pub(crate) fn parse(text: &str) -> Res<SidBuf> {
         let w = wide(text);
         let mut p = PSID::default();
         unsafe { ConvertStringSidToSidW(pcwstr(&w), &mut p) }
@@ -280,7 +308,7 @@ impl SidBuf {
         Ok(SidBuf(p))
     }
 
-    fn psid(&self) -> PSID {
+    pub(crate) fn psid(&self) -> PSID {
         self.0
     }
 }
@@ -318,9 +346,65 @@ pub fn sid_eq(a: &str, b: &str) -> bool {
 /// Access an opened handle needs for [`apply`] and [`read`]: permissions to read, `WRITE_DAC` and `WRITE_OWNER`.
 pub const SECURITY_ACCESS: u32 = 0x0002_0000 /* READ_CONTROL */ | 0x0004_0000 /* WRITE_DAC */ | 0x0008_0000 /* WRITE_OWNER */;
 
+/// A security descriptor with the protected DACL of an object, to give to the create call of that object: it then
+/// exists with its final permissions from its first moment (and not with whatever the folder around it would
+/// hand down). Freed on drop.
+pub struct SecurityDescriptor {
+    psd: PSECURITY_DESCRIPTOR,
+}
+
+impl SecurityDescriptor {
+    /// The descriptor for `obj`.
+    pub fn for_object(obj: Object, p: &Principals) -> Res<SecurityDescriptor> {
+        Self::from_aces(&expected(obj, p))
+    }
+
+    /// A protected DACL of exactly `aces`.
+    pub fn from_aces(aces: &[Ace]) -> Res<SecurityDescriptor> {
+        let text = sddl(aces);
+        let w = wide(&text);
+        let mut psd = PSECURITY_DESCRIPTOR::default();
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                pcwstr(&w),
+                SDDL_REVISION_1,
+                &mut psd,
+                None,
+            )
+        }
+        .map_err(|e| werr(&format!("security descriptor '{text}'"), e))?;
+        Ok(SecurityDescriptor { psd })
+    }
+
+    /// For the `sd` argument of [`vcam_protocol::secure::open_with_sd`] and `create_dir_with_sd`; valid as long as
+    /// `self` lives.
+    pub fn as_ptr(&self) -> *const core::ffi::c_void {
+        self.psd.0 as *const core::ffi::c_void
+    }
+}
+
+impl Drop for SecurityDescriptor {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(self.psd.0)));
+        }
+    }
+}
+
 /// Set owner and the protected DACL of `obj` on `h`.
 pub fn apply(h: &OwnedHandle, obj: Object, p: &Principals) -> Res<()> {
-    let text = sddl(&expected(obj, p));
+    apply_aces_to(h, &expected(obj, p), &p.owner)
+        .map_err(|e| format!("setting the permissions of {}: {e}", obj.describe()))
+}
+
+/// Set the owner and a protected DACL of exactly `aces` on `h`, and nothing else.
+///
+/// This uses `SetKernelObjectSecurity` (one `NtSetSecurityObject` on the handle), *not* `SetSecurityInfo`: that one
+/// walks the children of a folder and rewrites their inheritance, which would change the permissions of whatever a
+/// user hard-linked into the folder under a name the helper looks at (the file is somewhere else too). The helper
+/// changes the one object it opened and verified.
+pub(crate) fn apply_aces_to(h: &OwnedHandle, aces: &[Ace], owner: &str) -> Res<()> {
+    let text = format!("O:{owner}{}", sddl(aces));
     let w = wide(&text);
     let mut psd = PSECURITY_DESCRIPTOR::default();
     unsafe {
@@ -332,40 +416,25 @@ pub fn apply(h: &OwnedHandle, obj: Object, p: &Principals) -> Res<()> {
         )
     }
     .map_err(|e| werr(&format!("security descriptor '{text}'"), e))?;
-    let result = (|| {
-        let mut present = windows_core::BOOL(0);
-        let mut defaulted = windows_core::BOOL(0);
-        let mut dacl: *mut ACL = std::ptr::null_mut();
-        unsafe { GetSecurityDescriptorDacl(psd, &mut present, &mut dacl, &mut defaulted) }
-            .map_err(|e| werr("GetSecurityDescriptorDacl", e))?;
-        let owner = SidBuf::parse(&p.owner)?;
-        let r = unsafe {
-            SetSecurityInfo(
-                HANDLE(h.as_raw_handle()),
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION
-                    | DACL_SECURITY_INFORMATION
-                    | PROTECTED_DACL_SECURITY_INFORMATION,
-                Some(owner.psid()),
-                None,
-                Some(dacl),
-                None,
-            )
-        };
-        if r == ERROR_SUCCESS {
-            Ok(())
-        } else {
-            Err(format!(
-                "SetSecurityInfo on {}: error {}",
-                obj.describe(),
-                r.0
-            ))
-        }
-    })();
+    let r = unsafe {
+        SetKernelObjectSecurity(
+            HANDLE(h.as_raw_handle()),
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            psd,
+        )
+    };
     unsafe {
         let _ = LocalFree(Some(HLOCAL(psd.0)));
     }
-    result
+    r.map_err(|e| werr("SetKernelObjectSecurity", e))
+}
+
+/// [`apply_aces_to`] under the name the tests use (they set up the permissions an older version left).
+#[cfg(test)]
+pub(crate) fn apply_aces(h: &OwnedHandle, aces: &[Ace], owner: &str) -> Res<()> {
+    apply_aces_to(h, aces, owner)
 }
 
 /// An ACE as stored on an object.
@@ -460,6 +529,11 @@ pub fn check(snap: &Snapshot, want: &[Ace], owner: &str) -> Result<(), String> {
     if !sid_eq(&snap.owner, owner) {
         return Err(format!("owner is {}, not {owner}", snap.owner));
     }
+    check_dacl(snap, want)
+}
+
+/// [`check`] without the owner: the DACL must be protected and consist of exactly `want`.
+pub fn check_dacl(snap: &Snapshot, want: &[Ace]) -> Result<(), String> {
     if !snap.protected {
         return Err("the DACL inherits from the parent folder".into());
     }
@@ -605,10 +679,10 @@ mod tests {
     }
 
     #[test]
-    fn the_logs_acl_lets_only_the_service_write() {
+    fn the_logs_acl_lets_only_the_service_write_and_the_user_read_nothing_in_it() {
         let p = principals();
         let aces = expected(Object::LogsDir, &p);
-        assert_eq!(aces.len(), 6);
+        assert_eq!(aces.len(), 5);
         let both = OBJECT_INHERIT | CONTAINER_INHERIT;
         assert!(aces.contains(&ace(SID_SYSTEM, FULL, both)));
         assert!(aces.contains(&ace(SID_ADMINS, FULL, both)));
@@ -618,22 +692,64 @@ mod tests {
             FILE_MODIFY,
             OBJECT_INHERIT | INHERIT_ONLY
         )));
-        // the user: read and traverse here, read on files; no ACE gives the user ADD_FILE, DELETE or WRITE_*
+        // the user: read and traverse the folder itself, and NOTHING on the files in it (an open for reading is
+        // enough to hold an oplock that blocks every other open of the file): no inheritable ACE for the user,
+        // none that gives ADD_FILE, DELETE or WRITE_*
         let mine: Vec<&Ace> = aces.iter().filter(|a| a.sid == USER).collect();
-        assert_eq!(mine.len(), 2);
-        for a in mine {
-            assert_eq!(
-                a.mask & (0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000),
-                0
-            );
+        assert_eq!(mine.len(), 1);
+        assert_eq!(*mine[0], ace(USER, READ_TRAVERSE, 0));
+        assert_eq!(mine[0].flags & (OBJECT_INHERIT | CONTAINER_INHERIT), 0);
+        assert_eq!(
+            mine[0].mask & (0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000),
+            0
+        );
+        // nothing inheritable reaches a file besides the administrators' and the service's own
+        for a in aces
+            .iter()
+            .filter(|a| a.flags & OBJECT_INHERIT != 0 && a.sid != SID_SYSTEM && a.sid != SID_ADMINS)
+        {
+            assert_eq!(a.sid, SID_LOCAL_SERVICE);
         }
         assert_eq!(
             sddl(&aces),
             format!(
                 "D:P(A;OICI;0x1f01ff;;;S-1-5-18)(A;OICI;0x1f01ff;;;S-1-5-32-544)(A;;0x1200ab;;;S-1-5-19)\
-                 (A;OIIO;0x1301bf;;;S-1-5-19)(A;;0x1200a9;;;{USER})(A;OIIO;0x120089;;;{USER})"
+                 (A;OIIO;0x1301bf;;;S-1-5-19)(A;;0x1200a9;;;{USER})"
             )
         );
+    }
+
+    /// `install.log` has a DACL of its own so that LOCAL SERVICE's inheritable modify right on `logs` does not
+    /// reach it, and the user can read it (the app shows its last error line).
+    #[test]
+    fn the_install_log_is_not_writable_by_the_service_and_readable_by_the_user() {
+        let p = principals();
+        let aces = expected(Object::InstallLog, &p);
+        assert_eq!(
+            aces,
+            vec![
+                ace(SID_SYSTEM, FULL, 0),
+                ace(SID_ADMINS, FULL, 0),
+                ace(USER, FILE_READ, 0),
+            ]
+        );
+        assert!(aces.iter().all(|a| a.sid != SID_LOCAL_SERVICE));
+        // read only for the user: none of FILE_WRITE_DATA, FILE_APPEND_DATA, attributes, DELETE, WRITE_DAC/OWNER
+        assert_eq!(
+            aces[2].mask & (0x2 | 0x4 | 0x10 | 0x100 | 0x10000 | 0x40000 | 0x80000),
+            0
+        );
+        assert_eq!(
+            sddl(&aces),
+            format!(
+                "D:P(A;;0x1f01ff;;;S-1-5-18)(A;;0x1f01ff;;;S-1-5-32-544)(A;;0x120089;;;{USER})"
+            )
+        );
+        // the part of `logs` that would hand it LOCAL SERVICE's modify right is inheritable: that is why the file's
+        // DACL must be protected
+        assert!(sddl(&aces).starts_with("D:P"));
+        assert!(Object::InstallLog.is_file() && Object::FramesFile.is_file());
+        assert!(!Object::LogsDir.is_file() && !Object::DataDir.is_file());
     }
 
     #[test]
@@ -643,19 +759,99 @@ mod tests {
         assert_eq!(aces.len(), 4);
         for who in [SID_LOCAL_SERVICE, USER] {
             let a = aces.iter().find(|a| a.sid == who).unwrap();
-            assert_eq!(a.mask, FILE_READ_WRITE);
+            assert_eq!(a.mask, FRAMES_READ_WRITE);
             assert_eq!(a.flags, 0);
             // FILE_READ_DATA and FILE_WRITE_DATA, so a mapping can be read-write
             assert_eq!(a.mask & 0x3, 0x3);
-            // no DELETE (0x10000), WRITE_DAC (0x40000), WRITE_OWNER (0x80000), FILE_DELETE_CHILD (0x40)
-            assert_eq!(a.mask & (0x10000 | 0x40000 | 0x80000 | 0x40), 0);
+            // no DELETE (0x10000), WRITE_DAC (0x40000), WRITE_OWNER (0x80000), FILE_DELETE_CHILD (0x40), and
+            // neither FILE_WRITE_ATTRIBUTES (0x100) nor FILE_WRITE_EA (0x10): those let a user hard-link the file
+            // from their own folder or set it read-only or sparse
+            assert_eq!(
+                a.mask & (0x10000 | 0x40000 | 0x80000 | 0x40 | 0x100 | 0x10),
+                0
+            );
         }
         assert_eq!(
             sddl(&aces),
             format!(
-                "D:P(A;;0x1f01ff;;;S-1-5-18)(A;;0x1f01ff;;;S-1-5-32-544)(A;;0x12019f;;;S-1-5-19)(A;;0x12019f;;;{USER})"
+                "D:P(A;;0x1f01ff;;;S-1-5-18)(A;;0x1f01ff;;;S-1-5-32-544)(A;;0x12008f;;;S-1-5-19)(A;;0x12008f;;;{USER})"
             )
         );
+    }
+
+    /// The reviewer's reproduction on a real file: with the old mask (`0x12019f`) the user could hard-link the file
+    /// from a folder of their own and set it read-only; with the new one both are denied while a read-write
+    /// mapping, the way the app and the DLL use the file, still works.
+    #[test]
+    fn the_frame_file_acl_denies_hard_links_and_attributes_but_not_a_read_write_mapping() {
+        use vcam_protocol::secure::{self, DISP_CREATE_NEW};
+        let me = crate::current_user_sid().unwrap();
+        let dir = std::env::temp_dir().join(format!("vcam-acl-frames-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // a file that gives `me` exactly one ACE, with the given mask, from the create call on
+        let make = |name: &str, mask: u32| {
+            let sd = SecurityDescriptor::from_aces(&[ace(&me, mask, 0)]).unwrap();
+            let path = dir.join(name);
+            let h = unsafe {
+                secure::open_with_sd(
+                    &path,
+                    secure::ACCESS_READ_WRITE,
+                    secure::SHARE_ALL,
+                    DISP_CREATE_NEW,
+                    false,
+                    0,
+                    Some(sd.as_ptr()),
+                )
+            }
+            .unwrap();
+            let f = std::fs::File::from(h);
+            f.set_len(vcam_protocol::FILE_SIZE).unwrap();
+            path
+        };
+        let denied = |r: std::io::Result<()>| {
+            r.expect_err("must be denied").kind() == std::io::ErrorKind::PermissionDenied
+        };
+
+        // control: the old mask lets the user link and mark the file
+        let old = make("old.bin", 0x0012_019f);
+        std::fs::hard_link(&old, dir.join("old-link.bin"))
+            .expect("the old mask allows a hard link");
+        let mut perm = std::fs::metadata(&old).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&old, perm).expect("the old mask allows attrib +R");
+        assert!(
+            secure::open_existing(&old, true, None).is_err(),
+            "a read-only or hard-linked file is refused: the fault the reviewer found"
+        );
+
+        // the new mask
+        let new = make("new.bin", FRAMES_READ_WRITE);
+        assert!(denied(std::fs::hard_link(&new, dir.join("new-link.bin"))));
+        let mut perm = std::fs::metadata(&new).unwrap().permissions();
+        perm.set_readonly(true);
+        assert!(denied(std::fs::set_permissions(&new, perm)));
+        assert!(!dir.join("new-link.bin").exists());
+        // sparse files are made with FSCTL_SET_SPARSE, which needs FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES
+        // read-write mapping and writes through it still work, and it is still one plain file
+        let m = vcam_protocol::MappedFile::open(&new, vcam_protocol::Access::ReadWrite)
+            .expect("a read-write mapping needs no more than the new mask gives");
+        m.shared().set_consumer_active(true);
+        m.shared().set_consumer_heartbeat(7);
+        assert!(m.shared().is_writable());
+        assert_ne!(m.shared().header().consumer_active, 0);
+        assert_eq!(m.shared().header().consumer_heartbeat, 7);
+        drop(m);
+        secure::open_existing(&new, true, None).expect("still a plain file with one link");
+        let w = vcam_protocol::Writer::open_precreated(&new, None)
+            .expect("the app's writer opens it with the new access too");
+        w.set_state(vcam_protocol::WriterState::Live);
+        drop(w);
+        let mut perm = std::fs::metadata(&old).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perm.set_readonly(false);
+        let _ = std::fs::set_permissions(&old, perm);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A temp folder owned by the current user whose DACL is `aces` (the user is the owner and the "administrator"
@@ -681,53 +877,6 @@ mod tests {
         all.push(ace(&me, FULL, OBJECT_INHERIT | CONTAINER_INHERIT));
         apply_aces(&h, &all, &me).unwrap();
         (dir, h)
-    }
-
-    /// [`apply`] for an arbitrary list (tests).
-    fn apply_aces(h: &OwnedHandle, aces: &[Ace], owner: &str) -> Res<()> {
-        let mut p = Principals::machine(None);
-        p.owner = owner.to_string();
-        // reuse `apply` through a one-off object kind: write the SDDL directly
-        let text = sddl(aces);
-        let w = wide(&text);
-        let mut psd = PSECURITY_DESCRIPTOR::default();
-        unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                pcwstr(&w),
-                SDDL_REVISION_1,
-                &mut psd,
-                None,
-            )
-        }
-        .map_err(|e| werr("sd", e))?;
-        let mut present = windows_core::BOOL(0);
-        let mut defaulted = windows_core::BOOL(0);
-        let mut dacl: *mut ACL = std::ptr::null_mut();
-        unsafe { GetSecurityDescriptorDacl(psd, &mut present, &mut dacl, &mut defaulted) }
-            .map_err(|e| werr("dacl", e))?;
-        let owner = SidBuf::parse(owner)?;
-        let r = unsafe {
-            SetSecurityInfo(
-                HANDLE(h.as_raw_handle()),
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION
-                    | DACL_SECURITY_INFORMATION
-                    | PROTECTED_DACL_SECURITY_INFORMATION,
-                Some(owner.psid()),
-                None,
-                Some(dacl),
-                None,
-            )
-        };
-        unsafe {
-            let _ = LocalFree(Some(HLOCAL(psd.0)));
-        }
-        let _ = p;
-        if r == ERROR_SUCCESS {
-            Ok(())
-        } else {
-            Err(format!("SetSecurityInfo {}", r.0))
-        }
     }
 
     /// The DACL of `h` as SDDL text, as Windows prints it.
@@ -825,7 +974,7 @@ mod tests {
         p.owner = me.clone();
         p.admins = me.clone();
         let want = expected(Object::FramesFile, &p);
-        let (dir, h) = object_with(&[ace(SID_LOCAL_SERVICE, FILE_READ_WRITE, 0)], "extra");
+        let (dir, h) = object_with(&[ace(SID_LOCAL_SERVICE, FRAMES_READ_WRITE, 0)], "extra");
         let snap = read(&h).unwrap();
         // the user's own ACE of `object_with` is inheritable (OICI): it is not what `want` says
         assert!(check(&snap, &want, &me).is_err());
