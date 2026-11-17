@@ -1,0 +1,12 @@
+{
+  "color_filter": {
+    "gamma": 0,
+    "contrast": 0,
+    "brightness": 0,
+    "saturation": 0,
+    "hue_shift": 0,
+    "opacity": 1,
+    "color_multiply": 16777215,
+    "color_add": 0
+  }
+}

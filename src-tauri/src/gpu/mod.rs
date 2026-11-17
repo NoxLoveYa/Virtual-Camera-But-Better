@@ -6,10 +6,10 @@
 //! * [`TexturePool`] / [`RgbaTexture`]: pooled `R8G8B8A8_UNORM` render targets keyed by size (the working format).
 //! * [`Renderer`]: the device plus those caches and a fullscreen-triangle draw helper. Every pass of the pipeline
 //!   (convert, filters, output, encode) is one [`Renderer::draw`].
-//! * [`FilterChain`] / [`FilterPass`]: the (empty) filter stage between convert and output.
 //! * [`GpuTimer`]: GPU time of the frame via timestamp queries.
 //!
 //! The pipeline modules are [`convert`] (input to RGBA), [`output`] (fit and encode) and [`readback`] (staging ring).
+//! The filter stage between convert and output is [`crate::fx`].
 //! Threading: all draw calls belong on one render thread; the shader cache and the texture pool are thread safe.
 
 pub mod convert;
@@ -17,7 +17,7 @@ pub mod downscale;
 pub mod output;
 pub mod pattern;
 #[cfg(test)]
-mod pipeline_tests;
+pub(crate) mod pipeline_tests;
 pub mod readback;
 
 use std::collections::HashMap;
@@ -403,6 +403,8 @@ pub struct ShaderCache {
     vertex: Mutex<HashMap<ShaderId, ID3D11VertexShader>>,
     pixel: Mutex<HashMap<(ShaderId, &'static str), ID3D11PixelShader>>,
     bytecode: Mutex<Bytecodes>,
+    /// Pixel shaders compiled from sources that do not belong to [`ShaderId`] (the filters), by name.
+    custom: Mutex<HashMap<&'static str, ID3D11PixelShader>>,
 }
 
 /// Compiled bytecode by shader and entry point.
@@ -415,7 +417,31 @@ impl ShaderCache {
             vertex: Mutex::default(),
             pixel: Mutex::default(),
             bytecode: Mutex::default(),
+            custom: Mutex::default(),
         }
+    }
+
+    /// A pixel shader (entry point `main`) compiled from `source`, cached under `name`. The first call compiles; a
+    /// later call with the same name returns the cached shader whatever `source` is, so a name belongs to one source.
+    pub fn pixel_source(
+        &self,
+        name: &'static str,
+        source: &'static str,
+    ) -> GpuResult<ID3D11PixelShader> {
+        if let Some(p) = lock(&self.custom).get(name) {
+            return Ok(p.clone());
+        }
+        let code = compile_shader(name, source, "main", "ps_5_0")?;
+        let mut ps = None;
+        // SAFETY: plain call with valid bytecode.
+        unsafe { self.device.CreatePixelShader(&code, None, Some(&mut ps))? };
+        let ps = ps.ok_or_else(|| {
+            GpuError::Api(windows::core::Error::from(
+                windows::Win32::Foundation::E_POINTER,
+            ))
+        })?;
+        lock(&self.custom).insert(name, ps.clone());
+        Ok(ps)
     }
 
     /// Bytecode of `id`'s `entry` point (`target` is `vs_5_0` or `ps_5_0`).
@@ -656,22 +682,28 @@ impl ConstantBuffer {
 
     /// Upload `value` (a `#[repr(C)]` struct with the layout of the cbuffer, exactly `size` bytes).
     pub fn write<T: Copy>(&self, context: &ID3D11DeviceContext, value: &T) -> GpuResult<()> {
-        if std::mem::size_of::<T>() != self.size {
+        // SAFETY: `value` is a live `T`; its bytes are read as plain data (the structs are `#[repr(C)]` and padded
+        // explicitly, so every byte is initialized).
+        let bytes = unsafe {
+            std::slice::from_raw_parts(value as *const T as *const u8, std::mem::size_of::<T>())
+        };
+        self.write_bytes(context, bytes)
+    }
+
+    /// Upload `bytes` (exactly `size` of them: the packed cbuffer a filter built).
+    pub fn write_bytes(&self, context: &ID3D11DeviceContext, bytes: &[u8]) -> GpuResult<()> {
+        if bytes.len() != self.size {
             return Err(GpuError::Invalid(format!(
                 "constant buffer holds {} bytes, got {}",
                 self.size,
-                std::mem::size_of::<T>()
+                bytes.len()
             )));
         }
         let mut m = D3D11_MAPPED_SUBRESOURCE::default();
         // SAFETY: the buffer is dynamic and `size` bytes long; the copy stays inside it.
         unsafe {
             context.Map(&self.buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut m))?;
-            std::ptr::copy_nonoverlapping(
-                value as *const T as *const u8,
-                m.pData as *mut u8,
-                self.size,
-            );
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), m.pData as *mut u8, self.size);
             context.Unmap(&self.buffer, 0);
         }
         Ok(())
@@ -776,6 +808,19 @@ impl Renderer {
         }
     }
 
+    /// Copy `src` into `dst` (same size; the whole texture).
+    pub fn copy(&self, src: &RgbaTexture, dst: &RgbaTexture) -> GpuResult<()> {
+        if (src.width, src.height) != (dst.width, dst.height) {
+            return Err(GpuError::Invalid(format!(
+                "copy {}x{} into {}x{}",
+                src.width, src.height, dst.width, dst.height
+            )));
+        }
+        // SAFETY: plain call; both textures are live and have the same size and format.
+        unsafe { self.gpu.context.CopyResource(&dst.texture, &src.texture) };
+        Ok(())
+    }
+
     /// Clear a render target.
     pub fn clear(&self, target: &ID3D11RenderTargetView, rgba: [f32; 4]) {
         // SAFETY: plain call.
@@ -786,62 +831,6 @@ impl Renderer {
     pub fn flush(&self) {
         // SAFETY: plain call.
         unsafe { self.gpu.context.Flush() };
-    }
-}
-
-// ---------------------------------------------------------------------------------------------------------------
-// Filter chain
-
-/// One filter. A pass reads `input` and writes `output` (both pooled RGBA textures; `output` has the size
-/// [`FilterPass::output_size`] returned). Passes run in order on the render thread.
-pub trait FilterPass: Send {
-    fn name(&self) -> &str;
-
-    /// Size of the result for an input of this size. Most filters keep it.
-    fn output_size(&self, input: (u32, u32)) -> (u32, u32) {
-        input
-    }
-
-    fn apply(&mut self, r: &Renderer, input: &RgbaTexture, output: &RgbaTexture) -> GpuResult<()>;
-}
-
-/// The filter stage between input convert and output. Empty means "identity": [`FilterChain::run`] hands the input
-/// back untouched. Each pass ping-pongs through the texture pool.
-#[derive(Default)]
-pub struct FilterChain {
-    passes: Vec<Box<dyn FilterPass>>,
-}
-
-impl FilterChain {
-    pub fn new() -> FilterChain {
-        FilterChain::default()
-    }
-
-    pub fn push(&mut self, pass: Box<dyn FilterPass>) {
-        self.passes.push(pass);
-    }
-
-    pub fn clear(&mut self) {
-        self.passes.clear();
-    }
-
-    pub fn len(&self) -> usize {
-        self.passes.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.passes.is_empty()
-    }
-
-    pub fn run(&mut self, r: &Renderer, mut image: Pooled) -> GpuResult<Pooled> {
-        for pass in &mut self.passes {
-            let (w, h) = pass.output_size((image.width, image.height));
-            let out = r.texture(w, h)?;
-            pass.apply(r, &image, &out)?;
-            // `image` returns to the pool here and becomes the next pass's output.
-            image = out;
-        }
-        Ok(image)
     }
 }
 

@@ -1,0 +1,32 @@
+{
+  "steps": [
+    { "do": "print", "text": "== Color Correction through the real virtual camera: synthetic SMPTE bars 1080p60, set_chain saturation -1 turns the bars gray, an empty chain brings the colours back" },
+    { "do": "start",
+      "source": {
+        "video_device_id": null, "res_type": "custom", "resolution": "1920x1080", "frame_interval": 166666,
+        "video_format": "nv12", "color_space": "default", "color_range": "default", "buffering": "auto",
+        "flip_vertically": false, "autorotation": true, "hw_decode": true, "deactivate_when_not_showing": false
+      },
+      "output": { "resolution": "1920x1080", "fps": "source", "fit": "fit", "background_color": 4278190080, "extra_sizes": true },
+      "synthetic": { "width": 1920, "height": 1080, "fps": 60 },
+      "chain": [] },
+    { "do": "wait_state", "state": "live", "timeout": 15, "label": "start -> live" },
+    { "do": "consume", "seconds": 12, "size": "1920x1080", "label": "consumer 1080p60", "light": true, "fps": 60, "background": true },
+    { "do": "sleep", "seconds": 3 },
+
+    { "do": "set_chain", "mark": "gray", "label": "set_chain saturation -1 -> bars gray",
+      "chain": [ { "id": "cc1", "kind": "color_filter", "enabled": true, "params": { "saturation": -1 } } ] },
+    { "do": "sleep", "seconds": 2.5 },
+
+    { "do": "set_chain", "mark": "color", "label": "set_chain [] -> colours back", "chain": [] },
+    { "do": "sleep", "seconds": 2.5 },
+
+    { "do": "set_chain", "mark": "gray", "label": "set_chain saturation -1 again -> bars gray",
+      "chain": [ { "id": "cc1", "kind": "color_filter", "enabled": true, "params": { "saturation": -1 } } ] },
+    { "do": "sleep", "seconds": 2 },
+    { "do": "stats_report", "label": "stats with the filter on (2 s)", "seconds": 2 },
+    { "do": "join" },
+    { "do": "stop" },
+    { "do": "wait_state", "state": "stopped", "timeout": 5, "label": "stop -> stopped" }
+  ]
+}

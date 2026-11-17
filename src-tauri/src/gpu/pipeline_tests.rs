@@ -20,8 +20,7 @@ use super::output::{fit_rect, EncodeFormat, Encoder, FitMode, OutputParams, Outp
 use super::pattern::{self, smpte_bars};
 use super::readback::{PlaneDesc, ReadbackRing};
 use super::{
-    AdapterKind, FilterChain, FilterPass, GpuDevice, GpuError, GpuResult, GpuTimer, Pass, Pooled,
-    Renderer, RgbaTexture, ShaderId,
+    AdapterKind, GpuDevice, GpuError, GpuTimer, Renderer, RgbaTexture, ShaderId,
 };
 use crate::capture::PixelFormat;
 
@@ -30,7 +29,7 @@ fn renderer(kind: AdapterKind) -> Option<Arc<Renderer>> {
     Some(Arc::new(Renderer::new(Arc::new(gpu)).expect("renderer")))
 }
 
-fn warp() -> Arc<Renderer> {
+pub(crate) fn warp() -> Arc<Renderer> {
     renderer(AdapterKind::Warp).expect("WARP device")
 }
 
@@ -68,7 +67,7 @@ fn read_texture(r: &Renderer, tex: &ID3D11Texture2D, w: u32, h: u32, bpt: u32) -
     out
 }
 
-fn read_rgba(r: &Renderer, t: &RgbaTexture) -> Vec<u8> {
+pub(crate) fn read_rgba(r: &Renderer, t: &RgbaTexture) -> Vec<u8> {
     read_texture(r, &t.texture, t.width, t.height, 4)
 }
 
@@ -724,7 +723,7 @@ fn bgra_encode_swizzles_to_bgrx_bytes() {
     assert_eq!(out, vec![10, 120, 240, 255, 10, 120, 240, 255]);
 }
 
-fn fill_rgba(r: &Renderer, tex: &RgbaTexture, value: impl Fn(u32, u32) -> [u8; 4]) {
+pub(crate) fn fill_rgba(r: &Renderer, tex: &RgbaTexture, value: impl Fn(u32, u32) -> [u8; 4]) {
     let mut data = Vec::new();
     for y in 0..tex.height {
         for x in 0..tex.width {
@@ -826,63 +825,90 @@ fn ring_on(r: &Arc<Renderer>) {
     assert!(ring.submit(&[], 0).is_err());
 }
 
-struct Invert;
-
-impl FilterPass for Invert {
-    fn name(&self) -> &str {
-        "invert"
-    }
-
-    fn apply(&mut self, r: &Renderer, input: &RgbaTexture, output: &RgbaTexture) -> GpuResult<()> {
-        let code = super::compile_shader(
-            "invert",
-            "Texture2D<float4> t : register(t0);\nfloat4 main(float4 p : SV_Position) : SV_Target { float4 c = t.Load(int3(int2(p.xy),0)); return float4(1.0 - c.rgb, c.a); }",
-            "main",
-            "ps_5_0",
-        )?;
-        let mut ps = None;
-        unsafe { r.gpu.device.CreatePixelShader(&code, None, Some(&mut ps))? };
-        r.draw(&Pass {
-            ps: ps.as_ref().unwrap(),
-            srvs: &[Some(input.srv.clone())],
-            constants: None,
-            target: &output.rtv,
-            width: output.width,
-            height: output.height,
-        });
-        Ok(())
+#[test]
+fn translucent_pixels_blend_over_the_background_in_linear_light() {
+    let r = warp();
+    let stage = OutputStage::new(r.clone()).unwrap();
+    let src = r.texture(4, 1).unwrap();
+    let px = [
+        [255u8, 255, 255, 0],
+        [255, 255, 255, 255],
+        [40, 200, 90, 128],
+        [255, 255, 255, 64],
+    ];
+    fill_rgba(&r, &src, |x, _| px[x as usize]);
+    let out = stage
+        .run(
+            &src,
+            &OutputParams {
+                width: 4,
+                height: 1,
+                fit: FitMode::Fit,
+                background: [0.2, 0.4, 0.6],
+            },
+        )
+        .unwrap();
+    let got = read_rgba(&r, &out);
+    let dec = |c: f64| {
+        let u = c / 255.0;
+        if u <= 0.04045 {
+            u / 12.92
+        } else {
+            ((u + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let enc = |l: f64| {
+        let u = if l <= 0.0031308 {
+            12.92 * l
+        } else {
+            1.055 * l.powf(1.0 / 2.4) - 0.055
+        };
+        u * 255.0
+    };
+    let bg = [51.0, 102.0, 153.0];
+    // clear shows the background exactly, opaque shows the picture exactly
+    assert_eq!(&got[0..4], &[51, 102, 153, 255]);
+    assert_eq!(&got[4..8], &[255, 255, 255, 255]);
+    for x in [2usize, 3] {
+        let a = px[x][3] as f64 / 255.0;
+        for k in 0..3 {
+            let want = enc(a * dec(px[x][k] as f64) + (1.0 - a) * dec(bg[k]));
+            assert!(
+                (got[x * 4 + k] as f64 - want).abs() <= 1.5,
+                "pixel {x} channel {k}: {} vs {want}",
+                got[x * 4 + k]
+            );
+        }
     }
 }
 
 #[test]
-fn a_filter_pass_plugs_in_between_convert_and_output() {
+fn scaling_weights_colour_by_alpha_so_clear_texels_do_not_leak() {
     let r = warp();
-    let mut conv = Converter::new(r.clone()).unwrap();
-    let data = [10u8, 120, 240, 255, 0, 0, 0, 255];
-    let src = conv
-        .convert(
-            &cpu_frame(&data, 2, 1, PixelFormat::Xrgb, 8, ColorSettings::default()),
-            false,
+    let stage = OutputStage::new(r.clone()).unwrap();
+    // left: opaque red, right: fully clear blue. A plain bilinear filter would paint purple between them.
+    let src = r.texture(2, 1).unwrap();
+    fill_rgba(&r, &src, |x, _| if x == 0 { [255, 0, 0, 255] } else { [0, 0, 255, 0] });
+    let out = stage
+        .run(
+            &src,
+            &OutputParams {
+                width: 16,
+                height: 1,
+                fit: FitMode::Stretch,
+                background: [0.0, 0.0, 0.0],
+            },
         )
         .unwrap();
-    let mut chain = FilterChain::new();
-    assert!(chain.is_empty());
-    // identity: the very same texture comes back
-    let same = chain.run(&r, src).unwrap();
-    assert_eq!(read_rgba(&r, &same), vec![240, 120, 10, 255, 0, 0, 0, 255]);
-    chain.push(Box::new(Invert));
-    chain.push(Box::new(Invert));
-    chain.push(Box::new(Invert));
-    let out: Pooled = chain.run(&r, same).unwrap();
-    assert_eq!(
-        read_rgba(&r, &out),
-        vec![15, 135, 245, 255, 255, 255, 255, 255]
-    );
-    // ping-pong textures went back to the pool
-    drop(out);
-    assert!(r.pool.free_count() >= 2);
+    let got = read_rgba(&r, &out);
+    for x in 0..16usize {
+        assert_eq!(got[x * 4 + 2], 0, "pixel {x} has blue in it: {:?}", &got[x * 4..x * 4 + 4]);
+    }
+    assert_eq!(&got[0..3], &[255, 0, 0]);
+    assert_eq!(&got[15 * 4..15 * 4 + 3], &[0, 0, 0]);
+    // the edge fades from red to the background
+    assert!(got[7 * 4] > got[9 * 4], "red fades towards the clear side");
 }
-
 #[test]
 fn the_texture_pool_reuses_textures_by_size() {
     let r = warp();

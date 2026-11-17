@@ -7,16 +7,24 @@
 //!
 //! A script is `{"steps": [ ... ]}`; the steps run one after the other. Every step has a `do`:
 //!
-//! * `start` `{source, output, controls?, chain?}`, `stop`, `set_source` `{source}`, `set_output` `{output}`,
-//!   `pause` `{on}`, `window` `{visible}`: the commands (`window` is what `main.rs` sends from window events).
+//! * `start` `{source, output, controls?, chain?, synthetic?}`, `stop`, `set_source` `{source}`, `set_output`
+//!   `{output}`, `set_chain` `{chain, mark?, label?}`, `pause` `{on}`, `window` `{visible}`: the commands (`window` is
+//!   what `main.rs` sends from window events). `synthetic` `{width, height, fps}` replaces the camera with NV12 colour
+//!   bars. `mark` (`"gray"` or `"color"`) notes the time of a `set_chain` call, so a consumer can report how long the
+//!   pictures took to change.
+//! * `sweep_chain` `{id, kind, param, from, to, hz, seconds, mark?}`: `set_chain` at `hz` calls a second, one filter
+//!   whose `param` moves linearly from `from` to `to`; prints the call count and the slowest call.
 //! * `list_cameras`: prints the cameras and their formats as the frontend gets them.
 //! * `sleep` `{seconds}`, `print` `{text}`, `header`: print the writer state and counters of `frames.bin`.
 //! * `wait_state` `{state, reason_contains?, timeout, max?, label}`: wait for an `engine-state` event after the
 //!   last command and print how long it took (`FAIL` past `max`, or when it never comes).
 //! * `stats_report` `{label}`: count the `stats` events since the last report and print the rate and the last one.
-//! * `consume` `{seconds, size, format?, label, dump?, background?}`: open the Better Cam camera as an app does,
-//!   read frames, and say how many were video, which slate showed when, and how many pictures were distinct.
-//!   `dump` saves one video frame as PNG.
+//! * `consume` `{seconds, size, format?, label, dump?, background?, light?, fps?}`: open the Better Cam camera as an
+//!   app does, read frames, and say how many were video, which slate showed when, and how many pictures were
+//!   distinct. `dump` saves one video frame as PNG. NV12 frames are also measured on the colour bars (the widest
+//!   spread between red, green and blue over a grid of points: 0 is grey); the report says how long each `set_chain`
+//!   `mark` took to show. `light` skips the slate comparison (cheap enough for 1080p60); `fps` checks the longest gap
+//!   between frames against two frame periods.
 //! * `run` `{cmd, args, label, wait?}`: start another process (`capture_probe`, `vcam-tool`), print its output.
 //! * `join`: wait for background consumers and processes.
 //!
@@ -27,10 +35,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use better_cam::api::Service;
-use better_cam::capture::{self, MfSession};
+use better_cam::api::settings_from;
+use better_cam::capture::{self, MfSession, PixelFormat};
 use better_cam::config::{OutputCfg, SourceCfg};
-use better_cam::engine::{EngineEvent, EventSink};
-use better_cam::gpu::convert::{ColorRange, ColorSpace};
+use better_cam::engine::{EngineEvent, EventSink, SourceSpec, SyntheticSpec};
+use better_cam::gpu::convert::{ColorRange, ColorSettings, ColorSpace};
 use better_cam::gpu::pattern;
 use serde_json::Value;
 use vcam_protocol::slate::{self, Slate, SlateKind};
@@ -77,6 +86,10 @@ impl EventSink for LogSink {
             ),
             EngineEvent::Error(m) => println!("[t={t:7.3}] engine-error {m:?}"),
             EngineEvent::DevicesChanged => println!("[t={t:7.3}] devices-changed"),
+            EngineEvent::FilterError(e) => println!(
+                "[t={t:7.3}] filter-error {}",
+                serde_json::to_string(e).unwrap_or_default()
+            ),
             EngineEvent::Stats(_) | EngineEvent::Controls(_) => {}
         }
         self.0.events.lock().unwrap().push(Logged {
@@ -268,9 +281,50 @@ struct Seen {
     t: f64,
     class: Class,
     hash: u64,
+    /// Widest spread between the colour channels over a grid of points, 255 when not measured.
+    spread: u8,
+}
+
+/// A `set_chain` call whose effect on the picture is timed.
+struct Mark {
+    /// Seconds since the start of the script.
+    t: f64,
+    /// `"gray"` or `"color"`.
+    expect: String,
+    label: String,
+}
+
+static MARKS: Mutex<Vec<Mark>> = Mutex::new(Vec::new());
+
+/// Largest `max - min` of R, G, B over a 16 x 9 grid of points of an NV12 picture (BT.709 limited). A grey picture
+/// gives 0; colour bars give far more than 100.
+fn grid_spread<'a>(row: &dyn Fn(u32) -> &'a [u8], w: u32, h: u32) -> u8 {
+    let mut worst = 0u8;
+    for gy in 0..9u32 {
+        let y = (h as f64 * (gy as f64 + 0.5) / 9.0) as u32;
+        let luma_row = row(y);
+        let uv = row(h + y / 2);
+        for gx in 0..16u32 {
+            let x = ((w as f64 * (gx as f64 + 0.5) / 16.0) as u32 & !1) as usize;
+            let luma = luma_row[x] as f64;
+            let (u, v) = (uv[x] as f64 - 128.0, uv[x + 1] as f64 - 128.0);
+            let c = 1.164383 * (luma - 16.0);
+            let rgb = [
+                c + 1.792741 * v,
+                c - 0.213249 * u - 0.532909 * v,
+                c + 2.112402 * u,
+            ]
+            .map(|v: f64| v.clamp(0.0, 255.0));
+            let spread = rgb.iter().fold(0.0f64, |a, b| a.max(*b))
+                - rgb.iter().fold(255.0f64, |a, b| a.min(*b));
+            worst = worst.max(spread.round() as u8);
+        }
+    }
+    worst
 }
 
 /// Read the virtual camera for `seconds` and describe what came.
+#[allow(clippy::too_many_arguments)]
 fn consume(
     label: &str,
     size: (u32, u32),
@@ -278,6 +332,8 @@ fn consume(
     seconds: f64,
     dump: Option<String>,
     gain: u32,
+    light: bool,
+    fps: Option<f64>,
     t0: Instant,
 ) -> Result<String, String> {
     capture::ensure_com();
@@ -402,7 +458,7 @@ fn consume(
         // The slates differ only in their text line: the closest one decides, and it must be close.
         let mut class = Class::Video;
         let mut best = 2.0f64;
-        for (c, expected) in &slates {
+        for (c, expected) in slates.iter().filter(|_| !light) {
             let diff = slate::mean_luma_diff(
                 |y| expected[y as usize * w as usize..(y as usize + 1) * w as usize].to_vec(),
                 |y| row(y).to_vec(),
@@ -425,6 +481,11 @@ fn consume(
             }
             picture = Some(copy);
         }
+        let spread = if nv12 && class == Class::Video {
+            grid_spread(&row, w, h)
+        } else {
+            255
+        };
         unsafe {
             if locked1d {
                 let _ = buffer.Unlock();
@@ -432,7 +493,12 @@ fn consume(
                 let _ = b.Unlock2D();
             }
         }
-        seen.push(Seen { t, class, hash });
+        seen.push(Seen {
+            t,
+            class,
+            hash,
+            spread,
+        });
     }
     unsafe {
         let _ = source.Shutdown();
@@ -474,6 +540,58 @@ fn consume(
         }
     }
     report.push_str(&format!("\n  timeline: {}", timeline.join(" -> ")));
+    if let Some(fps) = fps {
+        let limit = 2.0 / fps;
+        report.push_str(&format!(
+            "\n  RESULT {label}: longest gap between frames {:.1} ms, limit {:.1} ms (two periods at {fps} fps) -> {}",
+            max_gap * 1000.0,
+            limit * 1000.0,
+            if max_gap <= limit { "PASS" } else { "FAIL" }
+        ));
+    }
+    // How long each marked `set_chain` took to show on the bars, and whether the picture then stayed that way.
+    let t_start = started.duration_since(t0).as_secs_f64();
+    let marks: Vec<(f64, String, String)> = MARKS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|m| m.t >= t_start)
+        .map(|m| (m.t, m.expect.clone(), m.label.clone()))
+        .collect();
+    let shows = |s: &Seen, expect: &str| {
+        s.class == Class::Video
+            && if expect == "gray" {
+                s.spread <= 3
+            } else {
+                s.spread > 60
+            }
+    };
+    for (i, (t, expect, mark_label)) in marks.iter().enumerate() {
+        let until = marks.get(i + 1).map_or(f64::INFINITY, |m| m.0);
+        let frames: Vec<&Seen> = seen.iter().filter(|s| s.t >= *t && s.t < until).collect();
+        match frames.iter().position(|s| shows(s, expect)) {
+            Some(first) => {
+                let ms = (frames[first].t - t) * 1000.0;
+                let stable = frames[first..].iter().all(|s| shows(s, expect));
+                let limit = fps.map_or(100.0, |f| 100.0 + 1000.0 / f);
+                report.push_str(&format!(
+                    "\n  RESULT {mark_label}: picture {expect} {ms:.1} ms after the set_chain call (limit {limit:.1} ms: 100 ms + one frame), {} frames before the change, stays {expect}: {stable} -> {}",
+                    first,
+                    if ms <= limit && stable { "PASS" } else { "FAIL" }
+                ));
+            }
+            None => report.push_str(&format!(
+                "\n  RESULT {mark_label}: the picture never turned {expect} within {:.1} s -> FAIL",
+                until.min(t0.elapsed().as_secs_f64()) - t
+            )),
+        }
+    }
+    if nv12 && !light {
+        let measured: Vec<u8> = seen.iter().map(|s| s.spread).filter(|s| *s != 255).collect();
+        if let (Some(lo), Some(hi)) = (measured.iter().min(), measured.iter().max()) {
+            report.push_str(&format!("\n  colour spread over the video frames: {lo} .. {hi}"));
+        }
+    }
     if let (Some(data), Some(path)) = (picture, dump) {
         if nv12 {
             let mut rgb = pattern::nv12_to_rgb(
@@ -585,12 +703,91 @@ fn run() -> Result<(), String> {
                         format!("invalid args `output` for command `start_engine`: {e}")
                     })?;
                 last_command = Instant::now();
-                svc.start_engine(
-                    source,
-                    output,
-                    step.get("controls").cloned(),
-                    step.get("chain").cloned(),
-                )?;
+                match step.get("synthetic") {
+                    // Colour bars instead of the camera, through the same start path.
+                    Some(s) => {
+                        let num = |k: &str| {
+                            s[k].as_u64()
+                                .map(|v| v as u32)
+                                .ok_or_else(|| format!("'synthetic.{k}' must be a number"))
+                        };
+                        let mut settings = settings_from(&source, &output)?;
+                        settings.source = SourceSpec::Synthetic(SyntheticSpec {
+                            width: num("width")?,
+                            height: num("height")?,
+                            fps: num("fps")?,
+                            format: PixelFormat::Nv12,
+                            color: ColorSettings {
+                                space: Some(ColorSpace::Bt709),
+                                range: Some(ColorRange::Limited),
+                            },
+                        });
+                        svc.start_with(
+                            settings,
+                            step.get("controls").cloned(),
+                            step.get("chain").cloned(),
+                        )?;
+                    }
+                    None => svc.start_engine(
+                        source,
+                        output,
+                        step.get("controls").cloned(),
+                        step.get("chain").cloned(),
+                    )?,
+                }
+            }
+            "set_chain" => {
+                let chain = field(step, "chain")?;
+                let mark = step["mark"].as_str().map(str::to_string);
+                let label = step["label"].as_str().unwrap_or("set_chain").to_string();
+                last_command = Instant::now();
+                let t = t0.elapsed().as_secs_f64();
+                // The mark is noted just before the call, so the measured time includes the call itself.
+                if let Some(expect) = mark {
+                    MARKS.lock().unwrap().push(Mark { t, expect, label });
+                }
+                svc.set_chain(chain)?;
+                println!(
+                    "set_chain returned after {:.3} ms",
+                    (t0.elapsed().as_secs_f64() - t) * 1000.0
+                );
+            }
+            "sweep_chain" => {
+                let id = field(step, "id")?.as_str().ok_or("'id' must be a string")?;
+                let kind = field(step, "kind")?.as_str().ok_or("'kind' must be a string")?;
+                let param = field(step, "param")?.as_str().ok_or("'param' must be a string")?;
+                let (from, to) = (secs(step, "from", 0.0), secs(step, "to", 1.0));
+                let (hz, seconds) = (secs(step, "hz", 60.0), secs(step, "seconds", 5.0));
+                let calls = (hz * seconds).round() as u32;
+                let begin = Instant::now();
+                if let Some(expect) = step["mark"].as_str() {
+                    MARKS.lock().unwrap().push(Mark {
+                        t: t0.elapsed().as_secs_f64(),
+                        expect: expect.to_string(),
+                        label: step["label"].as_str().unwrap_or("sweep_chain").to_string(),
+                    });
+                }
+                let mut slowest = Duration::ZERO;
+                for i in 0..calls {
+                    // Wait for the slot of this call; the last stretch spins, a sleep is too coarse for 60 Hz.
+                    let at = begin + Duration::from_secs_f64(i as f64 / hz);
+                    while Instant::now() < at {
+                        std::thread::yield_now();
+                    }
+                    let value = from + (to - from) * i as f64 / (calls.max(2) - 1) as f64;
+                    let chain = serde_json::json!([{
+                        "id": id, "kind": kind, "enabled": true, "params": { param: value }
+                    }]);
+                    let call = Instant::now();
+                    svc.set_chain(&chain)?;
+                    slowest = slowest.max(call.elapsed());
+                }
+                println!(
+                    "RESULT sweep_chain: {calls} calls in {:.2} s ({:.1} a second), {param} {from} -> {to}, slowest call {:.3} ms",
+                    begin.elapsed().as_secs_f64(),
+                    calls as f64 / begin.elapsed().as_secs_f64(),
+                    slowest.as_secs_f64() * 1000.0
+                );
             }
             "stop" => {
                 last_command = Instant::now();
@@ -734,6 +931,23 @@ fn run() -> Result<(), String> {
                 if let Some((_, s)) = stats.last() {
                     println!("  last: {}", serde_json::to_string(s).unwrap_or_default());
                 }
+                // The engine's own numbers over the window: GPU time per frame and the frames it dropped.
+                // (`gpu_ms` is 0 for the first second after a start; those events are left out.)
+                let gpu: Vec<f64> = stats.iter().map(|(_, s)| s.gpu_ms).filter(|g| *g > 0.0).collect();
+                if let (Some((_, first)), Some((_, last))) = (stats.first(), stats.last()) {
+                    println!(
+                        "  RESULT {label}: gpu_ms mean {:.3} max {:.3} over {} events, dropped {} -> {} (+{}), output {}x{} @ {:.1} fps",
+                        gpu.iter().sum::<f64>() / gpu.len().max(1) as f64,
+                        gpu.iter().fold(0.0f64, |a, b| a.max(*b)),
+                        gpu.len(),
+                        first.dropped,
+                        last.dropped,
+                        last.dropped.saturating_sub(first.dropped),
+                        last.output.width,
+                        last.output.height,
+                        last.output.fps
+                    );
+                }
                 last_report = Instant::now();
             }
             "consume" => {
@@ -743,11 +957,14 @@ fn run() -> Result<(), String> {
                 let label = step["label"].as_str().unwrap_or("consumer").to_string();
                 let dump = step["dump"].as_str().map(str::to_string);
                 let gain = step["gain"].as_u64().unwrap_or(1) as u32;
+                let light = step["light"].as_bool().unwrap_or(false);
+                let fps = step["fps"].as_f64();
                 let l = label.clone();
                 // `wait_state` after this step times from here: how long until the engine reacts to the consumer.
                 last_command = Instant::now();
-                let handle =
-                    std::thread::spawn(move || consume(&l, size, nv12, seconds, dump, gain, t0));
+                let handle = std::thread::spawn(move || {
+                    consume(&l, size, nv12, seconds, dump, gain, light, fps, t0)
+                });
                 let job = Background {
                     label,
                     kind: "consumer",

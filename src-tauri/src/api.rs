@@ -13,6 +13,7 @@ use serde_json::Value;
 use crate::camera_controls::{parse_record, ControlInfoDto};
 use crate::config::{self, CameraDto, OutputCfg, SourceCfg};
 use crate::engine::{Engine, EventSink, ReadbackPolicy, Settings, SourceSpec, SourceUpdate};
+use crate::fx;
 use crate::preview::{Preview, Sink};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -107,7 +108,8 @@ impl Service {
 
     /// `start_engine(source, output, controls, chain)`: `controls` is the record of what the user changed on the
     /// selected camera (see [`crate::camera_controls::parse_record`]), re-applied after every camera open; `chain` is
-    /// accepted and ignored until the phase that uses it.
+    /// the initial filter chain (an array of filters, see [`fx::parse_chain`]). Without it the engine keeps the chain
+    /// it has (an earlier `set_chain`).
     pub fn start_engine(
         &self,
         source: SourceCfg,
@@ -115,11 +117,26 @@ impl Service {
         controls: Option<Value>,
         chain: Option<Value>,
     ) -> Result<(), String> {
-        let _ = chain;
         let settings = settings_from(&source, &output)?;
+        self.start_with(settings, controls, chain)
+    }
+
+    /// [`Service::start_engine`] with settings that are already built (the scripted example starts synthetic bars
+    /// this way).
+    pub fn start_with(
+        &self,
+        settings: Settings,
+        controls: Option<Value>,
+        chain: Option<Value>,
+    ) -> Result<(), String> {
+        let chain = chain.as_ref().map(fx::parse_chain).transpose()?;
         let record = parse_record(controls.as_ref())?;
         let engine = self.engine()?;
         engine.controls().set_record(record);
+        if let Some(chain) = chain {
+            // Before `start`: both go over the same channel, so the first frame already has the chain.
+            engine.set_chain(chain);
+        }
         engine.start(settings);
         Ok(())
     }
@@ -177,6 +194,20 @@ impl Service {
         let settings = config::output_settings(&output)?;
         if let Some(e) = self.existing() {
             e.set_output(settings);
+        }
+        Ok(())
+    }
+
+    /// `set_chain(chain)`: the filter chain as the frontend holds it, an array of `{id, kind, enabled, params}`. It
+    /// applies to the next frame with no reopen and no restart; while the engine is stopped it is kept for the next
+    /// start. A malformed chain is an error and changes nothing; unknown kinds are skipped by the engine.
+    ///
+    /// Before the engine exists (the first moments of the app) the call does nothing, like `set_output`; the chain
+    /// that `start_engine` carries is the one that counts then.
+    pub fn set_chain(&self, chain: &Value) -> Result<(), String> {
+        let chain = fx::parse_chain(chain)?;
+        if let Some(e) = self.existing() {
+            e.set_chain(chain);
         }
         Ok(())
     }
@@ -301,11 +332,24 @@ mod tests {
         assert!(svc.set_pause(true).is_ok());
         assert!(svc.set_source(SourceCfg::default()).is_ok());
         assert!(svc.set_output(OutputCfg::default()).is_ok());
+        assert!(svc.set_chain(&json!([])).is_ok());
         svc.set_window_visible(true);
         let nowhere: Sink = Arc::new(|_| true);
         assert!(svc.set_preview(false, 0, 0, nowhere).is_ok());
         svc.preview_ack(1);
         svc.shutdown();
+    }
+
+    #[test]
+    fn set_chain_takes_the_frontends_shape_and_rejects_a_malformed_chain() {
+        let svc = Service::new();
+        let chain = json!([
+            { "id": "a1", "kind": "color_filter", "enabled": true, "params": { "saturation": -1 } },
+            { "id": "b2", "kind": "crop_filter", "enabled": false, "params": { "relative": true, "left": 10 } }
+        ]);
+        assert!(svc.set_chain(&chain).is_ok());
+        assert!(svc.set_chain(&json!([{ "kind": "color_filter" }])).is_err());
+        assert!(svc.set_chain(&json!("nope")).is_err());
     }
 
     #[test]

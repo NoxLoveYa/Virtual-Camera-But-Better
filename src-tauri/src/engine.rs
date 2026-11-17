@@ -26,7 +26,7 @@
 //! after `standby_delay` (5 s) with neither a `Live` or `Reconnecting` engine goes to `Standby` and closes the camera.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -55,7 +55,8 @@ use crate::gpu::convert::{
 };
 use crate::gpu::output::{FitMode, OutputParams, OutputStage};
 use crate::gpu::pattern;
-use crate::gpu::{AdapterKind, FilterChain, GpuDevice, GpuError, GpuTimer, Renderer, RgbaTexture};
+use crate::fx::{Chain, FilterCfg, FilterError};
+use crate::gpu::{AdapterKind, GpuDevice, GpuError, GpuTimer, Renderer, RgbaTexture};
 use crate::output_writer::{FrameTag, OutputWriter, Published};
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -271,6 +272,8 @@ pub enum Msg {
     /// The app window is visible (shown and not minimized). Counts as "somebody watches".
     SetWindowVisible(bool),
     SetTap(Option<Box<dyn FrameTap>>),
+    /// The newest filter chain. It applies to the next frame; the engine keeps it while stopped, for the next start.
+    SetChain(Vec<FilterCfg>),
     /// Stop and end the control thread.
     Shutdown,
 }
@@ -374,6 +377,8 @@ pub enum EngineEvent {
     DevicesChanged,
     /// The camera's controls (`controls-changed`): about once a second while one is on Auto, and after a re-apply.
     Controls(Vec<ControlInfoDto>),
+    /// A filter failed to render and is bypassed (`filter-error`, plan 5.6). Sent once per failure, not per frame.
+    FilterError(FilterError),
 }
 
 /// Receives [`EngineEvent`]s on the control thread: return quickly.
@@ -425,6 +430,9 @@ struct Shared {
     color: Mutex<ColorSettings>,
     paused: AtomicBool,
     tap: Mutex<Option<Box<dyn FrameTap>>>,
+    /// The newest chain and its version: the render thread applies it when the version changed.
+    chain: Mutex<Arc<Vec<FilterCfg>>>,
+    chain_gen: AtomicU64,
     sink: Mutex<Option<Arc<dyn EventSink>>>,
     /// Symbolic link of the open camera (for hot-plug removal), empty while none is open.
     camera_link: Mutex<Option<String>>,
@@ -493,6 +501,7 @@ impl Engine {
     ) -> Result<Engine, String> {
         let renderer = Arc::new(Renderer::new(gpu).map_err(|e| e.to_string())?);
         renderer.shaders.warm_up().map_err(|e| e.to_string())?;
+        crate::fx::warm_up(&renderer).map_err(|e| e.to_string())?;
         let shared = Arc::new(Shared {
             state: Mutex::new(EngineState::Stopped),
             reason: Mutex::new(None),
@@ -507,6 +516,8 @@ impl Engine {
             color: Mutex::new(ColorSettings::default()),
             paused: AtomicBool::new(false),
             tap: Mutex::new(None),
+            chain: Mutex::new(Arc::new(Vec::new())),
+            chain_gen: AtomicU64::new(0),
             sink: Mutex::new(None),
             camera_link: Mutex::new(None),
             advertised: Mutex::new(None),
@@ -593,6 +604,11 @@ impl Engine {
     pub fn set_pause(&self, on: bool) {
         self.shared.paused.store(on, Ordering::Release);
         self.send(Msg::SetPause(on));
+    }
+
+    /// `Msg::SetChain`: the render thread applies it before the next frame; no reopen, no restart.
+    pub fn set_chain(&self, chain: Vec<FilterCfg>) {
+        self.send(Msg::SetChain(chain));
     }
 
     /// `Msg::SetWindowVisible`.
@@ -818,6 +834,10 @@ impl Control {
             Msg::SetPause(on) => self.set_pause(on),
             Msg::SetWindowVisible(v) => self.window_visible = v,
             Msg::SetTap(t) => *lock(&self.shared.tap) = t,
+            Msg::SetChain(c) => {
+                *lock(&self.shared.chain) = Arc::new(c);
+                self.shared.chain_gen.fetch_add(1, Ordering::Release);
+            }
             Msg::Shutdown => {}
         }
     }
@@ -1874,7 +1894,9 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
 
     let mut converter = Converter::new(renderer.clone()).map_err(|e| e.to_string())?;
     let stage = OutputStage::new(renderer.clone()).map_err(|e| e.to_string())?;
-    let mut chain = FilterChain::new();
+    let mut chain = Chain::new();
+    // The chain version this session has applied; the session starts with none, so the first frame applies it.
+    let mut chain_gen = u64::MAX;
     let mut output =
         OutputWriter::new(renderer.clone(), writer.clone()).map_err(|e| e.to_string())?;
     let mut timer = GpuTimer::new(&renderer.gpu.device).ok();
@@ -2011,6 +2033,13 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
             };
             // The decoder surface was copied by the pass above; give it back before the rest of the pipeline.
             drop(frame);
+            // The newest chain applies before this frame.
+            let wanted = shared.chain_gen.load(Ordering::Acquire);
+            if wanted != chain_gen {
+                chain_gen = wanted;
+                let cfg = lock(&shared.chain).clone();
+                chain.apply(renderer, &cfg);
+            }
             let rgba = chain.run(renderer, rgba)?;
             let fitted = stage.run(
                 &rgba,
@@ -2046,6 +2075,10 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                 // would wait for the next frame's work and read as one frame interval.
                 renderer.flush();
             }
+        }
+        // Filters that failed this frame were bypassed; each failure is reported once (the chain keeps count).
+        for e in chain.take_errors() {
+            emit(shared, EngineEvent::FilterError(e));
         }
         match rendered_frame {
             Ok(()) => {
@@ -2388,6 +2421,65 @@ mod tests {
         assert_eq!(
             reader.shared().header().writer_state,
             WriterState::Closed as u32
+        );
+    }
+
+    #[test]
+    fn set_chain_applies_live_and_survives_a_stop() {
+        let rig = Rig::new("sm-chain.bin", fast());
+        let chain = |sat: Option<f64>| match sat {
+            Some(s) => crate::fx::parse_chain(&serde_json::json!([
+                { "id": "c", "kind": "color_filter", "enabled": true, "params": { "saturation": s } },
+                { "id": "u", "kind": "not_a_filter", "enabled": true, "params": {} }
+            ]))
+            .unwrap(),
+            None => Vec::new(),
+        };
+        // The widest channel spread of the latest published frame: 0 is grey, bars are far above 100.
+        let spread = |rig: &Rig| -> Option<u8> {
+            let (w, h, _, buf) = latest(&rig.file)?;
+            let rgb = nv12_to_rgb(&buf, w, h, w as usize, ColorSpace::Bt709, ColorRange::Limited);
+            rgb.chunks(3)
+                .map(|p| p.iter().max().unwrap() - p.iter().min().unwrap())
+                .max()
+        };
+
+        // A chain set while stopped is kept for the start.
+        rig.engine.set_chain(chain(Some(-1.0)));
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("grey frames", Duration::from_secs(10), |r| {
+            spread(r).is_some_and(|s| s <= 4)
+        });
+
+        // Live: the colours come back without a reopen, and go away again.
+        rig.engine.set_chain(chain(None));
+        rig.wait("colour", Duration::from_secs(10), |r| {
+            spread(r).is_some_and(|s| s > 100)
+        });
+        rig.engine.set_chain(chain(Some(-1.0)));
+        rig.wait("grey again", Duration::from_secs(10), |r| {
+            spread(r).is_some_and(|s| s <= 4)
+        });
+        assert_eq!(rig.opens(), 1, "a chain change does not reopen the camera");
+        assert_eq!(rig.engine.state(), EngineState::Live);
+
+        // Stopped: the chain is still the engine's, the next start renders it from the first frame.
+        rig.engine.stop();
+        assert!(rig.engine.wait_stopped(Duration::from_secs(10)));
+        rig.engine.set_chain(chain(None));
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("colour after the restart", Duration::from_secs(10), |r| {
+            spread(r).is_some_and(|s| s > 100)
+        });
+        assert!(
+            !rig.events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, e)| matches!(e, EngineEvent::FilterError(_))),
+            "no filter failed"
         );
     }
 

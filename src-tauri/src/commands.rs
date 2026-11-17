@@ -38,7 +38,8 @@ pub async fn list_cameras(state: State<'_, AppState>) -> Result<Vec<CameraDto>, 
 
 /// Start the engine: Standby, then Live (at once, or when an app or the window watches with
 /// `deactivate_when_not_showing`). `controls` is the record of the changed camera controls, re-applied after every
-/// camera open; `chain` is accepted and ignored for now.
+/// camera open; `chain` is the initial filter chain (an array of `{id, kind, enabled, params}`); omitted, the engine
+/// keeps the chain of an earlier `set_chain`.
 #[tauri::command]
 pub async fn start_engine(
     state: State<'_, AppState>,
@@ -105,6 +106,15 @@ pub async fn reset_camera_controls(
 #[tauri::command]
 pub async fn set_output(state: State<'_, AppState>, output: OutputCfg) -> Result<(), String> {
     state.service.set_output(output)
+}
+
+/// Replace the filter chain: an array of `{id, kind, enabled, params}` (plan 5.3). It applies to the next frame with no
+/// reopen and no restart, also while stopped (the engine keeps it for the next start). Unknown kinds are skipped and
+/// values are clamped to their ranges. Not async on purpose: commands that are not async run in order on one thread,
+/// so the newest chain is always the one applied, and the call only parses and queues a message.
+#[tauri::command]
+pub fn set_chain(state: State<AppState>, chain: serde_json::Value) -> Result<(), String> {
+    state.service.set_chain(&chain)
 }
 
 #[tauri::command]
