@@ -258,6 +258,18 @@ const CATALOGUE = {
       { type: "bool", key: "stretch", label: "Stretch Image (discard image aspect ratio)", def: false },
     ],
   },
+  // Auto Adjust (P16): Better Cam's own filter, no OBS counterpart.
+  auto_adjust: {
+    label: "Auto Adjust",
+    hint: "Automatic exposure and white balance in software",
+    params: [
+      { type: "bool", key: "exposure", label: "Auto exposure", def: true },
+      { type: "bool", key: "white_balance", label: "Auto white balance", def: true },
+      { type: "slider", key: "target", label: "Target brightness", min: 0.2, max: 0.8, step: 0.01, def: 0.45, showIf: { key: "exposure", in: [true] } },
+      { type: "slider", key: "strength", label: "Strength", min: 0, max: 1, step: 0.01, def: 1 },
+      { type: "slider", key: "speed", label: "Adaptation speed", min: 0.05, max: 1, step: 0.01, def: 0.3 },
+    ],
+  },
 } satisfies Record<string, FilterDef>;
 
 export type FilterKind = keyof typeof CATALOGUE;

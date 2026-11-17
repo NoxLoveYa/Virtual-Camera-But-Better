@@ -17,6 +17,7 @@
 //! * `defaults.json`: the default params of every registered kind, a copy of the TypeScript schema's defaults.
 
 pub mod assets;
+pub mod auto_adjust;
 pub mod color;
 pub mod geometry;
 pub mod keys;
@@ -173,6 +174,8 @@ const REGISTRY: &[(&str, Maker)] = &[
     (keys::COLOR_KIND, keys::make_color),
     (keys::LUMA_KIND, keys::make_luma),
     (mask::KIND, mask::make),
+    // Auto Adjust (P16, Better Cam's own)
+    (auto_adjust::KIND, auto_adjust::make),
 ];
 
 /// A new filter of this kind, with default settings. `None` for a kind that is not registered.

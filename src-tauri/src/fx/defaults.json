@@ -69,5 +69,12 @@
     "color": 16777215,
     "opacity": 1,
     "stretch": false
+  },
+  "auto_adjust": {
+    "exposure": true,
+    "white_balance": true,
+    "target": 0.45,
+    "strength": 1,
+    "speed": 0.3
   }
 }
