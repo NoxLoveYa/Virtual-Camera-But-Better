@@ -176,4 +176,6 @@ macro_rules! vlog {
 pub mod slot {
     pub const REQUEST_SAMPLE: usize = 0;
     pub const SAMPLE_OUT: usize = 1;
+    pub const HEADER_INVALID: usize = 2;
+    pub const SLOT_INVALID: usize = 3;
 }

@@ -1,9 +1,16 @@
 //! `capture-test`: open the Better Cam device with a Media Foundation Source Reader (the same path the Camera app
-//! and browsers use through Frame Server) and check the stream against the P1 test pattern.
+//! and browsers use through Frame Server) and check the stream against what it should show.
+//!
+//! `--expect feed` (default): the checkerboard + moving stripe of `vcam-tool feed`, stripe advancing, no torn,
+//! black or foreign frames. `--expect slate[-paused|-starting]`: every frame is that slate. `--expect feed-to-slate`:
+//! feed frames, then the "not running" slate for the rest of the capture (stop the feeder while it runs).
 
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use vcam_protocol::pattern::{slot_from_box_x, slots, BOX_SIZE, BOX_STEP, DETECT_LUMA};
+use vcam_protocol::pattern::{self, Analysis};
+use vcam_protocol::slate::{self, Slate, SlateKind};
+use vcam_protocol::{qpc_frequency, qpc_now, Access, MappedFile, SUBTYPE_NV12, SUBTYPE_RGB32};
 use windows::Win32::Media::MediaFoundation::{
     IMF2DBuffer, IMFMediaSource, IMFSample, IMFSourceReader, MFCreateAttributes,
     MFCreateSourceReaderFromMediaSource, MFMediaType_Video, MFVideoFormat_NV12,
@@ -16,16 +23,44 @@ use windows_core::{Interface, GUID};
 use crate::status::enum_mf_devices;
 use crate::util::init_com_and_mf;
 
+pub const USAGE: &str =
+    "usage: vcam-tool capture-test [--frames N] [--format nv12|rgb32] [--size WxH] [--fps N]
+                             [--expect feed|slate|slate-paused|slate-starting|feed-to-slate]";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fmt {
     Nv12,
     Rgb32,
 }
 
+impl Fmt {
+    fn subtype(self) -> u32 {
+        match self {
+            Fmt::Nv12 => SUBTYPE_NV12,
+            Fmt::Rgb32 => SUBTYPE_RGB32,
+        }
+    }
+    fn row_bytes(self, width: u32) -> usize {
+        match self {
+            Fmt::Nv12 => width as usize,
+            Fmt::Rgb32 => width as usize * 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expect {
+    Feed,
+    Slate(SlateKind),
+    FeedToSlate,
+}
+
 pub struct Args {
     frames: usize,
     fmt: Fmt,
     size: (u32, u32),
+    fps: Option<u32>,
+    expect: Expect,
 }
 
 pub fn parse_args(args: &[String]) -> Result<Args, String> {
@@ -33,6 +68,8 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
         frames: 120,
         fmt: Fmt::Nv12,
         size: (1920, 1080),
+        fps: None,
+        expect: Expect::Feed,
     };
     let mut it = args.iter();
     while let Some(k) = it.next() {
@@ -54,6 +91,21 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
                     h.parse().map_err(|_| "bad height")?,
                 );
             }
+            "--fps" => a.fps = Some(val()?.parse().map_err(|_| "bad --fps")?),
+            "--expect" => {
+                a.expect = match val()?.to_lowercase().as_str() {
+                    "feed" => Expect::Feed,
+                    "slate" => Expect::Slate(SlateKind::NotRunning),
+                    "slate-paused" => Expect::Slate(SlateKind::Paused),
+                    "slate-starting" => Expect::Slate(SlateKind::Starting),
+                    "feed-to-slate" => Expect::FeedToSlate,
+                    o => {
+                        return Err(format!(
+                            "unknown expectation '{o}' (feed|slate|slate-paused|slate-starting|feed-to-slate)"
+                        ))
+                    }
+                }
+            }
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
@@ -63,51 +115,92 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
     Ok(a)
 }
 
-/// What one decoded frame looked like.
-struct FrameInfo {
-    slot: Option<u32>,
-    black: bool,
+// ---- embedded slates ---------------------------------------------------------------------------------------------
+
+static EMBEDDED: [&[u8]; 3] = [
+    include_bytes!("../../vcam-source/assets/slates/not_running.rle"),
+    include_bytes!("../../vcam-source/assets/slates/paused.rle"),
+    include_bytes!("../../vcam-source/assets/slates/starting.rle"),
+];
+
+fn embedded_slate(kind: SlateKind) -> &'static Slate {
+    static DECODED: [OnceLock<Slate>; 3] = [const { OnceLock::new() }; 3];
+    let i = SlateKind::ALL.iter().position(|k| *k == kind).unwrap();
+    DECODED[i].get_or_init(|| slate::decode(EMBEDDED[i]).expect("embedded slate decodes"))
 }
 
-/// Analyse a locked frame. `scan0`/`pitch` as returned by `IMF2DBuffer::Lock2D` (pitch may be negative).
+/// The slate scaled and converted exactly like the DLL does, as tight rows.
+struct ExpectedSlate {
+    pixels: Vec<u8>,
+    row_bytes: usize,
+}
+
+impl ExpectedSlate {
+    fn new(kind: SlateKind, fmt: Fmt, width: u32, height: u32) -> ExpectedSlate {
+        let s = embedded_slate(kind);
+        let pixels = match fmt {
+            Fmt::Nv12 => s.scale_nv12(width, height),
+            Fmt::Rgb32 => s.scale_bgrx(width, height),
+        };
+        ExpectedSlate {
+            pixels,
+            row_bytes: fmt.row_bytes(width),
+        }
+    }
+    fn row(&self, y: u32) -> Vec<u8> {
+        self.pixels[y as usize * self.row_bytes..(y as usize + 1) * self.row_bytes].to_vec()
+    }
+}
+
+/// Mean luma difference under which a frame counts as "this slate".
+const SLATE_TOLERANCE: f64 = 2.0;
+
+// ---- per-frame analysis ------------------------------------------------------------------------------------------
+
+struct FrameInfo {
+    analysis: Analysis,
+    /// Mean luma difference to each slate that was asked about (`NaN` when not computed).
+    slate_diff: f64,
+}
+
+impl FrameInfo {
+    fn is_feed(&self) -> bool {
+        self.analysis.slot().is_some() && self.analysis.board_ok
+    }
+    fn is_slate(&self) -> bool {
+        self.slate_diff <= SLATE_TOLERANCE
+    }
+}
+
+/// Analyse a locked frame. `scan0`/`pitch` as returned by `IMF2DBuffer::Lock2D`.
 ///
 /// # Safety
 /// `scan0` must point at the first scanline of a locked buffer holding `height` rows at `pitch` bytes.
-unsafe fn analyse(scan0: *const u8, pitch: i32, fmt: Fmt, width: u32, height: u32) -> FrameInfo {
-    let row_bytes = match fmt {
-        Fmt::Nv12 => width as usize,
-        Fmt::Rgb32 => width as usize * 4,
+unsafe fn analyse_locked(
+    scan0: *const u8,
+    pitch: i32,
+    fmt: Fmt,
+    width: u32,
+    height: u32,
+    slate: Option<&ExpectedSlate>,
+) -> FrameInfo {
+    let rb = fmt.row_bytes(width);
+    let row = |r: u32| std::slice::from_raw_parts(scan0.offset(r as isize * pitch as isize), rb);
+    let analysis = pattern::analyse(row, fmt.subtype(), width, height);
+    let slate_diff = match slate {
+        Some(s) => slate::mean_luma_diff(
+            |y| s.row(y),
+            |y| row(y).to_vec(),
+            width,
+            height,
+            fmt == Fmt::Rgb32,
+            4,
+        ),
+        None => f64::NAN,
     };
-    let row =
-        |r: u32| std::slice::from_raw_parts(scan0.offset(r as isize * pitch as isize), row_bytes);
-    // brightness of pixel x on a row
-    let bright = |line: &[u8], x: usize| match fmt {
-        Fmt::Nv12 => line[x],
-        Fmt::Rgb32 => line[x * 4].min(line[x * 4 + 1]).min(line[x * 4 + 2]),
-    };
-    let box_row = row(vcam_protocol::pattern::box_y(height) + BOX_SIZE / 2);
-    let mut run = 0u32;
-    let mut slot = None;
-    for x in 0..width as usize {
-        if bright(box_row, x) >= DETECT_LUMA {
-            run += 1;
-            if run == BOX_SIZE / 2 {
-                slot = Some(slot_from_box_x(x as u32 + 1 - run));
-                break;
-            }
-        } else {
-            run = 0;
-        }
-    }
-    // black: a row away from the box with no pixel above the black level
-    let probe = row(height / 2 + BOX_SIZE);
-    let any_lit = (0..width as usize).any(|x| match fmt {
-        Fmt::Nv12 => probe[x] > 20,
-        Fmt::Rgb32 => probe[x * 4] > 8 || probe[x * 4 + 1] > 8 || probe[x * 4 + 2] > 8,
-    });
     FrameInfo {
-        slot,
-        black: !any_lit,
+        analysis,
+        slate_diff,
     }
 }
 
@@ -116,24 +209,22 @@ fn decode(
     fmt: Fmt,
     width: u32,
     height: u32,
+    slate: Option<&ExpectedSlate>,
 ) -> windows_core::Result<FrameInfo> {
     let buffer = unsafe { sample.ConvertToContiguousBuffer()? };
     if let Ok(b2) = buffer.cast::<IMF2DBuffer>() {
         let mut scan0 = std::ptr::null_mut();
         let mut pitch = 0i32;
         unsafe { b2.Lock2D(&mut scan0, &mut pitch)? };
-        let info = unsafe { analyse(scan0, pitch, fmt, width, height) };
+        let info = unsafe { analyse_locked(scan0, pitch, fmt, width, height, slate) };
         unsafe { b2.Unlock2D()? };
         Ok(info)
     } else {
         // contiguous 1-D buffer: assume a tight pitch
         let (mut data, mut max, mut cur) = (std::ptr::null_mut(), 0u32, 0u32);
         unsafe { buffer.Lock(&mut data, Some(&mut max), Some(&mut cur))? };
-        let pitch = match fmt {
-            Fmt::Nv12 => width as i32,
-            Fmt::Rgb32 => width as i32 * 4,
-        };
-        let info = unsafe { analyse(data, pitch, fmt, width, height) };
+        let pitch = fmt.row_bytes(width) as i32;
+        let info = unsafe { analyse_locked(data, pitch, fmt, width, height, slate) };
         unsafe { buffer.Unlock()? };
         Ok(info)
     }
@@ -157,8 +248,9 @@ fn select_native_type(reader: &IMFSourceReader, args: &Args) -> Result<(), Strin
         let size = unsafe { t.GetUINT64(&MF_MT_FRAME_SIZE) }.unwrap_or(0);
         let rate = unsafe { t.GetUINT64(&MF_MT_FRAME_RATE) }.unwrap_or(0);
         let (w, h) = ((size >> 32) as u32, (size & 0xFFFF_FFFF) as u32);
+        let fps = (rate >> 32) as u32 / ((rate & 0xFFFF_FFFF) as u32).max(1);
         seen.push(format!(
-            "{} {w}x{h} @{}/{}",
+            "{} {w}x{h} @{fps}",
             if sub == MFVideoFormat_NV12 {
                 "nv12"
             } else if sub == MFVideoFormat_RGB32 {
@@ -166,10 +258,8 @@ fn select_native_type(reader: &IMFSourceReader, args: &Args) -> Result<(), Strin
             } else {
                 "other"
             },
-            rate >> 32,
-            rate & 0xFFFF_FFFF
         ));
-        if sub == want && (w, h) == args.size {
+        if sub == want && (w, h) == args.size && args.fps.is_none_or(|f| f == fps) {
             unsafe {
                 reader.SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32, None, &t)
             }
@@ -186,6 +276,15 @@ fn select_native_type(reader: &IMFSourceReader, args: &Args) -> Result<(), Strin
 struct Report {
     lines: Vec<String>,
     failures: Vec<String>,
+    label: String,
+}
+
+/// One frame as it arrived.
+struct Rec {
+    at: Instant,
+    qpc: u64,
+    stamp: i64,
+    info: FrameInfo,
 }
 
 fn run_capture(args: &Args) -> Result<Report, String> {
@@ -215,14 +314,16 @@ fn run_capture(args: &Args) -> Result<Report, String> {
     let sub = unsafe { negotiated.GetGUID(&MF_MT_SUBTYPE) }.unwrap_or_default();
     let major = unsafe { negotiated.GetGUID(&MF_MT_MAJOR_TYPE) }.unwrap_or_default();
     let size = unsafe { negotiated.GetUINT64(&MF_MT_FRAME_SIZE) }.unwrap_or(0);
+    let rate = unsafe { negotiated.GetUINT64(&MF_MT_FRAME_RATE) }.unwrap_or(0);
     let (w, h) = ((size >> 32) as u32, (size & 0xFFFF_FFFF) as u32);
+    let negotiated_fps = (rate >> 32) as f64 / ((rate & 0xFFFF_FFFF) as f64).max(1.0);
     let mut failures = Vec::new();
     let sub_ok = match args.fmt {
         Fmt::Nv12 => sub == MFVideoFormat_NV12,
         Fmt::Rgb32 => sub == MFVideoFormat_RGB32,
     };
     lines.push(format!(
-        "negotiated: {} {w}x{h} (requested {:?} {}x{})",
+        "negotiated: {} {w}x{h} @{negotiated_fps} (requested {:?} {}x{})",
         if sub == MFVideoFormat_NV12 {
             "nv12"
         } else if sub == MFVideoFormat_RGB32 {
@@ -238,15 +339,25 @@ fn run_capture(args: &Args) -> Result<Report, String> {
         failures.push("negotiated type differs from the requested one".to_string());
     }
 
-    let n_slots = slots(w.max(1));
+    // what to compare against
+    let slate_kinds: Vec<SlateKind> = match args.expect {
+        Expect::Feed => vec![],
+        Expect::Slate(k) => vec![k],
+        Expect::FeedToSlate => vec![SlateKind::NotRunning],
+    };
+    let expected: Option<ExpectedSlate> = slate_kinds
+        .first()
+        .map(|k| ExpectedSlate::new(*k, args.fmt, w, h));
+
     let started = Instant::now();
-    let mut arrivals: Vec<Instant> = Vec::with_capacity(args.frames);
-    let mut stamps: Vec<i64> = Vec::with_capacity(args.frames);
-    let mut seq_slots: Vec<u32> = Vec::with_capacity(args.frames);
-    let mut black = 0usize;
-    let mut no_box = 0usize;
+    let mut recs: Vec<Rec> = Vec::with_capacity(args.frames);
     let mut ticks = 0usize;
-    while arrivals.len() < args.frames {
+    // `--expect feed` ignores frames until the first feed frame (the writer needs a moment to follow the
+    // negotiated size), at most 2 s worth
+    let mut warmup_frames = 0usize;
+    let mut warming = args.expect == Expect::Feed;
+    let warmup_limit = Duration::from_secs(2);
+    while recs.len() < args.frames {
         let (mut flags, mut ts) = (0u32, 0i64);
         let mut sample: Option<IMFSample> = None;
         let mut actual = 0u32;
@@ -273,17 +384,30 @@ fn run_capture(args: &Args) -> Result<Report, String> {
             ticks += 1;
         }
         let Some(sample) = sample else { continue };
-        let now = Instant::now();
-        let info = decode(&sample, args.fmt, w, h).map_err(|e| format!("decode: {e}"))?;
-        arrivals.push(now);
-        stamps.push(ts);
-        if info.black {
-            black += 1;
+        let qpc = qpc_now();
+        let at = Instant::now();
+        let info = decode(&sample, args.fmt, w, h, expected.as_ref())
+            .map_err(|e| format!("decode: {e}"))?;
+        if warming {
+            if info.is_feed() {
+                warming = false;
+            } else {
+                warmup_frames += 1;
+                if started.elapsed() > warmup_limit {
+                    failures.push(format!(
+                        "no feed frame within {warmup_limit:?} ({warmup_frames} other frames)"
+                    ));
+                    break;
+                }
+                continue;
+            }
         }
-        match info.slot {
-            Some(s) => seq_slots.push(s),
-            None => no_box += 1,
-        }
+        recs.push(Rec {
+            at,
+            qpc,
+            stamp: ts,
+            info,
+        });
     }
     let total = started.elapsed();
     unsafe {
@@ -291,31 +415,43 @@ fn run_capture(args: &Args) -> Result<Report, String> {
         let _ = activate.ShutdownObject();
     }
 
-    // checks
-    let n = arrivals.len();
+    // ---- checks common to all expectations
+    let n = recs.len();
     lines.push(format!("frames read: {n} in {:.2}s", total.as_secs_f64()));
+    if warmup_frames > 0 {
+        lines.push(format!(
+            "warm-up frames before the first feed frame: {warmup_frames}"
+        ));
+    }
     if n < args.frames {
         failures.push(format!("only {n} of {} frames read", args.frames));
     }
     if n >= 2 {
-        let wall = (n - 1) as f64 / arrivals[n - 1].duration_since(arrivals[0]).as_secs_f64();
-        let ts_span = (stamps[n - 1] - stamps[0]) as f64 / 1e7;
+        let span = recs[n - 1].at.duration_since(recs[0].at).as_secs_f64();
+        let wall = (n - 1) as f64 / span;
+        let ts_span = (recs[n - 1].stamp - recs[0].stamp) as f64 / 1e7;
         let ts_fps = if ts_span > 0.0 {
             (n - 1) as f64 / ts_span
         } else {
             0.0
         };
-        let max_gap = arrivals
+        let max_gap = recs
             .windows(2)
-            .map(|p| p[1].duration_since(p[0]))
+            .map(|p| p[1].at.duration_since(p[0].at))
             .max()
             .unwrap_or(Duration::ZERO);
         lines.push(format!(
             "wall fps: {wall:.2}   timestamp fps: {ts_fps:.2}   max gap: {} ms",
             max_gap.as_millis()
         ));
-        if !(27.0..=33.0).contains(&wall) {
-            failures.push(format!("measured {wall:.2} fps, expected 30 +/- 10%"));
+        // a feed-to-slate run is not steady, the rate there is informational
+        if args.expect != Expect::FeedToSlate && negotiated_fps > 0.0 {
+            let (lo, hi) = (negotiated_fps * 0.9, negotiated_fps * 1.1);
+            if !(lo..=hi).contains(&wall) {
+                failures.push(format!(
+                    "measured {wall:.2} fps, expected {negotiated_fps} +/- 10%"
+                ));
+            }
         }
         if max_gap > Duration::from_millis(250) {
             failures.push(format!(
@@ -323,49 +459,197 @@ fn run_capture(args: &Args) -> Result<Report, String> {
                 max_gap.as_millis()
             ));
         }
-    }
-    // box must advance exactly one slot per frame
-    let mut jumps = Vec::new();
-    for (i, p) in seq_slots.windows(2).enumerate() {
-        if n_slots > 0 && (p[0] + 1) % n_slots != p[1] {
-            jumps.push((i + 1, p[0], p[1]));
+        if recs.windows(2).any(|p| p[1].stamp <= p[0].stamp) {
+            failures.push("sample timestamps did not grow".into());
         }
     }
+
+    match args.expect {
+        Expect::Feed => check_feed(&recs, w, &mut lines, &mut failures),
+        Expect::Slate(kind) => check_slate(&recs, kind, &mut lines, &mut failures),
+        Expect::FeedToSlate => check_feed_to_slate(&recs, &mut lines, &mut failures),
+    }
+    lines.push(format!("stream ticks: {ticks}"));
+    let label = format!("{:?} {w}x{h} {:?}", args.fmt, args.expect);
+    Ok(Report {
+        lines,
+        failures,
+        label,
+    })
+}
+
+fn median(v: &mut [i64]) -> i64 {
+    v.sort_unstable();
+    v.get(v.len() / 2).copied().unwrap_or(0)
+}
+
+fn check_feed(recs: &[Rec], width: u32, lines: &mut Vec<String>, failures: &mut Vec<String>) {
+    let n_slots = pattern::slots(width).max(1) as i64;
+    let (mut torn, mut black, mut no_stripe, mut board, mut slate) = (0, 0, 0, 0, 0);
+    let mut slots: Vec<i64> = Vec::new();
+    for r in recs {
+        let a = &r.info.analysis;
+        if a.black {
+            black += 1;
+        } else if a.torn() {
+            torn += 1;
+        } else if let (Some(s), true) = (a.slot(), a.board_ok) {
+            slots.push(s as i64);
+        } else if a.slot().is_some() {
+            board += 1;
+        } else if r.info.slate_diff.is_nan() && a.stripes.iter().all(|s| s.is_none()) {
+            no_stripe += 1;
+        } else {
+            slate += 1;
+        }
+    }
+    // signed step between frames, folded into -n/2..n/2
+    let mut steps: Vec<i64> = slots
+        .windows(2)
+        .map(|p| ((p[1] - p[0] + n_slots + n_slots / 2).rem_euclid(n_slots)) - n_slots / 2)
+        .collect();
+    let backwards = steps.iter().filter(|&&d| d < 0).count();
+    let repeats = steps.iter().filter(|&&d| d == 0).count();
+    let typical = median(&mut steps.clone());
+    let irregular = steps.iter().filter(|&&d| d != typical).count();
     lines.push(format!(
-        "box step {BOX_STEP}px/frame: {} frames decoded, {} out of sequence, {} without a box",
-        seq_slots.len(),
-        jumps.len(),
-        no_box
+        "stripe: {} frames decoded, typical step {typical} slot(s)/frame, {repeats} repeated, {backwards} backwards, {irregular} irregular",
+        slots.len()
     ));
-    if let Some(&(i, a, b)) = jumps.first() {
+    steps.sort_unstable();
+    lines.push(format!(
+        "torn frames: {torn}   black frames: {black}   frames without stripe: {no_stripe}   bad checkerboard: {board}   other: {slate}"
+    ));
+    if torn > 0 {
         failures.push(format!(
-            "{} frame(s) out of sequence, first at read #{i}: slot {a} -> {b} (expected {})",
-            jumps.len(),
-            (a + 1) % n_slots
+            "{torn} torn frame(s): the stripe is at different places on different rows"
         ));
     }
-    if no_box > 0 {
-        failures.push(format!("{no_box} frame(s) had no white box"));
-    }
-    lines.push(format!("black frames: {black}   stream ticks: {ticks}"));
     if black > 0 {
         failures.push(format!("{black} black frame(s)"));
     }
-    Ok(Report { lines, failures })
+    if no_stripe > 0 || slate > 0 {
+        failures.push(format!(
+            "{} frame(s) without the feed pattern",
+            no_stripe + slate
+        ));
+    }
+    if board > 0 {
+        failures.push(format!("{board} frame(s) with a damaged checkerboard"));
+    }
+    if backwards > 0 {
+        failures.push(format!("{backwards} frame(s) moved the stripe backwards"));
+    }
+    if typical < 1 {
+        failures.push("the stripe does not advance".into());
+    }
+    if irregular * 100 > slots.len().max(1) * 2 {
+        failures.push(format!(
+            "{irregular} of {} frames broke the typical step of {typical} (more than 2 %)",
+            slots.len()
+        ));
+    }
+}
+
+fn check_slate(recs: &[Rec], kind: SlateKind, lines: &mut Vec<String>, failures: &mut Vec<String>) {
+    let worst = recs
+        .iter()
+        .map(|r| r.info.slate_diff)
+        .fold(0.0f64, f64::max);
+    let mismatched = recs.iter().filter(|r| !r.info.is_slate()).count();
+    let feed = recs.iter().filter(|r| r.info.is_feed()).count();
+    lines.push(format!(
+        "slate '{}': {} of {} frames match (worst mean luma difference {worst:.2}, tolerance {SLATE_TOLERANCE}); {feed} feed frames",
+        kind.text(),
+        recs.len() - mismatched,
+        recs.len()
+    ));
+    if mismatched > 0 {
+        failures.push(format!(
+            "{mismatched} frame(s) are not the '{}' slate",
+            kind.text()
+        ));
+    }
+}
+
+fn check_feed_to_slate(recs: &[Rec], lines: &mut Vec<String>, failures: &mut Vec<String>) {
+    let first_slate = recs
+        .iter()
+        .position(|r| r.info.is_slate() && !r.info.is_feed());
+    let feed_before = recs
+        .iter()
+        .take(first_slate.unwrap_or(recs.len()))
+        .filter(|r| r.info.is_feed())
+        .count();
+    lines.push(format!(
+        "feed frames before the slate: {feed_before}; first slate frame: {}",
+        first_slate
+            .map(|i| format!("#{i}"))
+            .unwrap_or_else(|| "none".into())
+    ));
+    let Some(i) = first_slate else {
+        failures
+            .push("the 'not running' slate never appeared (is the feeder still running?)".into());
+        return;
+    };
+    if feed_before == 0 {
+        failures
+            .push("no feed frame before the slate (start the feeder before the capture)".into());
+    }
+    let after_bad = recs[i..]
+        .iter()
+        .filter(|r| !(r.info.is_slate() && !r.info.is_feed()))
+        .count();
+    if after_bad > 0 {
+        failures.push(format!(
+            "{after_bad} frame(s) after the first slate frame are not the slate"
+        ));
+    }
+    let other = recs[..i].iter().filter(|r| !r.info.is_feed()).count();
+    if other > 0 {
+        failures.push(format!(
+            "{other} frame(s) before the slate are neither feed nor slate"
+        ));
+    }
+    // how long after the writer's last sign of life did the slate appear
+    match MappedFile::open(&vcam_protocol::frames_path(), Access::ReadOnly) {
+        Ok(m) => {
+            let h = m.shared().header();
+            let state = vcam_protocol::WriterState::from_u32(h.writer_state)
+                .map(|s| s.name())
+                .unwrap_or("?");
+            let delta_ms =
+                (recs[i].qpc as i128 - h.writer_heartbeat as i128) * 1000 / qpc_frequency() as i128;
+            lines.push(format!(
+                "writer state at the end: {state}; slate appeared {delta_ms} ms after the writer's last heartbeat"
+            ));
+            if delta_ms > 1000 {
+                failures.push(format!(
+                    "the slate took {delta_ms} ms after the last heartbeat (limit 1000 ms)"
+                ));
+            }
+        }
+        Err(e) => lines.push(format!(
+            "frames.bin not readable ({e}): timing against the heartbeat skipped"
+        )),
+    }
 }
 
 pub fn run(args: &[String]) -> i32 {
     let args = match parse_args(args) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("{e}\nusage: vcam-tool capture-test [--frames N] [--format nv12|rgb32] [--size WxH]");
+            eprintln!("{e}\n{USAGE}");
             return 2;
         }
     };
     // the reader can block forever when no frames arrive: run it on a worker and watch the clock
     let budget = Duration::from_secs(60) + Duration::from_secs_f64(args.frames as f64 / 20.0);
     let (tx, rx) = std::sync::mpsc::channel();
-    let fmt_name = format!("{:?} {}x{}", args.fmt, args.size.0, args.size.1);
+    let fmt_name = format!(
+        "{:?} {}x{} {:?}",
+        args.fmt, args.size.0, args.size.1, args.expect
+    );
     std::thread::spawn(move || {
         let r = run_capture(&args);
         let _ = tx.send(r);
@@ -376,13 +660,13 @@ pub fn run(args: &[String]) -> i32 {
                 println!("{l}");
             }
             if report.failures.is_empty() {
-                println!("PASS ({fmt_name})");
+                println!("PASS ({})", report.label);
                 0
             } else {
                 for f in &report.failures {
                     println!("  - {f}");
                 }
-                println!("FAIL ({fmt_name})");
+                println!("FAIL ({})", report.label);
                 1
             }
         }
@@ -395,6 +679,149 @@ pub fn run(args: &[String]) -> i32 {
             println!("  - no result within {budget:?}: the stream stalled");
             println!("FAIL ({fmt_name})");
             std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn parses_expectations() {
+        assert_eq!(parse_args(&[]).unwrap().expect, Expect::Feed);
+        assert_eq!(
+            parse_args(&s(&["--expect", "slate-paused", "--frames", "10"]))
+                .unwrap()
+                .expect,
+            Expect::Slate(SlateKind::Paused)
+        );
+        assert_eq!(
+            parse_args(&s(&["--expect", "feed-to-slate"]))
+                .unwrap()
+                .expect,
+            Expect::FeedToSlate
+        );
+        assert_eq!(parse_args(&s(&["--fps", "30"])).unwrap().fps, Some(30));
+        assert!(parse_args(&s(&["--expect", "nope"])).is_err());
+        assert!(parse_args(&s(&["--frames", "1"])).is_err());
+        assert!(parse_args(&s(&["--size", "big"])).is_err());
+    }
+
+    fn rec(info: FrameInfo, i: usize) -> Rec {
+        Rec {
+            at: Instant::now(),
+            qpc: i as u64,
+            stamp: i as i64 * 333_333,
+            info,
+        }
+    }
+    fn feed_info(slot: u32) -> FrameInfo {
+        FrameInfo {
+            analysis: Analysis {
+                stripes: [Some(slot); 3],
+                board_ok: true,
+                black: false,
+            },
+            slate_diff: f64::NAN,
+        }
+    }
+
+    #[test]
+    fn feed_check_accepts_a_steady_stripe_and_rejects_trouble() {
+        let steady: Vec<Rec> = (0..100)
+            .map(|i| rec(feed_info((i * 2 % 118) as u32), i))
+            .collect();
+        let (mut lines, mut fails) = (vec![], vec![]);
+        check_feed(&steady, 1920, &mut lines, &mut fails);
+        assert!(fails.is_empty(), "{fails:?} {lines:?}");
+
+        // wrap-around at the slot count is a normal step
+        let wrap: Vec<Rec> = (0..300)
+            .map(|i| rec(feed_info((i % 118) as u32), i))
+            .collect();
+        let (mut lines, mut fails) = (vec![], vec![]);
+        check_feed(&wrap, 1920, &mut lines, &mut fails);
+        assert!(fails.is_empty(), "{fails:?}");
+
+        // a torn frame, a black frame and a backwards step
+        let mut bad: Vec<Rec> = (0..100)
+            .map(|i| rec(feed_info((i % 118) as u32), i))
+            .collect();
+        bad[10] = rec(
+            FrameInfo {
+                analysis: Analysis {
+                    stripes: [Some(3), Some(3), Some(9)],
+                    board_ok: true,
+                    black: false,
+                },
+                slate_diff: f64::NAN,
+            },
+            10,
+        );
+        bad[20] = rec(
+            FrameInfo {
+                analysis: Analysis {
+                    stripes: [None; 3],
+                    board_ok: false,
+                    black: true,
+                },
+                slate_diff: f64::NAN,
+            },
+            20,
+        );
+        bad[30] = rec(feed_info(5), 30);
+        let (mut lines, mut fails) = (vec![], vec![]);
+        check_feed(&bad, 1920, &mut lines, &mut fails);
+        let text = fails.join("\n");
+        assert!(text.contains("torn"), "{text}");
+        assert!(text.contains("black"), "{text}");
+        assert!(text.contains("backwards"), "{text}");
+        let _ = lines;
+    }
+
+    #[test]
+    fn feed_check_tolerates_a_decimated_stream() {
+        // consumer at half the writer rate: every step is 2
+        let v: Vec<Rec> = (0..100)
+            .map(|i| rec(feed_info(((i * 2) % 118) as u32), i))
+            .collect();
+        let (mut lines, mut fails) = (vec![], vec![]);
+        check_feed(&v, 1920, &mut lines, &mut fails);
+        assert!(fails.is_empty(), "{fails:?}");
+        assert!(lines[0].contains("typical step 2"), "{lines:?}");
+    }
+
+    #[test]
+    fn slate_check_needs_every_frame_to_match() {
+        let slate_info = |d: f64| FrameInfo {
+            analysis: Analysis {
+                stripes: [None; 3],
+                board_ok: false,
+                black: false,
+            },
+            slate_diff: d,
+        };
+        let good: Vec<Rec> = (0..10).map(|i| rec(slate_info(0.0), i)).collect();
+        let (mut lines, mut fails) = (vec![], vec![]);
+        check_slate(&good, SlateKind::NotRunning, &mut lines, &mut fails);
+        assert!(fails.is_empty());
+        let mut mixed = good;
+        mixed[4] = rec(slate_info(40.0), 4);
+        let (mut lines, mut fails) = (vec![], vec![]);
+        check_slate(&mixed, SlateKind::NotRunning, &mut lines, &mut fails);
+        assert_eq!(fails.len(), 1, "{lines:?}");
+    }
+
+    #[test]
+    fn embedded_slates_decode() {
+        for k in SlateKind::ALL {
+            let s = embedded_slate(k);
+            assert_eq!((s.width, s.height), (1920, 1080));
         }
     }
 }

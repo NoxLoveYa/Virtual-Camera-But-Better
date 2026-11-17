@@ -134,6 +134,88 @@ fn set_data_acl(path: &Path, user_sid: Option<&str>) -> Res<()> {
     result
 }
 
+/// The DACL of `path` as an SDDL string.
+fn dacl_sddl(path: &Path) -> Res<String> {
+    use windows::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+    };
+    let path_w = wide(&path.to_string_lossy());
+    let mut psd = PSECURITY_DESCRIPTOR::default();
+    let r = unsafe {
+        GetNamedSecurityInfoW(
+            pcwstr(&path_w),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            None,
+            &mut psd,
+        )
+    };
+    if r != ERROR_SUCCESS {
+        return Err(format!("GetNamedSecurityInfoW {}: {r:?}", path.display()));
+    }
+    let mut s = windows_core::PWSTR::null();
+    let conv = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            psd,
+            SDDL_REVISION_1,
+            DACL_SECURITY_INFORMATION,
+            &mut s,
+            None,
+        )
+    };
+    let text = match conv {
+        Ok(()) => unsafe { s.to_string() }.map_err(|e| werr("sddl utf16", e)),
+        Err(e) => Err(werr(
+            "ConvertSecurityDescriptorToStringSecurityDescriptorW",
+            e,
+        )),
+    };
+    unsafe {
+        if !s.is_null() {
+            let _ = LocalFree(Some(HLOCAL(s.0 as *mut _)));
+        }
+        let _ = LocalFree(Some(HLOCAL(psd.0)));
+    }
+    text
+}
+
+/// Make sure both the user's writer and LOCAL SERVICE can open `frames.bin` read-write: the folder DACL carries
+/// modify access for both with inheritance (so a file the writer creates inherits it), and an existing
+/// `frames.bin` gets the same DACL. Verified by reading the DACL back.
+fn ensure_frames_access(user_sid: Option<&str>, out: &mut Out) -> Res<()> {
+    let dir = data_dir();
+    set_data_acl(&dir, user_sid)?;
+    let frames = dir.join(vcam_protocol::FRAMES_FILE_NAME);
+    if frames.exists() {
+        set_data_acl(&frames, user_sid)?;
+        out.line(&format!("frames.bin: DACL applied ({})", frames.display()));
+    } else {
+        out.line(
+            "frames.bin: not created yet (the writer creates it and inherits the folder DACL)",
+        );
+    }
+    let sddl = dacl_sddl(&dir)?;
+    out.line(&format!("data dir DACL: {sddl}"));
+    for (who, tag) in [("LOCAL SERVICE", ";;;LS)")]
+        .into_iter()
+        .chain(user_sid.map(|s| ("the user", s)))
+    {
+        if !sddl.contains(tag) {
+            return Err(format!("data dir DACL has no entry for {who}"));
+        }
+    }
+    if frames.exists() {
+        let f = dacl_sddl(&frames)?;
+        if !f.contains(";;;LS)") {
+            return Err("frames.bin DACL has no entry for LOCAL SERVICE".into());
+        }
+    }
+    Ok(())
+}
+
 fn create_virtual_camera() -> Res<IMFVirtualCamera> {
     let name = wide(CAMERA_NAME);
     let clsid = wide(CLSID_STRING);
@@ -213,7 +295,7 @@ pub fn register(opts: &RegisterOptions, out: &mut Out) -> Res<()> {
     // 4. data folders with an explicit ACL
     let logs = log_dir();
     std::fs::create_dir_all(&logs).map_err(|e| werr("create log dir", e))?;
-    set_data_acl(&data_dir(), opts.user_sid.as_deref())?;
+    ensure_frames_access(opts.user_sid.as_deref(), out)?;
     out.line(&format!("data dir ready: {}", logs.display()));
 
     // 5. + 6. virtual camera

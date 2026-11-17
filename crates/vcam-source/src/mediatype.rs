@@ -1,6 +1,7 @@
-//! Media types advertised by the stream: NV12 and RGB32 at 1920x1080 and 1280x720, 30 fps.
+//! Media types advertised by the stream: the list the app wrote into the header of `frames.bin`, or NV12 and RGB32
+//! at 1920x1080 and 1280x720, 30 fps, when there is no valid file.
 
-use vcam_protocol::{FPS, SIZES};
+use vcam_protocol::{FPS, SUBTYPE_NV12, SUBTYPE_RGB32};
 use windows::Win32::Media::MediaFoundation::{
     IMFMediaType, MFCreateMediaType, MFMediaType_Video, MFNominalRange_16_235, MFVideoFormat_NV12,
     MFVideoFormat_RGB32, MFVideoPrimaries_BT709, MFVideoTransFunc_709, MFVideoTransferMatrix_BT709,
@@ -40,6 +41,20 @@ impl PixelFormat {
             Some(PixelFormat::Rgb32)
         } else {
             None
+        }
+    }
+    /// The `subtype` value of `frames.bin`.
+    pub fn protocol_subtype(self) -> u32 {
+        match self {
+            PixelFormat::Nv12 => SUBTYPE_NV12,
+            PixelFormat::Rgb32 => SUBTYPE_RGB32,
+        }
+    }
+    pub fn from_protocol_subtype(s: u32) -> Option<Self> {
+        match s {
+            SUBTYPE_NV12 => Some(PixelFormat::Nv12),
+            SUBTYPE_RGB32 => Some(PixelFormat::Rgb32),
+            _ => None,
         }
     }
     /// `dwFourCC` for `MFCreate2DMediaBuffer`.
@@ -140,15 +155,30 @@ pub fn build_media_type(
     Ok(t)
 }
 
-/// Every advertised type, preferred (default) first: NV12 1080p, NV12 720p, RGB32 1080p, RGB32 720p.
+/// Every advertised type, preferred (default) first. Read from the header of `frames.bin` (one plain read);
+/// without a valid file: NV12 1080p, NV12 720p, RGB32 1080p, RGB32 720p at 30 fps.
 pub fn advertised_types() -> Result<Vec<IMFMediaType>> {
     let mut out = Vec::new();
-    for pixel in [PixelFormat::Nv12, PixelFormat::Rgb32] {
-        for &(w, h) in &SIZES {
-            out.push(build_media_type(pixel, w, h, FPS)?);
+    for f in crate::frames::advertised() {
+        if let Some(pixel) = PixelFormat::from_protocol_subtype(f.subtype) {
+            out.push(build_media_type(pixel, f.width, f.height, f.fps())?);
+        }
+    }
+    if out.is_empty() {
+        for f in vcam_protocol::default_advertised() {
+            if let Some(pixel) = PixelFormat::from_protocol_subtype(f.subtype) {
+                out.push(build_media_type(pixel, f.width, f.height, FPS)?);
+            }
         }
     }
     Ok(out)
+}
+
+/// A format a stream may be started with: whatever Frame Server picked from what we advertised, but never
+/// something the protocol would reject.
+pub fn is_sane(f: &FrameFormat) -> bool {
+    vcam_protocol::validate_format(f.width, f.height, f.pixel.protocol_subtype()).is_ok()
+        && (1..=240).contains(&f.fps)
 }
 
 #[cfg(test)]

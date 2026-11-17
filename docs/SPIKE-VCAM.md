@@ -257,3 +257,293 @@ Camera device is "Better Cam (Windows Virtual Camera)". Expect scrolling colour 
    for `PANIC` lines: `findstr /s PANIC C:\ProgramData\BetterCam\logs\vcam-*.log`.
 
 To remove: `target\release\vcam-tool.exe unregister`.
+
+
+---
+
+# P2: frame transport
+
+Spike P2 of `docs/PLAN.md`: frames written by another process reach camera consumers through
+`%ProgramData%\BetterCam\frames.bin`; the DLL no longer draws anything of its own, it copies frames from that file or
+shows a slate. Machine as in P1. DLL under test: `better_cam_vcam_1.ae99667d.dll` (the second P2 build, see trap 1).
+
+**Verdict: the transport works end to end through the real Frame Server.** 1080p60 NV12, 1080p60 RGB32, 720p30,
+360p30 and a 60-to-30 fps decimation all pass `capture-test` with no torn, black or irregular frames; the three slates
+match their embedded images exactly; hostile files give the slate. One of the brief's measurements does not come out
+the way the brief wants (disk writes, see check 6) and one is a hair over its bound by design (killed writer, check 4).
+
+## What was built
+
+| Path | Content |
+|---|---|
+| `crates/vcam-protocol/src/header.rs` | header layout (offsets + a `#[repr(C)]` mirror the compiler checks with `offset_of!`), `Format`, `WriterState`, `RawHeader`, advertised-list rules (`advertised_for_output`, `default_advertised`) |
+| `.../seqlock.rs` | `Shared`: atomic header access, `publish` (writer seqlock), `read_latest` (reader seqlock + callback), DLL-side setters; a view made read-only never stores |
+| `.../validate.rs` | `validate_header`, `validate_slot`, `validate_format`, `is_stale`: every field checked before use |
+| `.../map.rs` | Windows: `MappedFile` (open/map, refuses files under 4096 B or over 256 MB before mapping), QPC helpers, `read_advertised` (one plain 4096-byte read), `Writer` |
+| `.../pattern.rs`, `.../slate.rs` | test pattern (checkerboard + stripe, fill + analyse), slate RLE codec, nearest-neighbour scale, NV12 to BGRX |
+| `crates/vcam-source/src/frames.rs` | `FrameSource`: the poll state machine, slates, repeat rule, consumer counters; `advertised()`; test-only path override |
+| `crates/vcam-source/src/stream.rs` | pump now driven by `FrameSource`; 1 ms high-resolution waitable timer for the fine polls; `make_sample` copies a tight frame into a pitched MF buffer |
+| `crates/vcam-source/assets/slates/*.rle` | `not_running`, `paused`, `starting` (32-35 KB each) |
+| `crates/vcam-tool` | new `feed`, `stats`, `gen-slates`; `capture-test --expect feed\|slate\|slate-paused\|slate-starting\|feed-to-slate [--fps N]`; `register` verifies the data-folder DACL and re-applies it to an existing `frames.bin` |
+
+The P1 pattern (bars + box) is gone from the DLL, from `vcam-protocol` and from the tool.
+
+Header layout actually used (bytes): magic 0, protocol 4, header_size 8, slot_count 12, file_size 16, slot_capacity 24,
+writer_pid 32, writer_state 36, writer_heartbeat 40, qpc_frequency 48, writer_frames 56, advertised_count 64,
+advertised[8] 72 (20 B each), consumer_active 232, reader_slot 236, consumer_heartbeat 240, negotiated 248,
+latency_p50_us 268, latency_p95_us 272, delivered 280, repeated 288, latest_slot 296, slots 304 (48 B each:
+seq, width, height, stride, subtype, capture_qpc, data_offset, data_size). File = 4096 + 3 x 12 451 840 = 37 359 616 B.
+
+## Check results
+
+### 1. Tests
+
+```
+cargo test -p vcam-protocol -p vcam-source -p vcam-tool
+  vcam-protocol  39 passed     vcam-source  27 passed     vcam-tool  14 passed     (0 failed)
+```
+
+Including: writer thread at 1 kHz + reader thread for 2 s with no torn frame (`seqlock::tests`, plus an unthrottled
+writer); validation rejects `file_size` past the mapping, slot offsets past the file end (also `u64::MAX - 4`, and inside
+the header), odd sizes, zero sizes, sizes over 4096x2304, RGB32 over 1080p, bad strides; in-process DLL tests through
+`DllGetClassObject` with a real writer thread: live frames at every advertised type (NV12 and RGB32), 30 fps pacing, the
+three slates, a writer that closes, a writer that dies (slate after 0.8-1.6 s, last frame repeated meanwhile), a corrupted
+header (magic, protocol, header size, slot count, file size, slot capacity, qpc frequency, writer state, heartbeat in the
+future: each gives the slate and recovers when restored), damaged slot descriptors, activation stays cheap (nothing
+mapped, `consumer_active` stays 0), 60 fps writer into a 30 fps stream is halved exactly. The DLL suite was run 7 more times
+in a row (4 before and 3 after the last code change): no flake.
+`cargo clippy -p vcam-protocol -p vcam-source -p vcam-tool --all-targets` and `cargo fmt -p ... --check`: clean
+(fmt scoped to these three packages; `src-tauri` belongs to another agent).
+
+### 2. Build and register
+
+```
+cargo build -p vcam-source -p vcam-tool --release  -> Finished (exit 0); DLL 698 880 bytes
+vcam-tool register  (second P2 build)
+  dll copied: C:\Program Files\Better Cam\vcam\better_cam_vcam_1.ae99667d.dll
+  frames.bin: DACL applied (C:\ProgramData\BetterCam\frames.bin)
+  data dir DACL: D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;LS)(A;OICI;0x1301bf;;;S-1-5-21-...-1001)
+  registered / started
+  locked, delete scheduled at reboot: ...\better_cam_vcam_1.04629341.dll
+```
+
+Frame Server log (first line): `process 'C:\WINDOWS\System32\svchost.exe' pid 33460 session 0 account 'LOCAL SERVICE' dll '...better_cam_vcam_1.ae99667d.dll'`.
+LOCAL SERVICE opens `frames.bin` read-write (the DLL writes `negotiated` and the feeder reads it back). No `PANIC` line
+in any Frame Server log. The log of the consumer-side probe (`vcam-tool.exe`, session 1, the user) has no `pump` and no
+`frames:` line: activation and `CreatePresentationDescriptor` map nothing and start nothing.
+
+### 3. `capture-test --expect feed`
+
+```
+feed --size 1920x1080 --fps 60 --seconds 300   (background)
+capture-test --expect feed --frames 600
+negotiated: nv12 1920x1080 @60
+frames read: 600 in 10.00s
+wall fps: 60.00   timestamp fps: 60.00   max gap: 18 ms
+stripe: 600 frames decoded, typical step 1 slot(s)/frame, 0 repeated, 0 backwards, 0 irregular
+torn frames: 0   black frames: 0   frames without stripe: 0   bad checkerboard: 0   other: 0
+PASS (Nv12 1920x1080 Feed)
+
+feed --size 1280x720 --fps 30      capture-test --expect feed --size 1280x720 --frames 600
+negotiated: nv12 1280x720 @30 / frames read: 600 in 19.98s / wall fps: 30.00 / max gap: 34 ms
+stripe: 600 frames decoded, typical step 1, 0 repeated, 0 backwards, 0 irregular / torn 0, black 0
+PASS (Nv12 1280x720 Feed)
+```
+
+More, all with the final DLL (feeder at 1080p60 unless noted; the feeder follows the format the DLL negotiated):
+
+| consumer type | frames | result |
+|---|---|---|
+| NV12 1920x1080 @60, 2400 frames (run alongside the disk measurements; every result that was looked at passed) | 2400 | PASS, 60.03 fps, 1 repeated, 1 irregular, max gap 33 ms (the run whose output was read in full) |
+| RGB32 1920x1080 @60 | 300 | PASS, 60.00 fps, 0 irregular |
+| NV12 640x360 @30 (writer at 60) | 150 | PASS, 30.01 fps, constant step 2 |
+| NV12 1920x1080 @30 (writer at 60) | 300 | PASS, 30.00 fps, constant step 2, 0 irregular |
+
+`--expect feed` skips frames until the first feed frame (the writer needs a frame or two to follow a new negotiated size;
+at most 2 s) and then requires every frame to be a feed frame; irregular steps are tolerated up to 2 %.
+
+### 4. Slates
+
+```
+feeder stopped cleanly while a capture runs (feed --seconds 6; capture-test --expect feed-to-slate --frames 360)
+feed frames before the slate: 120; first slate frame: #120
+writer state at the end: closed; slate appeared 35 ms after the writer's last heartbeat
+PASS (Nv12 1280x720 FeedToSlate)                                    (earlier DLL build: 31 ms)
+
+feeder killed (Stop-Process -Force, no clean close)
+feed frames before the slate: 151; first slate frame: #151
+writer state at the end: live; slate appeared 1006 ms after the writer's last heartbeat
+  - the slate took 1006 ms after the last heartbeat (limit 1000 ms)
+FAIL (Nv12 1280x720 FeedToSlate)                                    (earlier DLL build: 1034 ms)
+```
+
+A writer that closes the file (`Drop`, Ctrl+C, end of `--seconds`) gives the slate within one frame. A writer that
+vanishes without closing is only noticed when its heartbeat is older than 1 s, so the slate comes 1.0-1.03 s after the
+last heartbeat: the decided 1 s timeout and a "within 1 s" bound cannot both hold for a killed process. The check keeps
+its 1000 ms limit and fails by 6-34 ms; lowering `HEARTBEAT_TIMEOUT_MS` (one constant in `vcam-protocol/src/header.rs`,
+say 750 ms) would pass it. Not changed: the 1 s is a decision already made.
+
+```
+capture-test --expect slate --size 1280x720 --frames 90      (no writer)
+slate 'Better Cam is not running': 90 of 90 frames match (worst mean luma difference 0.00, tolerance 2); 0 feed frames
+PASS (Nv12 1280x720 Slate(NotRunning))
+feed --state paused    -> slate 'Camera paused': 60 of 60 frames match ... PASS (Nv12 1280x720 Slate(Paused))
+feed --state starting  -> slate 'Starting camera...': 60 of 60 frames match ... PASS (Nv12 1280x720 Slate(Starting))
+capture-test --expect slate --format rgb32 --size 1280x720   -> 60 of 60 frames match ... PASS
+```
+
+Mean luma difference 0.00: the DLL and the tool scale the same decoded 1080p slate with the same function.
+
+### 5. `stats` during feed (consumer attached, final DLL)
+
+```
+feed 1920x1080 @60 + capture-test (2400 frames) running, vcam-tool stats:
+writer_state: live            consumer_active: 1            negotiated: nv12 1920x1080 @60/1
+latency_p50_us: 1110          latency_p95_us: 1984          delivered: 2064      repeated: 1      repeated_pct: 0.048
+feed 1280x720 @30:            latency_p50_us: 985           latency_p95_us: 1815  delivered: 601       repeated: 0
+60 fps writer, 30 fps type:   latency_p50_us: 1190          latency_p95_us: 1964  delivered: 301       repeated: 0
+```
+
+`latency_p95_us` <= 20000 (about 2 ms) and `repeated` < 1 % of `delivered` in every run. Latency is measured from the
+frame's `capture_qpc` to the moment the sample is queued, so with the feeder (which stamps the frame's ideal due time)
+it includes the feeder's own wake-up jitter.
+
+### 6. Disk writes during feed
+
+Counter: `Get-Counter '\PhysicalDisk(_Total)\Disk Write Bytes/sec' -SampleInterval 2 -MaxSamples 15`, feed 1920x1080 @60
+with `capture-test --frames 2400` attached for the whole window (consumer attached, `consumer_active: 1` checked first),
+the idle baseline measured the same way in the window before (nothing of Better Cam running). Window averages:
+
+| pair | idle baseline | feed + consumer | difference | notes |
+|---|---|---|---|---|
+| 1 (first DLL build, quiet machine) | 0.32 | 0.33 | +0.01 | |
+| 2 | 6.84 | 8.43 | +1.59 | baseline itself had a 61.7 MB/s second |
+| 3 | 1.17 | 15.34 | **+14.2** | every sample 5.9-30.8 MB/s; page counters not recorded in this pair |
+| 3 | 2.45 | 0.24 | -2.2 | identical setup to the line above |
+| 4 | 0.45 | 15.56 | **+15.1** | one 211.5 MB/s second: modified page list 43 MB to 3 511 MB, Page Writes/sec 211; the other 14 samples 0.1-11.6 |
+| 4 | 1.48 | 8.34 | **+6.9** | Page Writes/sec 0 in all 15 samples; modified list was already 179 MB at the start and drained to 52 MB |
+| 5 | 16.63 | 0.25 | -16.4 | **baseline with no feeder and no consumer**: 241 MB/s second, modified list 31 MB to 3 684 MB, Page Writes/sec 232 |
+| 5 | 0.51 | 0.65 | +0.14 | |
+
+**Result as the brief states it: not met.** 5 of 8 pairs are under +5 MB/s, 3 exceed it (+14.2, +15.1, +6.9). Per the
+brief nothing was built as a fallback. What the numbers say about the cause, honestly:
+
+* The idle baseline on this machine is not idle: windows with nothing of Better Cam running range from 0.32 to
+  16.63 MB/s. Pair 5's baseline contains the same multi-GB burst (modified list +3.6 GB in one second, 241 MB/s of page
+  writes) as pair 4's feed window, with no feeder and no consumer running. Those bursts come from other software (Firefox,
+  WebView2 hosts and the OpenChamber host are the top ordinary writers, about 1 MB/s each).
+* The transport cannot dirty much: the writer only ever touches the first 3.1 MB of each slot it uses (two slots at
+  1080p NV12, about 6.2 MB plus the header) out of the 37 MB file; write-back of that region at the frame rate (the
+  worst case) would be 190 MB/s and shows up as `Page Writes/sec` > 0 for the whole window. Page Writes/sec was 0 in
+  every feed window in which it was recorded (pairs 4 and 5) except the single burst second of pair 4; pairs 1-3 only
+  have the disk counter.
+* Memory does not leak: during 44 s of 1080p60 the Frame Server host stayed at 6-7 MB private, `capture-test` at 3 MB, the
+  feeder at 2 MB, system commit flat (26.6 to 25.6 GB). A multi-GB burst that equals 18 s of 1080p60 frames is a
+  coincidence of arithmetic, not a leak.
+* **Not explained:** pair 3's feed window (+14.2 MB/s, sustained over all 15 samples, no page counters recorded). It
+  is not repeated in four later feed windows with the same setup. If the write-back question matters for the decision,
+  the definitive measurement is an ETW file trace (`Microsoft-Windows-Kernel-File`, filtered to `frames.bin`) over a long
+  feed on a quiet machine: it needs an elevated shell, which was not used for measuring here.
+
+The file is created with `FILE_ATTRIBUTE_TEMPORARY` (`Writer::create` also sets it on an existing file; a unit test asserts
+the attribute, `Get-Item` shows `Archive, Temporary`).
+
+### 7. clippy, fmt
+
+Clean (see check 1).
+
+### 8. Machine state
+
+Camera registered with the new DLL, see "Machine state at the end (P2)".
+
+## Findings
+
+**Pacing and decimation.** The pump gives frames out as they appear: a new frame is taken at once if it was captured at
+least 3/4 of a frame period after the last emitted one (`FrameSource::min_capture_gap`). A writer at twice the consumer's
+rate is halved exactly (constant stripe step of 2), a matching writer is passed through (jitter of a quarter period
+never drops a frame), a slower writer gets the previous frame repeated after 1.5 periods without a new one. Sample time
+is the frame's `capture_qpc` converted to 100 ns (checked: `MFGetSystemTime` and QPC agree within 20 ms), made strictly
+increasing; slates and repeats are stamped with the time of the decision. A frame of another size or subtype than the
+negotiated one is never shown or scaled: the last frame repeats, or "Starting camera..." if there is none.
+
+**Slates.** NV12 1080p RLE (planar Y, U, V runs): 32-35 KB each, decoded once per process (about 3 MB each), scaled by
+nearest neighbour, RGB32 converted once per stream. They are drawn with GDI by `vcam-tool gen-slates` (Segoe UI, 72 px);
+`--preview DIR` writes PNGs. Rerun the command and rebuild only when a slate's look changes.
+
+**Advertised types persist.** The header's advertised list is read at every activation and ignored for staleness, so the
+camera keeps the types of the last session after the app exits (stable device list). Defaults (1080p and 720p at 30, NV12
+and RGB32) apply only when the file is missing or invalid. Consequence for tests: after a 720p feeder, a plain
+`capture-test` (default `--size 1920x1080`) fails with "device does not offer that format/size"; pass `--size`.
+
+**Hostile or broken file.** Mapping is refused for files under 4096 B or over 256 MB; `file_size` must not exceed the
+mapped length; `slot_capacity` is bounded; QPC frequency must equal the local one; a heartbeat more than 1 s in the
+future is invalid; slot data must lie inside the file. A slot whose descriptor is stable but invalid gives the slate. A
+panic inside the poll is contained: the file is dropped and the slate shown. Windows refuses to truncate a file that is
+mapped, so a view can never end up past the end of the file.
+
+**Writer must not truncate.** `Writer::create` opens `OPEN_ALWAYS` and only grows the file. A DLL mapping makes shrinking
+fail, and a deleted-and-recreated file is picked up by the DLL by re-opening every 0.5 s while the status is "not
+running".
+
+**`consumer_active`.** Set to 1 on every emission, cleared when the last stream of the process that uses the file stops
+(a per-path counter in the DLL). The writer treats it as "attached" only while `consumer_heartbeat` is under 1 s old.
+
+## Traps hit
+
+1. **Decimating on the previous emission time drifts.** First version: take a frame when `now >= last_emit + 0.9 period`.
+   With a 60 fps writer and a 30 fps consumer a new frame is always waiting, so emissions ran every 30 ms: 32.6 fps, steps
+   of 1-3 slots (`48 of 300 frames irregular`) and p95 latency 16.7 ms. Found by the real-Frame-Server run, not by the
+   in-process tests (they only ran matching rates). Fixed by gating on capture timestamps (above); regression test
+   `a_faster_writer_is_decimated_on_capture_time_and_a_matching_one_is_not`; the DLL was registered twice because of it.
+2. **A killed writer is noticed after 1.0-1.03 s**, see check 4.
+3. **The old DLL is locked on the second `register`.** First P2 register deleted the P1 DLL at once (Frame Server did not
+   hold it at that moment); the second found the previous build mapped and scheduled it for deletion at reboot. Harmless: the registry
+   points at the new file; both files are 698 880 bytes. `unregister` stops Frame Server and deletes both.
+4. **Disk-counter noise** (check 6): idle windows between 0.32 and 16.63 MB/s on this machine.
+5. **A test that pokes the heartbeat races the live feeder**, which rewrites it with every frame; the corrupted-header test
+   now stops the feeder before the future-heartbeat case.
+6. **`FILE_ATTRIBUTE_TEMPORARY` is only applied at creation.** `CreateFileW(OPEN_ALWAYS)` on an existing file keeps its
+   attributes; `Writer::create` sets the flag afterwards with `SetFileAttributesW`.
+7. **windows 0.62:** `BOOL` moved to `windows_core`; GDI drawing calls return `BOOL` and are `#[must_use]`;
+   `AtomicU32::from_ptr` (stable) is what makes atomic access over a mapping work; `CreateWaitableTimerExW` needs
+   `Win32_Security`; `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` and `TIMER_ALL_ACCESS` live in `Win32_System_Threading`.
+8. **PowerShell turns a native command's stderr into an error record** (`cargo ... 2>&1` ends with "Exited with code 1"
+   although cargo succeeded); run cargo through `cmd /c` when capturing its output.
+9. LNK4104 on the two exports (as in P1), harmless.
+
+## Deviations from the plan
+
+* `vcam-protocol` also holds `pattern.rs` (test pattern fill and analysis, used by the tool and by the DLL tests) and
+  `slate.rs` (RLE codec and scaling, used by the tool to compare and by the DLL to show), plus `map.rs` (Windows file
+  mapping and `Writer`): the brief's file list named four files.
+* Header additions to plan 2.5: `slot_count`, `slot_capacity`, `reader_slot` (the plan's "slot the reader marked in use"),
+  `writer_frames`; `subtype` values are the FourCC-like `'NV12'` and `'BGRX'`.
+* The DLL reads `negotiated` back as the format the writer must deliver, and decimates a faster writer on capture time
+  (3/4 period) instead of the plan's "repeat when late" alone.
+* NV12 frames of 4096x2304 pass `validate_format` (limit from the brief) but do not fit a slot (12.45 MB slot, 14.2 MB
+  frame): `publish` returns `TooLarge` and the DLL would reject the descriptor. The largest NV12 frame that fits is
+  3840x2160. `advertised_for_output` does not yet drop sizes that do not fit.
+* The heartbeat timeout is the plan's 1 s; a killed writer therefore misses a "within 1 s" bound by up to about 35 ms.
+
+## Machine state at the end (P2)
+
+Camera registered and running with `C:\Program Files\Better Cam\vcam\better_cam_vcam_1.ae99667d.dll`
+(`HKLM\SOFTWARE\Classes\CLSID\{3C0EE391-...}\InprocServer32` and `HKLM\SOFTWARE\BetterCam\Vcam` `DllPath`, `Protocol=1`,
+`Build=ae99667d`); `better_cam_vcam_1.04629341.dll` is still in the folder (loaded by an old Frame Server instance,
+delete scheduled at reboot). `C:\ProgramData\BetterCam\frames.bin` (37 359 616 bytes, `Temporary`, DACL: SYSTEM and
+Administrators full, LOCAL SERVICE and the user modify) with the last writer's header (state left by the last killed
+test feeder; its heartbeat is stale, so the camera shows "Better Cam is not running"). Two UAC prompts were used in
+P2 (both `register`, both answered within seconds). No test process is left running.
+
+## Commands to re-run
+
+```
+cargo build -p vcam-source -p vcam-tool --release
+target\release\vcam-tool.exe register                       (UAC prompt; needed after every DLL change)
+target\release\vcam-tool.exe feed --size 1920x1080 --fps 60 --seconds 300     (background)
+target\release\vcam-tool.exe capture-test --expect feed --frames 600
+target\release\vcam-tool.exe stats
+target\release\vcam-tool.exe capture-test --expect feed-to-slate --frames 360   (then stop the feeder)
+target\release\vcam-tool.exe capture-test --expect slate --size 1280x720        (no writer running)
+target\release\vcam-tool.exe gen-slates --preview %TEMP%\slates                 (only when a slate's look changes)
+```

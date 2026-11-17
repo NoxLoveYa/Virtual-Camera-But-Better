@@ -1,11 +1,15 @@
-//! `vcam-tool`: register / unregister the Better Cam virtual camera, show its status, and capture-test it.
+//! `vcam-tool`: register / unregister the Better Cam virtual camera, show its status, capture-test it, and (P2)
+//! act as the frame writer (`feed`), print the transport counters (`stats`) and render the slates (`gen-slates`).
 //!
 //! `register` and `unregister` re-launch this exe elevated (UAC), wait, print what the elevated child logged and
 //! return its exit code. The child is the same binary started with `--elevated`.
 
 mod capture;
 mod elevate;
+mod feed;
+mod gen_slates;
 mod install;
+mod stats;
 mod status;
 mod util;
 
@@ -18,8 +22,13 @@ const USAGE: &str = "usage: vcam-tool <command>
   register [--dshow-class]   install DLL + registry + virtual camera (asks for elevation)
   unregister                 remove the virtual camera, registry keys and DLL (asks for elevation)
   status                     is Better Cam listed by Media Foundation and DirectShow?
-  capture-test [--frames N] [--format nv12|rgb32] [--size WxH]
-                             open the camera with a Source Reader and check the test pattern";
+  capture-test [--frames N] [--format nv12|rgb32] [--size WxH] [--fps N]
+               [--expect feed|slate|slate-paused|slate-starting|feed-to-slate]
+                             open the camera with a Source Reader and check what it shows
+  feed [--size WxH] [--fps N] [--seconds S] [--state live|paused|starting]
+                             write the test pattern into frames.bin like the app would
+  stats                      print the counters in frames.bin
+  gen-slates [--preview DIR] render the slates into crates/vcam-source/assets/slates";
 
 /// How long the parent waits for the UAC prompt and the elevated work.
 const ELEVATION_WAIT: Duration = Duration::from_secs(5 * 60);
@@ -136,6 +145,9 @@ fn main() {
         },
         "status" => status::run(),
         "capture-test" => capture::run(rest),
+        "feed" => feed::run(rest),
+        "stats" => stats::run(),
+        "gen-slates" => gen_slates::run(rest),
         _ => {
             eprintln!("{USAGE}");
             2

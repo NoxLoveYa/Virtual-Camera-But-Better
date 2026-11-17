@@ -1,17 +1,19 @@
 //! `MediaStream`: `IMFMediaStream2` + `IKsControl` (+ `IMFAttributes` through an inner store).
 //!
-//! Frames are produced by a pacing thread: `RequestSample` queues a token, the thread waits for the next 30 fps
-//! deadline, draws the test pattern into a `MFCreateSample` + `MFCreate2DMediaBuffer` sample (system memory,
-//! always) and posts `MEMediaSample`.
+//! Frames come from a [`FrameSource`] (the shared file, or a slate). `RequestSample` queues a token; one pump thread
+//! per stream waits until the source has something to emit, copies it into a `MFCreateSample` +
+//! `MFCreate2DMediaBuffer` sample (system memory, always) and posts `MEMediaSample`. The thread exists only while the
+//! stream runs; creating the source or its presentation descriptor starts nothing.
 
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use windows::Win32::Foundation::{E_POINTER, S_OK};
+use windows::Win32::Foundation::{CloseHandle, E_POINTER, HANDLE, S_OK};
 use windows::Win32::Media::timeBeginPeriod;
 use windows::Win32::Media::timeEndPeriod;
 use windows::Win32::Media::KernelStreaming::{
@@ -31,12 +33,16 @@ use windows::Win32::Media::MediaFoundation::{
     MF_STREAM_STATE_RUNNING, MF_STREAM_STATE_STOPPED,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+use windows::Win32::System::Threading::{
+    CreateWaitableTimerExW, SetWaitableTimer, WaitForSingleObject,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
+};
 use windows_core::{implement, ComObject, Error, IUnknown, Interface, Ref, Result, GUID, HRESULT};
 
 use crate::attrs::delegate_attributes;
+use crate::frames::{FrameSource, Poll, Wait};
 use crate::guard::{guard, LockExt};
 use crate::mediatype::{advertised_types, FrameFormat, PixelFormat};
-use crate::pattern;
 use crate::{object_created, object_dropped, pump_thread_spawned, vlog};
 
 /// Media Foundation event queues and sample tokens are free-threaded (they are handed to arbitrary MF work
@@ -68,6 +74,7 @@ impl Pump {
         queue: IMFMediaEventQueue,
         fmt: FrameFormat,
         frames_out: Arc<AtomicU64>,
+        path: PathBuf,
     ) -> Result<Pump> {
         let shared = Arc::new(PumpShared {
             inner: Mutex::new(PumpInner {
@@ -84,7 +91,7 @@ impl Pump {
             .spawn(move || {
                 let queue = queue; // capture the whole Agile wrapper, not its field
                 let r = catch_unwind(AssertUnwindSafe(|| {
-                    pump_loop(&s2, &queue.0, fmt, &frames_out)
+                    pump_loop(&s2, &queue.0, fmt, &frames_out, path)
                 }));
                 if r.is_err() {
                     vlog!("PANIC contained in pump thread");
@@ -119,16 +126,59 @@ impl Pump {
     }
 }
 
+/// A high-resolution waitable timer for the 1 ms polls (falls back to `sleep` when the OS lacks one).
+struct HiResTimer(Option<HANDLE>);
+
+impl HiResTimer {
+    fn new() -> HiResTimer {
+        let h = unsafe {
+            CreateWaitableTimerExW(
+                None,
+                windows_core::PCWSTR::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS.0,
+            )
+        };
+        HiResTimer(h.ok())
+    }
+
+    fn wait_1ms(&self) {
+        if let Some(h) = self.0 {
+            let due: i64 = -10_000; // 1 ms, relative, in 100 ns units
+            if unsafe { SetWaitableTimer(h, &due, 0, None, None, false) }.is_ok() {
+                unsafe { WaitForSingleObject(h, 50) };
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+impl Drop for HiResTimer {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            let _ = unsafe { CloseHandle(h) };
+        }
+    }
+}
+
+fn is_stopped(shared: &PumpShared) -> bool {
+    shared.inner.lock_safe().stop
+}
+
 fn pump_loop(
     shared: &PumpShared,
     queue: &IMFMediaEventQueue,
     fmt: FrameFormat,
     frames_out: &AtomicU64,
+    path: PathBuf,
 ) {
     unsafe { timeBeginPeriod(1) };
-    let period = fmt.frame_duration();
-    let mut frame: u64 = 0;
-    let mut next_due: i64 = 0;
+    let timer = HiResTimer::new();
+    let freq = vcam_protocol::qpc_frequency();
+    let mut src = FrameSource::new(path, fmt);
+    src.start();
+    let mut prev_ts: i64 = 0;
     vlog!("pump start {:?}", fmt);
     'outer: loop {
         // wait for a token
@@ -147,35 +197,38 @@ fn pump_loop(
                 };
             }
         };
-        // pace to the frame rate; resync when the consumer fell behind
-        let now = unsafe { MFGetSystemTime() };
-        if next_due == 0 || now > next_due + 4 * period {
-            next_due = now;
-        }
-        if next_due > now {
-            let wait = Duration::from_nanos(((next_due - now) as u64) * 100);
-            let g = shared.inner.lock_safe();
-            let (g, _) = match shared.cv.wait_timeout_while(g, wait, |i| !i.stop) {
-                Ok(r) => r,
-                Err(p) => p.into_inner(),
-            };
-            if g.stop {
+        // wait until the source has something to emit
+        let emit = loop {
+            if is_stopped(shared) {
                 break 'outer;
             }
-        }
-        let ts = next_due;
-        next_due += period;
-        match make_sample(&fmt, frame, ts, token.map(|t| t.0)) {
+            let now = vcam_protocol::qpc_now();
+            match src.poll(now) {
+                Poll::Ready(e) => break e,
+                Poll::Wait(Wait::Soon) => timer.wait_1ms(),
+                Poll::Wait(Wait::Until(t)) => {
+                    let ns = (t.saturating_sub(now) as u128 * 1_000_000_000 / freq as u128) as u64;
+                    let g = shared.inner.lock_safe();
+                    let _ = shared
+                        .cv
+                        .wait_timeout_while(g, Duration::from_nanos(ns), |i| !i.stop);
+                }
+            }
+        };
+        // timestamps must grow: a late live frame can be older than a repeat posted before it
+        let ts = vcam_protocol::qpc_to_hns(emit.sample_qpc()).max(prev_ts + 1);
+        match make_sample(&fmt, src.data(), ts, token.map(|t| t.0)) {
             Ok(sample) => {
                 let r = unsafe {
                     queue.QueueEventParamUnk(MEMediaSample.0 as u32, &GUID::zeroed(), S_OK, &sample)
                 };
                 match r {
                     Ok(()) => {
-                        frame += 1;
+                        prev_ts = ts;
+                        src.finish_emit(emit, vcam_protocol::qpc_now());
                         let n = frames_out.fetch_add(1, Ordering::Relaxed) + 1;
                         if n <= 3 || n % 900 == 0 {
-                            vlog!("sample #{n} frame={frame} ts={ts}");
+                            vlog!("sample #{n} {:?} ts={ts}", emit.kind);
                         }
                     }
                     Err(e) => {
@@ -190,17 +243,25 @@ fn pump_loop(
             }
         }
     }
-    vlog!("pump stop after {frame} frames");
+    src.stop();
+    vlog!(
+        "pump stop after {} samples",
+        frames_out.load(Ordering::Relaxed)
+    );
     unsafe { timeEndPeriod(1) };
 }
 
-/// Draw frame number `frame` into a fresh MF sample.
+/// Copy a tight frame (`data`, NV12 or BGRX of `fmt`) into a fresh MF sample stamped `ts` (100 ns units).
 pub fn make_sample(
     fmt: &FrameFormat,
-    frame: u64,
+    data: &[u8],
     ts: i64,
     token: Option<IUnknown>,
 ) -> Result<IMFSample> {
+    let (w, h) = (fmt.width as usize, fmt.height as usize);
+    if data.len() != fmt.pixel.frame_bytes(fmt.width, fmt.height) as usize {
+        return Err(Error::from(MF_E_INVALIDMEDIATYPE));
+    }
     unsafe {
         let sample = MFCreateSample()?;
         let buffer =
@@ -218,27 +279,38 @@ pub fn make_sample(
             &mut start,
             &mut len,
         )?;
-        let drawn = (|| -> Result<()> {
+        let copied = (|| -> Result<()> {
             if scan0.is_null() || pitch <= 0 {
                 return Err(Error::from(E_POINTER));
             }
             let pitch = pitch as usize;
-            let needed = match fmt.pixel {
-                PixelFormat::Nv12 => pattern::nv12_len(fmt.height, pitch),
-                PixelFormat::Rgb32 => pitch * fmt.height as usize,
+            let row_bytes = match fmt.pixel {
+                PixelFormat::Nv12 => w,
+                PixelFormat::Rgb32 => w * 4,
             };
-            if (len as usize) < needed || start != scan0 {
+            let rows = match fmt.pixel {
+                PixelFormat::Nv12 => h * 3 / 2,
+                PixelFormat::Rgb32 => h,
+            };
+            let needed = pitch * rows;
+            if pitch < row_bytes || (len as usize) < needed || start != scan0 {
                 return Err(Error::from(MF_E_INVALIDMEDIATYPE));
             }
-            let buf = std::slice::from_raw_parts_mut(scan0, len as usize);
-            match fmt.pixel {
-                PixelFormat::Nv12 => pattern::fill_nv12(frame, fmt.width, fmt.height, buf, pitch),
-                PixelFormat::Rgb32 => pattern::fill_bgrx(frame, fmt.width, fmt.height, buf, pitch),
+            let dst = std::slice::from_raw_parts_mut(scan0, len as usize);
+            if pitch == row_bytes {
+                dst[..data.len()].copy_from_slice(data);
+            } else {
+                // rows of both planes are `row_bytes` wide in `data`; the UV plane follows the Y plane at the
+                // same pitch in the buffer
+                for r in 0..rows {
+                    dst[r * pitch..r * pitch + row_bytes]
+                        .copy_from_slice(&data[r * row_bytes..(r + 1) * row_bytes]);
+                }
             }
             Ok(())
         })();
         let unlocked = b2.Unlock2D();
-        drawn?;
+        copied?;
         unlocked?;
         let contiguous = b2.GetContiguousLength()?;
         buffer.SetCurrentLength(contiguous)?;
@@ -354,7 +426,7 @@ impl MediaStream {
             None => self.current_descriptor_type()?,
         };
         let fmt = FrameFormat::from_media_type(&mt)?;
-        if !vcam_protocol::SIZES.contains(&(fmt.width, fmt.height)) || fmt.fps == 0 {
+        if !crate::mediatype::is_sane(&fmt) {
             vlog!("Stream::start rejects {:?}", fmt);
             return Err(Error::from(MF_E_INVALIDMEDIATYPE));
         }
@@ -375,6 +447,7 @@ impl MediaStream {
             self.queue.clone(),
             fmt,
             self.frames_out.clone(),
+            crate::frames::frames_path(),
         )?);
         st.format = Some(fmt);
         st.state = MF_STREAM_STATE_RUNNING;

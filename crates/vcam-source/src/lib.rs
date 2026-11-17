@@ -1,5 +1,6 @@
-//! Better Cam virtual camera media source (P1 spike): a COM DLL that Windows Frame Server loads as LOCAL SERVICE.
-//! It draws its own test pattern; there is no IPC yet.
+//! Better Cam virtual camera media source: a COM DLL that Windows Frame Server loads as LOCAL SERVICE.
+//! Pixels come from the shared file `%ProgramData%\BetterCam\frames.bin` written by the app (see `vcam-protocol`),
+//! or from a slate when no writer is alive.
 //!
 //! Hard rule: nothing may unwind out of an export or a COM method (a crash here takes down Frame Server for every
 //! camera app). Every entry point goes through `guard::guard` / `guard::guard_hr`.
@@ -10,10 +11,10 @@
 pub mod activator;
 mod attrs;
 pub mod factory;
+pub mod frames;
 pub mod guard;
 pub mod log;
 pub mod mediatype;
-pub mod pattern;
 pub mod source;
 pub mod stream;
 
