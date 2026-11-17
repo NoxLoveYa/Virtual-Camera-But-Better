@@ -1,6 +1,7 @@
 use better_cam::api::Service;
 use better_cam::camera_controls::ControlInfoDto;
 use better_cam::config::{CameraDto, OutputCfg, SourceCfg};
+use better_cam::file_dialog;
 use better_cam::preview::Sink;
 use better_cam::vcam_admin::{self, VcamStatus};
 use std::path::PathBuf;
@@ -168,6 +169,17 @@ pub async fn vcam_install(state: State<'_, AppState>) -> Result<(), String> {
 pub async fn vcam_uninstall(state: State<'_, AppState>) -> Result<(), String> {
     let svc = state.service.clone();
     blocking(move || vcam_admin::uninstall(&svc, &vcam_install::ShellLauncher)).await
+}
+
+/// The native "open file" dialog (plan 5.5), owned by the app window: `kind` is `"image"` (PNG, JPEG, BMP, GIF) or
+/// `"lut"` (`.cube`, `.png`), each with an "All files" entry. Resolves to the chosen file's full path, or `null` when
+/// the user cancelled. The dialog runs off the UI thread, so the page keeps running while it is open.
+#[tauri::command]
+pub async fn pick_file(window: tauri::WebviewWindow, kind: String) -> Result<Option<String>, String> {
+    let kind = file_dialog::PickKind::parse(&kind)?;
+    // The window handle as an integer: Tauri's `windows` crate need not be the one this crate builds against.
+    let owner = window.hwnd().ok().map(|h| h.0 as isize);
+    blocking(move || file_dialog::pick_file(kind, owner)).await
 }
 
 #[tauri::command]

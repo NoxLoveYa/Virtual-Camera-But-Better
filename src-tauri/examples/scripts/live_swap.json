@@ -8,7 +8,7 @@
         "flip_vertically": false, "autorotation": true, "hw_decode": true, "deactivate_when_not_showing": false
       },
       "output": { "resolution": "1280x720", "fps": "source", "fit": "fit", "background_color": 4278190080, "extra_sizes": true },
-      "controls": {}, "chain": [] },
+      "chain": [] },
     { "do": "wait_state", "state": "live", "timeout": 15, "label": "start -> live" },
     { "do": "consume", "seconds": 19, "size": "1280x720", "label": "consumer across the whole script", "dump": "live_before.png", "background": true },
     { "do": "sleep", "seconds": 3 },
@@ -45,7 +45,7 @@
         "flip_vertically": false, "autorotation": true, "hw_decode": true, "deactivate_when_not_showing": false
       },
       "output": { "resolution": "1280x720", "fps": "source", "fit": "fit", "background_color": 4278190080, "extra_sizes": true },
-      "controls": {}, "chain": [] },
+      "chain": [] },
     { "do": "wait_state", "state": "live", "timeout": 15, "label": "restart -> live" },
     { "do": "sleep", "seconds": 2 },
     { "do": "join" }

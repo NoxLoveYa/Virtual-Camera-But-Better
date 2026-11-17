@@ -55,6 +55,7 @@ use crate::gpu::convert::{
 };
 use crate::gpu::output::{FitMode, OutputParams, OutputStage};
 use crate::gpu::pattern;
+use crate::fx::assets::{AssetClient, Assets};
 use crate::fx::{Chain, FilterCfg, FilterError};
 use crate::gpu::{AdapterKind, GpuDevice, GpuError, GpuTimer, Renderer, RgbaTexture};
 use crate::output_writer::{FrameTag, OutputWriter, Published};
@@ -378,6 +379,9 @@ pub enum EngineEvent {
     /// The camera's controls (`controls-changed`): about once a second while one is on Auto, and after a re-apply.
     Controls(Vec<ControlInfoDto>),
     /// A filter failed to render and is bypassed (`filter-error`, plan 5.6). Sent once per failure, not per frame.
+    /// The asset service (`fx::assets`) uses the same event for a file that could not be loaded
+    /// (`could not load <file>: <reason>`), and with an **empty `message`** to clear the card's line after a good
+    /// load or when the path was cleared.
     FilterError(FilterError),
 }
 
@@ -524,6 +528,14 @@ impl Engine {
             hub: Arc::new(ControlsHub::new(opener)),
         });
         let poller = spawn_poller(shared.clone()).map_err(|e| e.to_string())?;
+        // The asset loader reports failed loads (and the clears) straight to the sink, from its own thread.
+        let assets = {
+            let shared = shared.clone();
+            Assets::new(
+                renderer.gpu.clone(),
+                Arc::new(move |e| emit(&shared, EngineEvent::FilterError(e))),
+            )
+        };
         let (tx, rx) = mpsc::channel();
         let (events_tx, events_rx) = mpsc::channel();
         let control = {
@@ -533,6 +545,7 @@ impl Engine {
                 events_tx,
                 shared: shared.clone(),
                 renderer,
+                assets,
                 writer: writer.clone(),
                 factory,
                 timings,
@@ -758,6 +771,8 @@ struct Control {
     events_tx: Sender<SessionEvent>,
     shared: Arc<Shared>,
     renderer: Arc<Renderer>,
+    /// The files filters read (pictures, tables): one loader thread for the engine's lifetime.
+    assets: Assets,
     writer: Arc<Writer>,
     factory: Arc<dyn SourceFactory>,
     timings: Timings,
@@ -999,6 +1014,7 @@ impl Control {
             gen: self.gen,
             shared: self.shared.clone(),
             renderer: self.renderer.clone(),
+            assets: self.assets.client(),
             writer: self.writer.clone(),
             factory: self.factory.clone(),
             stop: stop.clone(),
@@ -1229,6 +1245,7 @@ struct SessionCtx {
     gen: u64,
     shared: Arc<Shared>,
     renderer: Arc<Renderer>,
+    assets: AssetClient,
     writer: Arc<Writer>,
     factory: Arc<dyn SourceFactory>,
     stop: Arc<AtomicBool>,
@@ -1895,6 +1912,7 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
     let mut converter = Converter::new(renderer.clone()).map_err(|e| e.to_string())?;
     let stage = OutputStage::new(renderer.clone()).map_err(|e| e.to_string())?;
     let mut chain = Chain::new();
+    chain.set_assets(ctx.assets.clone());
     // The chain version this session has applied; the session starts with none, so the first frame applies it.
     let mut chain_gen = u64::MAX;
     let mut output =

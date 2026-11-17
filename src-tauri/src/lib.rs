@@ -5,6 +5,7 @@ pub mod camera_controls;
 pub mod capture;
 pub mod config;
 pub mod engine;
+pub mod file_dialog;
 pub mod fx;
 pub mod gpu;
 pub mod output_writer;

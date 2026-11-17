@@ -17,10 +17,20 @@
 
 use windows::Win32::Graphics::Direct3D11::{ID3D11PixelShader, ID3D11ShaderResourceView};
 
-use super::{GpuFilter, Params};
+use super::assets::{Asset, AssetHandle, AssetKind, LutDim};
+use super::{ps, GpuFilter, Params};
 use crate::gpu::{ConstantBuffer, GpuResult, Pass, Renderer, RgbaTexture};
 
+/// The setting that holds the path of a file extra input (the OBS name, shared by the LUT and mask filters).
+pub const PATH_KEY: &str = "image_path";
+
 /// A texture the shader reads besides the input.
+///
+/// With an asset service ([`GpuFilter::attach_assets`]) the filter loads these from the file named by the
+/// [`PATH_KEY`] setting, one file per filter: an `Image` entry shows the picture, a `Lut3D` entry the 3D `.cube`
+/// table (the texture [`super::assets::CubeAsset`] holds). A file that is not loaded yet, has failed, or does not
+/// fit the entry (a 1D table, a `.png` table: those are for the filter that handles them itself) leaves the
+/// extra unset, so the filter passes its input through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExtraInput {
     /// A 2D image (a picture the user picked).
@@ -52,6 +62,8 @@ pub struct ShaderFilter {
     constants: Option<ConstantBuffer>,
     ps: Option<ID3D11PixelShader>,
     extras: Vec<Option<ID3D11ShaderResourceView>>,
+    /// Present when the engine has an asset service and the definition has file extras.
+    assets: Option<AssetHandle>,
 }
 
 impl ShaderFilter {
@@ -64,19 +76,54 @@ impl ShaderFilter {
             constants: None,
             ps: None,
             extras: vec![None; def.extra.len()],
+            assets: None,
         }
     }
 
-    /// Hand the filter the texture for extra input `index` (`None` takes it away again).
+    /// Hand the filter the texture for extra input `index` (`None` takes it away again). With an asset service
+    /// attached the filter overwrites its extras from the loaded file on every frame; set them by hand only
+    /// without one.
     pub fn set_extra(&mut self, index: usize, srv: Option<ID3D11ShaderResourceView>) {
         if let Some(slot) = self.extras.get_mut(index) {
             *slot = srv;
         }
     }
+
+    /// The asset kind the definition's extras read, if any.
+    fn asset_kind(&self) -> Option<AssetKind> {
+        self.def.extra.first().map(|e| match e {
+            ExtraInput::Image => AssetKind::Image,
+            ExtraInput::Lut3D => AssetKind::Lut,
+        })
+    }
+
+    /// Point the extras at what the file is now: set when loaded and fitting, unset otherwise.
+    fn sync_assets(&mut self) {
+        let Some(h) = &self.assets else { return };
+        let asset = h.get();
+        for (slot, extra) in self.extras.iter_mut().zip(self.def.extra) {
+            *slot = match (extra, asset.as_deref()) {
+                (ExtraInput::Image, Some(Asset::Image(i))) => Some(i.srv.clone()),
+                (ExtraInput::Lut3D, Some(Asset::Cube(c))) if c.lut.dim == LutDim::ThreeD => {
+                    Some(c.srv.clone())
+                }
+                _ => None,
+            };
+        }
+    }
 }
 
 impl GpuFilter for ShaderFilter {
+    fn attach_assets(&mut self, assets: AssetHandle) {
+        if self.asset_kind().is_some() {
+            self.assets = Some(assets);
+        }
+    }
+
     fn update(&mut self, _r: &Renderer, p: &Params) {
+        if let (Some(kind), Some(h)) = (self.asset_kind(), self.assets.as_mut()) {
+            h.request(kind, ps(p, PATH_KEY, ""));
+        }
         let packed = (self.def.pack)(p);
         if packed != self.packed {
             if packed.len() != self.packed.len() {
@@ -94,6 +141,7 @@ impl GpuFilter for ShaderFilter {
     }
 
     fn render(&mut self, r: &Renderer, input: &RgbaTexture, output: &RgbaTexture) -> GpuResult<()> {
+        self.sync_assets();
         if self.extras.iter().any(Option::is_none) {
             // An asset that is not loaded yet: show the picture unchanged.
             return r.copy(input, output);

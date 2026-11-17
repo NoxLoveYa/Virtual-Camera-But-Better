@@ -232,11 +232,20 @@ export const useStore = create<State>((set, get) => {
   const setChain = (chain: FilterCfg[]) => {
     const before = get().chain;
     const errors = get().filterErrors;
-    // A failure message is about one version of one entry: it goes when the entry changes or is gone.
+    // A failure message is about one version of one entry: it goes when the entry changes or is gone. One exception:
+    // "could not load <file>" stays while the file's path is the same (a slider moved; the engine tells again only
+    // when the path or the file changes, or when the load works).
     const kept = Object.fromEntries(
-      Object.entries(errors).filter(([id]) => {
+      Object.entries(errors).filter(([id, message]) => {
         const was = before.find((f) => f.id === id);
-        return was !== undefined && chain.find((f) => f.id === id) === was;
+        const now = chain.find((f) => f.id === id);
+        if (was === undefined || now === undefined) return false;
+        if (was === now) return true;
+        return (
+          message.startsWith("could not load ") &&
+          was.kind === now.kind &&
+          FILTERS[now.kind].params.every((p) => p.type !== "path" || was.params[p.key] === now.params[p.key])
+        );
       }),
     );
     set({ chain, ...(Object.keys(kept).length !== Object.keys(errors).length && { filterErrors: kept }) });
@@ -467,6 +476,16 @@ export const useStore = create<State>((set, get) => {
         persist();
       });
       await api.onFilterError(({ id, message }) => {
+        // An empty message clears the card's line (the file loaded, or its path was cleared).
+        if (message === "") {
+          if (id in get().filterErrors) {
+            set((s) => {
+              const { [id]: _gone, ...rest } = s.filterErrors;
+              return { filterErrors: rest };
+            });
+          }
+          return;
+        }
         // Only for a card that exists; the card shows it until its entry changes.
         if (get().chain.some((f) => f.id === id)) set((s) => ({ filterErrors: { ...s.filterErrors, [id]: message } }));
       });

@@ -63,6 +63,8 @@ export const api = {
   vcamInstall: () => invoke<void>("vcam_install"),
   /** Stops the engine, then removes the virtual camera: one UAC prompt. Rejects like `vcamInstall`. */
   vcamUninstall: () => invoke<void>("vcam_uninstall"),
+  /** The native "open file" dialog: the full path of the chosen file, `null` when cancelled. The page keeps running while it is open. */
+  pickFile: (kind: "image" | "lut") => invoke<string | null>("pick_file", { kind }),
   getAutostart: () => invoke<boolean>("get_autostart"),
   setAutostart: (on: boolean) => invoke<void>("set_autostart", { on }),
   launchedAtStartup: () => invoke<boolean>("launched_at_startup"),
@@ -77,7 +79,11 @@ export const api = {
   deletePreset: (name: string) => invoke<void>("delete_preset", { name }),
   onEngineState: (cb: (s: EngineState) => void) => listen<EngineState>("engine-state", (e) => cb(e.payload)),
   onEngineError: (cb: (msg: string) => void) => listen<string>("engine-error", (e) => cb(e.payload)),
-  /** A filter failed and is bypassed until it recovers (not fatal). `id` is the card's id. */
+  /**
+   * A filter failed and is bypassed until it recovers (not fatal), or a file it reads could not be loaded
+   * (`could not load <file>: <reason>`). `id` is the card's id. An **empty `message`** means the problem is gone: the
+   * file loaded, or its path was cleared.
+   */
   onFilterError: (cb: (e: { id: string; message: string }) => void) =>
     listen<{ id: string; message: string }>("filter-error", (e) => cb(e.payload)),
   onStats: (cb: (s: Stats) => void) => listen<Stats>("stats", (e) => cb(e.payload)),

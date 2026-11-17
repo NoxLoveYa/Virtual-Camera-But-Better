@@ -10,7 +10,7 @@
         "flip_vertically": false, "autorotation": true, "hw_decode": true, "deactivate_when_not_showing": false
       },
       "output": { "resolution": "1280x720", "fps": "source", "fit": "fit", "background_color": 4278190080, "extra_sizes": true },
-      "controls": {}, "chain": [] },
+      "chain": [] },
     { "do": "wait_state", "state": "reconnecting", "reason_contains": "in use", "timeout": 10, "max": 3.0, "label": "start while the camera is held -> reconnecting (in use)" },
     { "do": "header" },
     { "do": "wait_process", "label": "probe" },

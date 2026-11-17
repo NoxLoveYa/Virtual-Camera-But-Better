@@ -150,6 +150,7 @@ fn main() {
             commands::vcam_status,
             commands::vcam_install,
             commands::vcam_uninstall,
+            commands::pick_file,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Better Cam")

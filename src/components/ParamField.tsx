@@ -4,6 +4,7 @@ import { formatValue, snap, toColorInt } from "../filters/values";
 import { ColorField } from "./ColorField";
 import { ComboField } from "./ComboField";
 import { NumberField } from "./NumberField";
+import { PathField } from "./PathField";
 import { Select } from "./Select";
 
 interface Props {
@@ -74,13 +75,10 @@ export function ParamField({ def, params, onChange }: Props) {
       );
 
     case "path":
-      // The file picker command does not exist yet; the first filter that needs it brings PathField.
       return (
-        <div className="pf" data-key={def.key} title={def.hint}>
+        <div className="pf pf-wide" data-key={def.key} title={def.hint}>
           <span>{def.label}</span>
-          <div className="pf-path" aria-disabled="true">
-            File picker arrives with the first filter that needs it
-          </div>
+          <PathField value={String(value)} kind={def.filter} label={def.label} onChange={set} />
           {hint}
         </div>
       );

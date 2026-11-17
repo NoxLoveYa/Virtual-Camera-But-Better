@@ -11,9 +11,12 @@
 //!   the instances whose `id` and `kind` are unchanged, and [`Chain::run`] renders a frame through the enabled ones.
 //!   A filter whose `render` fails is bypassed for that frame; the failure is reported once ([`FilterError`]) until
 //!   the filter has rendered again.
+//! * [`assets`]: files that filters read (pictures, `.cube` tables), loaded off the render thread. A filter that
+//!   needs one keeps the [`assets::AssetHandle`] the chain gives it in [`GpuFilter::attach_assets`].
 //! * [`make`] and [`kinds`]: the registry of filter kinds. Adding a filter is one file and one line in `REGISTRY`.
 //! * `defaults.json`: the default params of every registered kind, a copy of the TypeScript schema's defaults.
 
+pub mod assets;
 pub mod color;
 pub mod shader_filter;
 #[cfg(test)]
@@ -23,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::gpu::{GpuResult, Pooled, Renderer, RgbaTexture};
+use assets::{AssetClient, AssetHandle};
 
 /// The `params` of a filter: setting name to number, string or boolean.
 pub type Params = serde_json::Map<String, Value>;
@@ -116,6 +120,12 @@ pub fn pc(p: &Params, k: &str, d: u32) -> [f32; 4] {
 
 /// One filter on the GPU. All methods run on the render thread.
 pub trait GpuFilter: Send {
+    /// The chain calls this once, right after it made the filter, when the engine has an asset service (a chain
+    /// built for a test may have none: then the filter never gets a handle and must work without assets). Keep the
+    /// handle; ask for files with [`AssetHandle::request`] in `update` and read them with [`AssetHandle::get`] in
+    /// `render`. The handle is the filter's alone: dropping the filter lets go of its file.
+    fn attach_assets(&mut self, _assets: AssetHandle) {}
+
     /// Take new settings. Cheap: repack constants, remember what changed. Called every time the chain is applied,
     /// on every instance (also when nothing changed), so compare before doing real work.
     fn update(&mut self, r: &Renderer, p: &Params);
@@ -183,6 +193,7 @@ pub struct Chain {
     factory: fn(&str) -> Option<Box<dyn GpuFilter>>,
     made: u64,
     errors: Vec<FilterError>,
+    assets: Option<AssetClient>,
 }
 
 impl Default for Chain {
@@ -203,7 +214,14 @@ impl Chain {
             factory,
             made: 0,
             errors: Vec::new(),
+            assets: None,
         }
+    }
+
+    /// Give the filters this chain makes from now on a handle to the asset service ([`GpuFilter::attach_assets`]).
+    /// Call it before the first [`Chain::apply`].
+    pub fn set_assets(&mut self, assets: AssetClient) {
+        self.assets = Some(assets);
     }
 
     /// Rebuild the chain from `cfg`: an entry whose `id` and `kind` match an existing instance keeps it, any other
@@ -218,7 +236,10 @@ impl Chain {
             {
                 Some(i) => old.swap_remove(i),
                 None => match (self.factory)(&c.kind) {
-                    Some(filter) => {
+                    Some(mut filter) => {
+                        if let Some(a) = &self.assets {
+                            filter.attach_assets(a.handle(&c.id));
+                        }
                         self.made += 1;
                         Slot {
                             id: c.id.clone(),
