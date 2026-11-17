@@ -1,5 +1,6 @@
 //! Helpers shared by the tests of this crate: a sandbox below the temp folder, junctions, security snapshots.
 
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use vcam_protocol::secure;
@@ -252,4 +253,83 @@ pub fn asides_in(paths: &Paths) -> Vec<PathBuf> {
         })
         .map(|e| e.path())
         .collect()
+}
+
+/// Give the folder `dir` the compressed attribute, which is what `compact /c <dir>` does to a folder (it is the same
+/// `FSCTL_SET_COMPRESSION` on the folder's handle): every file and folder made in it afterwards is compressed too.
+/// False when this volume cannot compress.
+pub fn compress_folder(dir: &Path) -> bool {
+    let Ok(h) = secure::open_with(
+        dir,
+        0x8000_0000 | 0x4000_0000, // GENERIC_READ | GENERIC_WRITE
+        secure::SHARE_ALL,
+        secure::DISP_OPEN_EXISTING,
+        true,
+        0,
+    ) else {
+        return false;
+    };
+    secure::set_compressed(secure::raw(&h), true).is_ok()
+        && secure::kind(secure::raw(&h))
+            .is_ok_and(|k| k.attributes & secure::ATTRIBUTE_COMPRESSED != 0)
+}
+
+/// [`sandbox`] whose `%ProgramData%` is compressed (so what is made in it starts out compressed, as on a PC with
+/// "Compress this drive" or after `compact /c` on `ProgramData`). `None`, with a message, on a volume that cannot
+/// compress: the test then skips itself. A control file made in it must come out compressed, else the volume does not
+/// hand the attribute on and the test would prove nothing.
+pub fn compressed_sandbox(name: &str) -> Option<Sandbox> {
+    let s = sandbox(name);
+    if !compress_folder(&s.paths.program_data) {
+        eprintln!("this volume cannot compress a folder: skipped");
+        return None;
+    }
+    let probe = s.paths.program_data.join("probe.txt");
+    std::fs::write(&probe, b"x").unwrap();
+    let handed_on =
+        std::fs::metadata(&probe).unwrap().file_attributes() & secure::ATTRIBUTE_COMPRESSED != 0;
+    let _ = remove_no_follow(&probe);
+    if !handed_on {
+        eprintln!("this volume does not hand the compressed attribute to new files: skipped");
+        return None;
+    }
+    Some(s)
+}
+
+/// A throwaway set of registry keys under `HKCU\Software\BetterCam-test-<pid>-<n>` (and `...-classes`), made fresh and
+/// deleted when the guard drops, also when the test fails. Never `HKLM`: the real registry code runs against it
+/// through [`crate::registry::Keys`] unchanged.
+pub struct ScratchKeys {
+    pub keys: crate::registry::Keys,
+}
+
+impl ScratchKeys {
+    pub fn new() -> ScratchKeys {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::SeqCst);
+        let prefix = format!(r"Software\BetterCam-test-{}-{n}", std::process::id());
+        let keys = crate::registry::Keys::scratch(&prefix);
+        // a key left by an earlier process that had this id
+        Self::delete(&keys);
+        ScratchKeys { keys }
+    }
+
+    fn delete(keys: &crate::registry::Keys) {
+        use crate::registry::{delete_tree, Root};
+        assert_eq!(keys.root, Root::CurrentUser, "a test must never touch HKLM");
+        let _ = delete_tree(keys.root, &keys.vendor);
+        // the class key lives in a key of its own (`<prefix>-classes`), which goes too
+        let classes = keys
+            .clsid
+            .rsplit_once('\\')
+            .map_or(&*keys.clsid, |(p, _)| p);
+        let _ = delete_tree(keys.root, classes);
+    }
+}
+
+impl Drop for ScratchKeys {
+    fn drop(&mut self) {
+        Self::delete(&self.keys);
+    }
 }

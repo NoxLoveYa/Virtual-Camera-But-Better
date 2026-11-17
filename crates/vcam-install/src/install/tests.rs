@@ -1236,9 +1236,16 @@ fn a_different_copy_that_a_program_holds_a_lock_on_is_not_replaced_and_not_waite
     // names both (a lock on either file gives this refusal; it used to name the copy only)
     std::fs::write(&dest, &old).unwrap();
     let mut lock = None;
-    let result = copy_dll_with(&bytes, &dest, &s.p, &mut VecLog::default(), &mut |_| {
-        lock = Oplock::take(&dest).unwrap();
-    });
+    let result = copy_dll_with(
+        &bytes,
+        &dest,
+        &s.p,
+        &mut VecLog::default(),
+        &mut |_| {
+            lock = Oplock::take(&dest).unwrap();
+        },
+        &mut inherit_permissions,
+    );
     if lock.is_none() {
         eprintln!("this file system grants no oplock: that part is skipped");
         return;
@@ -1576,6 +1583,227 @@ fn a_recorded_name_that_was_freed_and_filled_with_another_folder_is_left_alone()
 
 // ---- the temporary DLL (findings 3 and 6)
 
+/// The install folder hands down read access to somebody else (as `Program Files` does to Users): what a copy has
+/// when it carries the permissions of its folder, and what a private one lacks.
+fn hand_down_read(s: &Sandbox) {
+    use crate::acl::{self, Ace};
+    std::fs::create_dir_all(&s.paths.install).unwrap();
+    let h = secure::open_with(
+        &s.paths.install,
+        0x8000_0000 | acl::SECURITY_ACCESS,
+        secure::SHARE_ALL,
+        secure::DISP_OPEN_EXISTING,
+        true,
+        0,
+    )
+    .unwrap();
+    let inherit = acl::OBJECT_INHERIT | acl::CONTAINER_INHERIT;
+    let aces = [
+        Ace {
+            sid: s.p.owner.clone(),
+            mask: acl::FULL,
+            flags: inherit,
+        },
+        Ace {
+            sid: crate::testkit::FAKE_USER.into(),
+            mask: acl::FILE_READ,
+            flags: inherit,
+        },
+    ];
+    acl::apply_aces(&h, &aces, &s.p.owner).unwrap();
+}
+
+/// A copy of the DLL as the temporary file is made: private to SYSTEM and the administrators, protected.
+fn make_private_copy(s: &Sandbox, dest: &Path, bytes: &[u8]) {
+    use crate::acl::{self, Ace};
+    let sd = SecurityDescriptor::from_aces(&[
+        Ace {
+            sid: s.p.system.clone(),
+            mask: acl::FULL,
+            flags: 0,
+        },
+        Ace {
+            sid: s.p.admins.clone(),
+            mask: acl::FULL,
+            flags: 0,
+        },
+    ])
+    .unwrap();
+    // SAFETY: `sd` outlives the call.
+    unsafe { secure::write_new_file_with_sd(dest, bytes, Some(sd.as_ptr())) }.unwrap();
+}
+
+/// Whether the copy at `p` has the entry its folder hands down (read for the made-up user of the sandbox).
+fn has_inherited_read(p: &Path) -> bool {
+    crate::testkit::security_of(p)
+        .aces
+        .iter()
+        .any(|a| crate::acl::sid_eq(&a.sid, crate::testkit::FAKE_USER))
+}
+
+/// A copy that is there with exactly the right bytes and still carries the private permissions of the temporary file
+/// (the helper died between the rename and `inherit_permissions`, or that call failed and the delete after it too)
+/// was taken for a good one by every later Repair: "dll already present", and the camera service (LOCAL SERVICE) could
+/// never load it. Now the permissions are brought to the inherited state on that path too: the same file (not
+/// replaced, its contents untouched), not protected, with the entry the folder hands down.
+#[test]
+fn a_copy_with_the_right_bytes_and_private_permissions_is_given_the_inherited_ones() {
+    let s = sandbox("dll-private-left");
+    let dll = fake_dll(&s.root.join("src"), 6);
+    let bytes = dll_bytes(&dll);
+    let dest = dest_of(&s, &dll);
+    hand_down_read(&s);
+    make_private_copy(&s, &dest, &bytes);
+    let before = crate::testkit::security_of(&dest);
+    assert!(before.protected, "the copy starts out private");
+    assert!(!has_inherited_read(&dest));
+    let id = crate::testkit::identity_of(&dest);
+    let mut log = VecLog::default();
+    assert!(
+        !copy_dll(&bytes, &dest, &s.p, &mut log).unwrap(),
+        "the copy was there: nothing new was made"
+    );
+    let after = crate::testkit::security_of(&dest);
+    assert!(
+        !after.protected && has_inherited_read(&dest),
+        "still private after a Repair: {after:?}"
+    );
+    assert_eq!(after.owner, before.owner, "the owner is not changed");
+    assert_eq!(
+        crate::testkit::identity_of(&dest),
+        id,
+        "the copy was replaced"
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+    assert!(
+        log.0.iter().any(|l| l.contains("already present")),
+        "{:?}",
+        log.0
+    );
+    // once more, with the permissions as they should be: harmless, and the same
+    let mut log = VecLog::default();
+    assert!(!copy_dll(&bytes, &dest, &s.p, &mut log).unwrap());
+    assert_eq!(crate::testkit::security_of(&dest), after);
+}
+
+/// The same through a whole Repair on an installed machine: the registered copy has the private permissions again
+/// (as after the interrupted copy), the Repair succeeds and puts them right.
+#[test]
+fn a_repair_gives_the_registered_copy_the_inherited_permissions_back() {
+    let (s, mut m) = installed("dll-private-repair");
+    let dll = s.root.join("src").join("better_cam_vcam.dll");
+    let dest = PathBuf::from(m.reg.as_ref().unwrap().dll.clone());
+    {
+        let h = secure::open_with(
+            &dest,
+            0x0002_0000 | crate::acl::SECURITY_ACCESS,
+            secure::SHARE_ALL,
+            secure::DISP_OPEN_EXISTING,
+            false,
+            0,
+        )
+        .unwrap();
+        crate::acl::apply_aces(
+            &h,
+            &[
+                crate::acl::Ace {
+                    sid: s.p.system.clone(),
+                    mask: crate::acl::FULL,
+                    flags: 0,
+                },
+                crate::acl::Ace {
+                    sid: s.p.admins.clone(),
+                    mask: crate::acl::FULL,
+                    flags: 0,
+                },
+            ],
+            &s.p.owner,
+        )
+        .unwrap();
+    }
+    assert!(crate::testkit::security_of(&dest).protected);
+    let mut log = VecLog::default();
+    assert_eq!(
+        do_install(&s, &dll, &mut m, &mut log).unwrap(),
+        InstallOutcome::Done
+    );
+    assert!(
+        !crate::testkit::security_of(&dest).protected,
+        "the Repair left the private permissions: {:?}",
+        log.0
+    );
+    registration_is_sound(&m);
+}
+
+/// The branch that gives up: the permissions of a copy that was just made cannot be set. The copy is deleted again
+/// (a copy the service cannot read must not be taken for a good one by the next Repair), no temporary file is left,
+/// and the error says so.
+#[test]
+fn a_new_copy_whose_permissions_cannot_be_set_is_deleted_again_and_the_install_fails() {
+    let s = sandbox("dll-permissions-fail-new");
+    let dll = fake_dll(&s.root.join("src"), 8);
+    let bytes = dll_bytes(&dll);
+    let dest = dest_of(&s, &dll);
+    let mut asked = Vec::new();
+    let mut log = VecLog::default();
+    let err = copy_dll_with(&bytes, &dest, &s.p, &mut log, &mut |_| {}, &mut |p| {
+        asked.push(p.to_path_buf());
+        Err("SetSecurityInfo: error 5 (injected)".to_string())
+    })
+    .unwrap_err();
+    assert_eq!(
+        asked,
+        std::slice::from_ref(&dest),
+        "asked once, for the copy"
+    );
+    assert!(
+        err.contains("could not be given the permissions of its folder")
+            && err.contains("deleted again")
+            && err.contains("error 5 (injected)")
+            && err.contains(&dest.display().to_string()),
+        "{err}"
+    );
+    assert!(!dest.exists(), "the copy is still there");
+    assert!(!dest.with_extension("dll.tmp").exists());
+    assert!(
+        !log.0.iter().any(|l| l.contains("dll copied")),
+        "{:?}",
+        log.0
+    );
+    // the next run, with nothing wrong, makes it
+    assert!(copy_dll(&bytes, &dest, &s.p, &mut VecLog::default()).unwrap());
+}
+
+/// The same step failing for a copy that was there already: an error that says so, and the copy is **not** deleted (it
+/// may be the registered one, loaded by the service this moment). The install that meets it fails before the
+/// registry is touched.
+#[test]
+fn an_installed_copy_whose_permissions_cannot_be_set_is_an_error_and_is_left_in_place() {
+    let s = sandbox("dll-permissions-fail-present");
+    let dll = fake_dll(&s.root.join("src"), 9);
+    let bytes = dll_bytes(&dll);
+    let dest = dest_of(&s, &dll);
+    assert!(copy_dll(&bytes, &dest, &s.p, &mut VecLog::default()).unwrap());
+    let mut log = VecLog::default();
+    let err = copy_dll_with(&bytes, &dest, &s.p, &mut log, &mut |_| {}, &mut |_| {
+        Err("SetSecurityInfo: error 5 (injected)".to_string())
+    })
+    .unwrap_err();
+    assert!(
+        err.contains("is there but could not be given the permissions")
+            && err.contains("error 5 (injected)")
+            && err.contains(&dest.display().to_string()),
+        "{err}"
+    );
+    assert!(!err.contains("deleted"), "{err}");
+    assert_eq!(std::fs::read(&dest).unwrap(), bytes, "the copy was touched");
+    assert!(
+        !log.0.iter().any(|l| l.contains("already present")),
+        "success was logged for a failure: {:?}",
+        log.0
+    );
+}
+
 /// The temporary file is made with a protected DACL that grants only SYSTEM and Administrators (here: the account
 /// that plays the administrators), so no standard user can open or lock it before the rename. A rename keeps that
 /// DACL (`acl::tests::a_rename_keeps_a_protected_dacl...`), so the final file is given what its folder hands down: not
@@ -1588,37 +1816,18 @@ fn the_temporary_dll_is_private_and_the_final_one_has_the_permissions_of_its_fol
     let dll = fake_dll(&s.root.join("src"), 5);
     let bytes = dll_bytes(&dll);
     let dest = dest_of(&s, &dll);
-    // the install folder hands down read access to somebody else (as `Program Files` does to Users)
-    std::fs::create_dir_all(&s.paths.install).unwrap();
-    {
-        let h = secure::open_with(
-            &s.paths.install,
-            0x8000_0000 | acl::SECURITY_ACCESS,
-            secure::SHARE_ALL,
-            secure::DISP_OPEN_EXISTING,
-            true,
-            0,
-        )
-        .unwrap();
-        let inherit = acl::OBJECT_INHERIT | acl::CONTAINER_INHERIT;
-        let aces = [
-            Ace {
-                sid: s.p.owner.clone(),
-                mask: acl::FULL,
-                flags: inherit,
-            },
-            Ace {
-                sid: crate::testkit::FAKE_USER.into(),
-                mask: acl::FILE_READ,
-                flags: inherit,
-            },
-        ];
-        acl::apply_aces(&h, &aces, &s.p.owner).unwrap();
-    }
+    hand_down_read(&s);
     let mut seen = None;
-    let copied = copy_dll_with(&bytes, &dest, &s.p, &mut VecLog::default(), &mut |tmp| {
-        seen = Some(crate::testkit::security_of(tmp));
-    })
+    let copied = copy_dll_with(
+        &bytes,
+        &dest,
+        &s.p,
+        &mut VecLog::default(),
+        &mut |tmp| {
+            seen = Some(crate::testkit::security_of(tmp));
+        },
+        &mut inherit_permissions,
+    )
     .unwrap();
     assert!(copied);
     // the temporary file, as it was between the write and the rename: protected, exactly SYSTEM and the

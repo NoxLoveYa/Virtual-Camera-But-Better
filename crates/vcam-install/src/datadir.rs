@@ -24,7 +24,14 @@
 //!   and one link, or it is replaced by a new file (a new file is never sparse). Nothing is ever cleared in place: the
 //!   camera's user may write to the file, so may extend it at any moment, and clearing the sparse flag of a file that
 //!   is a hundred gigabytes long at that moment would make Windows allocate all of it while the helper holds the
-//!   machine-wide lock.
+//!   machine-wide lock. The reason to replace such a file is that only a new file is cheap and safe to bring to a
+//!   known state, **not** that the DLL or the app refuse it (they look at the length and the header, not at these
+//!   attributes);
+//! * a new frame file is made uncompressed whatever the folder around it is (NTFS gives a new child of a compressed
+//!   folder, `%ProgramData%` or a drive that is compressed, the compressed attribute): it is created with
+//!   `FILE_NO_COMPRESSION`, and the data folder's own compressed state is cleared so that it hands none on. A file
+//!   that is sparse or compressed all the same after it was made is accepted with one line of the log (the helper
+//!   replaces a file once per run and never fails on this alone); only the length is a failure.
 //!
 //! Nothing is ever left with the permissions it would inherit: a new object is created with its final security
 //! descriptor in the create call, and the order is the data folder first (its permissions are replaced before
@@ -54,6 +61,8 @@ const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
 /// `READ_CONTROL`: enough to read owner and DACL.
 const READ_CONTROL: u32 = 0x0002_0000;
+/// `FILE_ADD_FILE` (`FILE_WRITE_DATA` of a folder).
+const FILE_ADD_FILE: u32 = 0x2;
 
 /// What is known about an object that already exists (facts of an opened handle).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,12 +75,13 @@ pub struct Facts {
     pub owner_trusted: bool,
     /// Owner, protection and ACEs are exactly the expected ones.
     pub acl_as_expected: bool,
-    /// A file that is read-only or encrypted: the DLL and the app refuse such a frame file, and nothing but a new
-    /// file makes it right. Folders have no such flags that matter.
+    /// A file that is read-only or encrypted: the DLL and the app refuse such a frame file (they cannot open it for
+    /// writing, or read it), and nothing but a new file makes it right. Folders have no such flags that matter.
     pub bad_attributes: bool,
-    /// A file that is sparse or compressed (the DLL and the app refuse it too). A handle with only `FILE_WRITE_DATA`
-    /// can set both, so the mask of the frame file does not prevent it; such a file is replaced, never cleared in
-    /// place (clearing the flag of a sparse file allocates its whole length).
+    /// A file that is sparse or compressed (the DLL and the app can use it; it is replaced because only a new file is
+    /// cheap and safe to bring to a known state). A handle with only `FILE_WRITE_DATA` can set both, so the mask of
+    /// the frame file does not prevent it; such a file is replaced, never cleared in place (clearing the flag of a
+    /// sparse file allocates its whole length).
     pub sparse_or_compressed: bool,
     /// A file with a data stream besides its own contents (`frames.bin:name`). A handle with only `FILE_WRITE_DATA`
     /// can create one, and what is in it would survive a Repair that kept the file.
@@ -123,8 +133,9 @@ pub fn decide(obj: Object, facts: Option<&Facts>) -> Plan {
     if !wants_dir && f.extra_streams {
         return Plan::Replace("it has an extra data stream".into());
     }
-    // only the frame file: the DLL and the app refuse it when it is sparse or compressed, and nothing reads the log
-    // for that
+    // only the frame file: one that is sparse or compressed still works for the camera, but only a new file is cheap
+    // and safe to bring to a known state (clearing a flag in place can allocate a file's whole length); nothing
+    // reads the log for that
     if obj == Object::FramesFile && f.sparse_or_compressed {
         return Plan::Replace("it is sparse or compressed".into());
     }
@@ -517,7 +528,12 @@ fn locked_message(path: &Path) -> String {
 
 /// The access the helper needs to an object: to set and read permissions, and to size a file.
 fn access_for(obj: Object) -> u32 {
-    GENERIC_READ | acl::SECURITY_ACCESS | if obj.is_file() { GENERIC_WRITE } else { 0 }
+    GENERIC_READ
+        | acl::SECURITY_ACCESS
+        | if obj.is_file() { GENERIC_WRITE } else { 0 }
+        // the data folder's compressed state is cleared through this handle (`FSCTL_SET_COMPRESSION` needs read and
+        // write data, for a folder list and add-file): see `clear_folder_compression`
+        | if obj == Object::DataDir { FILE_ADD_FILE } else { 0 }
 }
 
 /// Folders are held without delete sharing: nobody can rename, delete or replace one while the helper works in it.
@@ -533,6 +549,15 @@ fn share_for(obj: Object) -> FILE_SHARE_MODE {
 fn attributes_for(obj: Object) -> u32 {
     if obj == Object::FramesFile {
         FILE_ATTRIBUTE_TEMPORARY.0
+    } else {
+        0
+    }
+}
+
+/// The create option the frame file is made with: no compression, whatever its folder says (see [`create_new`]).
+fn create_options_for(obj: Object) -> u32 {
+    if obj == Object::FramesFile {
+        secure::CREATE_NO_COMPRESSION
     } else {
         0
     }
@@ -583,14 +608,16 @@ fn open_checked(paths: &Paths, obj: Object) -> Res<OwnedHandle> {
 }
 
 /// Create the *new* `obj` with its final security descriptor in the create call (so it never exists with the
-/// permissions it would inherit), open it, and verify it. Fails when anything is there already.
+/// permissions it would inherit), open it, and verify it. Fails when anything is there already. The frame file is
+/// created with `FILE_NO_COMPRESSION`: a new child of a compressed folder (`%ProgramData%` or the drive may be
+/// compressed) gets the compressed attribute otherwise.
 pub(crate) fn create_new(paths: &Paths, obj: Object, p: &Principals) -> Res<OwnedHandle> {
     let path = path_of(paths, obj);
     let sd = acl::SecurityDescriptor::for_object(obj, p)?;
     // SAFETY: `sd` lives until the end of this function and holds a valid descriptor.
     let h = unsafe {
         if obj.is_file() {
-            secure::open_with_sd(
+            secure::open_with_sd_options(
                 &path,
                 access_for(obj),
                 share_for(obj),
@@ -598,6 +625,7 @@ pub(crate) fn create_new(paths: &Paths, obj: Object, p: &Principals) -> Res<Owne
                 true,
                 attributes_for(obj),
                 Some(sd.as_ptr()),
+                create_options_for(obj),
             )
         } else {
             secure::create_dir_with_sd(&path, access_for(obj), share_for(obj), sd.as_ptr())
@@ -751,6 +779,86 @@ fn lock(h: &OwnedHandle, obj: Object, p: &Principals, log: &mut dyn Log) -> Res<
         obj.describe(),
         snap.owner,
         snap.aces.len()
+    ));
+    Ok(())
+}
+
+/// A folder that carries the compressed attribute hands it to every file and folder made in it afterwards, and NTFS
+/// gives it to a new folder made inside a compressed folder or on a compressed drive (`compact /c` on `%ProgramData%`,
+/// "Compress this drive"). The data folder holds no data itself, so clearing its state through the handle that is held
+/// allocates and rewrites nothing. Nothing is done for a folder that is not compressed (no call at all); a folder that
+/// cannot be cleared (a volume without compression) is a line of the log and never a failure: the frame file is made
+/// with `FILE_NO_COMPRESSION` whatever its folder says. `logs` is left as it is: it holds log files only, which
+/// nothing sizes or maps, so a compressed one does no harm.
+fn clear_folder_compression(dir: &OwnedHandle, shown: &Path, log: &mut dyn Log) {
+    let compressed = match secure::kind(secure::raw(dir)) {
+        Ok(k) => k.attributes & secure::ATTRIBUTE_COMPRESSED != 0,
+        Err(e) => {
+            log.line(&format!(
+                "could not read the attributes of {} ({e}); not looking at its compressed state",
+                shown.display()
+            ));
+            return;
+        }
+    };
+    if !compressed {
+        return;
+    }
+    match secure::set_compressed(secure::raw(dir), false) {
+        Ok(()) => log.line(&format!(
+            "{} was compressed: cleared that, so that nothing made in it starts out compressed",
+            shown.display()
+        )),
+        Err(e) => log.line(&format!(
+            "{} is compressed and that could not be cleared ({e}); the frame file is made without compression anyway",
+            shown.display()
+        )),
+    }
+}
+
+/// The last look at the frame file the helper holds, before its permissions are set: it must be exactly
+/// [`vcam_protocol::FILE_SIZE`] bytes long. A file that was kept has that length already; a new one is empty and is
+/// grown to it. The camera's user can extend the file at any moment, so the length is read again and a file that
+/// changed in that moment is an error that says so.
+///
+/// **Sparse and compressed are not errors.** Such a file of exactly that length is one the DLL and the app can use
+/// (neither looks at these attributes). The helper replaces an existing one by a new file once per run, in
+/// [`ensure_exists`], and makes the new one without compression; a file that still carries the attribute here is a
+/// volume that compresses regardless or a user who changed it a moment ago, and failing on that would make every
+/// Repair fail again. It is one line of the log, and the file is kept as it is.
+fn finish_frame_file(frames: &OwnedHandle, log: &mut dyn Log) -> Res<()> {
+    let file = std::fs::File::from(
+        frames
+            .try_clone()
+            .map_err(|e| werr("duplicate handle", e))?,
+    );
+    let len_now = || file.metadata().map(|m| m.len());
+    if len_now().ok() != Some(vcam_protocol::FILE_SIZE) {
+        file.set_len(vcam_protocol::FILE_SIZE)
+            .map_err(|e| werr("size frames.bin", e))?;
+    }
+    let len = len_now().map_err(|e| werr("size frames.bin", e))?;
+    if len != vcam_protocol::FILE_SIZE {
+        let want = vcam_protocol::FILE_SIZE;
+        return Err(format!(
+            "frames.bin is {len} bytes long, not {want}: somebody is changing it; run Repair again"
+        ));
+    }
+    let attrs = secure::kind(secure::raw(frames))
+        .map_err(|e| werr("look at frames.bin", e))?
+        .attributes;
+    let what = match (
+        attrs & secure::ATTRIBUTE_SPARSE != 0,
+        attrs & secure::ATTRIBUTE_COMPRESSED != 0,
+    ) {
+        (false, false) => return Ok(()),
+        (true, false) => "sparse",
+        (false, true) => "compressed",
+        (true, true) => "sparse and compressed",
+    };
+    log.line(&format!(
+        "frames.bin is {what} (this volume or another program did that; a new file is made without compression and looked at before it is used). It is exactly {} bytes long, which the camera and the app can use, so it is kept as it is",
+        vcam_protocol::FILE_SIZE
     ));
     Ok(())
 }
@@ -1127,6 +1235,8 @@ pub fn prepare_recording(
     // 1. the folder: held (no delete sharing) until the end, and locked right away: from here the user can neither
     // create nor rename anything in it, and what it hands down to new children is only what the helper wants
     let data = ensure_exists(paths, Object::DataDir, p, stop_service, log, ledger)?;
+    // (a folder made inside a compressed `%ProgramData%` is compressed, and would hand that on to what is made in it)
+    clear_folder_compression(&data, &path_of(paths, Object::DataDir), log);
     lock(&data, Object::DataDir, p, log)?;
     // 2. the folder's children, each with a protected DACL of its own
     let logs = ensure_exists(paths, Object::LogsDir, p, stop_service, log, ledger)?;
@@ -1135,37 +1245,7 @@ pub fn prepare_recording(
     trusted.extend([p.system.clone(), p.admins.clone(), p.local_service.clone()]);
     sweep_logs(paths, &trusted, log);
     let frames = ensure_exists(paths, Object::FramesFile, p, stop_service, log, ledger)?;
-    // a file that was kept has the right length and is plain; a new one is empty (and never sparse). Whatever the
-    // length, the file ends at exactly the size the camera expects (the camera's user can extend it at any moment,
-    // so it is looked at again, and so is its sparse and compressed state: nothing is ever cleared in place)
-    {
-        let file = std::fs::File::from(
-            frames
-                .try_clone()
-                .map_err(|e| werr("duplicate handle", e))?,
-        );
-        let len_now = || file.metadata().map(|m| m.len());
-        if len_now().ok() != Some(vcam_protocol::FILE_SIZE) {
-            file.set_len(vcam_protocol::FILE_SIZE)
-                .map_err(|e| werr("size frames.bin", e))?;
-        }
-        let len = len_now().map_err(|e| werr("size frames.bin", e))?;
-        if len != vcam_protocol::FILE_SIZE {
-            let want = vcam_protocol::FILE_SIZE;
-            return Err(format!(
-                "frames.bin is {len} bytes long, not {want}: somebody is changing it; run Repair again"
-            ));
-        }
-        let attrs = secure::kind(secure::raw(&frames))
-            .map_err(|e| werr("look at frames.bin", e))?
-            .attributes;
-        if attrs & (secure::ATTRIBUTE_SPARSE | secure::ATTRIBUTE_COMPRESSED) != 0 {
-            return Err(
-                "frames.bin is sparse or compressed: somebody is changing it; run Repair again"
-                    .into(),
-            );
-        }
-    }
+    finish_frame_file(&frames, log)?;
     lock(&frames, Object::FramesFile, p, log)?;
     // the helper's own log: a DACL of its own, so the service's inheritable modify right on `logs` stops short of it
     let install_log = ensure_exists(paths, Object::InstallLog, p, stop_service, log, ledger)?;

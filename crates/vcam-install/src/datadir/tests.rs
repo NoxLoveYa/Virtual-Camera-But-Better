@@ -1,7 +1,10 @@
 use super::*;
 use crate::acl::Snapshot;
 use crate::log::VecLog;
-use crate::testkit::{junction, lock_on, sandbox, security_of, within, Sandbox, BOUND};
+use crate::testkit::{
+    compress_folder, compressed_sandbox, junction, lock_on, sandbox, security_of, within, Sandbox,
+    BOUND,
+};
 
 fn run(s: &Sandbox, log: &mut VecLog) -> Res<()> {
     prepare(&s.paths, &s.p, &mut || false, log)
@@ -2500,4 +2503,297 @@ fn entries_that_are_done_with_leave_the_record_during_rotation() {
     assert_eq!(swept.forget, ["BetterCam.old-g-1"]);
     assert_eq!(swept.kept, ["BetterCam.old-k-1"]);
     assert_eq!(store.names(), ["BetterCam.old-k-1"]);
+}
+
+// ---- M1 (P-hardening 7): a compressed %ProgramData% or drive hands the attribute to everything made in it
+
+fn compressed(p: &Path) -> bool {
+    attributes_of(p) & secure::ATTRIBUTE_COMPRESSED != 0
+}
+
+fn sparse_or_compressed(p: &Path) -> bool {
+    attributes_of(p) & (secure::ATTRIBUTE_SPARSE | secure::ATTRIBUTE_COMPRESSED) != 0
+}
+
+/// What a Repair must leave in a data folder that is made on a compressed `%ProgramData%`: the frame file is exactly
+/// the expected size and plain.
+fn assert_plain_frame_file(s: &Sandbox, what: &str) {
+    let frames = s.paths.frames();
+    assert_eq!(
+        std::fs::metadata(&frames).unwrap().len(),
+        vcam_protocol::FILE_SIZE,
+        "{what}"
+    );
+    assert!(
+        !sparse_or_compressed(&frames),
+        "{what}: the file is not plain"
+    );
+}
+
+/// The camera's writer opens the file (it writes the header: nothing of the old contents survives that).
+fn assert_writer_opens(s: &Sandbox, what: &str) {
+    vcam_protocol::Writer::open_precreated(&s.paths.frames(), Some(&s.paths.program_data))
+        .unwrap_or_else(|e| panic!("{what}: the app cannot use it: {e}"));
+}
+
+/// The reviewer's case. `compact /c` on `%ProgramData%` (or a compressed drive): the new `BetterCam` folder and the
+/// new `frames.bin` in it are compressed, and the Install used to end with "frames.bin is sparse or compressed:
+/// somebody is changing it; run Repair again". Now the first install succeeds, the frame file is exactly
+/// `FILE_SIZE` and plain, and the data folder does not hand compression on.
+#[test]
+fn a_first_install_on_a_compressed_program_data_makes_a_plain_frame_file() {
+    let Some(s) = compressed_sandbox("compressed-first") else {
+        return;
+    };
+    let mut log = VecLog::default();
+    run(&s, &mut log).unwrap_or_else(|e| panic!("{e}: {:?}", log.0));
+    assert_plain_frame_file(&s, "first install");
+    assert_writer_opens(&s, "first install");
+    assert!(
+        !compressed(&s.paths.data),
+        "the data folder is still compressed: {:?}",
+        log.0
+    );
+    assert!(
+        mentions(&log, "was compressed: cleared that"),
+        "the folder's state is said: {:?}",
+        log.0
+    );
+    assert!(
+        !mentions(&log, "sparse or compressed"),
+        "the file was not made plain on the first try: {:?}",
+        log.0
+    );
+    // `logs` and `install.log` were made after the folder was cleared
+    assert!(!compressed(&s.paths.logs()));
+    assert!(!compressed(&s.paths.install_log()));
+}
+
+/// A Repair on it succeeds and keeps the very same file: no replace loop (the old code replaced the compressed file
+/// with another compressed one, and failed, at every Repair).
+#[test]
+fn a_repair_on_a_compressed_program_data_keeps_the_same_frame_file() {
+    let Some(s) = compressed_sandbox("compressed-repair") else {
+        return;
+    };
+    run(&s, &mut VecLog::default()).unwrap();
+    mark(&s);
+    let id = file_id(&s.paths.frames());
+    for round in 0..3 {
+        let mut log = VecLog::default();
+        run(&s, &mut log).unwrap_or_else(|e| panic!("repair {round}: {e}: {:?}", log.0));
+        assert_eq!(file_id(&s.paths.frames()), id, "repair {round}: replaced");
+        assert!(marked(&s), "repair {round}: the contents changed");
+        assert!(
+            log.0.iter().any(|l| l.ends_with("frames.bin: kept")),
+            "repair {round}: {:?}",
+            log.0
+        );
+        assert!(
+            !mentions(&log, "moving it aside"),
+            "repair {round}: {:?}",
+            log.0
+        );
+        assert_plain_frame_file(&s, &format!("repair {round}"));
+    }
+    assert_writer_opens(&s, "after the repairs");
+}
+
+/// A frame file that a user compressed or made sparse (their handle has the rights) is replaced once, by a plain
+/// file, even on a compressed `%ProgramData%`; the next Repair keeps the new one.
+#[test]
+fn a_frame_file_a_user_compressed_or_made_sparse_is_replaced_once_and_the_result_is_plain() {
+    let Some(s) = compressed_sandbox("compressed-user") else {
+        return;
+    };
+    run(&s, &mut VecLog::default()).unwrap();
+    for (name, rights, damage) in [
+        (
+            "compressed",
+            0x3u32,
+            (|h| secure::set_compressed(h, true)) as fn(_) -> std::io::Result<()>,
+        ),
+        ("sparse", 0x2, |h| secure::set_sparse(h, true)),
+    ] {
+        mark(&s);
+        let h = secure::open_with(
+            &s.paths.frames(),
+            rights,
+            secure::SHARE_ALL,
+            DISP_OPEN_EXISTING,
+            false,
+            0,
+        )
+        .unwrap();
+        damage(secure::raw(&h)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        drop(h);
+        assert!(sparse_or_compressed(&s.paths.frames()), "{name}");
+        let id = file_id(&s.paths.frames());
+        let mut log = VecLog::default();
+        run(&s, &mut log).unwrap_or_else(|e| panic!("{name}: {e}: {:?}", log.0));
+        assert!(
+            mentions(&log, "it is sparse or compressed; moving it aside"),
+            "{name}: {:?}",
+            log.0
+        );
+        assert_ne!(file_id(&s.paths.frames()), id, "{name}: not replaced");
+        assert!(!marked(&s), "{name}: the old contents are in the new file");
+        assert_plain_frame_file(&s, name);
+        assert_writer_opens(&s, name);
+        // the next Repair keeps it
+        let id = file_id(&s.paths.frames());
+        let mut log = VecLog::default();
+        run(&s, &mut log).unwrap();
+        assert_eq!(file_id(&s.paths.frames()), id, "{name}: replaced again");
+    }
+}
+
+/// An existing data folder that is compressed (made by the version that went before this one, on a compressed drive)
+/// is cleared by a Repair; a data folder that is not compressed gets no call at all and no line.
+#[test]
+fn a_kept_data_folder_that_is_compressed_is_cleared_and_one_that_is_not_is_left_alone() {
+    let s = sandbox("kept-folder-cleared");
+    run(&s, &mut VecLog::default()).unwrap();
+    let mut log = VecLog::default();
+    run(&s, &mut log).unwrap();
+    assert!(!mentions(&log, "was compressed"), "{:?}", log.0);
+    if !compress_folder(&s.paths.data) {
+        eprintln!("this volume cannot compress a folder: skipped");
+        return;
+    }
+    assert!(compressed(&s.paths.data));
+    let id = file_id(&s.paths.frames());
+    let mut log = VecLog::default();
+    run(&s, &mut log).unwrap_or_else(|e| panic!("{e}: {:?}", log.0));
+    assert!(
+        !compressed(&s.paths.data),
+        "kept, and still compressed: {:?}",
+        log.0
+    );
+    assert!(
+        mentions(&log, "was compressed: cleared that"),
+        "{:?}",
+        log.0
+    );
+    assert_eq!(
+        file_id(&s.paths.frames()),
+        id,
+        "the frame file was replaced"
+    );
+    // and nothing made in it afterwards starts compressed
+    let probe = s.paths.data.join("probe.txt");
+    std::fs::write(&probe, b"x").unwrap();
+    assert!(!compressed(&probe));
+}
+
+/// The two measures one by one, in a data folder that hands compression on (the answer to "which one is needed"):
+///
+/// * `FILE_NO_COMPRESSION` alone gives a plain new file in a compressed folder, where a file made the ordinary way is
+///   compressed (so the option is what keeps the frame file plain whatever its folder is);
+/// * clearing the folder's own state alone gives a plain new file made the ordinary way (so the folder is enough for
+///   the frame file as long as it stays cleared, and also keeps everything else made in it plain).
+///
+/// Each works alone; both are harmless, and the option does not depend on the folder (a clear that fails, a folder
+/// compressed again by an administrator before the file is made).
+#[test]
+fn each_of_the_two_compression_measures_alone_gives_a_plain_new_file() {
+    let Some(s) = compressed_sandbox("compressed-measures") else {
+        return;
+    };
+    let dir = s.paths.program_data.join("folder");
+    std::fs::create_dir(&dir).unwrap();
+    assert!(
+        compressed(&dir),
+        "a new folder in a compressed folder is compressed"
+    );
+    let make = |name: &str, options: u32| {
+        let p = dir.join(name);
+        // SAFETY: no security descriptor is passed.
+        let h = unsafe {
+            secure::open_with_sd_options(
+                &p,
+                0x8000_0000 | 0x4000_0000,
+                secure::SHARE_ALL,
+                DISP_CREATE_NEW,
+                false,
+                0,
+                None,
+                options,
+            )
+        }
+        .unwrap();
+        drop(h);
+        p
+    };
+    // control: the ordinary create in a compressed folder is compressed
+    assert!(compressed(&make("ordinary", 0)));
+    // measure 1: the create option alone
+    assert!(!compressed(&make("option", secure::CREATE_NO_COMPRESSION)));
+    // measure 2: the folder cleared alone
+    let h = secure::open_with(
+        &dir,
+        0x8000_0000 | 0x4000_0000,
+        secure::SHARE_ALL,
+        DISP_OPEN_EXISTING,
+        true,
+        0,
+    )
+    .unwrap();
+    secure::set_compressed(secure::raw(&h), false).unwrap();
+    drop(h);
+    assert!(!compressed(&dir));
+    assert!(!compressed(&make("folder-cleared", 0)));
+    // the option in a cleared folder changes nothing
+    assert!(!compressed(&make("both", secure::CREATE_NO_COMPRESSION)));
+}
+
+/// A frame file that is sparse or compressed after it was made (a volume that compresses regardless, or a user who
+/// changed it that moment) is not a failure: one line of the log, the file is kept, no loop. The length stays an
+/// error.
+#[test]
+fn a_frame_file_that_still_carries_the_attribute_is_accepted_with_one_line() {
+    let s = sandbox("finish-attribute");
+    run(&s, &mut VecLog::default()).unwrap();
+    for (name, rights, damage) in [
+        (
+            "compressed",
+            0x3u32,
+            (|h| secure::set_compressed(h, true)) as fn(_) -> std::io::Result<()>,
+        ),
+        ("sparse", 0x2, |h| secure::set_sparse(h, true)),
+    ] {
+        let h = secure::open_with(
+            &s.paths.frames(),
+            rights,
+            secure::SHARE_ALL,
+            DISP_OPEN_EXISTING,
+            false,
+            0,
+        )
+        .unwrap();
+        if damage(secure::raw(&h)).is_err() {
+            eprintln!("{name}: this volume cannot do that: skipped");
+            continue;
+        }
+        drop(h);
+        let kept = open_checked(&s.paths, Object::FramesFile).unwrap();
+        let mut log = VecLog::default();
+        finish_frame_file(&kept, &mut log).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(log.0.len(), 1, "{name}: {:?}", log.0);
+        assert!(
+            log.0[0].contains(name)
+                && log.0[0].contains(&vcam_protocol::FILE_SIZE.to_string())
+                && log.0[0].contains("kept as it is"),
+            "{name}: {:?}",
+            log.0
+        );
+        assert!(
+            sparse_or_compressed(&s.paths.frames()),
+            "{name}: nothing was cleared in place"
+        );
+        drop(kept);
+        // back to a plain file for the next case
+        remove_no_follow(&s.paths.frames()).unwrap();
+        run(&s, &mut VecLog::default()).unwrap();
+    }
 }

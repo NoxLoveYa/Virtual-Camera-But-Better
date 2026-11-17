@@ -47,14 +47,15 @@ use windows::Win32::Foundation::{
 use windows::Win32::Security::SECURITY_DESCRIPTOR;
 use windows::Win32::Storage::FileSystem::{
     FileDispositionInfo, FileDispositionInfoEx, FileFullDirectoryInfo,
-    FileFullDirectoryRestartInfo, FileIdInfo, FileRenameInfo, FileStreamInfo, GetDriveTypeW,
-    GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-    GetFullPathNameW, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, CREATE_NEW,
-    FILE_ACCESS_RIGHTS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_CREATION_DISPOSITION, FILE_FLAGS_AND_ATTRIBUTES,
-    FILE_FULL_DIR_INFO, FILE_ID_INFO, FILE_NAME_NORMALIZED, FILE_RENAME_INFO, FILE_SHARE_DELETE,
-    FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STREAM_INFO,
-    GETFINALPATHNAMEBYHANDLE_FLAGS, OPEN_ALWAYS, OPEN_EXISTING, SYNCHRONIZE, VOLUME_NAME_DOS,
+    FileFullDirectoryRestartInfo, FileIdInfo, FileRenameInfo, FileStreamInfo, FlushFileBuffers,
+    GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    GetFinalPathNameByHandleW, GetFullPathNameW, SetFileInformationByHandle,
+    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, FILE_ACCESS_RIGHTS, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_CREATION_DISPOSITION,
+    FILE_FLAGS_AND_ATTRIBUTES, FILE_FULL_DIR_INFO, FILE_ID_INFO, FILE_NAME_NORMALIZED,
+    FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_STREAM_INFO, GETFINALPATHNAMEBYHANDLE_FLAGS, OPEN_ALWAYS, OPEN_EXISTING, SYNCHRONIZE,
+    VOLUME_NAME_DOS,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Ioctl::{
@@ -211,6 +212,41 @@ pub unsafe fn open_with_sd(
     extra_flags: u32,
     sd: Option<*const c_void>,
 ) -> io::Result<OwnedHandle> {
+    // SAFETY: the contract of `sd` is the caller's, passed on; no extra create option.
+    unsafe {
+        open_with_sd_options(
+            path,
+            access,
+            share,
+            disposition,
+            directory,
+            extra_flags,
+            sd,
+            0,
+        )
+    }
+}
+
+/// `FILE_NO_COMPRESSION`: a *new* file is made uncompressed whatever the state of the folder it is made in (NTFS gives
+/// a new child of a compressed folder the compressed attribute). Ignored when an existing file is opened.
+pub const CREATE_NO_COMPRESSION: u32 = 0x0000_8000;
+
+/// [`open_with_sd`] with extra `NtCreateFile` create options (for example [`CREATE_NO_COMPRESSION`]); `0` is exactly
+/// [`open_with_sd`].
+///
+/// # Safety
+/// `sd`, when given, must point to a valid self-relative or absolute security descriptor that outlives the call.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn open_with_sd_options(
+    path: &Path,
+    access: u32,
+    share: FILE_SHARE_MODE,
+    disposition: FILE_CREATION_DISPOSITION,
+    directory: bool,
+    extra_flags: u32,
+    sd: Option<*const c_void>,
+    extra_options: u32,
+) -> io::Result<OwnedHandle> {
     let nt_disposition = if disposition == OPEN_EXISTING {
         FILE_OPEN
     } else if disposition == CREATE_NEW {
@@ -221,6 +257,7 @@ pub unsafe fn open_with_sd(
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
     };
     let options = FILE_OPEN_REPARSE_POINT.0
+        | extra_options
         | if directory {
             // a folder or a file, as `FILE_FLAG_BACKUP_SEMANTICS` allows
             FILE_OPEN_FOR_BACKUP_INTENT.0
@@ -1036,7 +1073,40 @@ pub unsafe fn write_new_file_with_sd(
     bytes: &[u8],
     sd: Option<*const c_void>,
 ) -> io::Result<()> {
-    write_new_file_with(path, bytes, sd, &mut |f| f.sync_all())
+    write_new_file_with(path, bytes, sd, &mut flush_to_disk)
+}
+
+/// The flush of [`write_new_file_with_sd`] in production: `FlushFileBuffers` on the file (what `File::sync_all` is;
+/// `File::flush` does nothing). The one place that makes the call, so a test can count it (see
+/// `secure::tests::the_production_write_flushes_the_file_to_disk_after_the_last_byte`).
+fn flush_to_disk(f: &std::fs::File) -> io::Result<()> {
+    #[cfg(test)]
+    flushes::record(f);
+    // SAFETY: `f` owns a valid handle for the whole call.
+    unsafe { FlushFileBuffers(raw(f)) }.map_err(win_err)
+}
+
+/// What the tests see of the production flush: one entry per call, with the file position at that moment (the number
+/// of bytes written so far, read without any right the handle may lack).
+#[cfg(test)]
+pub(crate) mod flushes {
+    use std::cell::RefCell;
+    use std::io::Seek;
+
+    thread_local! {
+        static CALLS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record(f: &std::fs::File) {
+        let mut file: &std::fs::File = f;
+        let at = file.stream_position().unwrap_or(u64::MAX);
+        CALLS.with(|c| c.borrow_mut().push(at));
+    }
+
+    /// The calls of this thread since the last [`take`].
+    pub(crate) fn take() -> Vec<u64> {
+        CALLS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
 }
 
 /// [`write_new_file_with_sd`] with the flush to disk given (a test records it): called once, after all of `bytes` was
@@ -2167,6 +2237,41 @@ mod tests {
         let h = dir.join("c.tmp");
         write_new_file(&h, b"real").unwrap();
         assert_eq!(std::fs::read(&h).unwrap(), b"real");
+    }
+
+    /// The flush that production uses is the real one. The test above pins the *structure* with a stand-in; that
+    /// would pass if the default were changed from `sync_all` to `File::flush`, which does nothing. So: the public
+    /// functions are run (the same code path production uses) and the one function that makes the call, which both
+    /// of them hand to the writer, is seen to be called once, after the last byte; and that function is shown to be
+    /// `FlushFileBuffers` and not a no-op: on a handle without write access `FlushFileBuffers` is refused
+    /// (`ERROR_ACCESS_DENIED`) where `File::flush` succeeds.
+    #[test]
+    fn the_production_write_flushes_the_file_to_disk_after_the_last_byte() {
+        let (_root, dir) = sandbox("write-flush-production");
+        let _ = flushes::take();
+        write_new_file(&dir.join("p.tmp"), b"all the bytes").unwrap();
+        assert_eq!(
+            flushes::take(),
+            [13],
+            "write_new_file: one flush, after the last byte"
+        );
+        // SAFETY: no security descriptor is passed.
+        unsafe { write_new_file_with_sd(&dir.join("q.tmp"), b"abc", None) }.unwrap();
+        assert_eq!(
+            flushes::take(),
+            [3],
+            "write_new_file_with_sd: one flush, after the last byte"
+        );
+        assert_eq!(std::fs::read(dir.join("p.tmp")).unwrap(), b"all the bytes");
+        // the call is FlushFileBuffers: a read-only handle is refused, which a `File::flush` never is
+        let read_only = std::fs::File::open(dir.join("p.tmp")).unwrap();
+        let e = flush_to_disk(&read_only).expect_err("a no-op flush was called");
+        assert_eq!(e.raw_os_error(), Some(5), "{e}");
+        assert!(
+            std::io::Write::flush(&mut &read_only).is_ok(),
+            "the control: File::flush is a no-op"
+        );
+        let _ = flushes::take();
     }
 
     /// The identity of an object is the same on every handle to it and survives a rename; another object that takes

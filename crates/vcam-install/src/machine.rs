@@ -23,7 +23,7 @@ use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows_core::PCWSTR;
 
 use crate::camera::{add_dshow_class, create_virtual_camera};
-use crate::registry;
+use crate::registry::{self, Keys};
 use crate::util::{init_com_and_mf, pcwstr, werr, wide, Res};
 
 /// What `HKLM` records about the installed DLL.
@@ -82,13 +82,29 @@ pub trait Machine: AsideStore {
     fn delete_at_reboot(&mut self, p: &Path) -> Res<()>;
 }
 
-/// The real machine.
-#[derive(Default)]
-pub struct RealMachine;
+/// The real machine. The registry keys it works on are a parameter ([`Keys`]): production uses `HKLM`
+/// ([`RealMachine::new`]); the tests run this same code against a throwaway key under `HKCU`.
+pub struct RealMachine {
+    keys: Keys,
+}
+
+impl Default for RealMachine {
+    fn default() -> Self {
+        RealMachine::new()
+    }
+}
 
 impl RealMachine {
     pub fn new() -> RealMachine {
-        RealMachine
+        RealMachine {
+            keys: Keys::machine(),
+        }
+    }
+
+    /// The real implementation over other keys (a test's throwaway key under `HKCU`; never `HKLM`).
+    #[cfg(test)]
+    pub(crate) fn with_keys(keys: Keys) -> RealMachine {
+        RealMachine { keys }
     }
 }
 
@@ -147,7 +163,7 @@ impl Machine for RealMachine {
     }
 
     fn read_registration(&mut self) -> Option<Registration> {
-        let r = registry::read_registered()?;
+        let r = registry::read_registered_in(&self.keys)?;
         Some(Registration {
             dll: r.dll_path?,
             build: r.build?,
@@ -156,14 +172,14 @@ impl Machine for RealMachine {
     }
 
     fn write_registration(&mut self, r: &Registration) -> Res<()> {
-        let key = vcam_protocol::clsid_key();
-        registry::set_string(&key, None, vcam_protocol::CLSID_DESCRIPTION)?;
+        let (root, key, state) = (self.keys.root, &self.keys.clsid, &self.keys.state);
+        registry::set_string(root, key, None, vcam_protocol::CLSID_DESCRIPTION)?;
         let inproc = format!(r"{key}\InprocServer32");
-        registry::set_string(&inproc, None, &r.dll)?;
-        registry::set_string(&inproc, Some("ThreadingModel"), "Both")?;
-        registry::set_string(vcam_protocol::VCAM_STATE_KEY, Some("DllPath"), &r.dll)?;
-        registry::set_dword(vcam_protocol::VCAM_STATE_KEY, "Protocol", r.protocol)?;
-        registry::set_string(vcam_protocol::VCAM_STATE_KEY, Some("Build"), &r.build)?;
+        registry::set_string(root, &inproc, None, &r.dll)?;
+        registry::set_string(root, &inproc, Some("ThreadingModel"), "Both")?;
+        registry::set_string(root, state, Some("DllPath"), &r.dll)?;
+        registry::set_dword(root, state, "Protocol", r.protocol)?;
+        registry::set_string(root, state, Some("Build"), &r.build)?;
         Ok(())
     }
 
@@ -174,22 +190,24 @@ impl Machine for RealMachine {
                 failed.push(format!("{what} (error {})", r.0));
             }
         };
-        let clsid = vcam_protocol::clsid_key();
-        note(format!("HKLM\\{clsid}"), registry::delete_tree(&clsid));
+        let root = self.keys.root;
+        let shown = |p: &str| format!("{}\\{p}", self.keys.root.name());
+        let clsid = &self.keys.clsid;
+        note(shown(clsid), registry::delete_tree(root, clsid));
         // The state key also holds the record of moved-aside folders, which outlives the registration until the
         // folders are gone. So the registration's own values are deleted one by one and the key goes only when no
         // record is in it: the record is never deleted and written back, and is never missing for a moment.
-        let state = vcam_protocol::VCAM_STATE_KEY;
+        let state = &self.keys.state;
         for value in ["DllPath", "Protocol", "Build"] {
             note(
-                format!("HKLM\\{state}\\{value}"),
-                registry::delete_value(state, value),
+                format!("{}\\{value}", shown(state)),
+                registry::delete_value(root, state, value),
             );
         }
-        if !registry::value_exists(state, registry::ASIDE_VALUE) {
-            note(format!("HKLM\\{state}"), registry::delete_tree(state));
+        if !registry::value_exists(root, state, registry::ASIDE_VALUE) {
+            note(shown(state), registry::delete_tree(root, state));
         }
-        registry::delete_key_if_empty(r"SOFTWARE\BetterCam");
+        registry::delete_key_if_empty(root, &self.keys.vendor);
         failed
     }
 
@@ -253,18 +271,19 @@ impl Machine for RealMachine {
 
 impl AsideStore for RealMachine {
     fn aside_record(&mut self) -> Stored {
-        registry::read_multi_string(vcam_protocol::VCAM_STATE_KEY, registry::ASIDE_VALUE)
+        registry::read_multi_string(self.keys.root, &self.keys.state, registry::ASIDE_VALUE)
     }
 
     fn write_aside_record(&mut self, strings: &[String]) -> Res<()> {
         if !strings.is_empty() {
             return registry::set_multi_string(
-                vcam_protocol::VCAM_STATE_KEY,
+                self.keys.root,
+                &self.keys.state,
                 registry::ASIDE_VALUE,
                 strings,
             );
         }
-        let r = registry::delete_value(vcam_protocol::VCAM_STATE_KEY, registry::ASIDE_VALUE);
+        let r = registry::delete_value(self.keys.root, &self.keys.state, registry::ASIDE_VALUE);
         if r != windows::Win32::Foundation::ERROR_SUCCESS && !registry::is_missing(r) {
             return Err(format!(
                 "the record of old data folders could not be deleted (error {})",
@@ -272,10 +291,256 @@ impl AsideStore for RealMachine {
             ));
         }
         // the key holds nothing else when there is no registration: the record was all that kept it
-        if registry::read_registered().is_none() {
-            let _ = registry::delete_tree(vcam_protocol::VCAM_STATE_KEY);
-            registry::delete_key_if_empty(r"SOFTWARE\BetterCam");
+        if registry::read_registered_in(&self.keys).is_none() {
+            let _ = registry::delete_tree(self.keys.root, &self.keys.state);
+            registry::delete_key_if_empty(self.keys.root, &self.keys.vendor);
         }
         Ok(())
+    }
+}
+
+/// The real implementation, run against a throwaway key under `HKCU\Software\BetterCam-test-<pid>-<n>` (never
+/// `HKLM`): the same code production runs on `HKLM`, only the root and the paths are other.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::aside::{self, AsideEntry, Record};
+    use crate::registry::{key_exists, read_registered_in, Root};
+    use crate::testkit::ScratchKeys;
+    use vcam_protocol::secure::FileIdentity;
+
+    fn machine(k: &ScratchKeys) -> RealMachine {
+        assert_eq!(k.keys.root, Root::CurrentUser);
+        RealMachine::with_keys(k.keys.clone())
+    }
+
+    fn entry(n: usize) -> AsideEntry {
+        AsideEntry {
+            name: format!("BetterCam.old-{n}-0"),
+            identity: FileIdentity {
+                volume: 0x1234,
+                // never all zero (that is no identity)
+                id: [(n % 250) as u8 + 1; 16],
+            },
+        }
+    }
+
+    fn registration() -> Registration {
+        Registration {
+            dll: r"C:\Program Files\Better Cam\vcam\better_cam_vcam_1.aaaaaaaa.dll".into(),
+            build: "aaaaaaaa".into(),
+            protocol: vcam_protocol::PROTOCOL_VERSION,
+        }
+    }
+
+    fn names(m: &mut RealMachine) -> Vec<String> {
+        match aside::load(m) {
+            Record::Entries { entries, .. } => entries.into_iter().map(|e| e.name).collect(),
+            Record::Unreadable(why) => panic!("the record is unreadable: {why}"),
+        }
+    }
+
+    /// The registration is written, read back, and deleted by the real code.
+    #[test]
+    fn a_registration_is_written_read_and_deleted() {
+        let k = ScratchKeys::new();
+        let mut m = machine(&k);
+        assert_eq!(m.read_registration(), None);
+        m.write_registration(&registration()).unwrap();
+        assert_eq!(m.read_registration(), Some(registration()));
+        assert!(registry::clsid_key_present_in(&k.keys));
+        assert!(m.delete_registration().is_empty());
+        assert_eq!(m.read_registration(), None);
+        assert!(!registry::clsid_key_present_in(&k.keys));
+        // nothing is left: the state key and the key above it are gone
+        assert!(!key_exists(k.keys.root, &k.keys.state));
+        assert!(!key_exists(k.keys.root, &k.keys.vendor));
+        // and deleting what is not there is not a failure
+        assert!(m.delete_registration().is_empty());
+    }
+
+    /// The record round trips through `write_aside_record` and `aside_record`.
+    #[test]
+    fn the_record_round_trips_through_the_real_store() {
+        let k = ScratchKeys::new();
+        let mut m = machine(&k);
+        assert_eq!(m.aside_record(), Stored::Missing);
+        assert_eq!(names(&mut m), Vec::<String>::new());
+        let strings: Vec<String> = (0..3).map(|i| entry(i).encode()).collect();
+        m.write_aside_record(&strings).unwrap();
+        assert_eq!(m.aside_record(), Stored::Strings(strings));
+        assert_eq!(
+            names(&mut m),
+            [
+                "BetterCam.old-0-0",
+                "BetterCam.old-1-0",
+                "BetterCam.old-2-0"
+            ]
+        );
+        // add and remove go through the same store
+        aside::add(&mut m, &entry(5)).unwrap();
+        aside::remove(&mut m, "BetterCam.old-1-0").unwrap();
+        assert_eq!(
+            names(&mut m),
+            [
+                "BetterCam.old-0-0",
+                "BetterCam.old-2-0",
+                "BetterCam.old-5-0"
+            ]
+        );
+    }
+
+    /// A record that exists and cannot be read as one is `Unreadable`: another type, a value that is too long, more
+    /// strings than the helper ever writes. Nothing is added to it, and it is left exactly as it is.
+    #[test]
+    fn an_unreadable_record_is_reported_and_never_overwritten() {
+        let k = ScratchKeys::new();
+        let (root, state) = (k.keys.root, k.keys.state.clone());
+        let mut m = machine(&k);
+        // another type
+        registry::set_string(root, &state, Some(registry::ASIDE_VALUE), "text").unwrap();
+        assert!(matches!(m.aside_record(), Stored::Unreadable(_)));
+        let err = aside::add(&mut m, &entry(1)).unwrap_err();
+        assert!(
+            err.contains("cannot be read") && err.contains("not overwritten"),
+            "{err}"
+        );
+        assert!(matches!(
+            registry::read_multi_string(root, &state, registry::ASIDE_VALUE),
+            Stored::Unreadable(_)
+        ));
+        // too long
+        registry::set_multi_string(root, &state, registry::ASIDE_VALUE, &["x".repeat(70_000)])
+            .unwrap();
+        let Record::Unreadable(why) = aside::load(&mut m) else {
+            panic!("an over-long value was read")
+        };
+        assert!(why.contains("more than"), "{why}");
+        assert!(aside::add(&mut m, &entry(1)).is_err());
+        // more strings than the helper writes (a read that succeeds, a record that is refused)
+        let many: Vec<String> = (0..=aside::MAX_ENTRIES)
+            .map(|i| entry(i).encode())
+            .collect();
+        assert_eq!(many.len(), 257);
+        registry::set_multi_string(root, &state, registry::ASIDE_VALUE, &many).unwrap();
+        assert_eq!(m.aside_record(), Stored::Strings(many.clone()));
+        let Record::Unreadable(why) = aside::load(&mut m) else {
+            panic!("a record of 257 strings was accepted")
+        };
+        assert!(why.contains("257"), "{why}");
+        assert!(aside::add(&mut m, &entry(300)).is_err());
+        assert_eq!(
+            m.aside_record(),
+            Stored::Strings(many),
+            "the value was changed"
+        );
+        // exactly 256 is the most
+        let most: Vec<String> = (0..aside::MAX_ENTRIES).map(|i| entry(i).encode()).collect();
+        registry::set_multi_string(root, &state, registry::ASIDE_VALUE, &most).unwrap();
+        assert!(matches!(
+            aside::load(&mut m),
+            Record::Entries { entries, .. } if entries.len() == 256
+        ));
+    }
+
+    /// Deleting the registration removes its values one by one and the class key; the record stays, and so does the
+    /// state key that holds it. The record is never missing for a moment (it is not deleted and written back).
+    #[test]
+    fn deleting_the_registration_keeps_the_record_and_its_key() {
+        let k = ScratchKeys::new();
+        let mut m = machine(&k);
+        m.write_registration(&registration()).unwrap();
+        aside::add(&mut m, &entry(1)).unwrap();
+        aside::add(&mut m, &entry(2)).unwrap();
+        let before = m.aside_record();
+        assert!(m.delete_registration().is_empty());
+        assert_eq!(m.read_registration(), None, "the registration is gone");
+        assert!(
+            !registry::clsid_key_present_in(&k.keys),
+            "the class key is gone"
+        );
+        for value in ["DllPath", "Protocol", "Build"] {
+            assert!(
+                !registry::value_exists(k.keys.root, &k.keys.state, value),
+                "{value} is still there"
+            );
+        }
+        assert!(
+            key_exists(k.keys.root, &k.keys.state),
+            "the state key goes with the record in it"
+        );
+        assert!(key_exists(k.keys.root, &k.keys.vendor));
+        assert_eq!(m.aside_record(), before, "the record changed");
+        assert_eq!(names(&mut m), ["BetterCam.old-1-0", "BetterCam.old-2-0"]);
+        // a registration written again next to the record leaves it alone too
+        m.write_registration(&registration()).unwrap();
+        assert_eq!(m.aside_record(), before);
+    }
+
+    /// The last name leaving the record removes the value; the state key goes with it only when no registration is
+    /// there, and the key above it when it is empty.
+    #[test]
+    fn the_key_goes_when_nothing_is_left_and_stays_while_a_registration_is_there() {
+        // no registration: the record was all that kept the keys
+        let k = ScratchKeys::new();
+        let mut m = machine(&k);
+        aside::add(&mut m, &entry(1)).unwrap();
+        assert!(key_exists(k.keys.root, &k.keys.state));
+        aside::remove(&mut m, "BetterCam.old-1-0").unwrap();
+        assert_eq!(m.aside_record(), Stored::Missing);
+        assert!(
+            !key_exists(k.keys.root, &k.keys.state),
+            "the state key stayed"
+        );
+        assert!(
+            !key_exists(k.keys.root, &k.keys.vendor),
+            "the key above stayed"
+        );
+        // a registration is there: only the value goes
+        let k = ScratchKeys::new();
+        let mut m = machine(&k);
+        m.write_registration(&registration()).unwrap();
+        aside::add(&mut m, &entry(1)).unwrap();
+        aside::remove(&mut m, "BetterCam.old-1-0").unwrap();
+        assert_eq!(m.aside_record(), Stored::Missing);
+        assert!(key_exists(k.keys.root, &k.keys.state));
+        assert_eq!(
+            m.read_registration(),
+            Some(registration()),
+            "the registration was touched"
+        );
+        // writing an empty list with nothing there is not an error
+        let k = ScratchKeys::new();
+        machine(&k).write_aside_record(&[]).unwrap();
+    }
+
+    /// A state key that holds only the record is **not installed**: the status read gives no registration, and
+    /// the state derived from it is `missing`.
+    #[test]
+    fn a_status_read_with_only_the_record_left_says_not_installed() {
+        use crate::status::{state_from, Facts, VcamState};
+        let k = ScratchKeys::new();
+        let mut m = machine(&k);
+        m.write_registration(&registration()).unwrap();
+        aside::add(&mut m, &entry(1)).unwrap();
+        let registered = read_registered_in(&k.keys);
+        assert!(registered.is_some());
+        assert!(m.delete_registration().is_empty());
+        assert!(
+            key_exists(k.keys.root, &k.keys.state),
+            "only the record keeps the key"
+        );
+        let registered = read_registered_in(&k.keys);
+        assert_eq!(registered, None, "a record alone is no registration");
+        assert_eq!(m.read_registration(), None);
+        let facts = Facts {
+            registered,
+            clsid_present: registry::clsid_key_present_in(&k.keys),
+            dll_present: false,
+            listed: true,
+            shipped_build: Some("aaaaaaaa".into()),
+            shipped_protocol: vcam_protocol::PROTOCOL_VERSION,
+        };
+        assert_eq!(state_from(&facts), VcamState::Missing);
     }
 }

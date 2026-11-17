@@ -287,23 +287,43 @@ fn inherit_permissions(dest: &Path) -> Res<()> {
 /// cannot open it, so cannot lock it between the write and the rename), written, flushed to disk and renamed over
 /// `dest`; the rename keeps that DACL, so the final file then gets the permissions its folder hands down
 /// ([`inherit_permissions`]). A file whose permissions could not be set is deleted again: a copy that the camera
-/// service cannot read must not be taken for a good one by the next Repair.
+/// service cannot read must not be taken for a good one by the next Repair. A copy that is there already with the
+/// right contents gets the same permissions step (a helper that died before it left one with the private
+/// permissions, which every byte-for-byte check would call good); when that fails the install fails, and the copy is
+/// left where it is.
 fn copy_dll(bytes: &[u8], dest: &Path, p: &Principals, log: &mut dyn Log) -> Res<bool> {
-    copy_dll_with(bytes, dest, p, log, &mut |_| {})
+    copy_dll_with(bytes, dest, p, log, &mut |_| {}, &mut inherit_permissions)
 }
 
 /// [`copy_dll`] with a hook that runs between the write of the temporary file and its rename (tests look at the
-/// file as it is then).
+/// file as it is then), and the step that gives the copy the permissions of its folder (`inherit`: tests make it
+/// fail; production passes [`inherit_permissions`]).
 fn copy_dll_with(
     bytes: &[u8],
     dest: &Path,
     p: &Principals,
     log: &mut dyn Log,
     between: &mut dyn FnMut(&Path),
+    inherit: &mut dyn FnMut(&Path) -> Res<()>,
 ) -> Res<bool> {
     match secure::read_file(dest) {
         Ok(there) if there == bytes => {
-            log.line(&format!("dll already present: {}", dest.display()));
+            // A copy with the right contents may still have the private permissions of the temporary file (a helper
+            // that died between the rename and `inherit_permissions`, or a failure of that call and of the delete
+            // after it): the camera service could never load it, and no later Repair would say so. So the
+            // permissions are brought to the inherited state here too (harmless when they already are), and a
+            // failure is an error, not a silent success. The copy is not deleted: it may be the registered one,
+            // loaded by the service right now.
+            inherit(dest).map_err(|e| {
+                format!(
+                    "the installed copy {} is there but could not be given the permissions of its folder, so the camera service may not be able to load it: {e}",
+                    dest.display()
+                )
+            })?;
+            log.line(&format!(
+                "dll already present: {} (permissions of its folder applied)",
+                dest.display()
+            ));
             return Ok(false);
         }
         // other contents under this name: it is replaced below
@@ -343,7 +363,7 @@ fn copy_dll_with(
         let _ = delete_file(&tmp);
     }
     result?;
-    if let Err(e) = inherit_permissions(dest) {
+    if let Err(e) = inherit(dest) {
         let _ = delete_file(dest);
         return Err(format!(
             "the copy {} could not be given the permissions of its folder, and was deleted again: {e}",
