@@ -3,8 +3,8 @@
 
 use crate::header::{
     Format, RawHeader, SlotMeta, WriterState, ADVERTISED_MAX, HEADER_SIZE, HEARTBEAT_TIMEOUT_MS,
-    MAX_HEIGHT, MAX_WIDTH, RGB32_MAX_HEIGHT, RGB32_MAX_WIDTH, SLOT_COUNT, SUBTYPE_NV12,
-    SUBTYPE_RGB32,
+    MAX_HEIGHT, MAX_WIDTH, RGB32_MAX_HEIGHT, RGB32_MAX_WIDTH, SLOT_CAPACITY, SLOT_COUNT,
+    SUBTYPE_NV12, SUBTYPE_RGB32,
 };
 use crate::MAGIC;
 
@@ -157,7 +157,15 @@ pub fn validate_format(width: u32, height: u32, subtype: u32) -> Result<(), Form
         return Err(FormatError::TooLarge);
     }
     match subtype {
-        SUBTYPE_NV12 => Ok(()),
+        SUBTYPE_NV12 => {
+            // 4096x2304 passes the limits above but is 14 MB: it must also fit one slot, or a consumer that
+            // picks it would wait on a writer that can never publish it
+            if width as u64 * height as u64 * 3 / 2 > SLOT_CAPACITY {
+                Err(FormatError::TooLarge)
+            } else {
+                Ok(())
+            }
+        }
         SUBTYPE_RGB32 => {
             if width > RGB32_MAX_WIDTH || height > RGB32_MAX_HEIGHT {
                 Err(FormatError::Rgb32TooLarge)
@@ -380,13 +388,101 @@ mod tests {
             validate_slot(&m, &v),
             Err(SlotError::Format(FormatError::UnknownSubtype))
         );
-        // exactly the limits are fine as formats
-        assert!(validate_format(4096, 2304, SUBTYPE_NV12).is_ok());
+        // the limits themselves: 4096x2304 NV12 is 14 MB and does not fit a slot, 3840x2160 does
+        assert_eq!(
+            validate_format(4096, 2304, SUBTYPE_NV12),
+            Err(FormatError::TooLarge)
+        );
+        assert!(validate_format(3840, 2160, SUBTYPE_NV12).is_ok());
         assert_eq!(
             validate_format(4096, 2304, SUBTYPE_RGB32),
             Err(FormatError::Rgb32TooLarge)
         );
         assert!(validate_format(1920, 1080, SUBTYPE_RGB32).is_ok());
+    }
+
+    #[test]
+    fn accepted_formats_always_fit_a_slot_and_nothing_that_fits_is_refused() {
+        use crate::header::{advertised_for_output, SLOT_CAPACITY};
+        // every even size inside the width/height limits: valid exactly when the tight NV12 frame fits a slot
+        for w in (2..=MAX_WIDTH).step_by(14) {
+            for h in (2..=MAX_HEIGHT).step_by(18) {
+                let bytes = w as u64 * h as u64 * 3 / 2;
+                let r = validate_format(w, h, SUBTYPE_NV12);
+                assert_eq!(r.is_ok(), bytes <= SLOT_CAPACITY, "{w}x{h}: {r:?}");
+                if r.is_ok() {
+                    assert!(frame_bytes(w, h, w, SUBTYPE_NV12).unwrap() <= SLOT_CAPACITY);
+                }
+            }
+        }
+        assert!(validate_format(4096, 2026, SUBTYPE_NV12).is_ok());
+        assert_eq!(
+            validate_format(4096, 2160, SUBTYPE_NV12),
+            Err(FormatError::TooLarge)
+        );
+        // what the app advertises is what the protocol accepts, for 4K and larger outputs too
+        for (w, h) in [
+            (4096, 2304),
+            (4096, 2160),
+            (3840, 2160),
+            (1920, 1080),
+            (4000, 2250),
+        ] {
+            for fps in [24, 30, 60] {
+                let l = advertised_for_output(w, h, fps);
+                // an output that cannot be a format and is not 16:9 advertises nothing (readers then use the
+                // defaults); every other output advertises something
+                let output_ok = validate_format(w, h, SUBTYPE_NV12).is_ok();
+                let sixteen_nine = w as u64 * 9 == h as u64 * 16;
+                assert_eq!(l.is_empty(), !output_ok && !sixteen_nine, "{w}x{h}");
+                for f in &l {
+                    assert!(
+                        validate_format(f.width, f.height, f.subtype).is_ok(),
+                        "{w}x{h}@{fps} advertises {f:?}"
+                    );
+                }
+            }
+        }
+        // 4096x2304 is 16:9: it falls back to the smaller 16:9 sizes
+        let l = advertised_for_output(4096, 2304, 30);
+        assert!(l.iter().all(|f| f.width <= 1280));
+        assert!(l
+            .iter()
+            .any(|f| f.width == 1280 && f.subtype == SUBTYPE_NV12));
+    }
+
+    #[test]
+    fn extreme_frame_rates_neither_overflow_nor_pass() {
+        let mut h = good_header();
+        h.advertised_count = 5;
+        h.advertised[0] = Format {
+            fps_num: u32::MAX,
+            fps_den: u32::MAX,
+            ..Format::new(1280, 720, 30, SUBTYPE_NV12)
+        }; // exactly 1 fps: valid, and `num + den / 2` overflowed u32
+        h.advertised[1] = Format {
+            fps_num: u32::MAX,
+            fps_den: 1,
+            ..Format::new(1280, 720, 30, SUBTYPE_NV12)
+        }; // far above 240
+        h.advertised[2] = Format {
+            fps_num: u32::MAX - 1,
+            fps_den: u32::MAX,
+            ..Format::new(1280, 720, 30, SUBTYPE_NV12)
+        };
+        h.advertised[3] = Format {
+            fps_num: 0,
+            fps_den: u32::MAX,
+            ..Format::new(1280, 720, 30, SUBTYPE_NV12)
+        };
+        h.advertised[4] = Format {
+            fps_num: u32::MAX,
+            fps_den: 2,
+            ..Format::new(1280, 720, 30, SUBTYPE_NV12)
+        };
+        let v = validate_header(&h, FILE_SIZE, None, None).unwrap();
+        let rates: Vec<u32> = v.advertised.iter().map(|f| f.fps()).collect();
+        assert_eq!(rates, vec![1, 1]);
     }
 
     #[test]

@@ -191,14 +191,19 @@ impl IMFMediaSource_Impl for MediaSource_Impl {
             if !pguidtimeformat.is_null() && unsafe { *pguidtimeformat } != GUID::zeroed() {
                 return Err(Error::from(MF_E_UNSUPPORTED_TIME_FORMAT));
             }
-            let mut st = self.state.lock_safe();
-            if st.shutdown {
-                return Err(Error::from(MF_E_SHUTDOWN));
-            }
-            let own = st
-                .descriptor
-                .clone()
-                .ok_or_else(|| Error::from(MF_E_SHUTDOWN))?;
+            // The source lock is held only to read the state: starting the stream can wait for an old pump thread
+            // to end, and nothing the service calls in the meantime may block on this lock.
+            let (own, was_selected) = {
+                let st = self.state.lock_safe();
+                if st.shutdown {
+                    return Err(Error::from(MF_E_SHUTDOWN));
+                }
+                let own = st
+                    .descriptor
+                    .clone()
+                    .ok_or_else(|| Error::from(MF_E_SHUTDOWN))?;
+                (own, st.stream_was_selected)
+            };
 
             let count = unsafe { pd.GetStreamDescriptorCount()? };
             if count != 1 {
@@ -225,7 +230,7 @@ impl IMFMediaSource_Impl for MediaSource_Impl {
             };
 
             if selected.as_bool() {
-                let met = if st.stream_was_selected {
+                let met = if was_selected {
                     MEUpdatedStream
                 } else {
                     MENewStream
@@ -243,17 +248,14 @@ impl IMFMediaSource_Impl for MediaSource_Impl {
                 unsafe { own.DeselectStream(0)? };
                 self.stream.stop()?;
             }
-            st.stream_was_selected = selected.as_bool();
+            self.state.lock_safe().stream_was_selected = selected.as_bool();
             Ok(())
         })
     }
 
     fn Stop(&self) -> Result<()> {
         guard("Source::Stop", || {
-            let st = self.state.lock_safe();
-            if st.shutdown {
-                return Err(Error::from(MF_E_SHUTDOWN));
-            }
+            self.check_shutdown()?;
             // Microsoft's sample keeps the stream selected across Stop; a later Start then reports MEUpdatedStream.
             self.stream.stop()?;
             let t = PROPVARIANT::from(unsafe { MFGetSystemTime() });

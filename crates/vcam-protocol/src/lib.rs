@@ -9,19 +9,21 @@ pub mod header;
 #[cfg(windows)]
 pub mod map;
 pub mod pattern;
+#[cfg(windows)]
+pub mod secure;
 pub mod seqlock;
 pub mod slate;
 pub mod validate;
 
 pub use header::{
-    advertised_for_output, default_advertised, off, slot_off, Format, RawHeader, SlotMeta,
-    WriterState, ADVERTISED_MAX, FILE_SIZE, HEADER_SIZE, MAGIC, MAX_HEIGHT, MAX_WIDTH, NO_SLOT,
-    SLOT_CAPACITY, SLOT_COUNT, SUBTYPE_NV12, SUBTYPE_RGB32,
+    advertised_for_output, default_advertised, off, round_fps, slot_off, Format, RawHeader,
+    SlotMeta, WriterState, ADVERTISED_MAX, FILE_SIZE, HEADER_SIZE, MAGIC, MAX_HEIGHT, MAX_WIDTH,
+    NO_SLOT, SLOT_CAPACITY, SLOT_COUNT, SUBTYPE_NV12, SUBTYPE_RGB32,
 };
 #[cfg(windows)]
 pub use map::{
     data_dir as frames_dir, frames_path, hns_to_qpc, qpc_frequency, qpc_now, qpc_to_hns,
-    read_advertised, Access, MappedFile, Writer,
+    read_advertised, read_advertised_pinned, Access, MappedFile, Writer,
 };
 pub use seqlock::{Disposition, PublishError, Read, ReadError, Shared, SlotData, SlotFormat};
 pub use validate::{

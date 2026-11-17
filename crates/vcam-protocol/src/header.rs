@@ -216,10 +216,18 @@ impl Format {
     }
     /// Frame rate rounded to a whole number (0 when the denominator is 0).
     pub fn fps(&self) -> u32 {
-        (self.fps_num + self.fps_den / 2)
-            .checked_div(self.fps_den)
-            .unwrap_or(0)
+        round_fps(self.fps_num, self.fps_den).unwrap_or(0)
     }
+}
+
+/// `num / den` rounded to the nearest whole number; `None` when `den` is 0. Computed in 64 bits, so values near
+/// `u32::MAX` neither overflow nor wrap; a result above `u32::MAX` saturates.
+pub fn round_fps(num: u32, den: u32) -> Option<u32> {
+    let den = den as u64;
+    if den == 0 {
+        return None;
+    }
+    Some(((num as u64 + den / 2) / den).min(u32::MAX as u64) as u32)
 }
 
 /// What the writer is doing (`writer_state`).
@@ -359,24 +367,32 @@ pub fn default_advertised() -> Vec<Format> {
 /// The advertised list for an output size and rate (plan 4.3): the output size at its rate first, the same at 30 fps
 /// when the rate is higher, then 1280x720 and 640x360 at 30 fps for 16:9 outputs larger than they are; NV12 for every
 /// entry, then RGB32 for the entries up to 1080p. At most [`ADVERTISED_MAX`] entries.
+///
+/// An entry the protocol would refuse ([`crate::validate_format`]: odd size, past the limits, or not fitting a slot
+/// like 4096x2304 NV12) is left out, so the list never offers a type a consumer could choose and then wait on
+/// forever.
 pub fn advertised_for_output(width: u32, height: u32, fps: u32) -> Vec<Format> {
     let mut sizes: Vec<(u32, u32, u32)> = vec![(width, height, fps)];
     if fps > 30 {
         sizes.push((width, height, 30));
     }
-    if width * 9 == height * 16 {
+    if width as u64 * 9 == height as u64 * 16 {
         for &(w, h) in &[(1280u32, 720u32), (640, 360)] {
             if width > w {
                 sizes.push((w, h, 30));
             }
         }
     }
+    let fits =
+        |w: u32, h: u32, subtype: u32| crate::validate::validate_format(w, h, subtype).is_ok();
     let mut out = Vec::new();
     for &(w, h, f) in &sizes {
-        out.push(Format::new(w, h, f, SUBTYPE_NV12));
+        if fits(w, h, SUBTYPE_NV12) {
+            out.push(Format::new(w, h, f, SUBTYPE_NV12));
+        }
     }
     for &(w, h, f) in &sizes {
-        if w <= RGB32_MAX_WIDTH && h <= RGB32_MAX_HEIGHT {
+        if w <= RGB32_MAX_WIDTH && h <= RGB32_MAX_HEIGHT && fits(w, h, SUBTYPE_RGB32) {
             out.push(Format::new(w, h, f, SUBTYPE_RGB32));
         }
     }
@@ -435,6 +451,29 @@ mod tests {
         assert_eq!(d.len(), 4);
         assert_eq!((d[0].width, d[0].subtype), (1920, SUBTYPE_NV12));
         assert_eq!((d[3].height, d[3].subtype), (720, SUBTYPE_RGB32));
+    }
+
+    #[test]
+    fn rounded_frame_rates_do_not_overflow() {
+        // the old `num + den / 2` in u32 panicked in debug builds (wrapped in release) for these
+        assert_eq!(round_fps(u32::MAX, u32::MAX - 1), Some(1));
+        assert_eq!(round_fps(30, 1), Some(30));
+        assert_eq!(round_fps(30000, 1001), Some(30));
+        assert_eq!(round_fps(60, 0), None);
+        assert_eq!(round_fps(0, 5), Some(0));
+        assert_eq!(round_fps(u32::MAX, u32::MAX), Some(1));
+        assert_eq!(round_fps(u32::MAX - 1, u32::MAX), Some(1));
+        // num + den / 2 does not fit u32 here
+        assert_eq!(round_fps(u32::MAX, 2), Some(1 << 31));
+        assert_eq!(round_fps(u32::MAX, 1), Some(u32::MAX));
+        let f = Format {
+            fps_num: u32::MAX,
+            fps_den: u32::MAX,
+            ..Format::default()
+        };
+        assert_eq!(f.fps(), 1);
+        assert_eq!(Format::new(1, 2, 30, SUBTYPE_NV12).fps(), 30);
+        assert_eq!(Format { fps_den: 0, ..f }.fps(), 0);
     }
 
     #[test]

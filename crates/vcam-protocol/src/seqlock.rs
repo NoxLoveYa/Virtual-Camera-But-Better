@@ -428,6 +428,22 @@ impl Shared {
             self.a64(offset).store(value, Ordering::SeqCst);
         }
     }
+
+    /// Overwrite bytes anywhere in the view, e.g. frame data (tests: simulate a writer that is mid-frame). Ignored
+    /// on a read-only view or when the range is outside the view.
+    #[doc(hidden)]
+    pub fn poke_bytes(&self, offset: usize, bytes: &[u8]) {
+        if self.writable
+            && offset
+                .checked_add(bytes.len())
+                .is_some_and(|e| e <= self.len)
+        {
+            // SAFETY: the range is inside the view (checked above) and the view is writable.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.add(offset), bytes.len())
+            };
+        }
+    }
 }
 
 #[cfg(test)]
@@ -594,14 +610,25 @@ mod tests {
         );
         let short = SlotFormat { stride: 10, ..ok };
         assert_eq!(s.publish(short, 0, 0, |_| {}), Err(PublishError::BadStride));
-        // 4096x2304 NV12 is 14 MB: a legal size that does not fit a slot
+        // 4096x2304 NV12 is 14 MB: inside the width/height limits but not a format, because it does not fit a slot
         let huge = SlotFormat {
             width: 4096,
             height: 2304,
             stride: 4096,
             subtype: SUBTYPE_NV12,
         };
-        assert_eq!(s.publish(huge, 0, 0, |_| {}), Err(PublishError::TooLarge));
+        assert_eq!(
+            s.publish(huge, 0, 0, |_| {}),
+            Err(PublishError::Format(FormatError::TooLarge))
+        );
+        // a legal size with a padded stride that no longer fits is caught by the slot check
+        let padded = SlotFormat {
+            width: 3840,
+            height: 2160,
+            stride: 4096,
+            subtype: SUBTYPE_NV12,
+        };
+        assert_eq!(s.publish(padded, 0, 0, |_| {}), Err(PublishError::TooLarge));
         let rgb = SlotFormat {
             width: 1920,
             height: 1080,

@@ -91,7 +91,7 @@ pub struct FrameFormat {
 impl FrameFormat {
     /// Duration of one frame in 100 ns units.
     pub fn frame_duration(&self) -> i64 {
-        10_000_000 / self.fps as i64
+        10_000_000 / self.fps.max(1) as i64
     }
 
     pub fn from_media_type(t: &IMFMediaType) -> Result<Self> {
@@ -104,18 +104,23 @@ impl FrameFormat {
             t.GetUINT64(&MF_MT_FRAME_RATE)
                 .unwrap_or(((FPS as u64) << 32) | 1)
         };
-        let (num, den) = ((rate >> 32) as u32, (rate & 0xFFFF_FFFF) as u32);
         Ok(FrameFormat {
             pixel,
             width: (size >> 32) as u32,
             height: (size & 0xFFFF_FFFF) as u32,
-            fps: if den == 0 || num == 0 {
-                FPS
-            } else {
-                (num + den / 2) / den
-            },
+            fps: fps_of_rate(rate),
         })
     }
+}
+
+/// Whole frames per second of a packed `MF_MT_FRAME_RATE` (numerator in the high half, denominator in the low
+/// half); [`FPS`] when it has no numerator or denominator. Computed in 64 bits.
+pub fn fps_of_rate(rate: u64) -> u32 {
+    let (num, den) = ((rate >> 32) as u32, (rate & 0xFFFF_FFFF) as u32);
+    if num == 0 {
+        return FPS;
+    }
+    vcam_protocol::round_fps(num, den).unwrap_or(FPS)
 }
 
 fn pack(hi: u32, lo: u32) -> u64 {
@@ -211,6 +216,31 @@ mod tests {
         assert_eq!(fmts[1].width, 1280);
         assert_eq!(fmts[2].pixel, PixelFormat::Rgb32);
         assert_eq!(fmts[3].height, 720);
+    }
+
+    #[test]
+    fn frame_rates_of_every_edge_do_not_overflow() {
+        let pack = |n: u32, d: u32| ((n as u64) << 32) | d as u64;
+        assert_eq!(fps_of_rate(pack(30, 1)), 30);
+        assert_eq!(fps_of_rate(pack(30000, 1001)), 30);
+        assert_eq!(fps_of_rate(pack(0, 1)), FPS);
+        assert_eq!(fps_of_rate(pack(60, 0)), FPS);
+        assert_eq!(fps_of_rate(0), FPS);
+        // `num + den / 2` does not fit u32 for these
+        assert_eq!(fps_of_rate(pack(u32::MAX, u32::MAX)), 1);
+        assert_eq!(fps_of_rate(pack(u32::MAX - 1, u32::MAX)), 1);
+        assert_eq!(fps_of_rate(pack(u32::MAX, 2)), 1 << 31);
+        assert_eq!(fps_of_rate(pack(u32::MAX, 1)), u32::MAX);
+        // such a rate is far outside what a stream accepts
+        let f = FrameFormat {
+            pixel: PixelFormat::Nv12,
+            width: 1280,
+            height: 720,
+            fps: fps_of_rate(pack(u32::MAX, 1)),
+        };
+        assert!(!is_sane(&f));
+        assert_eq!(f.frame_duration(), 0); // computed, never a division by zero
+        assert_eq!(FrameFormat { fps: 0, ..f }.frame_duration(), 10_000_000);
     }
 
     #[test]

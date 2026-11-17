@@ -2,29 +2,30 @@
 
 use std::io;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::IntoRawHandle;
 use std::path::{Path, PathBuf};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetFileAttributesW, GetFileSizeEx, SetEndOfFile, SetFileAttributesW,
-    SetFilePointerEx, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TEMPORARY, FILE_BEGIN,
-    FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    INVALID_FILE_ATTRIBUTES, OPEN_ALWAYS, OPEN_EXISTING,
+    SetFilePointerEx, FILE_ATTRIBUTE_TEMPORARY, FILE_BEGIN, FILE_FLAGS_AND_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, INVALID_FILE_ATTRIBUTES, OPEN_ALWAYS,
 };
 use windows::Win32::System::Memory::{
-    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS, FILE_MAP_READ,
-    MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READONLY, PAGE_READWRITE,
+    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, VirtualQuery, FILE_MAP_ALL_ACCESS,
+    FILE_MAP_READ, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READONLY,
+    PAGE_READWRITE,
 };
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 use crate::header::{Format, WriterState, FILE_SIZE, HEADER_SIZE, MAX_FILE_SIZE};
+use crate::secure;
 use crate::seqlock::{PublishError, Shared, SlotFormat};
 
-/// `%ProgramData%\BetterCam`.
+/// `%ProgramData%\BetterCam`, with `%ProgramData%` from `SHGetKnownFolderPath` (not the environment).
 pub fn data_dir() -> PathBuf {
-    let base = std::env::var_os("ProgramData").unwrap_or_else(|| "C:\\ProgramData".into());
-    PathBuf::from(base).join(crate::DATA_DIR_NAME)
+    secure::program_data_dir().join(crate::DATA_DIR_NAME)
 }
 
 /// `%ProgramData%\BetterCam\frames.bin`.
@@ -52,12 +53,12 @@ pub fn qpc_frequency() -> u64 {
 
 /// QPC ticks to 100 ns units (the Media Foundation time base).
 pub fn qpc_to_hns(qpc: u64) -> i64 {
-    (qpc as u128 * 10_000_000 / qpc_frequency() as u128) as i64
+    (qpc as u128 * 10_000_000 / qpc_frequency() as u128).min(i64::MAX as u128) as i64
 }
 
 /// 100 ns units to QPC ticks.
 pub fn hns_to_qpc(hns: i64) -> u64 {
-    (hns.max(0) as u128 * qpc_frequency() as u128 / 10_000_000) as u64
+    (hns.max(0) as u128 * qpc_frequency() as u128 / 10_000_000).min(u64::MAX as u128) as u64
 }
 
 fn wide(p: &Path) -> Vec<u16> {
@@ -71,6 +72,22 @@ fn win_err(e: windows::core::Error) -> io::Error {
     io::Error::from_raw_os_error(e.code().0 & 0xFFFF)
 }
 
+#[cfg(test)]
+type SizeHook = Box<dyn FnOnce()>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once on this thread between the size query and the mapping of [`MappedFile::map`] (tests only).
+    static AFTER_SIZE_HOOK: std::cell::RefCell<Option<SizeHook>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_after_size_hook() {
+    if let Some(f) = AFTER_SIZE_HOOK.with(|h| h.borrow_mut().take()) {
+        f();
+    }
+}
+
 /// How a file is opened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Access {
@@ -80,7 +97,25 @@ pub enum Access {
 
 /// An open, mapped `frames.bin`. Dropping it unmaps the view and closes both handles.
 ///
-/// While the mapping exists the file cannot be truncated (Windows refuses), so a view never reaches past the end.
+/// # What keeps a read inside the view
+///
+/// `len` is the number of bytes the code may touch, and every offset read from the file is checked against it
+/// ([`crate::validate`]). The view must really be that long. Two facts of Windows guarantee it:
+///
+/// 1. **A mapped file cannot be cut below its section.** Once `CreateFileMappingW` has returned, truncating the file
+///    (`SetEndOfFile`, `set_len`) fails with `ERROR_USER_MAPPED_FILE` for as long as the section exists, in
+///    read-only and read-write mappings alike. Growing is allowed and harmless (the view stays in range).
+///    This is what protects a reader after `open`; test `a_mapped_file_cannot_be_truncated_under_a_reader` pins
+///    the behaviour down.
+/// 2. **The window before the section exists is closed by checking afterwards.** The file size is read first, and
+///    the file may shrink before the section is created. So the view is requested with exactly the checked size
+///    (`MapViewOfFile` fails when the section is smaller), and `VirtualQuery` confirms the size of the view; a
+///    shorter view fails the open cleanly. Test `a_file_that_shrinks_between_the_size_check_and_the_mapping_is_refused`
+///    drives that window deterministically, `a_reader_survives_a_file_whose_size_keeps_switching` races it.
+///
+/// What no check can catch is a read error of the *medium* under the view (a removed disk or dropped network
+/// share raises an in-page exception that `catch_unwind` cannot stop). That is why the DLL opens the file with
+/// [`MappedFile::open_pinned`], which accepts only a local fixed disk.
 pub struct MappedFile {
     file: HANDLE,
     mapping: HANDLE,
@@ -96,25 +131,23 @@ unsafe impl Sync for MappedFile {}
 impl MappedFile {
     /// Open an existing file and map all of it. Rejects files shorter than the header or longer than
     /// [`MAX_FILE_SIZE`] before mapping anything.
+    ///
+    /// A link, a directory or a file with more than one hard link is refused (see [`secure`]); the location of the
+    /// file is not checked, use [`MappedFile::open_pinned`] for a file in a folder that others can write to.
     pub fn open(path: &Path, access: Access) -> io::Result<MappedFile> {
-        let w = wide(path);
-        let desired = match access {
-            Access::ReadOnly => GENERIC_READ.0,
-            Access::ReadWrite => GENERIC_READ.0 | GENERIC_WRITE.0,
-        };
-        let file = unsafe {
-            CreateFileW(
-                PCWSTR(w.as_ptr()),
-                desired,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                None,
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                None,
-            )
-        }
-        .map_err(win_err)?;
-        Self::map(file, access)
+        Self::open_with(path, access, None)
+    }
+
+    /// [`MappedFile::open`] for a file that must really be `path` below the trusted folder `root` on a local fixed
+    /// disk (no junction or link in between; see [`secure::open_existing`]). The DLL uses this with
+    /// `%ProgramData%`.
+    pub fn open_pinned(path: &Path, root: &Path, access: Access) -> io::Result<MappedFile> {
+        Self::open_with(path, access, Some(root))
+    }
+
+    fn open_with(path: &Path, access: Access, pin: Option<&Path>) -> io::Result<MappedFile> {
+        let h = secure::open_existing(path, access == Access::ReadWrite, pin)?;
+        Self::map(HANDLE(h.into_raw_handle()), access)
     }
 
     fn map(file: HANDLE, access: Access) -> io::Result<MappedFile> {
@@ -128,6 +161,8 @@ impl MappedFile {
         if let Err(e) = unsafe { GetFileSizeEx(file, &mut size) } {
             return fail(file, win_err(e));
         }
+        #[cfg(test)]
+        run_after_size_hook();
         if size < HEADER_SIZE as i64 || size as u64 > MAX_FILE_SIZE {
             return fail(
                 file,
@@ -145,7 +180,10 @@ impl MappedFile {
             Ok(m) => m,
             Err(e) => return fail(file, win_err(e)),
         };
-        let view = unsafe { MapViewOfFile(mapping, view_access, 0, 0, 0) };
+        let len = size as usize;
+        // Map exactly the bytes that were checked: a section made from a file that shrank meanwhile is smaller than
+        // `len` and the call fails instead of returning a short view.
+        let view = unsafe { MapViewOfFile(mapping, view_access, 0, 0, len) };
         if view.Value.is_null() {
             let e = io::Error::last_os_error();
             unsafe {
@@ -153,8 +191,29 @@ impl MappedFile {
             }
             return fail(file, e);
         }
-        let len = size as usize;
-        // SAFETY: the view covers the whole file (`len` bytes) and a view is page aligned.
+        // Belt and braces: the committed size of the view must cover `len`.
+        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+        let got = unsafe {
+            VirtualQuery(
+                Some(view.Value as *const core::ffi::c_void),
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if got == 0 || mbi.RegionSize < len {
+            unsafe {
+                let _ = UnmapViewOfFile(view);
+                let _ = CloseHandle(mapping);
+            }
+            return fail(
+                file,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "file shrank while it was being mapped",
+                ),
+            );
+        }
+        // SAFETY: the view covers `len` bytes (checked above) and a view is page aligned.
         let shared =
             unsafe { Shared::new(view.Value as *mut u8, len, access == Access::ReadWrite) }
                 .expect("a mapped view of at least HEADER_SIZE bytes is aligned");
@@ -195,8 +254,18 @@ impl Drop for MappedFile {
 /// Read the first [`HEADER_SIZE`] bytes of `path` with plain file I/O (no mapping, no thread). Returns the bytes and
 /// the file length. Used where cost matters more than the live view: the advertised media types at source creation.
 pub fn read_header_bytes(path: &Path) -> io::Result<(Vec<u8>, u64)> {
+    read_header_bytes_with(path, None)
+}
+
+/// [`read_header_bytes`] for a file that must really be `path` below the trusted folder `root` (see
+/// [`MappedFile::open_pinned`]).
+pub fn read_header_bytes_pinned(path: &Path, root: &Path) -> io::Result<(Vec<u8>, u64)> {
+    read_header_bytes_with(path, Some(root))
+}
+
+fn read_header_bytes_with(path: &Path, pin: Option<&Path>) -> io::Result<(Vec<u8>, u64)> {
     use std::io::Read;
-    let mut f = std::fs::File::open(path)?;
+    let mut f = std::fs::File::from(secure::open_existing(path, false, pin)?);
     let len = f.metadata()?.len();
     if len < HEADER_SIZE as u64 {
         return Err(io::Error::new(
@@ -212,8 +281,17 @@ pub fn read_header_bytes(path: &Path) -> io::Result<(Vec<u8>, u64)> {
 /// The advertised media types of the file at `path`, or [`crate::default_advertised`] when it is missing, too short
 /// or invalid. One plain read, no mapping.
 pub fn read_advertised(path: &Path) -> Vec<Format> {
+    advertised_from(read_header_bytes(path))
+}
+
+/// [`read_advertised`] for a file that must really be `path` below the trusted folder `root`.
+pub fn read_advertised_pinned(path: &Path, root: &Path) -> Vec<Format> {
+    advertised_from(read_header_bytes_pinned(path, root))
+}
+
+fn advertised_from(read: io::Result<(Vec<u8>, u64)>) -> Vec<Format> {
     let from_file = (|| {
-        let (bytes, len) = read_header_bytes(path).ok()?;
+        let (bytes, len) = read.ok()?;
         let raw = crate::RawHeader::from_bytes(&bytes)?;
         let v = crate::validate_header(&raw, len, None, None).ok()?;
         Some(v.advertised)
@@ -493,6 +571,139 @@ mod tests {
         let m = MappedFile::open(&path, Access::ReadOnly).unwrap();
         let err = validate_header(&m.shared().header(), m.len() as u64, None, None).unwrap_err();
         assert_eq!(err, crate::validate::HeaderError::BadFileSize);
+    }
+
+    /// A file with a valid header and published frames (the writer alternates between slots 0 and 1, so the latest
+    /// slot is slot 1, about 12 MB into the file), the writer already gone so nothing maps it.
+    fn file_with_three_frames(name: &str) -> PathBuf {
+        let path = temp_file(name);
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        let fmt = SlotFormat {
+            width: 64,
+            height: 64,
+            stride: 64,
+            subtype: SUBTYPE_NV12,
+        };
+        for n in 0..3u8 {
+            w.publish(fmt, 100 + n as u64, |d| d.fill(n + 1)).unwrap();
+        }
+        // three publishes: slots 0, 1, 0 -> latest is 0; one more makes it 1
+        w.publish(fmt, 200, |d| d.fill(9)).unwrap();
+        assert_eq!(w.shared().header().latest_slot, 1);
+        path
+    }
+
+    /// Read the newest frame the way the DLL does: validate the header against the mapped length, then
+    /// `read_latest`, touching the first bytes of the slot data.
+    fn read_like_the_dll(m: &MappedFile) {
+        if let Ok(v) = validate_header(&m.shared().header(), m.len() as u64, None, None) {
+            let _ = m.shared().read_latest(&v, |_, d| {
+                let mut b = [0u8; 64];
+                d.copy_to(0, &mut b);
+                Disposition::Taken
+            });
+        }
+    }
+
+    #[test]
+    fn a_file_that_shrinks_between_the_size_check_and_the_mapping_is_refused() {
+        let path = file_with_three_frames("shrink-hook.bin");
+        let p = path.clone();
+        AFTER_SIZE_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+                f.set_len(8192).unwrap();
+            }));
+        });
+        let r = MappedFile::open(&path, Access::ReadWrite);
+        match r {
+            Err(_) => {}
+            Ok(m) => {
+                // Not reached by fixed code. The old code gets here with `len` of 37 MB over an 8 KB view.
+                panic!(
+                    "mapped a {} byte view over a file that shrank to 8192",
+                    m.len()
+                );
+            }
+        }
+        // the read-only path behaves the same
+        let path = file_with_three_frames("shrink-hook-ro.bin");
+        let p = path.clone();
+        AFTER_SIZE_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+                f.set_len(8192).unwrap();
+            }));
+        });
+        assert!(MappedFile::open(&path, Access::ReadOnly).is_err());
+    }
+
+    /// The reviewer's reproduction: one thread switches the file between 8 KB and full size while another opens,
+    /// validates and reads. The old code died with 0xC0000005 within a second or two.
+    #[test]
+    fn a_reader_survives_a_file_whose_size_keeps_switching() {
+        let path = file_with_three_frames("shrink-race.bin");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let toggler = {
+            let (p, stop) = (path.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // shrinking fails while a mapping exists (see MappedFile): that is the point
+                    let _ = f.set_len(8192);
+                    let _ = f.set_len(FILE_SIZE);
+                }
+            })
+        };
+        let began = std::time::Instant::now();
+        let (mut opened, mut refused) = (0u32, 0u32);
+        while began.elapsed() < std::time::Duration::from_secs(3) {
+            for access in [Access::ReadOnly, Access::ReadWrite] {
+                match MappedFile::open(&path, access) {
+                    Ok(m) => {
+                        opened += 1;
+                        read_like_the_dll(&m);
+                    }
+                    Err(_) => refused += 1,
+                }
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        toggler.join().unwrap();
+        eprintln!("size race: {opened} opened, {refused} refused");
+        assert!(opened + refused > 0);
+    }
+
+    #[test]
+    fn a_mapped_file_cannot_be_truncated_under_a_reader() {
+        // The guarantee `MappedFile` relies on: Windows refuses to cut a file below the size of a section that is
+        // mapped from it (ERROR_USER_MAPPED_FILE), whatever the access of the mapping.
+        for access in [Access::ReadOnly, Access::ReadWrite] {
+            let path = file_with_three_frames(&format!("truncate-{access:?}.bin"));
+            let m = MappedFile::open(&path, access).unwrap();
+            let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let err = f
+                .set_len(8192)
+                .expect_err("truncating a mapped file must fail");
+            assert_eq!(err.raw_os_error(), Some(1224), "{access:?}: {err}");
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), FILE_SIZE);
+            read_like_the_dll(&m);
+            // once the mapping is gone the file can shrink again
+            drop(m);
+            f.set_len(8192).unwrap();
+        }
+    }
+
+    #[test]
+    fn time_conversions_saturate_instead_of_wrapping() {
+        // a QPC value from a hostile file: u64::MAX ticks must not wrap into a negative time
+        assert!(qpc_to_hns(u64::MAX) > 0);
+        assert!(qpc_to_hns(u64::MAX) >= qpc_to_hns(u64::MAX / 2));
+        assert!(hns_to_qpc(i64::MAX) >= hns_to_qpc(i64::MAX / 2));
+        assert_eq!(hns_to_qpc(i64::MIN), 0);
+        assert_eq!(qpc_to_hns(0), 0);
     }
 
     #[test]

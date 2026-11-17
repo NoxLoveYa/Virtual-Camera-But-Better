@@ -57,9 +57,44 @@ pub fn frames_path() -> PathBuf {
     }
 }
 
+/// The folder `frames_path()` must lie in, as a verified location: `%ProgramData%` from the shell (a folder only an
+/// administrator can change), or the temp folder in tests. The file is opened only when it really is
+/// `<root>\BetterCam\frames.bin` on a local fixed disk, never through a link or junction.
+pub fn trusted_root() -> PathBuf {
+    #[cfg(test)]
+    {
+        std::env::temp_dir()
+    }
+    #[cfg(not(test))]
+    {
+        vcam_protocol::secure::program_data_dir()
+    }
+}
+
 /// Media types to advertise: from the file's header, or the defaults when it is missing or invalid.
 pub fn advertised() -> Vec<Format> {
-    vcam_protocol::read_advertised(&frames_path())
+    vcam_protocol::read_advertised_pinned(&frames_path(), &trusted_root())
+}
+
+/// Window in which a capture time read from the file is believed: this far before `now` and 1/20 s after it.
+/// The file is not trusted, and one far-future value would hold every later sample time in the future.
+const CAPTURE_PAST_SECS: u64 = 5;
+
+/// `capture_qpc` clamped to the window around `now` ([`CAPTURE_PAST_SECS`] back, 50 ms ahead). Never panics, for
+/// any input.
+pub fn clamp_capture(capture_qpc: u64, now: u64, freq: u64) -> u64 {
+    let lo = now.saturating_sub(freq.saturating_mul(CAPTURE_PAST_SECS));
+    let hi = now.saturating_add(freq / 20);
+    capture_qpc.clamp(lo, hi.max(lo))
+}
+
+#[cfg(test)]
+type CopyHook = Box<dyn FnMut()>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs inside the read callback just before the frame is copied (tests: tear the read on purpose).
+    static COPY_HOOK: std::cell::RefCell<Option<CopyHook>> = const { std::cell::RefCell::new(None) };
 }
 
 // ---- slates --------------------------------------------------------------------------------------------------
@@ -196,8 +231,16 @@ pub struct FrameSource {
     not_running: bool,
     running: bool,
 
+    /// The most recent `validate_header` of the mapped file passed. Everything the DLL writes into the file
+    /// (consumer state, negotiated format, statistics) happens only while this is true: a foreign file or a file of
+    /// another protocol version is never altered.
+    header_ok: bool,
+
     live_since: u64,
+    /// The last confirmed live frame (what a repeat shows).
     frame: Vec<u8>,
+    /// Copy target of a read; swapped into `frame` only when the sequence check confirmed the copy.
+    scratch: Vec<u8>,
     have_frame: bool,
     last_id: Option<(u32, u32, u64)>,
     last_new_seen: u64,
@@ -231,8 +274,10 @@ impl FrameSource {
             last_open_try: 0,
             not_running: true,
             running: false,
+            header_ok: false,
             live_since: 0,
             frame: vec![0; fmt.pixel.frame_bytes(fmt.width, fmt.height) as usize],
+            scratch: vec![0; fmt.pixel.frame_bytes(fmt.width, fmt.height) as usize],
             have_frame: false,
             last_id: None,
             last_new_seen: 0,
@@ -271,12 +316,13 @@ impl FrameSource {
         self.running = false;
         self.publish_stats();
         let left = active_adjust(&self.path, -1);
-        if left == 0 {
+        if left == 0 && self.header_ok {
             if let Some(m) = &self.map {
                 m.shared().set_consumer_active(false);
             }
         }
         self.map = None;
+        self.header_ok = false;
         vlog!(
             "frames: stop, delivered {} repeated {}",
             self.delivered,
@@ -301,12 +347,20 @@ impl FrameSource {
     }
 
     fn open_map(&mut self) -> Option<MappedFile> {
-        match MappedFile::open(&self.path, Access::ReadWrite) {
+        let root = trusted_root();
+        match MappedFile::open_pinned(&self.path, &root, Access::ReadWrite) {
             Ok(m) => Some(m),
+            Err(e) if vcam_protocol::secure::is_refused(&e) => {
+                // a link, a junction, a hard-linked or misplaced file: nothing is mapped, read-only or not
+                crate::log::log_sampled(crate::log::slot::FILE_REFUSED, 600, || {
+                    format!("frames: file refused ({e})")
+                });
+                None
+            }
             Err(e) => {
                 // no write access (or file in use): a read-only view still shows frames, but the writer
                 // learns nothing about us
-                match MappedFile::open(&self.path, Access::ReadOnly) {
+                match MappedFile::open_pinned(&self.path, &root, Access::ReadOnly) {
                     Ok(m) => {
                         vlog!("frames: opened read-only ({e})");
                         Some(m)
@@ -317,7 +371,23 @@ impl FrameSource {
         }
     }
 
+    /// Whether the mapped file's header passes [`validate_header`] at QPC `now`.
+    fn header_valid(&self, now: u64) -> bool {
+        self.map.as_ref().is_some_and(|m| {
+            validate_header(
+                &m.shared().header(),
+                m.len() as u64,
+                Some(self.freq),
+                Some(now),
+            )
+            .is_ok()
+        })
+    }
+
     fn announce(&self) {
+        if !self.header_ok {
+            return;
+        }
         if let Some(m) = &self.map {
             let s = m.shared();
             s.set_negotiated(&Format::new(
@@ -344,18 +414,26 @@ impl FrameSource {
             }
             self.map = m;
             self.last_id = None;
+            // nothing is written before the header of this very file has been validated
+            self.header_ok = self.header_valid(now);
             self.announce();
         }
     }
 
     fn status(&mut self, now: u64) -> Status {
-        let Some(map) = &self.map else {
-            return Status::Slate(SlateKind::NotRunning);
-        };
-        let raw = map.shared().header();
-        let v = match validate_header(&raw, map.len() as u64, Some(self.freq), Some(now)) {
-            Ok(v) => v,
-            Err(e) => {
+        let checked = self.map.as_ref().map(|map| {
+            validate_header(
+                &map.shared().header(),
+                map.len() as u64,
+                Some(self.freq),
+                Some(now),
+            )
+        });
+        self.header_ok = matches!(checked, Some(Ok(_)));
+        let v = match checked {
+            None => return Status::Slate(SlateKind::NotRunning),
+            Some(Ok(v)) => v,
+            Some(Err(e)) => {
                 crate::log::log_sampled(crate::log::slot::HEADER_INVALID, 600, || {
                     format!("frames: header invalid: {e:?}")
                 });
@@ -414,7 +492,7 @@ impl FrameSource {
         })
     }
 
-    fn try_read(&mut self, v: &ValidHeader) -> ReadResult {
+    fn try_read(&mut self, v: &ValidHeader, now: u64) -> ReadResult {
         let Some(map) = &self.map else {
             return ReadResult::Nothing;
         };
@@ -424,8 +502,11 @@ impl FrameSource {
         let last_id = self.last_id;
         let last_capture = self.last_capture;
         let min_gap = self.min_capture_gap();
+        let freq = self.freq;
         let pid = v.writer_pid;
-        let frame = &mut self.frame;
+        // The copy goes to a scratch buffer: a read the sequence check then rejects must not leave a mixed frame
+        // in `self.frame`, where a later repeat would show it.
+        let frame = &mut self.scratch;
         let r = map.shared().read_latest(v, |m, data| {
             if m.width as usize != w || m.height as usize != h || m.subtype != subtype {
                 return Disposition::Skip;
@@ -435,10 +516,17 @@ impl FrameSource {
             }
             // a faster writer is decimated by capture time: skip a frame captured too soon after the last one
             if let Some(c) = last_capture {
-                if m.capture_qpc >= c && m.capture_qpc - c < min_gap {
+                let cq = clamp_capture(m.capture_qpc, now, freq);
+                if cq >= c && cq - c < min_gap {
                     return Disposition::Skip;
                 }
             }
+            #[cfg(test)]
+            COPY_HOOK.with(|h| {
+                if let Some(f) = h.borrow_mut().as_mut() {
+                    f();
+                }
+            });
             let s = m.stride as usize;
             if nv12 {
                 if s == w {
@@ -465,8 +553,10 @@ impl FrameSource {
         });
         match r {
             Ok(Read::Taken(m)) => {
+                // confirmed by an unchanged even seq: only now the copy becomes the current frame
+                std::mem::swap(&mut self.frame, &mut self.scratch);
                 self.last_id = Some((m.index, pid, m.seq));
-                ReadResult::New(m.capture_qpc)
+                ReadResult::New(clamp_capture(m.capture_qpc, now, freq))
             }
             Ok(_) | Err(ReadError::Torn) => ReadResult::Nothing,
             Err(ReadError::Invalid(e)) => {
@@ -512,11 +602,13 @@ impl FrameSource {
         // least min_capture_gap after the last one emitted: a faster writer is decimated on capture time, so
         // the cadence follows the frames and not the poll phase. No frame can qualify earlier than that, so wait.
         let next_ok = match self.last_capture {
-            Some(c) => (c + self.min_capture_gap()).min(now + period),
+            Some(c) => c
+                .saturating_add(self.min_capture_gap())
+                .min(now.saturating_add(period)),
             None => 0,
         };
         if now >= next_ok {
-            match self.try_read(&v) {
+            match self.try_read(&v, now) {
                 ReadResult::New(capture_qpc) => {
                     self.have_frame = true;
                     self.last_capture = Some(capture_qpc);
@@ -580,7 +672,8 @@ impl FrameSource {
             }
             Kind::Slate(_) => {}
         }
-        if let Some(m) = &self.map {
+        // only into a file whose header validated at the last poll
+        if let (true, Some(m)) = (self.header_ok, &self.map) {
             let s = m.shared();
             s.set_consumer_heartbeat(after);
             s.set_consumer_active(true);
@@ -598,6 +691,9 @@ impl FrameSource {
     }
 
     fn publish_stats(&self) {
+        if !self.header_ok {
+            return;
+        }
         let Some(m) = &self.map else { return };
         let mut v = self.lat.clone();
         v.sort_unstable();
@@ -1043,6 +1139,325 @@ mod tests {
                 .scale_bgrx(fw, fh)
                 .as_slice()
         );
+    }
+
+    /// Run a source against `path` for a short time the way the pump does: start, poll for about `ms`, stop.
+    fn run_source_for(path: &std::path::Path, ms: u64) -> Vec<Kind> {
+        let mut src = FrameSource::new(path.to_path_buf(), nv12(320, 180, 30));
+        src.start();
+        let began = Instant::now();
+        let mut kinds = Vec::new();
+        while began.elapsed() < Duration::from_millis(ms) {
+            kinds.push(next_ready(&mut src, Duration::from_secs(2)).kind);
+        }
+        src.stop();
+        kinds
+    }
+
+    #[test]
+    fn foreign_files_and_other_protocol_versions_are_never_written_to() {
+        use vcam_protocol::off;
+        // (name, how to spoil a valid file)
+        type Spoil = fn(&Writer);
+        let cases: [(&str, Spoil); 3] = [
+            ("wrong magic", |w| {
+                w.shared().poke32(off::MAGIC, 0x1234_5678)
+            }),
+            // an old DLL still loaded in the service meets a file of a newer layout
+            ("newer protocol", |w| {
+                w.shared()
+                    .poke32(off::PROTOCOL, vcam_protocol::PROTOCOL_VERSION + 1)
+            }),
+            ("bad header size", |w| {
+                w.shared().poke32(off::HEADER_SIZE, 64)
+            }),
+        ];
+        for (name, spoil) in cases {
+            let path = temp_path(&format!("foreign-{}.bin", name.replace(' ', "-")));
+            let _ = std::fs::remove_file(&path);
+            let w = Writer::create(&path).unwrap();
+            w.set_state(WriterState::Live);
+            publish_pattern(&w, 320, 180, 1);
+            spoil(&w);
+            drop(w); // the writer's own close writes to the header: take the snapshot after it
+            let before = std::fs::read(&path).unwrap();
+            let kinds = run_source_for(&path, 150);
+            assert!(
+                kinds
+                    .iter()
+                    .all(|k| *k == Kind::Slate(SlateKind::NotRunning)),
+                "{name}: {kinds:?}"
+            );
+            assert!(
+                std::fs::read(&path).unwrap() == before,
+                "{name}: the DLL altered the file"
+            );
+        }
+        // a file that was never ours: 8 KB of one byte value, and a small one that only just passes the size check
+        for (name, size) in [("foreign-8k.bin", 8192usize), ("foreign-4k.bin", 4096)] {
+            let path = temp_path(name);
+            std::fs::write(&path, vec![0x5Au8; size]).unwrap();
+            let kinds = run_source_for(&path, 150);
+            assert!(kinds
+                .iter()
+                .all(|k| *k == Kind::Slate(SlateKind::NotRunning)));
+            assert!(
+                std::fs::read(&path).unwrap() == vec![0x5Au8; size],
+                "{name}: the DLL altered the file"
+            );
+        }
+    }
+
+    #[test]
+    fn a_valid_file_still_gets_consumer_state_after_it_became_valid() {
+        // the header gate must not starve a good file: invalid first, then valid, then the DLL writes
+        let path = temp_path("late-valid.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.shared().poke32(vcam_protocol::off::MAGIC, 0);
+        let mut src = FrameSource::new(path, nv12(320, 180, 30));
+        src.start();
+        let e = next_ready(&mut src, Duration::from_secs(1));
+        assert_eq!(e.kind, Kind::Slate(SlateKind::NotRunning));
+        assert_eq!(w.shared().header().consumer_active, 0);
+        w.shared()
+            .poke32(vcam_protocol::off::MAGIC, vcam_protocol::MAGIC);
+        w.set_state(WriterState::Live);
+        publish_pattern(&w, 320, 180, 2);
+        for _ in 0..20 {
+            if next_ready(&mut src, Duration::from_secs(1)).kind == Kind::Live {
+                break;
+            }
+        }
+        assert_eq!(w.shared().header().consumer_active, 1);
+        assert_eq!(
+            w.shared().header().negotiated,
+            Format::new(320, 180, 30, SUBTYPE_NV12)
+        );
+    }
+
+    fn junction(link: &std::path::Path, target: &std::path::Path) {
+        let out = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "mklink /J failed");
+    }
+
+    #[test]
+    fn a_frame_file_behind_a_junction_or_hard_link_is_not_used_and_not_touched() {
+        let base = temp_path("links");
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        // a live writer with frames: if the DLL followed a link it would show them
+        let w = Writer::create(&real.join("frames.bin")).unwrap();
+        w.set_state(WriterState::Live);
+        w.set_advertised(&vcam_protocol::advertised_for_output(1280, 720, 30));
+        publish_pattern(&w, 320, 180, 3);
+        let direct = run_source_for(&real.join("frames.bin"), 100);
+        assert!(
+            direct.contains(&Kind::Live),
+            "control run without a link: {direct:?}"
+        );
+        let clean = w.shared().header();
+
+        // 1. a junction in the path
+        let link = base.join("link");
+        junction(&link, &real);
+        for _ in 0..3 {
+            w.heartbeat();
+            let kinds = run_source_for(&link.join("frames.bin"), 100);
+            assert!(
+                kinds
+                    .iter()
+                    .all(|k| *k == Kind::Slate(SlateKind::NotRunning)),
+                "through the junction: {kinds:?}"
+            );
+        }
+        set_test_path(Some(link.join("frames.bin")));
+        assert_eq!(advertised(), vcam_protocol::default_advertised());
+        set_test_path(None);
+
+        // 2. a hard link to the file (the file then has two names: both are refused)
+        let alias = base.join("alias.bin");
+        std::fs::hard_link(real.join("frames.bin"), &alias).unwrap();
+        w.heartbeat();
+        let kinds = run_source_for(&alias, 100);
+        assert!(
+            kinds
+                .iter()
+                .all(|k| *k == Kind::Slate(SlateKind::NotRunning)),
+            "through the hard link: {kinds:?}"
+        );
+        // nothing of the refused runs reached the file: the header still shows only the control run's state
+        let after = w.shared().header();
+        assert_eq!(after.consumer_active, clean.consumer_active);
+        assert_eq!(after.negotiated, clean.negotiated);
+        assert_eq!(after.consumer_heartbeat, clean.consumer_heartbeat);
+        assert_eq!(after.delivered, clean.delivered);
+        let _ = std::fs::remove_dir(&link);
+    }
+
+    #[test]
+    fn hostile_capture_times_are_clamped_and_never_break_the_stream() {
+        let path = temp_path("captimes.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        let mut src = FrameSource::new(path, nv12(320, 180, 30));
+        src.start();
+        let freq = qpc_frequency();
+        let hostile = [
+            u64::MAX,
+            u64::MAX - 1,
+            i64::MAX as u64,
+            u64::MAX / 2,
+            0,
+            1,
+            qpc_now() + 3600 * freq,
+            qpc_now().saturating_sub(3600 * freq),
+            u64::MAX,
+        ];
+        let mut prev_ts = 0i64;
+        for (i, cap) in hostile.into_iter().enumerate() {
+            let before = qpc_now();
+            let fmt = SlotFormat {
+                width: 320,
+                height: 180,
+                stride: 320,
+                subtype: SUBTYPE_NV12,
+            };
+            w.publish(fmt, cap, |d| pattern::fill_nv12(i as u64, 320, 180, d, 320))
+                .unwrap();
+            let mut live = None;
+            for _ in 0..200 {
+                let e = next_ready(&mut src, Duration::from_secs(2));
+                if e.kind == Kind::Live {
+                    live = Some(e);
+                    break;
+                }
+                w.heartbeat();
+            }
+            let e = live.unwrap_or_else(|| panic!("no live frame for capture time {cap}"));
+            let after = qpc_now();
+            assert!(
+                e.capture_qpc <= after + freq / 20,
+                "capture {cap} became {} (now {after})",
+                e.capture_qpc
+            );
+            assert!(
+                e.capture_qpc + 5 * freq + freq / 100 >= before,
+                "capture {cap} became {} (now {before})",
+                e.capture_qpc
+            );
+            let ts = crate::stream::next_timestamp(e.sample_qpc(), prev_ts);
+            assert!(ts > prev_ts, "timestamps must grow");
+            assert!(
+                ts <= vcam_protocol::qpc_to_hns(after + freq / 20).max(prev_ts + 1),
+                "sample time {ts} is in the future for capture {cap}"
+            );
+            prev_ts = ts;
+        }
+        assert!(src.delivered() >= 9);
+    }
+
+    #[test]
+    fn capture_times_are_clamped_for_every_input() {
+        let f = 10_000_000u64;
+        let now = 100 * f;
+        // inside the window: unchanged
+        assert_eq!(clamp_capture(now - f, now, f), now - f);
+        assert_eq!(clamp_capture(now, now, f), now);
+        // far future and far past
+        assert_eq!(clamp_capture(u64::MAX, now, f), now + f / 20);
+        assert_eq!(clamp_capture(now + 1, now, f), now + 1);
+        assert_eq!(clamp_capture(now + 10 * f, now, f), now + f / 20);
+        assert_eq!(clamp_capture(0, now, f), now - 5 * f);
+        assert_eq!(clamp_capture(1, now, f), now - 5 * f);
+        // the clock is younger than the window
+        assert_eq!(clamp_capture(0, 2 * f, f), 0);
+        assert_eq!(clamp_capture(u64::MAX, 0, f), f / 20);
+        // arithmetic edges: no overflow, no panic from `clamp`
+        assert_eq!(clamp_capture(u64::MAX, u64::MAX, f), u64::MAX);
+        assert_eq!(clamp_capture(0, u64::MAX, f), u64::MAX - 5 * f);
+        assert_eq!(clamp_capture(5, 5, 0), 5);
+        assert_eq!(clamp_capture(u64::MAX, 10, u64::MAX), 10 + u64::MAX / 20);
+        // whatever the inputs, the result lies in the window
+        for cap in [0, 1, u64::MAX, u64::MAX / 2, now] {
+            for n in [0, 1, now, u64::MAX] {
+                for fr in [0, 1, f, u64::MAX] {
+                    let lo = n.saturating_sub(fr.saturating_mul(5));
+                    let hi = n.saturating_add(fr / 20);
+                    let c = clamp_capture(cap, n, fr);
+                    assert!((lo..=hi).contains(&c), "clamp({cap}, {n}, {fr}) = {c}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_torn_copy_never_reaches_the_last_frame_buffer() {
+        use vcam_protocol::{off, slot_off};
+        let path = temp_path("torn.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = std::rc::Rc::new(Writer::create(&path).unwrap());
+        w.set_state(WriterState::Live);
+        let (fw, fh) = (320u32, 180u32);
+        let mut src = FrameSource::new(path, nv12(fw, fh, 30));
+        src.start();
+        publish_pattern(&w, fw, fh, 5);
+        assert_eq!(
+            next_ready(&mut src, Duration::from_secs(1)).kind,
+            Kind::Live
+        );
+        let good = src.data().to_vec();
+        let slot_of = |data: &[u8]| {
+            pattern::analyse(
+                |r| &data[r as usize * fw as usize..(r as usize + 1) * fw as usize],
+                SUBTYPE_NV12,
+                fw,
+                fh,
+            )
+            .slot()
+        };
+        assert_eq!(slot_of(&good), Some(5 % pattern::slots(fw)));
+
+        // The next frame is published (a frame period later, or capture-time decimation would skip it), but while
+        // the DLL copies it the "writer" scribbles over it and finishes another frame (seq changes): the sequence
+        // check rejects the copy, twice, so the read ends torn.
+        std::thread::sleep(Duration::from_millis(40));
+        publish_pattern(&w, fw, fh, 6);
+        let w2 = w.clone();
+        COPY_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let sh = w2.shared();
+                let slot = sh.header().latest_slot as usize;
+                let meta = sh.slot_meta(slot);
+                sh.poke_bytes(meta.data_offset as usize, &vec![0xEE; (fw * fh) as usize]);
+                sh.poke64(slot_off(slot) + off::SLOT_SEQ, meta.seq + 2);
+            }))
+        });
+        // no new frame can be taken now; after 1.5 frame durations the last frame is repeated
+        let e = next_ready(&mut src, Duration::from_secs(1));
+        assert_eq!(e.kind, Kind::Repeat);
+        assert!(
+            src.data() == good.as_slice(),
+            "the repeat shows bytes of the torn copy"
+        );
+        let e = next_ready(&mut src, Duration::from_secs(1));
+        assert_eq!(e.kind, Kind::Repeat);
+        assert!(src.data() == good.as_slice());
+        COPY_HOOK.with(|h| *h.borrow_mut() = None);
+
+        // and a good frame afterwards goes through as usual
+        std::thread::sleep(Duration::from_millis(40));
+        publish_pattern(&w, fw, fh, 7);
+        let e = next_ready(&mut src, Duration::from_secs(1));
+        assert_eq!(e.kind, Kind::Live);
+        assert_eq!(slot_of(src.data()), Some(7 % pattern::slots(fw)));
     }
 
     #[test]

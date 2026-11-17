@@ -146,3 +146,64 @@ impl IMFActivate_Impl for Activator_Impl {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Media::MediaFoundation::{MFStartup, MFSTARTUP_FULL, MF_VERSION};
+
+    /// References on a COM object, read with an AddRef/Release pair.
+    fn refs(u: &IUnknown) -> u32 {
+        unsafe {
+            let vt = Interface::vtable(u);
+            let n = (vt.AddRef)(u.as_raw());
+            (vt.Release)(u.as_raw());
+            n - 1
+        }
+    }
+
+    /// Review finding 5 said `dump_attributes` leaks the `PROPVARIANT` it reads (no `Drop` in windows 0.62). It does
+    /// not: with the `Win32_System_Variant` feature (enabled for this crate) the `windows` crate gives `PROPVARIANT`
+    /// a `Drop` that calls `PropVariantClear` (`windows-0.62.2/src/extensions/Win32/System/StructuredStorage.rs`).
+    /// This test pins that down: a COM reference held by an attribute keeps its count across many dumps. If the
+    /// feature were ever removed, this test would fail and `PropVariantClear` would have to be called by hand.
+    #[test]
+    fn dumping_the_attributes_leaks_no_reference() {
+        unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL).unwrap() };
+        let mut store: Option<IMFAttributes> = None;
+        unsafe { MFCreateAttributes(&mut store, 4).unwrap() };
+        let store = store.unwrap();
+        let mut held: Option<IMFAttributes> = None;
+        unsafe { MFCreateAttributes(&mut held, 1).unwrap() };
+        let held: IUnknown = held.unwrap().into();
+        unsafe {
+            store
+                .SetUnknown(
+                    &GUID::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888),
+                    &held,
+                )
+                .unwrap();
+            store
+                .SetString(
+                    &GUID::from_u128(0x2111_2222_3333_4444_5555_6666_7777_8888),
+                    windows_core::w!("a string that an unread PROPVARIANT would leak"),
+                )
+                .unwrap();
+            store
+                .SetUINT32(
+                    &GUID::from_u128(0x3111_2222_3333_4444_5555_6666_7777_8888),
+                    7,
+                )
+                .unwrap();
+        }
+        let before = refs(&held);
+        for _ in 0..50 {
+            dump_attributes("test", &store);
+        }
+        assert_eq!(
+            refs(&held),
+            before,
+            "dump_attributes keeps references it never releases"
+        );
+    }
+}

@@ -547,3 +547,95 @@ target\release\vcam-tool.exe capture-test --expect feed-to-slate --frames 360   
 target\release\vcam-tool.exe capture-test --expect slate --size 1280x720        (no writer running)
 target\release\vcam-tool.exe gen-slates --preview %TEMP%\slates                 (only when a slate's look changes)
 ```
+# P-hardening: robustness of the DLL and the frame-file protocol (review fixes)
+
+A code review of the P2 DLL and `vcam-protocol` found faults that could crash the camera service or alter files it
+should not touch. Every finding below was fixed with a regression test (one finding was wrong, see 5). No layout
+change: `PROTOCOL_VERSION` is still 1 and the file is byte-compatible with the app. Build registered at the end:
+`C:\Program Files\Better Cam\vcam\better_cam_vcam_1.4690e664.dll` (`Build=4690e664`).
+
+## What changed
+
+| # | Finding | Fix | Regression test |
+|---|---|---|---|
+| 1 | The mapping could be shorter than `len`; a reader then ran past the view (reproduced: `0xC0000005` in the DLL path) | `MappedFile::map` asks `MapViewOfFile` for exactly the checked size (fails when the section is smaller) and confirms it with `VirtualQuery`; the guarantee that protects a reader after mapping is written on `MappedFile` | `map::tests::a_file_that_shrinks_between_the_size_check_and_the_mapping_is_refused` (deterministic, hook between size query and mapping), `a_reader_survives_a_file_whose_size_keeps_switching` (the reviewer's race, 3 s), `a_mapped_file_cannot_be_truncated_under_a_reader` |
+| 2 | The DLL wrote consumer fields into files whose header was not valid | `FrameSource.header_ok` is the result of the most recent `validate_header`; `announce`, `finish_emit`, `stop` and the statistics write only while it is true | `frames::tests::foreign_files_and_other_protocol_versions_are_never_written_to` (file byte-identical afterwards), `a_valid_file_still_gets_consumer_state_after_it_became_valid` |
+| 3 | The shared file and the log were opened without checking what they are | new `vcam_protocol::secure`: `FILE_FLAG_OPEN_REPARSE_POINT`, refuse reparse points, directories and files with more than one hard link, and `GetFinalPathNameByHandleW` must equal `<ProgramData>\BetterCam\frames.bin` on a local fixed disk (`MappedFile::open_pinned`, `read_advertised_pinned`); `%ProgramData%` comes from `SHGetKnownFolderPath`; the DLL creates no folders; the log verifies the `logs` folder and file the same way and rotates by truncating its verified handle | `secure::tests::*` (junction, hard link, directory, symbolic link, `..`), `frames::tests::a_frame_file_behind_a_junction_or_hard_link_is_not_used_and_not_touched`, `log::tests::missing_folders_are_never_created`, `a_logs_folder_that_is_a_junction_gets_nothing`, `a_data_folder_that_is_a_junction_gets_nothing`, `a_hard_linked_log_file_is_refused_and_left_alone`, `a_symbolic_link_as_log_file_is_refused_when_one_can_be_made` |
+| 4 | One log file per process, never deleted | when a log starts it keeps the newest 8 `vcam-*.log` plus those of running processes (only plain files are deleted); size cap kept (1 MB, truncated in place) | `log::tests::the_number_of_logs_stays_bounded_over_many_process_starts`, `pruning_keeps_the_newest_and_the_running_and_touches_only_plain_logs`, `a_full_log_is_truncated_through_its_handle_and_never_renamed` |
+| 5 | `PROPVARIANT` leak in `dump_attributes` | **finding is wrong, code unchanged** (see below) | `activator::tests::dumping_the_attributes_leaks_no_reference` |
+| 6 | `capture_qpc` from the file used unchecked | clamped to `[now - 5 s, now + 50 ms]` (`frames::clamp_capture`); `saturating_add` for the pacing arithmetic; `next_timestamp` saturates; `qpc_to_hns` / `hns_to_qpc` saturate | `frames::tests::hostile_capture_times_are_clamped_and_never_break_the_stream`, `capture_times_are_clamped_for_every_input`, `stream::tests::sample_times_never_overflow_and_always_grow`, `map::tests::time_conversions_saturate_instead_of_wrapping` |
+| 7 | A torn copy stayed in the "last frame" buffer | the read callback copies into `scratch`, swapped into `frame` only on a confirmed read | `frames::tests::a_torn_copy_never_reaches_the_last_frame_buffer` |
+| 8a | A panic in the pump left the stream "running" | the thread body runs in `catch_unwind`; a panic queues `MEError`; `timeBeginPeriod` is a guard (`TimerPeriod`) that ends on every path | `stream::tests::a_panic_in_the_pump_becomes_an_error_event_for_the_consumer`, `the_timer_resolution_is_given_back_when_the_pump_panics` |
+| 8b | `Pump::stop` joined under the stream and source locks | stream `start`/`stop`/`shutdown` take the old pump out and stop it outside the `state` lock (a separate `control` lock serialises them); `Source::Start`/`Stop` no longer hold the source lock across it; the wait is bounded (2 s), after that the thread is left to end by itself | `stream::tests::the_stream_state_lock_is_free_while_an_old_pump_is_being_stopped`, `stopping_a_pump_stuck_in_a_call_does_not_wait_for_ever` |
+| 8c | `num + den / 2` overflowed `u32` | `round_fps` in 64 bits (`Format::fps`, `FrameFormat::from_media_type` through `fps_of_rate`) | `header::tests::rounded_frame_rates_do_not_overflow`, `validate::tests::extreme_frame_rates_neither_overflow_nor_pass`, `mediatype::tests::frame_rates_of_every_edge_do_not_overflow` |
+| 8d | 4096x2304 NV12 was valid but did not fit a slot | `validate_format` also requires the tight NV12 frame to fit `SLOT_CAPACITY`; `advertised_for_output` drops entries that are not valid formats | `validate::tests::accepted_formats_always_fit_a_slot_and_nothing_that_fits_is_refused`, `seqlock::tests::publish_rejects_bad_formats` |
+
+The tests of findings 1, 2, 3, 4, 6, 7, 8a (the error event), 8b (the state lock), 8c (header) and 8d were run with the
+old behaviour re-introduced by hand, one at a time: each fails then (finding 1: the stress test dies with
+`STATUS_ACCESS_VIOLATION` on the unfixed code, the hook test fails). The tests of the new helper functions (`clamp_capture`,
+`next_timestamp`, `fps_of_rate`, `TimerPeriod`) have no old version to run. The truncation test passes on the old code too: it
+documents the guarantee the old code already relied on.
+
+### The guarantee behind finding 1
+
+Windows refuses to cut a file below the size of a mapped section (`ERROR_USER_MAPPED_FILE`, 1224), in read-only and
+read-write mappings, so after `CreateFileMappingW` a view cannot shrink under a reader (test above). The old code's
+fault was the window *before* the section exists: the size was read first, the section took the size at a later moment.
+`MapViewOfFile(.., len)` now fails when the section is smaller. What no check can catch is a read error of the medium
+under a mapped view (an in-page exception that `catch_unwind` cannot stop); pinning the file to a local fixed disk is
+what keeps a removable or network medium out.
+
+### Finding 5 is wrong
+
+`PROPVARIANT` has a `Drop` in `windows` 0.62.2 when the `Win32_System_Variant` feature is on, which this crate enables
+(`windows-0.62.2/src/extensions/Win32/System/StructuredStorage.rs`: `impl Drop for PROPVARIANT` calls
+`PropVariantClear`). The test holds a COM reference in an attribute and dumps 50 times: the count does not move. As a
+control, the same test fails (52 references instead of 2) when the value is wrapped in `ManuallyDrop`, so it would catch
+a real leak. No change to `activator.rs`.
+
+## Check results
+
+```
+cargo test -p vcam-protocol -p vcam-source -p vcam-tool    54 + 51 + 12 passed, 0 failed
+cargo clippy -p vcam-protocol -p vcam-source -p vcam-tool --all-targets   0 warnings (the LNK4104 linker note was there before)
+cargo fmt -p vcam-protocol -p vcam-source -p vcam-tool --check            clean
+cargo check -p better-cam                                  passes
+```
+
+Live, with the fixed DLL registered (one UAC prompt, answered in seconds; Frame Server was stopped once by `register`):
+
+```
+vcam-tool status                                      listed: true, directshow listed: true
+vcam-tool feed --size 1920x1080 --fps 60 --seconds 40 (background)
+vcam-tool capture-test --expect feed --frames 600     600 frames in 9.98 s, 60.03 fps, max gap 18 ms, 0 torn / black / repeated   PASS
+stats, consumer attached                              consumer_active 1, latency_p50 1086 us, latency_p95 1970 us, delivered 232, repeated 0 (0.000 %)
+stats right after the 600 frames                      latency_p95 2092 us, repeated 0.000 %
+feeder stopped: capture-test --expect slate           120 of 120 frames match the slate, PASS
+```
+
+A foreign `frames.bin` (8 KB of 0x5A in place of the file) gave the slate (`capture-test --expect slate --frames 90`
+PASS) and was byte-identical afterwards (same SHA-256). `frames.bin` as a second hard link of a live file, with a
+feeder writing into it, gave the slate too (PASS); the unit test of the same case fails with the old open call. Both were done by
+renaming the real file away and back: afterwards the folder DACL, the file DACL, the creation time and the size were
+the same and the file has one link. Not done live: a junction in place of `BetterCam` or `logs` (the service holds
+open files in `logs`, and replacing `BetterCam` would touch the folder and its permissions); covered by the unit
+tests above.
+
+Logs: 31 `vcam-*.log` files before the fixed DLL was registered; the first start of the fixed DLL pruned them to 9
+(newest 8 plus the current). Ten `capture-test --frames 30` runs (all go through one Frame Server process) and fourteen
+`status` runs: still 9 (`before 9, after 9`). The ten runs print `FAIL (... Feed)` only because `capture-test` expects a
+feed by default and no feeder was running; they were run for their consumer side effect, not for the pattern.
+
+## Open items for the installer
+
+* The DLL no longer creates `%ProgramData%\BetterCam` or `logs`; the installer must (it already does, register prints
+  `data dir ready`), with a DACL that lets LOCAL SERVICE and the user write.
+* `vcam-install` still resolves the data folder from the `ProgramData` environment variable (`util.rs` `data_dir`);
+  use `vcam_protocol::secure::program_data_dir()`.
+* The elevated `register` applies a DACL to `frames.bin` with `SetNamedSecurityInfoW`, which follows links: it must
+  refuse a `frames.bin` (and `logs`) that is a link, a junction or has more than one hard link before it touches it
+  (`vcam_protocol::secure::open_existing` and `verify_dir` do the checks). The same for `remove_data_dir`.
+* The folder is writable by the installing user. To make link planting impossible rather than refused, the installer
+  could give the user only modify rights on `frames.bin` (not create or delete rights in the folder) and make `logs`
+  writable by LOCAL SERVICE only; that needs the installer to create `frames.bin` first, and the app's `Writer::create`
+  (which still creates the folder and opens with `OPEN_ALWAYS`, following links) would then only open it.
