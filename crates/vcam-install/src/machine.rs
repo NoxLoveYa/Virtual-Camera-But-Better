@@ -60,6 +60,14 @@ pub trait Machine {
     fn stop_frame_server(&mut self) -> bool;
     /// Delete a file that is in use at the next restart.
     fn delete_at_reboot(&mut self, p: &Path) -> Res<()>;
+    /// The names (not paths) of the data folders this helper moved aside in `%ProgramData%` and could not delete
+    /// then. Kept where only administrators can write (the helper's HKLM key), so the sweep acts on exactly these
+    /// and not on whatever a user made under a similar name.
+    fn aside_names(&mut self) -> Vec<String>;
+    /// Add `name` to the record (no duplicates).
+    fn record_aside(&mut self, name: &str) -> Res<()>;
+    /// Take `name` out of the record (it is gone, or no longer the helper's).
+    fn forget_aside(&mut self, name: &str);
 }
 
 /// The real machine.
@@ -148,6 +156,9 @@ impl Machine for RealMachine {
     }
 
     fn delete_registration(&mut self) -> Vec<String> {
+        // the record of moved-aside folders is not part of the registration: it outlives it until the folders are
+        // gone (the next install or removal sweeps them)
+        let asides = self.aside_names();
         let mut failed = Vec::new();
         for key in [
             vcam_protocol::clsid_key(),
@@ -156,6 +167,15 @@ impl Machine for RealMachine {
             let r = registry::delete_tree(&key);
             if r != windows::Win32::Foundation::ERROR_SUCCESS && r != ERROR_FILE_NOT_FOUND {
                 failed.push(format!("HKLM\\{key} (error {})", r.0));
+            }
+        }
+        if !asides.is_empty() {
+            if let Err(e) = registry::set_multi_string(
+                vcam_protocol::VCAM_STATE_KEY,
+                registry::ASIDE_VALUE,
+                &asides,
+            ) {
+                failed.push(format!("the record of old data folders ({e})"));
             }
         }
         registry::delete_key_if_empty(r"SOFTWARE\BetterCam");
@@ -217,5 +237,36 @@ impl Machine for RealMachine {
         let w = wide(&p.to_string_lossy());
         unsafe { MoveFileExW(pcwstr(&w), PCWSTR::null(), MOVEFILE_DELAY_UNTIL_REBOOT) }
             .map_err(|e| werr("MoveFileExW", e))
+    }
+
+    fn aside_names(&mut self) -> Vec<String> {
+        registry::get_multi_string(vcam_protocol::VCAM_STATE_KEY, registry::ASIDE_VALUE)
+    }
+
+    fn record_aside(&mut self, name: &str) -> Res<()> {
+        let mut names = self.aside_names();
+        if !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+        registry::set_multi_string(vcam_protocol::VCAM_STATE_KEY, registry::ASIDE_VALUE, &names)
+    }
+
+    fn forget_aside(&mut self, name: &str) {
+        let mut names = self.aside_names();
+        names.retain(|n| n != name);
+        if !names.is_empty() {
+            let _ = registry::set_multi_string(
+                vcam_protocol::VCAM_STATE_KEY,
+                registry::ASIDE_VALUE,
+                &names,
+            );
+            return;
+        }
+        registry::delete_value(vcam_protocol::VCAM_STATE_KEY, registry::ASIDE_VALUE);
+        // the key holds nothing else when there is no registration: the record was all that kept it
+        if registry::read_registered().is_none() {
+            let _ = registry::delete_tree(vcam_protocol::VCAM_STATE_KEY);
+            registry::delete_key_if_empty(r"SOFTWARE\BetterCam");
+        }
     }
 }

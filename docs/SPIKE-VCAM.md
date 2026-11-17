@@ -908,9 +908,6 @@ no need. `fsutil sparse setflag` fails for the user only because it asks for mor
 
 ## Not done
 
-* Reads and the rename of the DLL in `Program Files` (`install::copy_dll`: `std::fs::read(dest)`, `rename(tmp, dest)`;
-  `std::fs::read(dll_src)`) still use the plain open: a standard user can read that folder, so a lock on the installed
-  DLL could make a Repair wait. The deletes there go through handles now. The same bounded handle read would close it.
 * A Repair fails (quickly, with the file named) while a program of the user holds an unanswered lock on `install.log`;
   Remove leaves `install.log`, `logs` and the data folder in that case, and says so. Neither waits.
 
@@ -953,3 +950,75 @@ frames.bin made sparse by a FILE_WRITE_DATA-only handle (app closed, standard us
                              install.log: "frames.bin: it is sparse or compressed; clearing that in place"; app LIVE, a consumer read 234 video frames in 8 s
 Remove, Install              5.8 s, 0.3 s; status missing, then ok; the user's old entry was skipped again, not an error
 ```
+
+
+# P-hardening 5: oversized frame files, the DLL copy, the sweep record (fourth review fixes)
+
+A fourth review found one medium fault that the last change introduced, one medium fault that was left open on
+purpose, and four small ones. All fixed, each with a test; the two medium ones were run against the old code (see
+"Check results"). No change to the frame-file layout, `PROTOCOL_VERSION`, the permission design of "P-hardening 3",
+the helper's command line or its exit codes (0, 1, 2, 5, 10, 11). **No file of `crates/vcam-source` changed**, and no
+function of `secure` that the DLL calls changed (`program_data_dir`, `expected_path`, `open_no_follow`, `open_with`,
+`verify_dir`, `verify_file`, `remove_plain_file`, `is_refused`, the access and share constants); the installed DLL stays
+valid without a new registration.
+
+## What changed
+
+| # | Finding | Fix | Tests |
+|---|---|---|---|
+| M1 | A Repair kept an oversized `frames.bin` and, since "P-hardening 4", cleared its sparse flag in place: a 512 MB sparse file went from 0 to 536,870,912 bytes on disk (Windows allocates the whole length synchronously, with the machine-wide lock held), and the DLL refuses the file anyway (`MAX_FILE_SIZE`) | `datadir::frame_file_in_shape` looks at the **length first**: any length but `FILE_SIZE` is a reason to replace the file, before a flag is touched, so nothing large is ever allocated; the length is read again after the flags were cleared, and `prepare_recording` ends with a check that the file is exactly `FILE_SIZE` (the file kept or made has that length already; a new file is grown to it, and a file that is changed in that moment is an error that says so) | `datadir::tests::an_oversized_sparse_frame_file_is_replaced_and_its_length_is_never_allocated` (a plain sparse 512 MB file made by the test, on-disk size read with `GetCompressedFileSizeW` before and after; deleted with the sandbox), `an_undersized_and_a_wrong_sized_frame_file_end_at_the_expected_size` (0, half, one short, one over, double), `the_length_check_leaves_the_in_place_clearing_of_a_right_sized_file_alone` |
+| M2 | The DLL copy waited for another program's lock: `std::fs::read(dll_src)`, `std::fs::read(dest)`, `File::open` in `file_looks_like_dll`, `std::fs::write` and `std::fs::rename` of the temporary file | `secure::read_file` / `open_read_following` (`NtCreateFile`, `FILE_COMPLETE_IF_OPLOCKED`; a link at the end is followed, it is a path the caller names), `secure::write_new_file` (a new file through a handle), `secure::rename_replacing_no_wait` (the handle rename with `ReplaceIfExists`, bounded like `rename_no_wait`); a stale temporary file is deleted through the handle delete first; `util::dll_build` reads the same way. A locked file is an error that names it (`install::file_error`: "... is locked by another program ... not waiting for it"), before anything is touched when it is the source. The rollback is unchanged | `install::tests::a_dll_source_that_a_program_holds_a_lock_on_is_a_named_error_and_not_a_wait`, `an_installed_copy_that_a_program_holds_a_lock_on_is_a_named_error_and_not_a_wait`, `a_different_copy_that_a_program_holds_a_lock_on_is_not_replaced_and_not_waited_for` (read-handle and read-write-handle lock), `a_leftover_temporary_file_that_a_program_holds_a_lock_on_is_a_named_error_and_not_a_wait`, `the_copy_works_when_nothing_is_locked_and_is_rolled_back_when_the_install_fails` (also replacing a damaged copy), `secure::tests::reading_writing_and_replacing_a_file_do_not_wait_for_an_oplock` |
+| L1 | `bounded` cancelled the rename once; a worker that had not entered the call yet (or could not be cancelled at that instant) was then joined without limit | `secure::bounded_with` repeats `CancelSynchronousIo` every 100 ms from the moment the bound has passed until the worker reports it is done; `bounded` is that with the real cancel | `secure::tests::a_call_that_ignores_the_first_cancels_is_cancelled_again_until_it_returns` (the stand-in lands on the fourth cancel; with one cancel it never returns), `a_call_that_returns_in_time_is_left_alone` |
+| L2 | A user could flood every run's log (one open, one owner read and one line per `BetterCam.old-*` entry) until the start marker of the run fell out of the tail the app reads | Entries that are not on the helper's record are not looked at at all. Of the recorded ones at most 32 are examined per run (`MAX_ASIDES_EXAMINED`; the rest stay on record and the log says how many), and the ones left alone are **one summary line**: the count and the first three names | `datadir::tests::entries_that_a_user_made_under_old_names_are_not_looked_at_and_do_not_flood_the_log` (400 entries: no line, none touched), `recorded_entries_that_are_left_alone_are_one_line_and_the_number_looked_at_is_bounded` |
+| L3 | "Owned by SYSTEM or Administrators" does not prove that the helper made an entry (an administrator-owned folder that a user may rename into `%ProgramData%` has that owner) | The helper **records** every data folder it moves aside and could not delete in `HKLM\SOFTWARE\BetterCam\Vcam`, value `MovedAside` (`REG_MULTI_SZ`; only administrators write the key), through `Machine::record_aside`; the sweep acts on exactly those names (`sweep_data_asides(paths, trusted, recorded, log) -> AsideSweep { left, forget }`). A recorded name is deleted only while it is not a link and its owner is trusted (looked at without following a link or touching a lock, and again on the handle the delete goes through); one that is gone, a link now, owned by somebody else, or not a plausible name (`\`, `/`, `:`) is **left exactly as it is and dropped from the record** (`Machine::forget_aside`); one that is still in use stays on record. `delete_registration` keeps the record, `read_registered` ignores a key that holds nothing else; removing the last name removes the key when no registration is there. The registry is behind the `Machine` trait, so the tests inject it | `datadir::tests::only_the_recorded_names_are_swept_and_the_record_is_cleared_of_what_is_done_with` (not recorded: stays; junction: not followed, dropped; owner changed: dropped; gone: dropped; a damaged name `BetterCam.old-\..\..\victim.txt`: never joined to a path), `moved_aside_data_folders_next_to_betercam_are_swept_without_following_links`, `a_sweep_entry_of_somebody_else_is_left_alone_and_never_waited_for`, `a_data_folder_that_is_moved_aside_and_stays_is_named_and_one_that_goes_is_not`, `install::tests::a_data_folder_that_stays_after_it_was_moved_aside_is_put_on_record` (also with a record that cannot be written), `an_install_and_an_uninstall_delete_the_data_folders_that_were_moved_aside`, `an_old_data_folder_that_cannot_be_deleted_is_reported_by_uninstall`, `registry::tests::*` |
+| L4 | Converting `RemoveError` to `io::Error` for a locked file dropped "(and N more)" | the count is part of the message; the error is still told apart as a lock | `secure::tests::the_count_of_the_entries_that_stayed_is_kept_when_the_error_is_converted` |
+| - | No test for "entry replaced between the two checks" | `sweep_data_asides_with` takes a hook that runs between the first look and the delete (and may change the owners the second look trusts: a real owner cannot be changed without a privilege) | `datadir::tests::an_entry_that_is_swapped_for_a_junction_after_the_first_look_is_left_alone`, `an_entry_whose_owner_is_not_trusted_on_the_handle_is_left_alone` |
+
+An existing record (none: this is new) is not needed for an upgrade: a `BetterCam.old-*` folder that an earlier version
+moved aside and could not delete stays where it is and is no longer deleted by the helper, because it is not on the
+record. It is inert (nobody but administrators can use it) and an administrator can delete it by hand. That is the
+price of "only what the helper itself moved aside".
+
+## Things found only by running it
+
+* **The 512 MB case needs a file of the user's making.** The file the helper makes has `FILE_ATTRIBUTE_TEMPORARY`, and on
+  this volume extending such a file gives it storage at once (37 MB for a `set_len` of 512 MB on a truncated, sparse,
+  temporary file), so the test makes a plain sparse file at that path instead, like a user would.
+* **An object that gives the caller nothing is undeletable only because of `SYNCHRONIZE`.** "P-hardening 4" says no open
+  for `DELETE` is allowed when the object's DACL does not grant it. Tried again: the owner of a file whose DACL
+  gives them only `READ_CONTROL | WRITE_DAC | SYNCHRONIZE` (no `DELETE`, no `FILE_READ_ATTRIBUTES`) can have it deleted
+  through the helper's handle delete, because the parent folder gives the delete-child right and every open here
+  asks for `SYNCHRONIZE`; with no ACE at all for the caller (nothing, `SYNCHRONIZE` included) the open is refused.
+  The helper's own objects grant Administrators full control, so this does not change what it can delete; the test
+  helper `testkit::undeletable_file` uses the second form, and `make_deletable` gives the rights back by path
+  (`SetNamedSecurityInfoW` opens for `WRITE_DAC` alone), because nothing in `secure` can open such a file.
+* `rustfmt` flips between two forms of a `match` arm with a long `format!` that returns: the code was restructured to
+  have one form.
+
+## Not done / for a later session
+
+* A live Repair with an oversized frame file, and a live Update with a locked DLL (this session ran no app, no
+  elevated step and touched neither `%ProgramData%\BetterCam` nor `Program Files\Better Cam`).
+* A moved-aside data folder from before this change is not on the record (see above).
+* Reading the DLL source and the installed copy is bounded in time (it does not wait), not in size; the source is a
+  file the app ships and `Program Files` is the administrators'.
+
+## Check results
+
+```
+cargo test -p vcam-protocol -p vcam-install -p vcam-tool   vcam-install 127 passed (+2 ignored: the child processes of two lock tests),
+                            vcam-protocol 72, vcam-tool 17; 0 failed (before: 110, 68, 17)
+cargo clippy -p vcam-protocol -p vcam-install -p vcam-tool --all-targets     0 warnings
+cargo fmt --check -p vcam-protocol -p vcam-install -p vcam-tool              clean
+cargo check -p better-cam                    ok
+git diff --stat f15bbd4 -- crates/vcam-source     empty
+```
+
+With the old behaviour put back by hand (the length check and the final size check taken out of `datadir`; `copy_dll`,
+the source read and `file_looks_like_dll` as plain `std::fs`): `an_oversized_sparse_frame_file_...` fails with
+"the length was allocated: 0 -> 536870912 bytes on disk" and the log shows "it is sparse or compressed; clearing that in
+place ... kept" (the reviewer's numbers); `an_undersized_and_a_wrong_sized_...` fails with "empty: kept" (the file
+index is the same, the file was grown in place, not replaced); the four lock tests of the DLL copy fail after their 10 s
+bound with "still waiting after 10s (it waits for a lock)". The L1 test cannot run against the old `bounded` (it takes no
+stand-in; with one cancel the worker is joined for ever). L2, L3, L4 and the new branch test are tests of new
+behaviour: L4's assertion is the text that the old conversion never had.

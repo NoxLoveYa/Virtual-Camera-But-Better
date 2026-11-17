@@ -6,6 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
+use vcam_protocol::secure;
+
 use crate::acl::{valid_sid, Principals};
 use crate::datadir;
 use crate::log::Log;
@@ -48,12 +50,15 @@ pub fn looks_like_dll(bytes: &[u8]) -> bool {
     bytes.len() >= MIN_DLL_BYTES && bytes.starts_with(b"MZ")
 }
 
-/// Whether the file at `path` can be a real DLL (reads its first bytes and its size only).
+/// Whether the file at `path` can be a real DLL (reads its first bytes and its size only). A file that another
+/// program holds an opportunistic lock on is not waited for (the open is the refusal of [`secure::open_with`]): it
+/// does not look like a DLL for now.
 pub fn file_looks_like_dll(path: &Path) -> bool {
     use std::io::Read;
-    let Ok(mut f) = std::fs::File::open(path) else {
+    let Ok(h) = secure::open_read_following(path) else {
         return false;
     };
+    let mut f = std::fs::File::from(h);
     let Ok(meta) = f.metadata() else {
         return false;
     };
@@ -66,7 +71,21 @@ pub fn file_looks_like_dll(path: &Path) -> bool {
 /// wait (with the machine-wide lock taken). A file that is locked, or loaded by the camera service, is "in use" as
 /// before, and the callers go on from there (stop the service, delete at the next restart).
 fn delete_file(p: &Path) -> std::io::Result<()> {
-    vcam_protocol::secure::remove_tree(p).map_err(std::io::Error::from)
+    secure::remove_tree(p).map_err(std::io::Error::from)
+}
+
+/// The sentence for a read, write, delete or rename of `path` that failed with `e`. A file that another program holds
+/// an opportunistic lock on is said so, with its name: nothing here waits for such a program, and the person who
+/// reads it knows what to close.
+fn file_error(what: &str, path: &Path, e: &std::io::Error) -> String {
+    if secure::is_oplock_busy(e) {
+        format!(
+            "{} is locked by another program (it holds an opportunistic lock); not waiting for it. Close the program that has it open and try again",
+            path.display()
+        )
+    } else {
+        werr(&format!("{what} {}", path.display()), e)
+    }
 }
 
 fn is_ours(p: &Path) -> bool {
@@ -119,8 +138,9 @@ pub fn install_with(
             Principals::machine(opts.user_sid.as_deref())
         }
     };
-    let bytes =
-        std::fs::read(dll_src).map_err(|e| werr(&format!("read {}", dll_src.display()), e))?;
+    // the source can be in a folder the user runs the app from: a program of theirs may hold a lock on it, which
+    // makes a plain read wait (with the machine-wide lock taken)
+    let bytes = secure::read_file(dll_src).map_err(|e| file_error("read", dll_src, &e))?;
     if !looks_like_dll(&bytes) {
         return Err(format!(
             "{} is not the virtual camera DLL (build it with `npm run vcam:build`)",
@@ -136,7 +156,27 @@ pub fn install_with(
         .filter(|r| Path::new(&r.dll).is_file());
 
     // 1. the data folder (no registration exists because of this step, nothing to undo)
-    if let Err(e) = datadir::prepare(paths, &principals, &mut || m.stop_frame_server(), log) {
+    let mut moved = Vec::new();
+    let prepared = datadir::prepare_recording(
+        paths,
+        &principals,
+        &mut || m.stop_frame_server(),
+        log,
+        &mut moved,
+    );
+    // a data folder that was moved aside and could not be deleted is the helper's: its name goes on record (also when
+    // preparing failed later), and the sweep of a later run deletes exactly the names on record
+    for name in &moved {
+        match m.record_aside(name) {
+            Ok(()) => log.line(&format!(
+                "{name} is on record; the next install or removal deletes it"
+            )),
+            Err(e) => log.line(&format!(
+                "could not put {name} on record ({e}); it stays where it is"
+            )),
+        }
+    }
+    if let Err(e) = prepared {
         // The log was let go of while the folder was worked on: whatever the caller writes about this failure (the
         // `ERROR:` line the app shows) must reach the file, so make it ready again before returning.
         log.folder_ready();
@@ -172,7 +212,11 @@ pub fn install_with(
 
     // 5. only now the older DLLs
     let pending = remove_old_dlls(&paths.install, &dest, m, log);
-    datadir::sweep_asides(paths, &principals.trusted_owners, log);
+    let recorded = m.aside_names();
+    let swept = datadir::sweep_asides(paths, &principals.trusted_owners, &recorded, log);
+    for name in &swept.forget {
+        m.forget_aside(name);
+    }
     Ok(if pending {
         log.line(
             "installed; the camera service still has an older build loaded: the new one takes effect after that service restarts or Windows restarts",
@@ -184,19 +228,35 @@ pub fn install_with(
 }
 
 /// Write `bytes` to `dest` unless it is already there. Returns true when a new file was made.
+///
+/// `Program Files` can be read by a standard user, so a program of theirs can hold an opportunistic lock on the copy
+/// that is there (or on a leftover temporary file), which makes a plain read, write or rename wait with the
+/// machine-wide lock taken. Nothing here waits: the copy is read through [`secure::read_file`], the temporary file is
+/// made and moved into place through handles, and a file that is locked is an error that names it.
 fn copy_dll(bytes: &[u8], dest: &Path, log: &mut dyn Log) -> Res<bool> {
-    if std::fs::read(dest).map(|d| d == bytes).unwrap_or(false) {
-        log.line(&format!("dll already present: {}", dest.display()));
-        return Ok(false);
+    match secure::read_file(dest) {
+        Ok(there) if there == bytes => {
+            log.line(&format!("dll already present: {}", dest.display()));
+            return Ok(false);
+        }
+        // other contents under this name: it is replaced below
+        Ok(_) => {}
+        Err(e) if secure::is_oplock_busy(&e) => return Err(file_error("read", dest, &e)),
+        // not there, or not readable: the write below says what is the matter
+        Err(_) => {}
     }
     if let Some(dir) = dest.parent() {
         std::fs::create_dir_all(dir).map_err(|e| werr("create install dir", e))?;
     }
     // a name that is never registered, then a rename: a failed copy leaves no half DLL under the real name
     let tmp = dest.with_extension("dll.tmp");
-    let result = std::fs::write(&tmp, bytes)
-        .and_then(|()| std::fs::rename(&tmp, dest))
-        .map_err(|e| werr(&format!("write {}", dest.display()), e));
+    let result = (|| -> Res<()> {
+        // what an earlier run left behind (the file is made new, so that nothing of it stays in the copy)
+        delete_file(&tmp).map_err(|e| file_error("remove the old", &tmp, &e))?;
+        secure::write_new_file(&tmp, bytes).map_err(|e| file_error("write", &tmp, &e))?;
+        // one step: `dest` is the old file or the new one, never none
+        secure::rename_replacing_no_wait(&tmp, dest).map_err(|e| file_error("write", dest, &e))
+    })();
     if result.is_err() {
         let _ = delete_file(&tmp);
     }
@@ -429,7 +489,12 @@ pub fn uninstall_trusting(
         left.push(why);
     }
     // a data folder that an install moved out of the way lives next to `BetterCam`, not in it
-    if datadir::sweep_data_asides(paths, trusted, log) > 0 {
+    let recorded = m.aside_names();
+    let swept = datadir::sweep_data_asides(paths, trusted, &recorded, log);
+    for name in &swept.forget {
+        m.forget_aside(name);
+    }
+    if swept.left > 0 {
         left.push(format!(
             "an old copy of the data folder in {} (in use)",
             paths.program_data.display()

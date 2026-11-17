@@ -105,3 +105,87 @@ pub fn fake_dll(dir: &Path, fill: u8) -> PathBuf {
     std::fs::write(&p, bytes).unwrap();
     p
 }
+
+/// A file `name` in `dir` that nobody but SYSTEM has any right on (its owner can only change the permissions back, by
+/// [`make_deletable`]). Every open of the helper asks for `SYNCHRONIZE` and the owner has no right to it, so the
+/// helper cannot delete the file (the plain `DeleteFileW` could, through the delete-child right of the folder). A
+/// folder with such a file in it can be renamed and not deleted: an old copy that stays.
+pub fn undeletable_file(dir: &Path, name: &str, owner: &str) -> PathBuf {
+    let f = dir.join(name);
+    std::fs::write(&f, b"x").unwrap();
+    let h = secure::open_with(
+        &f,
+        0x8000_0000 | acl::SECURITY_ACCESS,
+        secure::SHARE_ALL,
+        secure::DISP_OPEN_EXISTING,
+        true,
+        0,
+    )
+    .unwrap();
+    let only_system = [acl::Ace {
+        sid: acl::SID_SYSTEM.into(),
+        mask: acl::FULL,
+        flags: 0,
+    }];
+    acl::apply_aces(&h, &only_system, owner).unwrap();
+    f
+}
+
+/// Give `owner` full control of a file made by [`undeletable_file`] again, so that the folder it is in can be deleted.
+/// By path (`SetNamedSecurityInfoW` opens the file for `WRITE_DAC` alone, which an owner always has: nothing here
+/// can open it, as every open asks for `SYNCHRONIZE` too). The file is in a folder of the sandbox, not behind a link.
+pub fn make_deletable(f: &Path, owner: &str) {
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{
+        GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+    let sddl = crate::util::wide(&format!("D:P(A;;FA;;;{owner})"));
+    let path = crate::util::wide(&f.to_string_lossy());
+    let mut psd = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            crate::util::pcwstr(&sddl),
+            SDDL_REVISION_1,
+            &mut psd,
+            None,
+        )
+        .unwrap();
+        let (mut present, mut defaulted) = (windows_core::BOOL(0), windows_core::BOOL(0));
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        GetSecurityDescriptorDacl(psd, &mut present, &mut dacl, &mut defaulted).unwrap();
+        let r = SetNamedSecurityInfoW(
+            crate::util::pcwstr(&path),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl),
+            None,
+        );
+        let _ = LocalFree(Some(HLOCAL(psd.0)));
+        assert_eq!(
+            r.0,
+            0,
+            "could not give {} its permissions back",
+            f.display()
+        );
+    }
+}
+/// The `BetterCam.old-*` entries of the sandbox's `%ProgramData%`.
+pub fn asides_in(paths: &Paths) -> Vec<PathBuf> {
+    std::fs::read_dir(&paths.program_data)
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("BetterCam.old-")
+        })
+        .map(|e| e.path())
+        .collect()
+}

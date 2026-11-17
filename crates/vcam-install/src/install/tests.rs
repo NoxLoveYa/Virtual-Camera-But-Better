@@ -17,6 +17,12 @@ struct Fake {
     registry_leftovers: Vec<String>,
     stop_calls: u32,
     calls: Vec<String>,
+    /// The record of moved-aside data folders (the helper's HKLM value).
+    asides: Vec<String>,
+    /// Every name that was put on the record (also those taken off again).
+    recorded: Vec<String>,
+    /// Writing the record fails.
+    record_fails: bool,
 }
 
 impl Fake {
@@ -85,6 +91,22 @@ impl Machine for Fake {
             self.delayed.push(p.to_path_buf());
             Ok(())
         }
+    }
+    fn aside_names(&mut self) -> Vec<String> {
+        self.asides.clone()
+    }
+    fn record_aside(&mut self, name: &str) -> Res<()> {
+        if self.record_fails {
+            return Err("RegSetKeyValueW failed (injected)".into());
+        }
+        self.recorded.push(name.to_string());
+        if !self.asides.iter().any(|n| n == name) {
+            self.asides.push(name.to_string());
+        }
+        Ok(())
+    }
+    fn forget_aside(&mut self, name: &str) {
+        self.asides.retain(|n| n != name);
     }
 }
 
@@ -199,6 +221,15 @@ fn a_sid_that_is_not_a_user_account_is_refused_before_anything_is_touched() {
             panic!()
         }
         fn delete_at_reboot(&mut self, _: &Path) -> Res<()> {
+            panic!()
+        }
+        fn aside_names(&mut self) -> Vec<String> {
+            panic!()
+        }
+        fn record_aside(&mut self, _: &str) -> Res<()> {
+            panic!()
+        }
+        fn forget_aside(&mut self, _: &str) {
             panic!()
         }
     }
@@ -404,6 +435,15 @@ fn a_locked_old_dll_that_goes_once_the_service_stopped_is_done() {
         fn delete_at_reboot(&mut self, p: &Path) -> Res<()> {
             self.inner.delete_at_reboot(p)
         }
+        fn aside_names(&mut self) -> Vec<String> {
+            self.inner.aside_names()
+        }
+        fn record_aside(&mut self, n: &str) -> Res<()> {
+            self.inner.record_aside(n)
+        }
+        fn forget_aside(&mut self, n: &str) {
+            self.inner.forget_aside(n)
+        }
     }
     let mut st = Stopper {
         inner: std::mem::take(&mut m),
@@ -583,6 +623,15 @@ fn a_rollback_that_fails_says_so() {
         }
         fn delete_at_reboot(&mut self, p: &Path) -> Res<()> {
             self.0.delete_at_reboot(p)
+        }
+        fn aside_names(&mut self) -> Vec<String> {
+            self.0.aside_names()
+        }
+        fn record_aside(&mut self, n: &str) -> Res<()> {
+            self.0.record_aside(n)
+        }
+        fn forget_aside(&mut self, n: &str) {
+            self.0.forget_aside(n)
         }
     }
     let s = sandbox("rollback-incomplete");
@@ -831,6 +880,7 @@ fn an_install_and_an_uninstall_delete_the_data_folders_that_were_moved_aside() {
         d
     };
     let a = mk("BetterCam.old-1-0");
+    m.asides.push("BetterCam.old-1-0".into());
     let mut log = VecLog::default();
     do_install(&s, &dll, &mut m, &mut log).unwrap();
     assert!(
@@ -842,18 +892,25 @@ fn an_install_and_an_uninstall_delete_the_data_folders_that_were_moved_aside() {
         s.paths.frames().is_file(),
         "the live data folder is untouched"
     );
+    assert!(
+        m.asides.is_empty(),
+        "a name that is gone is taken off the record"
+    );
 
     let b = mk("BetterCam.old-2-0");
+    m.asides.push("BetterCam.old-2-0".into());
     let mut log = VecLog::default();
     uninstall_trusting(&s.paths, &s.p.trusted_owners, &mut m, &mut log).unwrap();
     assert!(!b.exists(), "uninstall leaves the old copy: {:?}", log.0);
     assert!(!s.paths.data.exists());
+    assert!(m.asides.is_empty());
 }
 
 /// An old copy that is still in use at uninstall is reported, not claimed as gone.
 #[test]
 fn an_old_data_folder_that_cannot_be_deleted_is_reported_by_uninstall() {
     let (s, mut m) = installed("old-data-busy");
+    m.asides.push("BetterCam.old-5-0".into());
     let d = s.paths.program_data.join("BetterCam.old-5-0");
     std::fs::create_dir_all(&d).unwrap();
     let f = d.join("vcam-1.log");
@@ -873,6 +930,11 @@ fn an_old_data_folder_that_cannot_be_deleted_is_reported_by_uninstall() {
     .unwrap_err();
     assert!(err.contains("old copy of the data folder"), "{err}");
     assert!(d.exists());
+    assert_eq!(
+        m.asides,
+        ["BetterCam.old-5-0"],
+        "a copy that is still in use stays on record, for the next run"
+    );
 }
 
 // ---- findings 1 and 2: what a user leaves in %ProgramData% never makes install or uninstall wait or fail
@@ -894,6 +956,7 @@ fn entry_with_a_locked_file(s: &Sandbox) -> (PathBuf, vcam_protocol::secure::opl
 fn a_repair_does_not_wait_for_or_fail_on_an_old_data_folder_with_a_locked_file() {
     let (s, mut m) = installed("repair-locked-aside");
     let (d, lock) = entry_with_a_locked_file(&s);
+    m.asides.push("BetterCam.old-test".into());
     let dll = fake_dll(&s.root.join("src2"), 2);
     let (paths, p) = (s.paths.clone(), s.p.clone());
     let (r, lines, m) = within("repair", BOUND, move || {
@@ -917,8 +980,9 @@ fn a_repair_does_not_wait_for_or_fail_on_an_old_data_folder_with_a_locked_file()
 /// wait; one that is the helper's with a lock in it is reported as left behind, truthfully, without a wait.
 #[test]
 fn an_uninstall_does_not_wait_for_a_locked_file_in_an_old_data_folder() {
-    let (s, m) = installed("uninstall-locked-aside");
+    let (s, mut m) = installed("uninstall-locked-aside");
     let (d, lock) = entry_with_a_locked_file(&s);
+    m.asides.push("BetterCam.old-test".into());
     // 1. not the helper's: only SYSTEM is trusted, the sandbox user made the entry
     let (paths, only_system) = (s.paths.clone(), vec![crate::acl::SID_SYSTEM.to_string()]);
     let (r, mut m) = within("uninstall (somebody else's entry)", BOUND, move || {
@@ -932,8 +996,13 @@ fn an_uninstall_does_not_wait_for_a_locked_file_in_an_old_data_folder() {
         "the removal itself succeeded"
     );
     assert_eq!(std::fs::metadata(d.join("f.txt")).unwrap().len(), 4096);
+    assert!(
+        m.asides.is_empty(),
+        "an entry that is not the helper's is taken off the record"
+    );
 
     // 2. the helper's own (trusted owner), with a lock in it: reported, not waited for
+    m.asides.push("BetterCam.old-test".into());
     let (paths, trusted) = (s.paths.clone(), s.p.trusted_owners.clone());
     let (r, lines) = within("uninstall (the helper's entry)", BOUND, move || {
         let mut log = VecLog::default();
@@ -954,7 +1023,10 @@ fn an_uninstall_does_not_wait_for_a_locked_file_in_an_old_data_folder() {
     uninstall_trusting(
         &s.paths,
         &s.p.trusted_owners,
-        &mut Fake::default(),
+        &mut Fake {
+            asides: vec!["BetterCam.old-test".into()],
+            ..Fake::default()
+        },
         &mut VecLog::default(),
     )
     .unwrap();
@@ -993,4 +1065,268 @@ fn an_uninstall_does_not_wait_for_a_locked_install_log_and_says_what_stayed() {
     // the next removal finishes the job
     uninstall_with(&s.paths, &mut Fake::default(), &mut VecLog::default()).unwrap();
     assert!(!s.paths.data.exists());
+}
+
+// ---- M2: the copy of the DLL does not wait for a program that holds a lock
+
+use vcam_protocol::secure::oplock::{self, Oplock};
+
+/// Where an install of `dll` puts its copy.
+fn dest_of(s: &Sandbox, dll: &Path) -> PathBuf {
+    let tag = content_tag(&std::fs::read(dll).unwrap());
+    s.paths
+        .install
+        .join(vcam_protocol::versioned_dll_name(&tag))
+}
+
+fn dll_bytes(dll: &Path) -> Vec<u8> {
+    std::fs::read(dll).unwrap()
+}
+
+/// The DLL to install is in a folder the user runs the app from; a program of theirs that holds a read-write-handle
+/// lock on it made `std::fs::read` wait, with the machine-wide lock held. Now it is an error that names the file,
+/// before anything is touched, and a check whether the file looks like a DLL does not wait either.
+#[test]
+fn a_dll_source_that_a_program_holds_a_lock_on_is_a_named_error_and_not_a_wait() {
+    let s = sandbox("dll-source-locked");
+    let dll = fake_dll(&s.root.join("src"), 1);
+    let Some(lock) = lock_on(&dll) else {
+        return;
+    };
+    let (paths, p, d) = (s.paths.clone(), s.p.clone(), dll.clone());
+    let (r, calls) = within("install", BOUND, move || {
+        let mut m = Fake::default();
+        let r = install_with(&opts(), &d, &paths, Some(p), &mut m, &mut VecLog::default());
+        (r, m.calls)
+    });
+    let err = r.unwrap_err();
+    assert!(
+        err.contains("locked by another program") && err.contains("better_cam_vcam.dll"),
+        "{err}"
+    );
+    assert!(calls.is_empty(), "nothing was touched: {calls:?}");
+    assert!(!s.paths.data.exists() && !s.paths.install.exists());
+    let d = dll.clone();
+    assert!(
+        !within("looks like a DLL", BOUND, move || file_looks_like_dll(&d)),
+        "a file that cannot be looked at for now does not look like a DLL"
+    );
+    let d = dll.clone();
+    let e = within("build tag", BOUND, move || crate::util::dll_build(&d)).unwrap_err();
+    assert!(e.contains("locked") || e.contains("lock"), "{e}");
+    drop(lock);
+    assert!(file_looks_like_dll(&dll));
+    let mut m = Fake::default();
+    assert_eq!(
+        do_install(&s, &dll, &mut m, &mut VecLog::default()).unwrap(),
+        InstallOutcome::Done
+    );
+}
+
+/// The installed copy is locked (a user may read `Program Files`): a Repair says so, within the bound, names the file,
+/// keeps the registration, and the next one works.
+#[test]
+fn an_installed_copy_that_a_program_holds_a_lock_on_is_a_named_error_and_not_a_wait() {
+    let (s, mut m) = installed("dll-dest-locked");
+    let dll = s.root.join("src").join("better_cam_vcam.dll");
+    let dest = PathBuf::from(m.reg.as_ref().unwrap().dll.clone());
+    let before = m.reg.clone();
+    let Some(lock) = lock_on(&dest) else {
+        return;
+    };
+    let (paths, p) = (s.paths.clone(), s.p.clone());
+    let (r, m) = within("repair", BOUND, move || {
+        let r = install_with(
+            &opts(),
+            &dll,
+            &paths,
+            Some(p),
+            &mut m,
+            &mut VecLog::default(),
+        );
+        (r, m)
+    });
+    let err = r.unwrap_err();
+    assert!(
+        err.contains("locked by another program") && err.contains("better_cam_vcam_"),
+        "{err}"
+    );
+    assert_eq!(m.reg, before, "the registration is as it was");
+    assert!(m.camera);
+    drop(lock);
+    let mut m = m;
+    let dll = s.root.join("src").join("better_cam_vcam.dll");
+    assert_eq!(
+        do_install(&s, &dll, &mut m, &mut VecLog::default()).unwrap(),
+        InstallOutcome::Done
+    );
+}
+
+/// A copy with other contents under the name (a damaged one) is replaced, in one step. A program that holds a lock of
+/// either kind on it (the read-handle lock is the one a rename breaks, a read does not) is not waited for: the
+/// error names the file, the old copy is as it was, and no temporary file is left.
+#[test]
+fn a_different_copy_that_a_program_holds_a_lock_on_is_not_replaced_and_not_waited_for() {
+    let s = sandbox("dll-replace-locked");
+    let dll = fake_dll(&s.root.join("src"), 7);
+    let bytes = dll_bytes(&dll);
+    let dest = dest_of(&s, &dll);
+    std::fs::create_dir_all(&s.paths.install).unwrap();
+    let old = vec![9u8; 70_000];
+    for level in [oplock::READ_HANDLE, oplock::READ_WRITE_HANDLE] {
+        std::fs::write(&dest, &old).unwrap();
+        let Some(lock) = Oplock::take_level(&dest, level).unwrap() else {
+            eprintln!("this file system grants no oplock: skipped");
+            return;
+        };
+        let (b, d) = (bytes.clone(), dest.clone());
+        let r = within("copy", BOUND, move || {
+            copy_dll(&b, &d, &mut VecLog::default())
+        });
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("locked by another program") && err.contains("better_cam_vcam_"),
+            "level {level}: {err}"
+        );
+        // (attribute-only calls: a read of the file would wait)
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), old.len() as u64);
+        assert!(
+            !dest.with_extension("dll.tmp").exists(),
+            "the temporary file is not left"
+        );
+        drop(lock);
+        assert!(copy_dll(&bytes, &dest, &mut VecLog::default()).unwrap());
+        assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+    }
+}
+
+/// A temporary file that an earlier run left and that a program holds a lock on: the same, and it names that file.
+#[test]
+fn a_leftover_temporary_file_that_a_program_holds_a_lock_on_is_a_named_error_and_not_a_wait() {
+    let s = sandbox("dll-tmp-locked");
+    let dll = fake_dll(&s.root.join("src"), 3);
+    let bytes = dll_bytes(&dll);
+    let dest = dest_of(&s, &dll);
+    std::fs::create_dir_all(&s.paths.install).unwrap();
+    let tmp = dest.with_extension("dll.tmp");
+    std::fs::write(&tmp, b"half a DLL").unwrap();
+    let Some(lock) = lock_on(&tmp) else {
+        return;
+    };
+    let (b, d) = (bytes.clone(), dest.clone());
+    let err = within("copy", BOUND, move || {
+        copy_dll(&b, &d, &mut VecLog::default())
+    })
+    .unwrap_err();
+    assert!(
+        err.contains("locked by another program") && err.contains(".dll.tmp"),
+        "{err}"
+    );
+    assert!(!dest.exists(), "no copy under the real name");
+    assert_eq!(std::fs::metadata(&tmp).unwrap().len(), 10);
+    drop(lock);
+    assert!(copy_dll(&bytes, &dest, &mut VecLog::default()).unwrap());
+    assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+    assert!(!tmp.exists());
+}
+
+/// Nothing locked: the copy is made, a copy that is there is recognised, a different one is replaced, a leftover
+/// temporary file does not matter, and a failure after the copy puts everything back (the copy goes).
+#[test]
+fn the_copy_works_when_nothing_is_locked_and_is_rolled_back_when_the_install_fails() {
+    let s = sandbox("dll-copy-plain");
+    let dll = fake_dll(&s.root.join("src"), 4);
+    let bytes = dll_bytes(&dll);
+    let dest = dest_of(&s, &dll);
+    let mut log = VecLog::default();
+    assert!(copy_dll(&bytes, &dest, &mut log).unwrap());
+    assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+    assert!(!copy_dll(&bytes, &dest, &mut log).unwrap(), "already there");
+    assert!(log.0.iter().any(|l| l.contains("already present")));
+    // other contents under the name, and a leftover temporary file
+    std::fs::write(&dest, b"damaged").unwrap();
+    std::fs::write(dest.with_extension("dll.tmp"), b"leftover").unwrap();
+    assert!(copy_dll(&bytes, &dest, &mut log).unwrap());
+    assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+    assert!(!dest.with_extension("dll.tmp").exists());
+    // the copy is a real file (not a handle's partial write): the same size and a plain one
+    assert_eq!(std::fs::metadata(&dest).unwrap().len(), bytes.len() as u64);
+
+    // an install that finds a damaged copy under its name replaces it, and a failing camera then removes it again
+    std::fs::write(&dest, b"damaged").unwrap();
+    let mut m = Fake {
+        fail: Some("create_camera"),
+        ..Fake::default()
+    };
+    let err = do_install(&s, &dll, &mut m, &mut VecLog::default()).unwrap_err();
+    assert!(err.contains("create_camera"), "{err}");
+    assert!(
+        !dest.exists(),
+        "the copy that this run made is deleted by the rollback"
+    );
+    assert!(m.reg.is_none());
+    // and the next one works
+    m.fail = None;
+    do_install(&s, &dll, &mut m, &mut VecLog::default()).unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+    registration_is_sound(&m);
+}
+
+// ---- L3: what the helper moved aside is put on record, whatever happens next
+
+/// Install puts the data folders that it moved aside and could not delete on the record, also when it fails later;
+/// a record that cannot be written is said and does not fail the install.
+#[test]
+fn a_data_folder_that_stays_after_it_was_moved_aside_is_put_on_record() {
+    let mut s = sandbox("record-moved");
+    let mut m = Fake::default();
+    let dll = fake_dll(&s.root.join("src"), 1);
+    do_install(&s, &dll, &mut m, &mut VecLog::default()).unwrap();
+    // only SYSTEM is trusted from now on (the sandbox user owns the data folder), with an object in it that cannot be
+    // deleted: the folder goes aside and stays
+    s.p.trusted_owners = vec![crate::acl::SID_SYSTEM.into()];
+    crate::testkit::undeletable_file(&s.paths.data, "junk.txt", &s.p.owner);
+    let mut log = VecLog::default();
+    do_install(&s, &dll, &mut m, &mut log).unwrap();
+    let asides = crate::testkit::asides_in(&s.paths);
+    assert_eq!(asides.len(), 1, "{:?}", log.0);
+    let name = asides[0]
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(m.recorded, std::slice::from_ref(&name), "{:?}", log.0);
+    assert!(
+        log.0.iter().any(|l| l.contains("is on record")),
+        "{:?}",
+        log.0
+    );
+    // the sweep at the end of that run found the old copy owned by somebody who is not trusted: left, forgotten
+    assert!(m.asides.is_empty(), "{:?}", m.asides);
+    assert!(asides[0].exists());
+
+    // the same with a record that cannot be written
+    crate::testkit::make_deletable(&asides[0].join("junk.txt"), &s.p.owner);
+    remove_all_asides(&s);
+    crate::testkit::undeletable_file(&s.paths.data, "junk.txt", &s.p.owner);
+    m.record_fails = true;
+    let mut log = VecLog::default();
+    do_install(&s, &dll, &mut m, &mut log).unwrap();
+    assert!(
+        log.0
+            .iter()
+            .any(|l| l.contains("could not put") && l.contains("on record")),
+        "{:?}",
+        log.0
+    );
+    let left = crate::testkit::asides_in(&s.paths);
+    assert_eq!(left.len(), 1);
+    crate::testkit::make_deletable(&left[0].join("junk.txt"), &s.p.owner);
+    remove_all_asides(&s);
+}
+
+fn remove_all_asides(s: &Sandbox) {
+    for a in crate::testkit::asides_in(&s.paths) {
+        crate::datadir::remove_no_follow(&a).unwrap();
+    }
 }

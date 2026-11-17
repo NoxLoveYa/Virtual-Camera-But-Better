@@ -193,7 +193,9 @@ pub fn content_tag(bytes: &[u8]) -> String {
 
 /// The build tag of the DLL file at `path` (see [`content_tag`]).
 pub fn dll_build(path: &std::path::Path) -> Res<String> {
-    let bytes = std::fs::read(path).map_err(|e| werr(&format!("read {}", path.display()), e))?;
+    // not a plain read: a program that holds an opportunistic lock on the file would make that wait
+    let bytes = vcam_protocol::secure::read_file(path)
+        .map_err(|e| werr(&format!("read {}", path.display()), e))?;
     Ok(content_tag(&bytes))
 }
 

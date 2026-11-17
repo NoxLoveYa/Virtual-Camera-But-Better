@@ -488,7 +488,12 @@ impl std::error::Error for RemoveError {}
 impl From<RemoveError> for io::Error {
     fn from(e: RemoveError) -> io::Error {
         if e.locked() {
-            refused(format!("{}: {OPLOCK_BUSY}", e.path.display()))
+            // the count of what else stayed is part of the message (and the text still says "locked")
+            let mut why = format!("{}: {OPLOCK_BUSY}", e.path.display());
+            if e.more > 0 {
+                why.push_str(&format!(" (and {} more)", e.more));
+            }
+            refused(why)
         } else if is_refused(&e.error) {
             refused(e.to_string())
         } else {
@@ -762,6 +767,17 @@ pub const ACCESS_OWNER_CHECK: u32 = ACCESS_READ_CONTROL;
 /// handle. A lock that another program holds gives the refusal of [`open_with`]; a file that another program has
 /// open without sharing delete (or a folder with such a file in it) gives the OS error.
 pub fn rename_no_wait(from: &Path, to: &Path) -> io::Result<()> {
+    rename_through_handle(from, to, false)
+}
+
+/// [`rename_no_wait`] that replaces `to` when it exists (one atomic step: `to` is either the old file or the new
+/// one). Replacing a file that another program holds a lock on, or has open without sharing delete, is not done: the
+/// result is the refusal of [`open_with`], or the OS error.
+pub fn rename_replacing_no_wait(from: &Path, to: &Path) -> io::Result<()> {
+    rename_through_handle(from, to, true)
+}
+
+fn rename_through_handle(from: &Path, to: &Path, replace: bool) -> io::Result<()> {
     let h = nt_open(
         from,
         ACCESS_DELETE | ACCESS_READ_ATTRIBUTES,
@@ -782,8 +798,8 @@ pub fn rename_no_wait(from: &Path, to: &Path) -> io::Result<()> {
     // SAFETY: `buf` is large enough for the header and the name, and 8-aligned like FILE_RENAME_INFO.
     unsafe {
         let info = base as *mut FILE_RENAME_INFO;
-        // no flags: do not replace an existing name
-        (*info).Anonymous.Flags = 0;
+        // the first byte is `ReplaceIfExists`: without it an existing name is not replaced
+        (*info).Anonymous.Flags = u32::from(replace);
         (*info).RootDirectory = HANDLE::default();
         (*info).FileNameLength = (units.len() * 2) as u32;
         std::ptr::copy_nonoverlapping(units.as_ptr(), base.add(header) as *mut u16, units.len());
@@ -810,12 +826,40 @@ pub fn rename_no_wait(from: &Path, to: &Path) -> io::Result<()> {
 /// How long a rename may wait for the holder of an oplock to answer a break before it is given up.
 const RENAME_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// How often a call that is still not over is cancelled again once its bound has passed.
+const CANCEL_AGAIN: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Run `job` (one synchronous system call that may wait for another program) and give up after `bound`: the call is
 /// cancelled (`CancelSynchronousIo`; the operation is aborted, nothing is changed) and the result is the refusal of
 /// [`open_with`] ("another program holds a lock on the file"). A call that was answered in time returns its own
 /// result.
+///
+/// One cancel is not enough: when the worker has not entered the call yet, or the wait cannot be cancelled at that
+/// instant, `CancelSynchronousIo` finds nothing to cancel and the call then blocks for as long as the other program
+/// likes. The cancel is therefore repeated every [`CANCEL_AGAIN`] until the worker reports that it is finished.
 fn bounded<T: Send>(
     bound: std::time::Duration,
+    job: impl FnOnce() -> io::Result<T> + Send,
+) -> io::Result<T> {
+    bounded_with(
+        bound,
+        CANCEL_AGAIN,
+        &|thread| {
+            // SAFETY: the thread handle stays valid until `bounded_with` closes it, after the worker has finished.
+            unsafe {
+                let _ = CancelSynchronousIo(HANDLE(thread as *mut c_void));
+            }
+        },
+        job,
+    )
+}
+
+/// [`bounded`] with the cancel given: it gets the worker's thread handle (as a number) and is called every `again`
+/// from the moment `bound` has passed until the worker is done (a test gives one that ignores the first calls).
+fn bounded_with<T: Send>(
+    bound: std::time::Duration,
+    again: std::time::Duration,
+    cancel: &dyn Fn(usize),
     job: impl FnOnce() -> io::Result<T> + Send,
 ) -> io::Result<T> {
     std::thread::scope(|scope| {
@@ -837,9 +881,15 @@ fn bounded<T: Send>(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ) && thread != 0
         {
-            // SAFETY: the thread handle stays valid until it is closed below.
-            unsafe {
-                let _ = CancelSynchronousIo(HANDLE(thread as *mut c_void));
+            // until the worker says it is done (or is gone): a cancel that found no call to abort is tried again
+            loop {
+                cancel(thread);
+                if !matches!(
+                    finished.recv_timeout(again),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    break;
+                }
             }
         }
         let result = worker.join();
@@ -873,6 +923,41 @@ fn to_absolute(p: &Path) -> io::Result<std::ffi::OsString> {
         }
         buf = vec![0u16; n + 1];
     }
+}
+
+/// Open the file `path` for reading (and its attributes), without waiting for another program: a lock that this open
+/// would break is the refusal of [`open_with`] ([`is_oplock_busy`]). Unlike [`open_with`] a link at the end *is*
+/// followed: this is for a file somebody names to the installer (the DLL to copy, the copy in `Program Files`), not
+/// for anything below the data folder.
+pub fn open_read_following(path: &Path) -> io::Result<OwnedHandle> {
+    nt_open(
+        path,
+        ACCESS_READ,
+        SHARE_ALL,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE.0,
+        FILE_ATTRIBUTE_NORMAL.0,
+        None,
+    )
+}
+
+/// The whole contents of the file `path`, read through [`open_read_following`] (so a program that holds an
+/// opportunistic lock on it, which makes `std::fs::read` wait, gives the refusal instead).
+pub fn read_file(path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::from(open_read_following(path)?).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Make the *new* file `path` (it must not exist; a link is never followed) and write `bytes` to it. Others may read
+/// it meanwhile, nothing more. A failed write leaves the partial file: the caller deletes it.
+pub fn write_new_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    let h = open_with(path, ACCESS_GENERIC_WRITE, SHARE_READ, CREATE_NEW, false, 0)?;
+    let mut file = std::fs::File::from(h);
+    file.write_all(bytes)?;
+    file.flush()
 }
 
 /// Delete the plain file `path` (a link, a folder or a missing file is not deleted) without waiting for anybody: the
@@ -1048,6 +1133,9 @@ pub fn set_sparse(h: HANDLE, on: bool) -> io::Result<()> {
 /// Share mode of the frame file: everybody may read, write and delete it while it is open.
 pub const SHARE_ALL: FILE_SHARE_MODE =
     FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0);
+
+/// Share mode that lets others read but not write, delete or rename (a file that is being written).
+pub const SHARE_READ: FILE_SHARE_MODE = FILE_SHARE_MODE(FILE_SHARE_READ.0);
 
 /// Share mode that lets others read and write but not delete or rename (a folder held while it is worked in).
 pub const SHARE_READ_WRITE: FILE_SHARE_MODE =
@@ -1663,6 +1751,165 @@ mod tests {
                 .kind(),
             io::ErrorKind::NotFound
         );
+    }
+
+    /// `bounded` cancels again and again. A call whose wait cannot be cancelled when the bound has passed (the
+    /// worker is not in the call yet) is not found by the first `CancelSynchronousIo`; the old code cancelled once and
+    /// then waited for the worker without limit. The stand-in for the call ignores the first cancels.
+    #[test]
+    fn a_call_that_ignores_the_first_cancels_is_cancelled_again_until_it_returns() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let cancels = Arc::new(AtomicU32::new(0));
+        let released = Arc::new(AtomicBool::new(false));
+        let (c, r) = (cancels.clone(), released.clone());
+        let started = std::time::Instant::now();
+        let result = within("bounded", Duration::from_secs(10), move || {
+            let job_released = r.clone();
+            bounded_with(
+                Duration::from_millis(50),
+                Duration::from_millis(10),
+                &|_thread| {
+                    // the fourth cancel is the first that lands
+                    if c.fetch_add(1, SeqCst) + 1 >= 4 {
+                        r.store(true, SeqCst);
+                    }
+                },
+                move || {
+                    while !job_released.load(SeqCst) {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    // ERROR_OPERATION_ABORTED, what a cancelled call ends with
+                    Err::<(), _>(io::Error::from_raw_os_error(995))
+                },
+            )
+        });
+        let e = result.unwrap_err();
+        assert!(is_oplock_busy(&e), "{e}");
+        assert!(cancels.load(SeqCst) >= 4, "{}", cancels.load(SeqCst));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A call that is over in time is not cancelled and keeps its own result.
+    #[test]
+    fn a_call_that_returns_in_time_is_left_alone() {
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        use std::time::Duration;
+        let cancels = AtomicU32::new(0);
+        let ok = bounded_with(
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            &|_| {
+                cancels.fetch_add(1, SeqCst);
+            },
+            || Ok(7),
+        );
+        assert_eq!(ok.unwrap(), 7);
+        let err = bounded_with(
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            &|_| {
+                cancels.fetch_add(1, SeqCst);
+            },
+            || Err::<(), _>(io::Error::from_raw_os_error(5)),
+        )
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(5));
+        assert_eq!(cancels.load(SeqCst), 0);
+    }
+
+    /// The conversion of a locked-file error keeps how many more entries stayed.
+    #[test]
+    fn the_count_of_the_entries_that_stayed_is_kept_when_the_error_is_converted() {
+        let locked = |more| RemoveError {
+            path: PathBuf::from(r"C:\x\locked.txt"),
+            error: refused(OPLOCK_BUSY),
+            more,
+        };
+        let one = io::Error::from(locked(0));
+        assert!(
+            is_oplock_busy(&one) && !one.to_string().contains("more"),
+            "{one}"
+        );
+        let three = io::Error::from(locked(2));
+        assert!(
+            is_oplock_busy(&three) && is_refused(&three),
+            "still told apart as a lock: {three}"
+        );
+        assert!(three.to_string().contains("locked.txt"), "{three}");
+        assert!(three.to_string().contains("(and 2 more)"), "{three}");
+        // the other kinds of failure keep it too
+        let busy = RemoveError {
+            path: PathBuf::from(r"C:\x\a.txt"),
+            error: io::Error::from_raw_os_error(32),
+            more: 4,
+        };
+        assert!(io::Error::from(busy).to_string().contains("(and 4 more)"));
+    }
+
+    /// The installer's reads and writes of the DLL do not wait for a program that holds an oplock: a read-write-handle
+    /// lock makes `std::fs::read` block and `MoveFileExW` too; here the read is the refusal, a replacing rename is
+    /// the refusal, and the file is where it was.
+    #[test]
+    fn reading_writing_and_replacing_a_file_do_not_wait_for_an_oplock() {
+        use std::time::Duration;
+        let (_root, dir) = sandbox("read-write-replace");
+        let f = dir.join("a.dll");
+        std::fs::write(&f, b"old contents").unwrap();
+        assert_eq!(read_file(&f).unwrap(), b"old contents");
+        assert!(open_read_following(&dir).is_err(), "a folder is not a file");
+        assert_eq!(
+            read_file(&dir.join("nothing")).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        // a link at the end is followed (the source of the DLL may be one)
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("x.dll"), b"through").unwrap();
+        let link = dir.join("link");
+        junction(&link, &real);
+        assert_eq!(read_file(&link.join("x.dll")).unwrap(), b"through");
+        remove_junction(&link);
+
+        // a new file: not over an existing one, written in full
+        let n = dir.join("new.tmp");
+        write_new_file(&n, b"fresh").unwrap();
+        assert_eq!(std::fs::read(&n).unwrap(), b"fresh");
+        assert!(
+            write_new_file(&n, b"again").is_err(),
+            "an existing file is not taken"
+        );
+        assert_eq!(std::fs::read(&n).unwrap(), b"fresh");
+
+        // replacing: one step, the name is the new file afterwards
+        rename_replacing_no_wait(&n, &f).unwrap();
+        assert!(!n.exists());
+        assert_eq!(std::fs::read(&f).unwrap(), b"fresh");
+        // and `rename_no_wait` still does not replace
+        write_new_file(&n, b"other").unwrap();
+        assert!(rename_no_wait(&n, &f).is_err());
+        assert_eq!(std::fs::read(&f).unwrap(), b"fresh");
+
+        let Some(lock) = oplock::Oplock::take(&f).unwrap() else {
+            eprintln!("this file system grants no oplock: that part is skipped");
+            return;
+        };
+        let p = f.clone();
+        let e = within("read", Duration::from_secs(3), move || read_file(&p)).unwrap_err();
+        assert!(is_oplock_busy(&e), "{e}");
+        let (a, b) = (n.clone(), f.clone());
+        let e = within("replace", Duration::from_secs(5), move || {
+            rename_replacing_no_wait(&a, &b)
+        })
+        .unwrap_err();
+        assert!(is_oplock_busy(&e), "{e}");
+        assert!(n.exists(), "the new file is where it was");
+        // (attribute-only calls: a read would wait)
+        assert_eq!(std::fs::metadata(&f).unwrap().len(), 5);
+        drop(lock);
+        rename_replacing_no_wait(&n, &f).unwrap();
+        assert_eq!(std::fs::read(&f).unwrap(), b"other");
     }
 
     fn is_reparse(p: &Path) -> bool {

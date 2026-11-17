@@ -991,18 +991,25 @@ fn moved_aside_data_folders_next_to_betercam_are_swept_without_following_links()
     std::fs::create_dir_all(pd.join("Other.old-1-0")).unwrap();
     std::fs::create_dir_all(pd.join("BetterCamera")).unwrap();
     let mut log = VecLog::default();
-    assert_eq!(
-        sweep_data_asides(&s.paths, &s.p.trusted_owners, &mut log),
-        0
-    );
+    let recorded = names(&["BetterCam.old-1-0", "BetterCam.old-2-0"]);
+    let swept = sweep_data_asides(&s.paths, &s.p.trusted_owners, &recorded, &mut log);
+    assert_eq!(swept.left, 0);
     assert!(!pd.join("BetterCam.old-1-0").exists());
-    assert!(!pd.join("BetterCam.old-2-0").exists(), "the junction goes");
+    // a recorded name that is a link now is not the helper's folder any more: it is left, not followed, not deleted
+    assert!(is_link(&pd.join("BetterCam.old-2-0")), "the junction stays");
     untouched(&dir, &frames, &logs);
+    assert_eq!(swept.forget, recorded, "both are done with");
     // not ours: other names stay, and so does the live data folder
     assert!(pd.join("Other.old-1-0").exists() && pd.join("BetterCamera").exists());
     assert!(pd.join("Better.old-3-0").exists());
     assert!(s.paths.frames().is_file());
     assert!(mentions(&log, "BetterCam.old-1-0"), "{:?}", log.0);
+    assert!(mentions(&log, "BetterCam.old-2-0"), "{:?}", log.0);
+    remove_no_follow(&pd.join("BetterCam.old-2-0")).unwrap();
+}
+
+fn names(n: &[&str]) -> Vec<String> {
+    n.iter().map(|s| s.to_string()).collect()
 }
 
 /// An object whose own permissions give the caller no `DELETE` is not deleted through a handle (the plain
@@ -1069,18 +1076,23 @@ fn a_sweep_entry_of_somebody_else_is_left_alone_and_never_waited_for() {
     // only SYSTEM is trusted here: the test user (who made the entry) plays the standard user
     let trusted = vec![acl::SID_SYSTEM.to_string()];
     let paths = s.paths.clone();
-    let (left, lines) = within("sweep", BOUND, move || {
+    let (swept, lines) = within("sweep", BOUND, move || {
         let mut log = VecLog::default();
-        (sweep_data_asides(&paths, &trusted, &mut log), log.0)
+        let recorded = names(&["BetterCam.old-test"]);
+        (
+            sweep_data_asides(&paths, &trusted, &recorded, &mut log),
+            log.0,
+        )
     });
     assert_eq!(
-        left, 0,
+        swept.left, 0,
         "somebody else's entry is not the helper's to report: {lines:?}"
     );
+    assert_eq!(swept.forget, ["BetterCam.old-test"]);
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("BetterCam.old-test left alone")),
+            .any(|l| l.contains("left alone") && l.contains("BetterCam.old-test")),
         "{lines:?}"
     );
     // (a read of the locked file would itself wait: its size is looked at without opening it for data)
@@ -1093,20 +1105,22 @@ fn a_sweep_entry_of_somebody_else_is_left_alone_and_never_waited_for() {
     // ... and a junction with such a name that somebody else made is not removed either
     let (dir, frames, logs) = elsewhere(&s);
     junction(&pd.join("BetterCam.old-link"), &dir);
+    let both = names(&["BetterCam.old-test", "BetterCam.old-link"]);
     let mut log = VecLog::default();
     assert_eq!(
-        sweep_data_asides(&s.paths, &[acl::SID_SYSTEM.to_string()], &mut log),
+        sweep_data_asides(&s.paths, &[acl::SID_SYSTEM.to_string()], &both, &mut log).left,
         0
     );
     assert!(is_link(&pd.join("BetterCam.old-link")));
     untouched(&dir, &frames, &logs);
-    // trusted: now it goes (as a junction), and so does the entry
+    // trusted: now the entry goes; a junction that has that name is a link, not the helper's folder: left alone
     let mut log = VecLog::default();
-    assert_eq!(
-        sweep_data_asides(&s.paths, &s.p.trusted_owners, &mut log),
-        0
-    );
-    assert!(!entry.exists() && !pd.join("BetterCam.old-link").exists());
+    let swept = sweep_data_asides(&s.paths, &s.p.trusted_owners, &both, &mut log);
+    assert_eq!(swept.left, 0);
+    assert!(!entry.exists());
+    assert!(is_link(&pd.join("BetterCam.old-link")));
+    untouched(&dir, &frames, &logs);
+    remove_no_follow(&pd.join("BetterCam.old-link")).unwrap();
     untouched(&dir, &frames, &logs);
 }
 
@@ -1123,11 +1137,14 @@ fn an_old_data_folder_of_the_helpers_with_a_locked_file_is_left_without_waiting(
         return;
     };
     let (paths, trusted) = (s.paths.clone(), s.p.trusted_owners.clone());
-    let (left, lines) = within("sweep", BOUND, move || {
+    let recorded = names(&["BetterCam.old-1-0"]);
+    let rec = recorded.clone();
+    let (swept, lines) = within("sweep", BOUND, move || {
         let mut log = VecLog::default();
-        (sweep_data_asides(&paths, &trusted, &mut log), log.0)
+        (sweep_data_asides(&paths, &trusted, &rec, &mut log), log.0)
     });
-    assert_eq!(left, 1, "{lines:?}");
+    assert_eq!(swept.left, 1, "{lines:?}");
+    assert!(swept.forget.is_empty(), "still there: it stays on record");
     assert!(
         lines
             .iter()
@@ -1140,10 +1157,9 @@ fn an_old_data_folder_of_the_helpers_with_a_locked_file_is_left_without_waiting(
     );
     drop(lock);
     let mut log = VecLog::default();
-    assert_eq!(
-        sweep_data_asides(&s.paths, &s.p.trusted_owners, &mut log),
-        0
-    );
+    let swept = sweep_data_asides(&s.paths, &s.p.trusted_owners, &recorded, &mut log);
+    assert_eq!(swept.left, 0);
+    assert_eq!(swept.forget, recorded);
     assert!(!entry.exists());
 }
 
@@ -1397,4 +1413,466 @@ fn a_program_data_that_is_a_junction_prepares_checks_and_logs() {
     run(&s, &mut log).unwrap();
     assert!(mentions(&log, "link or junction"), "{:?}", log.0);
     assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+}
+
+// ---- M1: a frame file of another length is replaced before anything of it is allocated
+
+/// Bytes that the file at `p` takes on the disk (`GetCompressedFileSizeW`: for a sparse file only what is stored).
+fn on_disk(p: &Path) -> u64 {
+    use windows::Win32::Storage::FileSystem::GetCompressedFileSizeW;
+    let w = crate::util::wide(&p.to_string_lossy());
+    let mut high = 0u32;
+    let low = unsafe { GetCompressedFileSizeW(crate::util::pcwstr(&w), Some(&mut high)) };
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+/// Set the length of the frame file through a handle that has the rights the camera's user has (read and write data).
+fn set_length(s: &Sandbox, len: u64, sparse: bool) -> bool {
+    let h = secure::open_with(
+        &s.paths.frames(),
+        0x3,
+        secure::SHARE_ALL,
+        DISP_OPEN_EXISTING,
+        false,
+        0,
+    )
+    .unwrap();
+    let file = std::fs::File::from(h);
+    if sparse {
+        // nothing of it is stored when it is cut to nothing first
+        file.set_len(0).unwrap();
+        if secure::set_sparse(secure::raw(&file), true).is_err() {
+            return false;
+        }
+    }
+    file.set_len(len).unwrap();
+    true
+}
+
+/// The reviewer's case: the camera's user sets `frames.bin` to 512 MB and marks it sparse (that costs nothing on
+/// disk). The Repair used to clear the sparse flag in place, which makes Windows allocate the whole length at once
+/// (0 -> 536,870,912 bytes), keep the file, and report success, while the DLL refuses a file longer than
+/// `MAX_FILE_SIZE`. Now the length is looked at first and the file is replaced: what is on disk afterwards is a new
+/// file of the right length.
+#[test]
+fn an_oversized_sparse_frame_file_is_replaced_and_its_length_is_never_allocated() {
+    const BIG: u64 = 512 << 20;
+    let s = sandbox("oversized-sparse");
+    run(&s, &mut VecLog::default()).unwrap();
+    let frames = s.paths.frames();
+    // a file of the user's making: plain, sparse, 512 MB (the file the helper made is `FILE_ATTRIBUTE_TEMPORARY`, which
+    // this volume gives storage to when it is extended; a user's own file is not)
+    remove_no_follow(&frames).unwrap();
+    {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&frames)
+            .unwrap();
+        if secure::set_sparse(secure::raw(&f), true).is_err() {
+            eprintln!("this volume cannot make a file sparse: skipped");
+            return;
+        }
+        f.set_len(BIG).unwrap();
+    }
+    let id = file_id(&frames);
+    let before = on_disk(&frames);
+    assert_eq!(std::fs::metadata(&frames).unwrap().len(), BIG);
+    assert_ne!(attributes_of(&frames) & secure::ATTRIBUTE_SPARSE, 0);
+    if before > 16 << 20 {
+        eprintln!("this volume stores a sparse file in full ({before} bytes): skipped");
+        return;
+    }
+
+    let mut log = VecLog::default();
+    run(&s, &mut log).unwrap();
+
+    // looked at first: nothing of the 512 MB was given storage (the old code: 0 -> 536870912)
+    let after = on_disk(&frames);
+    assert!(
+        after < 64 << 20,
+        "the length was allocated: {before} -> {after} bytes on disk ({:?})",
+        log.0
+    );
+    assert_eq!(
+        std::fs::metadata(&frames).unwrap().len(),
+        vcam_protocol::FILE_SIZE,
+        "the file has to end at the size the camera expects"
+    );
+    assert_eq!(attributes_of(&frames) & secure::ATTRIBUTE_SPARSE, 0);
+    assert_ne!(
+        file_id(&frames),
+        id,
+        "an oversized file is replaced, not kept"
+    );
+    assert!(
+        mentions(&log, &format!("its length is {BIG} bytes")),
+        "{:?}",
+        log.0
+    );
+    assert!(
+        !mentions(&log, "clearing that in place"),
+        "the flag must not be cleared on a file of the wrong length: {:?}",
+        log.0
+    );
+    // and the copy that was moved aside is deleted (it cost nothing, and goes at once)
+    let names: Vec<String> = std::fs::read_dir(&s.paths.data)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(names.iter().all(|n| !is_aside_name(n)), "{names:?}");
+    // the new file is kept the next time
+    let mut log = VecLog::default();
+    run(&s, &mut log).unwrap();
+    assert!(
+        log.0.iter().any(|l| l.ends_with("frames.bin: kept")),
+        "{:?}",
+        log.0
+    );
+}
+
+/// A file that is too short or too long and not sparse also ends at exactly the expected size.
+#[test]
+fn an_undersized_and_a_wrong_sized_frame_file_end_at_the_expected_size() {
+    let size = vcam_protocol::FILE_SIZE;
+    for (name, len) in [
+        ("empty", 0),
+        ("half", size / 2),
+        ("one-short", size - 1),
+        ("one-over", size + 1),
+        ("double", size * 2),
+    ] {
+        let s = sandbox(&format!("wrong-length-{name}"));
+        run(&s, &mut VecLog::default()).unwrap();
+        let id = file_id(&s.paths.frames());
+        assert!(set_length(&s, len, false));
+        assert_eq!(std::fs::metadata(s.paths.frames()).unwrap().len(), len);
+        let mut log = VecLog::default();
+        run(&s, &mut log).unwrap_or_else(|e| panic!("{name}: {e}: {:?}", log.0));
+        assert_eq!(
+            std::fs::metadata(s.paths.frames()).unwrap().len(),
+            size,
+            "{name}: {:?}",
+            log.0
+        );
+        assert_ne!(file_id(&s.paths.frames()), id, "{name}: kept");
+        assert!(
+            mentions(&log, &format!("its length is {len} bytes")),
+            "{name}: {:?}",
+            log.0
+        );
+        // the file is fine to the camera: the writer opens it
+        vcam_protocol::Writer::open_precreated(&s.paths.frames(), Some(&s.paths.program_data))
+            .unwrap_or_else(|e| panic!("{name}: the app cannot use it: {e}"));
+    }
+}
+
+/// A frame file of the right length with a flag set is still cleared in place and kept (the length check only
+/// stands in front of it).
+#[test]
+fn the_length_check_leaves_the_in_place_clearing_of_a_right_sized_file_alone() {
+    let s = sandbox("sized-sparse");
+    run(&s, &mut VecLog::default()).unwrap();
+    let id = file_id(&s.paths.frames());
+    let h = secure::open_with(
+        &s.paths.frames(),
+        0x3,
+        secure::SHARE_ALL,
+        DISP_OPEN_EXISTING,
+        false,
+        0,
+    )
+    .unwrap();
+    if secure::set_sparse(secure::raw(&h), true).is_err() {
+        eprintln!("this volume cannot make a file sparse: skipped");
+        return;
+    }
+    drop(h);
+    let mut log = VecLog::default();
+    run(&s, &mut log).unwrap();
+    assert!(mentions(&log, "clearing that in place"), "{:?}", log.0);
+    assert_eq!(file_id(&s.paths.frames()), id);
+    assert_eq!(
+        std::fs::metadata(s.paths.frames()).unwrap().len(),
+        vcam_protocol::FILE_SIZE
+    );
+}
+
+// ---- L2, L3: the sweep acts on the names the helper recorded, and says little
+
+/// Four hundred entries a user made under the names of the helper's old data folders cost nothing: none is opened,
+/// none is deleted, and nothing is written to the log (the old sweep opened each, read its owner and logged a line
+/// for each, which pushed the start of the run out of the tail the app reads).
+#[test]
+fn entries_that_a_user_made_under_old_names_are_not_looked_at_and_do_not_flood_the_log() {
+    let s = sandbox("flood-unrecorded");
+    let pd = &s.paths.program_data;
+    for i in 0..400 {
+        std::fs::create_dir_all(pd.join(format!("BetterCam.old-flood-{i}"))).unwrap();
+    }
+    let mut log = VecLog::default();
+    let swept = sweep_data_asides(&s.paths, &[acl::SID_SYSTEM.to_string()], &[], &mut log);
+    assert_eq!(swept, AsideSweep::default());
+    assert!(
+        log.0.is_empty(),
+        "{} lines: {:?}",
+        log.0.len(),
+        &log.0[..log.0.len().min(3)]
+    );
+    // trusted or not, nothing that is not on record is touched
+    let mut log = VecLog::default();
+    sweep_asides(&s.paths, &s.p.trusted_owners, &[], &mut log);
+    assert!(log.0.is_empty(), "{:?}", log.0);
+    assert_eq!(
+        std::fs::read_dir(pd)
+            .unwrap()
+            .flatten()
+            .filter(|e| e
+                .file_name()
+                .to_string_lossy()
+                .starts_with("BetterCam.old-flood-"))
+            .count(),
+        400
+    );
+}
+
+/// A record that is long, with entries that are not the helper's, gives one summary line (the count and the first
+/// few names) and a bounded number of looks; the names that were not looked at stay on record.
+#[test]
+fn recorded_entries_that_are_left_alone_are_one_line_and_the_number_looked_at_is_bounded() {
+    let s = sandbox("flood-recorded");
+    let pd = &s.paths.program_data;
+    let recorded: Vec<String> = (0..100)
+        .map(|i| format!("BetterCam.old-r-{i:03}"))
+        .collect();
+    for n in &recorded {
+        std::fs::create_dir_all(pd.join(n)).unwrap();
+    }
+    // only SYSTEM is trusted: the sandbox user made all of them
+    let mut log = VecLog::default();
+    let swept = sweep_data_asides(
+        &s.paths,
+        &[acl::SID_SYSTEM.to_string()],
+        &recorded,
+        &mut log,
+    );
+    assert_eq!(swept.left, 0);
+    assert_eq!(swept.forget.len(), MAX_ASIDES_EXAMINED, "{swept:?}");
+    assert_eq!(swept.forget[..], recorded[..MAX_ASIDES_EXAMINED]);
+    assert_eq!(
+        log.0.len(),
+        2,
+        "one summary line and one about the names not looked at: {:?}",
+        log.0
+    );
+    let summary = &log.0[0];
+    assert!(
+        summary.contains(&format!("{MAX_ASIDES_EXAMINED} recorded")),
+        "{summary}"
+    );
+    for shown in &recorded[..NAMES_SHOWN] {
+        assert!(summary.contains(shown.as_str()), "{summary}");
+    }
+    assert!(
+        !summary.contains(recorded[NAMES_SHOWN].as_str())
+            && summary.contains(&format!("and {} more", MAX_ASIDES_EXAMINED - NAMES_SHOWN)),
+        "{summary}"
+    );
+    assert!(
+        log.0[1].contains(&format!("{}", 100 - MAX_ASIDES_EXAMINED)),
+        "{:?}",
+        log.0
+    );
+    // nothing was deleted
+    assert!(recorded.iter().all(|n| pd.join(n).is_dir()));
+}
+
+/// The helper deletes the names on its record: a recorded folder that is its own, nothing else. An entry that
+/// somebody made under a name of that kind is left (a user can make one; so can an administrator-owned folder that
+/// a user may rename into `%ProgramData%`, which an owner check alone would trust). A recorded name that became a
+/// link or has another owner is left as it is and taken off the record; one that is gone too; a damaged record
+/// cannot lead out of the folder.
+#[test]
+fn only_the_recorded_names_are_swept_and_the_record_is_cleared_of_what_is_done_with() {
+    let s = sandbox("record");
+    let pd = &s.paths.program_data;
+    let (dir, frames, logs) = elsewhere(&s);
+    let mk = |n: &str| {
+        std::fs::create_dir_all(pd.join(n).join("logs")).unwrap();
+        std::fs::write(pd.join(n).join("frames.bin"), b"old").unwrap();
+    };
+    mk("BetterCam.old-1-0"); // recorded, the helper's: goes
+    mk("BetterCam.old-2-0"); // owned by a trusted account, but not recorded: stays
+    junction(&pd.join("BetterCam.old-3-0"), &dir); // recorded, a link now: stays, not followed
+    mk("BetterCam.old-5-0"); // recorded, but its owner is not trusted: stays
+    std::fs::write(s.root.join("victim.txt"), b"victim").unwrap();
+    let recorded = names(&[
+        "BetterCam.old-1-0",
+        "BetterCam.old-3-0",
+        "BetterCam.old-4-0", // gone
+        "BetterCam.old-5-0",
+        r"BetterCam.old-\..\..\victim.txt", // a damaged record
+        "Other.old-1-0",
+    ]);
+    let mut log = VecLog::default();
+    // 1-0 and 3-0 are owned by the sandbox user, who is trusted in this first pass; 5-0 is judged below
+    let first: Vec<String> = recorded
+        .iter()
+        .filter(|n| !n.ends_with("5-0"))
+        .cloned()
+        .collect();
+    let swept = sweep_data_asides(&s.paths, &s.p.trusted_owners, &first, &mut log);
+    assert_eq!(swept.left, 0, "{:?}", log.0);
+    assert_eq!(
+        swept.forget, first,
+        "all of them are done with: {:?}",
+        log.0
+    );
+    assert!(!pd.join("BetterCam.old-1-0").exists());
+    assert!(
+        pd.join("BetterCam.old-2-0").join("frames.bin").is_file(),
+        "not on record"
+    );
+    assert!(is_link(&pd.join("BetterCam.old-3-0")));
+    untouched(&dir, &frames, &logs);
+    assert_eq!(std::fs::read(s.root.join("victim.txt")).unwrap(), b"victim");
+    assert_eq!(log.0.len(), 2, "one deletion and one summary: {:?}", log.0);
+    // the owner is not trusted any more
+    let mut log = VecLog::default();
+    let swept = sweep_data_asides(
+        &s.paths,
+        &[acl::SID_SYSTEM.to_string()],
+        &names(&["BetterCam.old-5-0"]),
+        &mut log,
+    );
+    assert_eq!(swept.forget, ["BetterCam.old-5-0"]);
+    assert!(pd.join("BetterCam.old-5-0").join("frames.bin").is_file());
+    assert!(mentions(&log, "left alone"), "{:?}", log.0);
+    remove_no_follow(&pd.join("BetterCam.old-3-0")).unwrap();
+}
+
+/// The branch of the sweep for an entry that was swapped between the first look and the delete: the junction that
+/// took its place is not entered, not deleted, and the target is untouched.
+#[test]
+fn an_entry_that_is_swapped_for_a_junction_after_the_first_look_is_left_alone() {
+    let s = sandbox("swapped-link");
+    let pd = &s.paths.program_data;
+    let (dir, frames, logs) = elsewhere(&s);
+    let entry = pd.join("BetterCam.old-1-0");
+    std::fs::create_dir_all(entry.join("logs")).unwrap();
+    std::fs::write(entry.join("frames.bin"), b"old").unwrap();
+    let recorded = names(&["BetterCam.old-1-0"]);
+    let mut seen = Vec::new();
+    let mut log = VecLog::default();
+    let swept = sweep_data_asides_with(
+        &s.paths,
+        &s.p.trusted_owners,
+        &recorded,
+        &mut log,
+        &mut |p| {
+            seen.push(p.to_path_buf());
+            // the entry is looked at, found good, and replaced before the delete opens it
+            remove_no_follow(p).unwrap();
+            junction(p, &dir);
+            None
+        },
+    );
+    assert_eq!(
+        seen,
+        std::slice::from_ref(&entry),
+        "the hook runs between the two looks"
+    );
+    assert_eq!(swept.left, 0, "{:?}", log.0);
+    assert_eq!(swept.forget, recorded);
+    assert!(
+        is_link(&entry),
+        "the junction that took its place is not deleted"
+    );
+    assert!(
+        mentions(&log, "left alone") && mentions(&log, "BetterCam.old-1-0"),
+        "{:?}",
+        log.0
+    );
+    untouched(&dir, &frames, &logs);
+    remove_no_follow(&entry).unwrap();
+}
+
+/// The other half: the owner that the handle shows is not a trusted one (here the trusted set the second look uses
+/// is changed, as the owner of a real entry cannot be changed without a privilege).
+#[test]
+fn an_entry_whose_owner_is_not_trusted_on_the_handle_is_left_alone() {
+    let s = sandbox("swapped-owner");
+    let entry = s.paths.program_data.join("BetterCam.old-1-0");
+    std::fs::create_dir_all(entry.join("logs")).unwrap();
+    std::fs::write(entry.join("frames.bin"), b"old").unwrap();
+    let recorded = names(&["BetterCam.old-1-0"]);
+    let mut log = VecLog::default();
+    let swept = sweep_data_asides_with(
+        &s.paths,
+        &s.p.trusted_owners,
+        &recorded,
+        &mut log,
+        &mut |_| Some(vec![acl::SID_SYSTEM.to_string()]),
+    );
+    assert_eq!(swept.left, 0);
+    assert_eq!(swept.forget, recorded);
+    assert_eq!(std::fs::read(entry.join("frames.bin")).unwrap(), b"old");
+    assert!(mentions(&log, "left alone"), "{:?}", log.0);
+    assert!(!mentions(&log, "deleted old data folder"), "{:?}", log.0);
+}
+
+/// `prepare` names the data folder that it moved aside and could not delete (an object in it that nobody may
+/// delete), and only that: the caller puts the name on record. A folder that was deleted at once is not named.
+#[test]
+fn a_data_folder_that_is_moved_aside_and_stays_is_named_and_one_that_goes_is_not() {
+    let mut s = sandbox("moved-names");
+    run(&s, &mut VecLog::default()).unwrap();
+    // only SYSTEM is trusted from now on: the data folder (owned by the sandbox user) is somebody else's
+    s.p.trusted_owners = vec![acl::SID_SYSTEM.into()];
+    let mut moved = Vec::new();
+    prepare_recording(
+        &s.paths,
+        &s.p,
+        &mut || false,
+        &mut VecLog::default(),
+        &mut moved,
+    )
+    .unwrap();
+    assert!(
+        moved.is_empty(),
+        "the old copy was deleted at once: {moved:?}"
+    );
+    assert!(crate::testkit::asides_in(&s.paths).is_empty());
+
+    crate::testkit::undeletable_file(&s.paths.data, "junk.txt", &s.p.owner);
+    let mut moved = Vec::new();
+    let mut log = VecLog::default();
+    prepare_recording(&s.paths, &s.p, &mut || false, &mut log, &mut moved).unwrap();
+    let asides = crate::testkit::asides_in(&s.paths);
+    assert_eq!(asides.len(), 1, "{:?}", log.0);
+    let name = asides[0]
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(moved, std::slice::from_ref(&name));
+    assert!(is_aside_data_name(&name));
+    assert!(mentions(&log, "old copy kept as"), "{:?}", log.0);
+    // what a sweep with the record does: the owner of the old copy is not trusted here, so it is left
+    let swept = sweep_data_asides(
+        &s.paths,
+        &s.p.trusted_owners,
+        &moved,
+        &mut VecLog::default(),
+    );
+    assert_eq!(swept.forget, moved);
+    assert!(asides[0].exists());
+    // with the owner trusted and the file deletable it goes
+    crate::testkit::make_deletable(&asides[0].join("junk.txt"), &s.p.owner);
+    let trusted = vec![s.p.owner.clone()];
+    let swept = sweep_data_asides(&s.paths, &trusted, &moved, &mut VecLog::default());
+    assert_eq!(swept.forget, moved);
+    assert!(!asides[0].exists());
 }
