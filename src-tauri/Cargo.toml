@@ -25,6 +25,7 @@ tauri-plugin-autostart = "2.7.0"
 tauri-plugin-single-instance = "2.5.2"
 # The `implement` macro expands to paths in `windows_core`, so the crate must be a direct dependency.
 windows-core.workspace = true
+vcam-protocol = { workspace = true }
 
 [dependencies.windows]
 workspace = true
@@ -32,11 +33,14 @@ features = [
     "Win32_Foundation",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_Media_DirectShow",
     "Win32_Media_KernelStreaming",
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
+    "Win32_System_Console",
     "Win32_System_Performance",
 ]
