@@ -5,6 +5,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+pub use crate::registry::Stored;
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND, ERROR_PATH_NOT_FOUND,
 };
@@ -35,8 +36,24 @@ pub struct Registration {
     pub protocol: u32,
 }
 
+/// Where the record of moved-aside data folders is kept: two calls, so that everything that is decided about the
+/// record ([`crate::aside`]) is tested against a plain fake, and the real implementation stays a thin layer over the
+/// registry.
+pub trait AsideStore {
+    /// The record of the data folders this helper moved aside in `%ProgramData%`, as the strings stored (see
+    /// [`crate::aside`] for what is in them). Kept where only administrators can write (the helper's HKLM key), so
+    /// the sweep acts on exactly these and not on whatever a user made under a similar name. A record that is not
+    /// there is [`Stored::Missing`]; one that is there and cannot be read is [`Stored::Unreadable`], and is never
+    /// overwritten.
+    fn aside_record(&mut self) -> Stored;
+    /// Replace the record by `strings`. An empty list removes the value (and the state key when it holds nothing
+    /// else and no registration is there). The caller has read the record first and has not got
+    /// [`Stored::Unreadable`] for it.
+    fn write_aside_record(&mut self, strings: &[String]) -> Res<()>;
+}
+
 /// The parts of the machine that install and uninstall change besides the data folder and the DLL copies.
-pub trait Machine {
+pub trait Machine: AsideStore {
     /// Prepare the process: privileges, COM, Media Foundation. Called once, before anything is changed.
     fn start(&mut self) -> Res<()>;
     /// `sid` names a user account on this computer.
@@ -45,7 +62,10 @@ pub trait Machine {
     fn read_registration(&mut self) -> Option<Registration>;
     /// Write the COM class and the state key.
     fn write_registration(&mut self, r: &Registration) -> Res<()>;
-    /// Delete the COM class and the state key; the texts of what could not be deleted (empty: all gone).
+    /// Delete the COM class and the registration values of the state key; the texts of what could not be deleted
+    /// (empty: all gone). **The record of moved-aside data folders ([`Machine::aside_record`]) is never touched and
+    /// never part of the list**: it is not rewritten, so there is no moment in which it is gone, and nothing about it
+    /// can make a rollback incomplete. The state key itself goes when no record is in it.
     fn delete_registration(&mut self) -> Vec<String>;
     /// Create the virtual camera and start it (`dshow`: the DirectShow class fallback first).
     fn create_camera(&mut self, dshow: bool) -> Res<()>;
@@ -60,14 +80,6 @@ pub trait Machine {
     fn stop_frame_server(&mut self) -> bool;
     /// Delete a file that is in use at the next restart.
     fn delete_at_reboot(&mut self, p: &Path) -> Res<()>;
-    /// The names (not paths) of the data folders this helper moved aside in `%ProgramData%` and could not delete
-    /// then. Kept where only administrators can write (the helper's HKLM key), so the sweep acts on exactly these
-    /// and not on whatever a user made under a similar name.
-    fn aside_names(&mut self) -> Vec<String>;
-    /// Add `name` to the record (no duplicates).
-    fn record_aside(&mut self, name: &str) -> Res<()>;
-    /// Take `name` out of the record (it is gone, or no longer the helper's).
-    fn forget_aside(&mut self, name: &str);
 }
 
 /// The real machine.
@@ -156,27 +168,26 @@ impl Machine for RealMachine {
     }
 
     fn delete_registration(&mut self) -> Vec<String> {
-        // the record of moved-aside folders is not part of the registration: it outlives it until the folders are
-        // gone (the next install or removal sweeps them)
-        let asides = self.aside_names();
         let mut failed = Vec::new();
-        for key in [
-            vcam_protocol::clsid_key(),
-            vcam_protocol::VCAM_STATE_KEY.to_string(),
-        ] {
-            let r = registry::delete_tree(&key);
-            if r != windows::Win32::Foundation::ERROR_SUCCESS && r != ERROR_FILE_NOT_FOUND {
-                failed.push(format!("HKLM\\{key} (error {})", r.0));
+        let mut note = |what: String, r: windows::Win32::Foundation::WIN32_ERROR| {
+            if r != windows::Win32::Foundation::ERROR_SUCCESS && !registry::is_missing(r) {
+                failed.push(format!("{what} (error {})", r.0));
             }
+        };
+        let clsid = vcam_protocol::clsid_key();
+        note(format!("HKLM\\{clsid}"), registry::delete_tree(&clsid));
+        // The state key also holds the record of moved-aside folders, which outlives the registration until the
+        // folders are gone. So the registration's own values are deleted one by one and the key goes only when no
+        // record is in it: the record is never deleted and written back, and is never missing for a moment.
+        let state = vcam_protocol::VCAM_STATE_KEY;
+        for value in ["DllPath", "Protocol", "Build"] {
+            note(
+                format!("HKLM\\{state}\\{value}"),
+                registry::delete_value(state, value),
+            );
         }
-        if !asides.is_empty() {
-            if let Err(e) = registry::set_multi_string(
-                vcam_protocol::VCAM_STATE_KEY,
-                registry::ASIDE_VALUE,
-                &asides,
-            ) {
-                failed.push(format!("the record of old data folders ({e})"));
-            }
+        if !registry::value_exists(state, registry::ASIDE_VALUE) {
+            note(format!("HKLM\\{state}"), registry::delete_tree(state));
         }
         registry::delete_key_if_empty(r"SOFTWARE\BetterCam");
         failed
@@ -238,35 +249,33 @@ impl Machine for RealMachine {
         unsafe { MoveFileExW(pcwstr(&w), PCWSTR::null(), MOVEFILE_DELAY_UNTIL_REBOOT) }
             .map_err(|e| werr("MoveFileExW", e))
     }
+}
 
-    fn aside_names(&mut self) -> Vec<String> {
-        registry::get_multi_string(vcam_protocol::VCAM_STATE_KEY, registry::ASIDE_VALUE)
+impl AsideStore for RealMachine {
+    fn aside_record(&mut self) -> Stored {
+        registry::read_multi_string(vcam_protocol::VCAM_STATE_KEY, registry::ASIDE_VALUE)
     }
 
-    fn record_aside(&mut self, name: &str) -> Res<()> {
-        let mut names = self.aside_names();
-        if !names.iter().any(|n| n == name) {
-            names.push(name.to_string());
-        }
-        registry::set_multi_string(vcam_protocol::VCAM_STATE_KEY, registry::ASIDE_VALUE, &names)
-    }
-
-    fn forget_aside(&mut self, name: &str) {
-        let mut names = self.aside_names();
-        names.retain(|n| n != name);
-        if !names.is_empty() {
-            let _ = registry::set_multi_string(
+    fn write_aside_record(&mut self, strings: &[String]) -> Res<()> {
+        if !strings.is_empty() {
+            return registry::set_multi_string(
                 vcam_protocol::VCAM_STATE_KEY,
                 registry::ASIDE_VALUE,
-                &names,
+                strings,
             );
-            return;
         }
-        registry::delete_value(vcam_protocol::VCAM_STATE_KEY, registry::ASIDE_VALUE);
+        let r = registry::delete_value(vcam_protocol::VCAM_STATE_KEY, registry::ASIDE_VALUE);
+        if r != windows::Win32::Foundation::ERROR_SUCCESS && !registry::is_missing(r) {
+            return Err(format!(
+                "the record of old data folders could not be deleted (error {})",
+                r.0
+            ));
+        }
         // the key holds nothing else when there is no registration: the record was all that kept it
         if registry::read_registered().is_none() {
             let _ = registry::delete_tree(vcam_protocol::VCAM_STATE_KEY);
             registry::delete_key_if_empty(r"SOFTWARE\BetterCam");
         }
+        Ok(())
     }
 }

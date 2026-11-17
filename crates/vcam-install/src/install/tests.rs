@@ -1,5 +1,6 @@
 use super::*;
 use crate::log::VecLog;
+use crate::machine::{AsideStore, Stored};
 use crate::testkit::{fake_dll, lock_on, sandbox, within, Sandbox, BOUND};
 
 /// A machine that keeps its registry and camera in memory and fails at a named step.
@@ -17,12 +18,58 @@ struct Fake {
     registry_leftovers: Vec<String>,
     stop_calls: u32,
     calls: Vec<String>,
-    /// The record of moved-aside data folders (the helper's HKLM value).
-    asides: Vec<String>,
-    /// Every name that was put on the record (also those taken off again).
-    recorded: Vec<String>,
+    /// The record of moved-aside data folders as stored (the helper's HKLM value); `None`: there is none.
+    stored: Option<Stored>,
+    /// Every write of the record, in order (an empty list is the removal of the value).
+    record_writes: Vec<Vec<String>>,
     /// Writing the record fails.
     record_fails: bool,
+    /// A path whose existence is noted at every write of the record (the data folder: "before the rename").
+    watch: Option<PathBuf>,
+    /// For every write of the record: whether `watch` existed at that moment.
+    exists_at_write: Vec<bool>,
+}
+
+impl AsideStore for Fake {
+    fn aside_record(&mut self) -> Stored {
+        self.stored.clone().unwrap_or(Stored::Missing)
+    }
+    fn write_aside_record(&mut self, strings: &[String]) -> Res<()> {
+        if self.record_fails {
+            return Err("RegSetKeyValueW failed (injected)".into());
+        }
+        if let Some(w) = &self.watch {
+            self.exists_at_write.push(w.exists());
+        }
+        self.record_writes.push(strings.to_vec());
+        self.stored = (!strings.is_empty()).then(|| Stored::Strings(strings.to_vec()));
+        Ok(())
+    }
+}
+
+impl Fake {
+    /// The entries on the record.
+    fn entries(&mut self) -> Vec<aside::AsideEntry> {
+        match aside::load(self) {
+            aside::Record::Entries { entries, .. } => entries,
+            aside::Record::Unreadable(why) => panic!("the record is unreadable: {why}"),
+        }
+    }
+
+    /// The names on the record.
+    fn names(&mut self) -> Vec<String> {
+        self.entries().into_iter().map(|e| e.name).collect()
+    }
+
+    /// Put the folder `pd\name` (which exists) on the record, as the helper does when it moves it aside.
+    fn put_on_record(&mut self, pd: &Path, name: &str) {
+        let e = aside::AsideEntry {
+            name: name.to_string(),
+            identity: crate::testkit::identity_of(&pd.join(name)),
+        };
+        aside::add(self, &e).unwrap();
+        self.record_writes.clear();
+    }
 }
 
 impl Fake {
@@ -91,22 +138,6 @@ impl Machine for Fake {
             self.delayed.push(p.to_path_buf());
             Ok(())
         }
-    }
-    fn aside_names(&mut self) -> Vec<String> {
-        self.asides.clone()
-    }
-    fn record_aside(&mut self, name: &str) -> Res<()> {
-        if self.record_fails {
-            return Err("RegSetKeyValueW failed (injected)".into());
-        }
-        self.recorded.push(name.to_string());
-        if !self.asides.iter().any(|n| n == name) {
-            self.asides.push(name.to_string());
-        }
-        Ok(())
-    }
-    fn forget_aside(&mut self, name: &str) {
-        self.asides.retain(|n| n != name);
     }
 }
 
@@ -223,13 +254,12 @@ fn a_sid_that_is_not_a_user_account_is_refused_before_anything_is_touched() {
         fn delete_at_reboot(&mut self, _: &Path) -> Res<()> {
             panic!()
         }
-        fn aside_names(&mut self) -> Vec<String> {
+    }
+    impl AsideStore for Group {
+        fn aside_record(&mut self) -> Stored {
             panic!()
         }
-        fn record_aside(&mut self, _: &str) -> Res<()> {
-            panic!()
-        }
-        fn forget_aside(&mut self, _: &str) {
+        fn write_aside_record(&mut self, _: &[String]) -> Res<()> {
             panic!()
         }
     }
@@ -435,14 +465,13 @@ fn a_locked_old_dll_that_goes_once_the_service_stopped_is_done() {
         fn delete_at_reboot(&mut self, p: &Path) -> Res<()> {
             self.inner.delete_at_reboot(p)
         }
-        fn aside_names(&mut self) -> Vec<String> {
-            self.inner.aside_names()
+    }
+    impl AsideStore for Stopper<'_> {
+        fn aside_record(&mut self) -> Stored {
+            self.inner.aside_record()
         }
-        fn record_aside(&mut self, n: &str) -> Res<()> {
-            self.inner.record_aside(n)
-        }
-        fn forget_aside(&mut self, n: &str) {
-            self.inner.forget_aside(n)
+        fn write_aside_record(&mut self, s: &[String]) -> Res<()> {
+            self.inner.write_aside_record(s)
         }
     }
     let mut st = Stopper {
@@ -624,14 +653,13 @@ fn a_rollback_that_fails_says_so() {
         fn delete_at_reboot(&mut self, p: &Path) -> Res<()> {
             self.0.delete_at_reboot(p)
         }
-        fn aside_names(&mut self) -> Vec<String> {
-            self.0.aside_names()
+    }
+    impl AsideStore for Stubborn {
+        fn aside_record(&mut self) -> Stored {
+            self.0.aside_record()
         }
-        fn record_aside(&mut self, n: &str) -> Res<()> {
-            self.0.record_aside(n)
-        }
-        fn forget_aside(&mut self, n: &str) {
-            self.0.forget_aside(n)
+        fn write_aside_record(&mut self, s: &[String]) -> Res<()> {
+            self.0.write_aside_record(s)
         }
     }
     let s = sandbox("rollback-incomplete");
@@ -880,7 +908,7 @@ fn an_install_and_an_uninstall_delete_the_data_folders_that_were_moved_aside() {
         d
     };
     let a = mk("BetterCam.old-1-0");
-    m.asides.push("BetterCam.old-1-0".into());
+    m.put_on_record(pd, "BetterCam.old-1-0");
     let mut log = VecLog::default();
     do_install(&s, &dll, &mut m, &mut log).unwrap();
     assert!(
@@ -893,26 +921,30 @@ fn an_install_and_an_uninstall_delete_the_data_folders_that_were_moved_aside() {
         "the live data folder is untouched"
     );
     assert!(
-        m.asides.is_empty(),
+        m.names().is_empty(),
         "a name that is gone is taken off the record"
+    );
+    assert_eq!(
+        m.stored, None,
+        "the last entry takes the value away, not an empty list"
     );
 
     let b = mk("BetterCam.old-2-0");
-    m.asides.push("BetterCam.old-2-0".into());
+    m.put_on_record(pd, "BetterCam.old-2-0");
     let mut log = VecLog::default();
     uninstall_trusting(&s.paths, &s.p.trusted_owners, &mut m, &mut log).unwrap();
     assert!(!b.exists(), "uninstall leaves the old copy: {:?}", log.0);
     assert!(!s.paths.data.exists());
-    assert!(m.asides.is_empty());
+    assert!(m.names().is_empty());
 }
 
 /// An old copy that is still in use at uninstall is reported, not claimed as gone.
 #[test]
 fn an_old_data_folder_that_cannot_be_deleted_is_reported_by_uninstall() {
     let (s, mut m) = installed("old-data-busy");
-    m.asides.push("BetterCam.old-5-0".into());
     let d = s.paths.program_data.join("BetterCam.old-5-0");
     std::fs::create_dir_all(&d).unwrap();
+    m.put_on_record(&s.paths.program_data, "BetterCam.old-5-0");
     let f = d.join("vcam-1.log");
     std::fs::write(&f, b"x").unwrap();
     use std::os::windows::fs::OpenOptionsExt;
@@ -931,7 +963,7 @@ fn an_old_data_folder_that_cannot_be_deleted_is_reported_by_uninstall() {
     assert!(err.contains("old copy of the data folder"), "{err}");
     assert!(d.exists());
     assert_eq!(
-        m.asides,
+        m.names(),
         ["BetterCam.old-5-0"],
         "a copy that is still in use stays on record, for the next run"
     );
@@ -956,7 +988,7 @@ fn entry_with_a_locked_file(s: &Sandbox) -> (PathBuf, vcam_protocol::secure::opl
 fn a_repair_does_not_wait_for_or_fail_on_an_old_data_folder_with_a_locked_file() {
     let (s, mut m) = installed("repair-locked-aside");
     let (d, lock) = entry_with_a_locked_file(&s);
-    m.asides.push("BetterCam.old-test".into());
+    m.put_on_record(&s.paths.program_data, "BetterCam.old-test");
     let dll = fake_dll(&s.root.join("src2"), 2);
     let (paths, p) = (s.paths.clone(), s.p.clone());
     let (r, lines, m) = within("repair", BOUND, move || {
@@ -982,7 +1014,7 @@ fn a_repair_does_not_wait_for_or_fail_on_an_old_data_folder_with_a_locked_file()
 fn an_uninstall_does_not_wait_for_a_locked_file_in_an_old_data_folder() {
     let (s, mut m) = installed("uninstall-locked-aside");
     let (d, lock) = entry_with_a_locked_file(&s);
-    m.asides.push("BetterCam.old-test".into());
+    m.put_on_record(&s.paths.program_data, "BetterCam.old-test");
     // 1. not the helper's: only SYSTEM is trusted, the sandbox user made the entry
     let (paths, only_system) = (s.paths.clone(), vec![crate::acl::SID_SYSTEM.to_string()]);
     let (r, mut m) = within("uninstall (somebody else's entry)", BOUND, move || {
@@ -997,12 +1029,12 @@ fn an_uninstall_does_not_wait_for_a_locked_file_in_an_old_data_folder() {
     );
     assert_eq!(std::fs::metadata(d.join("f.txt")).unwrap().len(), 4096);
     assert!(
-        m.asides.is_empty(),
+        m.names().is_empty(),
         "an entry that is not the helper's is taken off the record"
     );
 
     // 2. the helper's own (trusted owner), with a lock in it: reported, not waited for
-    m.asides.push("BetterCam.old-test".into());
+    m.put_on_record(&s.paths.program_data, "BetterCam.old-test");
     let (paths, trusted) = (s.paths.clone(), s.p.trusted_owners.clone());
     let (r, lines) = within("uninstall (the helper's entry)", BOUND, move || {
         let mut log = VecLog::default();
@@ -1020,13 +1052,12 @@ fn an_uninstall_does_not_wait_for_a_locked_file_in_an_old_data_folder() {
         "{lines:?}"
     );
     drop(lock);
+    let mut last = Fake::default();
+    last.put_on_record(&s.paths.program_data, "BetterCam.old-test");
     uninstall_trusting(
         &s.paths,
         &s.p.trusted_owners,
-        &mut Fake {
-            asides: vec!["BetterCam.old-test".into()],
-            ..Fake::default()
-        },
+        &mut last,
         &mut VecLog::default(),
     )
     .unwrap();
@@ -1179,10 +1210,11 @@ fn a_different_copy_that_a_program_holds_a_lock_on_is_not_replaced_and_not_waite
             eprintln!("this file system grants no oplock: skipped");
             return;
         };
-        let (b, d) = (bytes.clone(), dest.clone());
+        let (b, d, p) = (bytes.clone(), dest.clone(), s.p.clone());
         let r = within("copy", BOUND, move || {
-            copy_dll(&b, &d, &mut VecLog::default())
+            copy_dll(&b, &d, &p, &mut VecLog::default())
         });
+        // (both kinds are met at the read of the copy, which says so)
         let err = r.unwrap_err();
         assert!(
             err.contains("locked by another program") && err.contains("better_cam_vcam_"),
@@ -1195,9 +1227,41 @@ fn a_different_copy_that_a_program_holds_a_lock_on_is_not_replaced_and_not_waite
             "the temporary file is not left"
         );
         drop(lock);
-        assert!(copy_dll(&bytes, &dest, &mut VecLog::default()).unwrap());
+        assert!(copy_dll(&bytes, &dest, &s.p, &mut VecLog::default()).unwrap());
         assert_eq!(std::fs::read(&dest).unwrap(), bytes);
     }
+
+    // A lock that is taken after the copy was read and before the rename (so it is the rename that meets it): the
+    // temporary file is not moved, the copy is as it was, and the message is about *moving* the one to the other and
+    // names both (a lock on either file gives this refusal; it used to name the copy only)
+    std::fs::write(&dest, &old).unwrap();
+    let mut lock = None;
+    let result = copy_dll_with(&bytes, &dest, &s.p, &mut VecLog::default(), &mut |_| {
+        lock = Oplock::take(&dest).unwrap();
+    });
+    if lock.is_none() {
+        eprintln!("this file system grants no oplock: that part is skipped");
+        return;
+    }
+    let err = result.unwrap_err();
+    let (tmp, to) = (
+        dest.with_extension("dll.tmp").display().to_string(),
+        dest.display().to_string(),
+    );
+    assert!(
+        err.contains("cannot move")
+            && err.contains("locked by another program")
+            && err.contains(&tmp)
+            && err.contains(&to),
+        "{err}"
+    );
+    assert_eq!(std::fs::metadata(&dest).unwrap().len(), old.len() as u64);
+    assert!(
+        !dest.with_extension("dll.tmp").exists(),
+        "the temporary file is not left"
+    );
+    drop(lock);
+    assert!(copy_dll(&bytes, &dest, &s.p, &mut VecLog::default()).unwrap());
 }
 
 /// A temporary file that an earlier run left and that a program holds a lock on: the same, and it names that file.
@@ -1213,9 +1277,9 @@ fn a_leftover_temporary_file_that_a_program_holds_a_lock_on_is_a_named_error_and
     let Some(lock) = lock_on(&tmp) else {
         return;
     };
-    let (b, d) = (bytes.clone(), dest.clone());
+    let (b, d, p) = (bytes.clone(), dest.clone(), s.p.clone());
     let err = within("copy", BOUND, move || {
-        copy_dll(&b, &d, &mut VecLog::default())
+        copy_dll(&b, &d, &p, &mut VecLog::default())
     })
     .unwrap_err();
     assert!(
@@ -1225,7 +1289,7 @@ fn a_leftover_temporary_file_that_a_program_holds_a_lock_on_is_a_named_error_and
     assert!(!dest.exists(), "no copy under the real name");
     assert_eq!(std::fs::metadata(&tmp).unwrap().len(), 10);
     drop(lock);
-    assert!(copy_dll(&bytes, &dest, &mut VecLog::default()).unwrap());
+    assert!(copy_dll(&bytes, &dest, &s.p, &mut VecLog::default()).unwrap());
     assert_eq!(std::fs::read(&dest).unwrap(), bytes);
     assert!(!tmp.exists());
 }
@@ -1239,14 +1303,17 @@ fn the_copy_works_when_nothing_is_locked_and_is_rolled_back_when_the_install_fai
     let bytes = dll_bytes(&dll);
     let dest = dest_of(&s, &dll);
     let mut log = VecLog::default();
-    assert!(copy_dll(&bytes, &dest, &mut log).unwrap());
+    assert!(copy_dll(&bytes, &dest, &s.p, &mut log).unwrap());
     assert_eq!(std::fs::read(&dest).unwrap(), bytes);
-    assert!(!copy_dll(&bytes, &dest, &mut log).unwrap(), "already there");
+    assert!(
+        !copy_dll(&bytes, &dest, &s.p, &mut log).unwrap(),
+        "already there"
+    );
     assert!(log.0.iter().any(|l| l.contains("already present")));
     // other contents under the name, and a leftover temporary file
     std::fs::write(&dest, b"damaged").unwrap();
     std::fs::write(dest.with_extension("dll.tmp"), b"leftover").unwrap();
-    assert!(copy_dll(&bytes, &dest, &mut log).unwrap());
+    assert!(copy_dll(&bytes, &dest, &s.p, &mut log).unwrap());
     assert_eq!(std::fs::read(&dest).unwrap(), bytes);
     assert!(!dest.with_extension("dll.tmp").exists());
     // the copy is a real file (not a handle's partial write): the same size and a plain one
@@ -1272,13 +1339,21 @@ fn the_copy_works_when_nothing_is_locked_and_is_rolled_back_when_the_install_fai
     registration_is_sound(&m);
 }
 
-// ---- L3: what the helper moved aside is put on record, whatever happens next
+// ---- the record of what the helper moved aside (findings 1, 4, 5, 7)
 
-/// Install puts the data folders that it moved aside and could not delete on the record, also when it fails later;
-/// a record that cannot be written is said and does not fail the install.
+fn remove_all_asides(s: &Sandbox) {
+    for a in crate::testkit::asides_in(&s.paths) {
+        crate::datadir::remove_no_follow(&a).unwrap();
+    }
+}
+
+/// A data folder that a user made (its owner is not SYSTEM or Administrators) is moved aside and, with a file in it
+/// that cannot be deleted, stays. It is **not put on the record**: the old code recorded it, so that a user who kept a
+/// file open and then swapped the name for an administrator-owned folder got that folder deleted by the next run.
+/// The entry is left where it is, with one line that says why, and no record is written.
 #[test]
-fn a_data_folder_that_stays_after_it_was_moved_aside_is_put_on_record() {
-    let mut s = sandbox("record-moved");
+fn a_data_folder_that_is_not_owned_by_a_trusted_account_is_never_put_on_record() {
+    let mut s = sandbox("record-untrusted");
     let mut m = Fake::default();
     let dll = fake_dll(&s.root.join("src"), 1);
     do_install(&s, &dll, &mut m, &mut VecLog::default()).unwrap();
@@ -1290,26 +1365,66 @@ fn a_data_folder_that_stays_after_it_was_moved_aside_is_put_on_record() {
     do_install(&s, &dll, &mut m, &mut log).unwrap();
     let asides = crate::testkit::asides_in(&s.paths);
     assert_eq!(asides.len(), 1, "{:?}", log.0);
-    let name = asides[0]
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-    assert_eq!(m.recorded, std::slice::from_ref(&name), "{:?}", log.0);
+    assert!(m.record_writes.is_empty(), "{:?}", m.record_writes);
+    assert_eq!(m.stored, None);
     assert!(
-        log.0.iter().any(|l| l.contains("is on record")),
+        log.0.iter().any(|l| l.contains("old copy kept as")
+            && l.contains("left where it is")
+            && l.contains("not SYSTEM or Administrators")),
         "{:?}",
         log.0
     );
-    // the sweep at the end of that run found the old copy owned by somebody who is not trusted: left, forgotten
-    assert!(m.asides.is_empty(), "{:?}", m.asides);
     assert!(asides[0].exists());
-
-    // the same with a record that cannot be written
     crate::testkit::make_deletable(&asides[0].join("junk.txt"), &s.p.owner);
     remove_all_asides(&s);
-    crate::testkit::undeletable_file(&s.paths.data, "junk.txt", &s.p.owner);
-    m.record_fails = true;
+}
+
+/// A data folder that is the helper's (a trusted owner; here a file named like the folder) is put on the record
+/// **before** it is renamed, with its identity, and taken off again when the old copy is deleted at once. The fake
+/// notes whether the data folder still existed under its name at each write.
+#[test]
+fn a_moved_aside_folder_is_put_on_record_before_the_rename_and_off_it_when_it_is_deleted() {
+    let s = sandbox("record-before");
+    std::fs::write(&s.paths.data, b"a file where the data folder goes").unwrap();
+    let before = crate::testkit::identity_of(&s.paths.data);
+    let mut m = Fake {
+        watch: Some(s.paths.data.clone()),
+        ..Fake::default()
+    };
+    let dll = fake_dll(&s.root.join("src"), 1);
+    let mut log = VecLog::default();
+    do_install(&s, &dll, &mut m, &mut log).unwrap();
+    assert_eq!(m.record_writes.len(), 2, "{:?}", log.0);
+    let first = &m.record_writes[0];
+    assert_eq!(first.len(), 1);
+    let entry = aside::AsideEntry::parse(&first[0]).expect("an entry with an identity");
+    assert!(entry.name.starts_with("BetterCam.old-"), "{entry:?}");
+    assert_eq!(
+        entry.identity, before,
+        "the identity read on the handle that was renamed"
+    );
+    assert_eq!(
+        m.exists_at_write,
+        [true, false],
+        "written while the data folder still had its name, taken off once the copy was deleted"
+    );
+    assert!(m.record_writes[1].is_empty());
+    assert_eq!(m.stored, None, "nothing is left on the record");
+    assert!(s.paths.data.is_dir() && crate::testkit::asides_in(&s.paths).is_empty());
+}
+
+/// A record that cannot be written is said and does not fail the install. And, the other half of a fault in the
+/// rollback: a failing step after that rolls back completely: nothing about the record makes it "incomplete".
+#[test]
+fn a_record_that_cannot_be_written_is_a_line_of_the_log_and_never_an_incomplete_rollback() {
+    let s = sandbox("record-fails");
+    std::fs::write(&s.paths.data, b"a file where the data folder goes").unwrap();
+    let dll = fake_dll(&s.root.join("src"), 1);
+    // the install goes through
+    let mut m = Fake {
+        record_fails: true,
+        ..Fake::default()
+    };
     let mut log = VecLog::default();
     do_install(&s, &dll, &mut m, &mut log).unwrap();
     assert!(
@@ -1319,14 +1434,249 @@ fn a_data_folder_that_stays_after_it_was_moved_aside_is_put_on_record() {
         "{:?}",
         log.0
     );
-    let left = crate::testkit::asides_in(&s.paths);
-    assert_eq!(left.len(), 1);
-    crate::testkit::make_deletable(&left[0].join("junk.txt"), &s.p.owner);
-    remove_all_asides(&s);
+    // and a later failing camera is rolled back completely, with the record failing all the while
+    let s = sandbox("record-fails-rollback");
+    std::fs::write(&s.paths.data, b"a file where the data folder goes").unwrap();
+    let mut m = Fake {
+        record_fails: true,
+        fail: Some("create_camera"),
+        ..Fake::default()
+    };
+    let err = do_install(&s, &dll, &mut m, &mut VecLog::default()).unwrap_err();
+    assert!(err.contains("create_camera"), "{err}");
+    assert!(
+        err.contains("nothing was changed") && !err.contains("incomplete"),
+        "{err}"
+    );
+    assert!(m.reg.is_none());
+    assert!(
+        dll_files(&s).is_empty(),
+        "the copy was deleted by the rollback"
+    );
 }
 
-fn remove_all_asides(s: &Sandbox) {
-    for a in crate::testkit::asides_in(&s.paths) {
-        crate::datadir::remove_no_follow(&a).unwrap();
+/// A record that exists and cannot be read (another type, too long) is not acted on and not overwritten: nothing is
+/// deleted because of it, nothing is written, and the install goes on. Strings in it that are not entries are
+/// dropped, and the good entries next to them are still swept.
+#[test]
+fn a_damaged_record_is_not_overwritten_and_not_acted_on() {
+    let (s, mut m) = installed("record-damaged");
+    let pd = s.paths.program_data.clone();
+    let old = pd.join("BetterCam.old-1-0");
+    std::fs::create_dir_all(old.join("logs")).unwrap();
+    let dll = fake_dll(&s.root.join("src2"), 2);
+    let good = crate::testkit::entry_of(&pd, "BetterCam.old-1-0");
+    for damaged in [
+        Stored::Unreadable("error 1630 (another type)".into()),
+        Stored::Unreadable("error 234 (more data)".into()),
+        Stored::Strings(
+            (0..=aside::MAX_ENTRIES)
+                .map(|i| format!("BetterCam.old-{i}-0|0000000000000001|{:032x}", i + 1))
+                .collect(),
+        ),
+    ] {
+        m.stored = Some(damaged.clone());
+        m.record_writes.clear();
+        let mut log = VecLog::default();
+        do_install(&s, &dll, &mut m, &mut log).unwrap();
+        assert!(old.is_dir(), "an old copy was deleted on a damaged record");
+        assert_eq!(
+            m.stored,
+            Some(damaged),
+            "the damaged record was overwritten"
+        );
+        assert!(m.record_writes.is_empty());
+        assert!(
+            log.0.iter().any(|l| l.contains("cannot be read")),
+            "{:?}",
+            log.0
+        );
+    }
+    // strings that are not entries are dropped; the entry next to them is the helper's and is swept
+    m.stored = Some(Stored::Strings(vec![
+        "junk".into(),
+        good.encode(),
+        "BetterCam.old-9-0|zz|zz".into(),
+    ]));
+    let mut log = VecLog::default();
+    do_install(&s, &dll, &mut m, &mut log).unwrap();
+    assert!(!old.exists(), "{:?}", log.0);
+    assert_eq!(
+        m.stored, None,
+        "the junk went with the write that removed the entry"
+    );
+    assert!(
+        log.0
+            .iter()
+            .any(|l| l.contains("2 string(s)") && l.contains("not entries")),
+        "{:?}",
+        log.0
+    );
+    // a record that holds nothing but strings that are not entries is cleaned up by the run that found it
+    m.stored = Some(Stored::Strings(vec!["junk".into(), "also|junk".into()]));
+    do_install(&s, &dll, &mut m, &mut VecLog::default()).unwrap();
+    assert_eq!(m.stored, None, "the junk stayed on the record");
+}
+
+/// The reviewer's chain, end to end: a name is on the record, the folder behind it is deleted, and another folder
+/// with a *trusted owner* (here: the same account, which is trusted in the sandbox) is renamed into the name. The old
+/// code saw "a recorded name, not a link, trusted owner" and deleted it with administrator rights. Now the folder is
+/// not the one that was recorded: it is left exactly as it is, and the name is dropped from the record.
+#[test]
+fn a_recorded_name_that_was_freed_and_filled_with_another_folder_is_left_alone() {
+    let (s, mut m) = installed("record-swapped");
+    let pd = s.paths.program_data.clone();
+    let name = "BetterCam.old-1-0";
+    let mk = || {
+        std::fs::create_dir_all(pd.join(name).join("logs")).unwrap();
+        std::fs::write(pd.join(name).join("frames.bin"), b"theirs").unwrap();
+    };
+    mk();
+    m.put_on_record(&pd, name);
+    // the user keeps it from being deleted at once and later frees the name
+    crate::datadir::remove_no_follow(&pd.join(name)).unwrap();
+    // another folder of the same account takes the name (an administrator-owned folder that the user may rename)
+    let other = pd.join("Somebody-elses-folder");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("precious.txt"), b"precious").unwrap();
+    std::fs::rename(&other, pd.join(name)).unwrap();
+    let dll = fake_dll(&s.root.join("src2"), 2);
+    let mut log = VecLog::default();
+    do_install(&s, &dll, &mut m, &mut log).unwrap();
+    assert_eq!(
+        std::fs::read(pd.join(name).join("precious.txt")).unwrap(),
+        b"precious",
+        "the folder that took the name was deleted: {:?}",
+        log.0
+    );
+    assert!(m.names().is_empty(), "the name is dropped from the record");
+    assert!(
+        log.0
+            .iter()
+            .any(|l| l.contains("left alone") && l.contains(name)),
+        "{:?}",
+        log.0
+    );
+    // and the same for an uninstall
+    m.put_on_record(&pd, name);
+    crate::datadir::remove_no_follow(&pd.join(name)).unwrap();
+    std::fs::create_dir_all(other.join("sub")).unwrap();
+    std::fs::write(other.join("precious.txt"), b"precious").unwrap();
+    std::fs::rename(&other, pd.join(name)).unwrap();
+    uninstall_trusting(
+        &s.paths,
+        &s.p.trusted_owners,
+        &mut m,
+        &mut VecLog::default(),
+    )
+    .unwrap();
+    assert!(pd.join(name).join("precious.txt").is_file());
+    assert!(m.names().is_empty());
+}
+
+// ---- the temporary DLL (findings 3 and 6)
+
+/// The temporary file is made with a protected DACL that grants only SYSTEM and Administrators (here: the account
+/// that plays the administrators), so no standard user can open or lock it before the rename. A rename keeps that
+/// DACL (`acl::tests::a_rename_keeps_a_protected_dacl...`), so the final file is given what its folder hands down: not
+/// protected, with the entry that `Program Files` gives its readers (the camera service reads the DLL as LOCAL
+/// SERVICE through such an entry).
+#[test]
+fn the_temporary_dll_is_private_and_the_final_one_has_the_permissions_of_its_folder() {
+    use crate::acl::{self, Ace};
+    let s = sandbox("dll-permissions");
+    let dll = fake_dll(&s.root.join("src"), 5);
+    let bytes = dll_bytes(&dll);
+    let dest = dest_of(&s, &dll);
+    // the install folder hands down read access to somebody else (as `Program Files` does to Users)
+    std::fs::create_dir_all(&s.paths.install).unwrap();
+    {
+        let h = secure::open_with(
+            &s.paths.install,
+            0x8000_0000 | acl::SECURITY_ACCESS,
+            secure::SHARE_ALL,
+            secure::DISP_OPEN_EXISTING,
+            true,
+            0,
+        )
+        .unwrap();
+        let inherit = acl::OBJECT_INHERIT | acl::CONTAINER_INHERIT;
+        let aces = [
+            Ace {
+                sid: s.p.owner.clone(),
+                mask: acl::FULL,
+                flags: inherit,
+            },
+            Ace {
+                sid: crate::testkit::FAKE_USER.into(),
+                mask: acl::FILE_READ,
+                flags: inherit,
+            },
+        ];
+        acl::apply_aces(&h, &aces, &s.p.owner).unwrap();
+    }
+    let mut seen = None;
+    let copied = copy_dll_with(&bytes, &dest, &s.p, &mut VecLog::default(), &mut |tmp| {
+        seen = Some(crate::testkit::security_of(tmp));
+    })
+    .unwrap();
+    assert!(copied);
+    // the temporary file, as it was between the write and the rename: protected, exactly SYSTEM and the
+    // administrators, and nothing for the user the folder gives read access to
+    let tmp_acl = seen.expect("the hook ran between the write and the rename");
+    acl::check_dacl(
+        &tmp_acl,
+        &[
+            Ace {
+                sid: s.p.system.clone(),
+                mask: acl::FULL,
+                flags: 0,
+            },
+            Ace {
+                sid: s.p.admins.clone(),
+                mask: acl::FULL,
+                flags: 0,
+            },
+        ],
+    )
+    .unwrap_or_else(|e| panic!("the temporary file's DACL is not the private one: {e}"));
+    assert!(!tmp_acl
+        .aces
+        .iter()
+        .any(|a| acl::sid_eq(&a.sid, crate::testkit::FAKE_USER)));
+    // the final file: the folder's permissions
+    let fin = crate::testkit::security_of(&dest);
+    assert!(!fin.protected, "the DACL of the copy does not inherit");
+    let user = fin
+        .aces
+        .iter()
+        .find(|a| acl::sid_eq(&a.sid, crate::testkit::FAKE_USER))
+        .unwrap_or_else(|| panic!("the entry the folder hands down is missing: {:?}", fin.aces));
+    assert_eq!(user.mask & acl::FILE_READ, acl::FILE_READ);
+    assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+    assert!(!dest.with_extension("dll.tmp").exists());
+    // a copy that is there and right is left as it is
+    assert!(!copy_dll(&bytes, &dest, &s.p, &mut VecLog::default()).unwrap());
+    assert_eq!(crate::testkit::security_of(&dest), fin);
+}
+
+/// The sentence for a failed move names both files, whichever of them another program holds a lock on, and whatever
+/// else went wrong.
+#[test]
+fn the_error_of_a_failed_move_names_both_files() {
+    let from = Path::new(r"C:\x\better_cam_vcam_1.abcd1234.dll.tmp");
+    let to = Path::new(r"C:\x\better_cam_vcam_1.abcd1234.dll");
+    let busy = secure::refused(format!(
+        "{}: another program holds a lock on the file (an oplock break is in progress); not waiting for it",
+        to.display()
+    ));
+    assert!(secure::is_oplock_busy(&busy));
+    for e in [busy, std::io::Error::from_raw_os_error(5)] {
+        let text = rename_error(from, to, &e);
+        assert!(
+            text.contains(&from.display().to_string()) && text.contains(&to.display().to_string()),
+            "{text}"
+        );
+        assert!(text.contains("move"), "{text}");
     }
 }

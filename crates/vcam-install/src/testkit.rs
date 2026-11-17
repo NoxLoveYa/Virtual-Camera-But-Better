@@ -96,6 +96,70 @@ pub fn lock_on(p: &Path) -> Option<vcam_protocol::secure::oplock::Oplock> {
     l
 }
 
+/// The identity (volume and file id) of the file or folder at `p`, read without following a link at its end.
+pub fn identity_of(p: &Path) -> secure::FileIdentity {
+    let h = secure::open_with(
+        p,
+        0x80, // FILE_READ_ATTRIBUTES
+        secure::SHARE_ALL,
+        secure::DISP_OPEN_EXISTING,
+        true,
+        0,
+    )
+    .unwrap();
+    secure::file_identity(secure::raw(&h)).unwrap()
+}
+
+/// The record entry for the existing folder `program_data\name`, as the helper writes it.
+pub fn entry_of(program_data: &Path, name: &str) -> crate::aside::AsideEntry {
+    crate::aside::AsideEntry {
+        name: name.to_string(),
+        identity: identity_of(&program_data.join(name)),
+    }
+}
+
+/// A record store in memory (the helper's HKLM value) that can be told to fail, and counts its writes.
+#[derive(Default)]
+pub struct MemStore {
+    /// `None`: there is no value.
+    pub stored: Option<crate::machine::Stored>,
+    /// Every write, in order (an empty list is the removal of the value).
+    pub writes: Vec<Vec<String>>,
+    pub fail_writes: bool,
+}
+
+impl crate::machine::AsideStore for MemStore {
+    fn aside_record(&mut self) -> crate::machine::Stored {
+        self.stored
+            .clone()
+            .unwrap_or(crate::machine::Stored::Missing)
+    }
+    fn write_aside_record(&mut self, strings: &[String]) -> crate::util::Res<()> {
+        if self.fail_writes {
+            return Err("write failed (injected)".into());
+        }
+        self.writes.push(strings.to_vec());
+        self.stored =
+            (!strings.is_empty()).then(|| crate::machine::Stored::Strings(strings.to_vec()));
+        Ok(())
+    }
+}
+
+impl MemStore {
+    /// The entries on the record.
+    pub fn entries(&mut self) -> Vec<crate::aside::AsideEntry> {
+        match crate::aside::load(self) {
+            crate::aside::Record::Entries { entries, .. } => entries,
+            crate::aside::Record::Unreadable(why) => panic!("the record is unreadable: {why}"),
+        }
+    }
+
+    /// The names on the record, in order.
+    pub fn names(&mut self) -> Vec<String> {
+        self.entries().into_iter().map(|e| e.name).collect()
+    }
+}
+
 /// A fake DLL that passes `looks_like_dll`.
 pub fn fake_dll(dir: &Path, fill: u8) -> PathBuf {
     std::fs::create_dir_all(dir).unwrap();

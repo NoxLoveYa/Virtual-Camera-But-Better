@@ -1,10 +1,12 @@
 //! The HKLM keys of the virtual camera: the COM registration of the media source and the state key.
 
-use windows::Win32::Foundation::{ERROR_SUCCESS, WIN32_ERROR};
+use windows::Win32::Foundation::{
+    ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, WIN32_ERROR,
+};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegDeleteKeyValueW, RegDeleteKeyW, RegDeleteTreeW, RegGetValueW, RegOpenKeyExW,
     RegSetKeyValueW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_DWORD, REG_MULTI_SZ, REG_SZ,
-    RRF_RT_REG_DWORD, RRF_RT_REG_MULTI_SZ, RRF_RT_REG_SZ,
+    RRF_RT_ANY, RRF_RT_REG_DWORD, RRF_RT_REG_MULTI_SZ, RRF_RT_REG_SZ,
 };
 use windows_core::PCWSTR;
 
@@ -152,9 +154,10 @@ pub fn registered_from(
     })
 }
 
-/// The value of the state key that lists the names of the data folders this helper moved aside in `%ProgramData%`
-/// (a `REG_MULTI_SZ`). Only administrators can write the key, so a name in it was put there by the helper: it is what
-/// the sweep of old data folders trusts, instead of every `BetterCam.old-*` entry a user could have made.
+/// The value of the state key that lists the data folders this helper moved aside in `%ProgramData%` (a
+/// `REG_MULTI_SZ`, one string per folder: its name and its identity, see [`crate::aside`]). Only administrators can
+/// write the key, so an entry in it was put there by the helper: it is what the sweep of old data folders trusts,
+/// instead of every `BetterCam.old-*` entry a user could have made.
 pub const ASIDE_VALUE: &str = "MovedAside";
 
 /// The strings of a `REG_MULTI_SZ` (up to the first empty one).
@@ -179,8 +182,31 @@ pub fn encode_multi_sz(items: &[String]) -> Vec<u16> {
     out
 }
 
-/// The strings of the `REG_MULTI_SZ` `name` of `subkey` (empty when there is none).
-pub fn get_multi_string(subkey: &str, name: &str) -> Vec<String> {
+/// What a `REG_MULTI_SZ` value holds, told apart from what it does not: a value that is **not there** is an empty
+/// record; one that is there and **cannot be read** (another type, too long, access denied, changing while it is read)
+/// is something nobody may act on or overwrite.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Stored {
+    /// The value (or its key) does not exist.
+    Missing,
+    /// The strings of the value.
+    Strings(Vec<String>),
+    /// It exists and was not read; the text says why.
+    Unreadable(String),
+}
+
+/// The longest value read, in bytes. The record is a few lines; anything longer is not something this helper wrote.
+pub const MAX_VALUE_BYTES: u32 = 64 * 1024;
+
+/// True for the result codes that say "there is no such value or key" (the only case that is an empty record).
+pub fn is_missing(code: WIN32_ERROR) -> bool {
+    code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND
+}
+
+/// The strings of the `REG_MULTI_SZ` `name` of `subkey`: [`Stored::Missing`] only when it is not there,
+/// [`Stored::Unreadable`] for every other way of not getting it (a value of another type is error 1630, a value that
+/// grew while it was read is `ERROR_MORE_DATA`, anything above [`MAX_VALUE_BYTES`] is refused).
+pub fn read_multi_string(subkey: &str, name: &str) -> Stored {
     let sk = wide(subkey);
     let nm = wide(name);
     let mut size = 0u32;
@@ -196,8 +222,19 @@ pub fn get_multi_string(subkey: &str, name: &str) -> Vec<String> {
             Some(&mut size),
         )
     };
-    if r != ERROR_SUCCESS || size == 0 {
-        return Vec::new();
+    if is_missing(r) {
+        return Stored::Missing;
+    }
+    if r != ERROR_SUCCESS {
+        return Stored::Unreadable(format!(
+            "HKLM\\{subkey}\\{name} cannot be read (error {})",
+            r.0
+        ));
+    }
+    if size > MAX_VALUE_BYTES {
+        return Stored::Unreadable(format!(
+            "HKLM\\{subkey}\\{name} is {size} bytes long, more than the {MAX_VALUE_BYTES} that are read"
+        ));
     }
     let mut buf = vec![0u16; (size as usize).div_ceil(2) + 1];
     let mut size = (buf.len() * 2) as u32;
@@ -212,10 +249,37 @@ pub fn get_multi_string(subkey: &str, name: &str) -> Vec<String> {
             Some(&mut size),
         )
     };
-    if r != ERROR_SUCCESS {
-        return Vec::new();
+    if is_missing(r) {
+        return Stored::Missing;
     }
-    decode_multi_sz(&buf[..(size as usize / 2).min(buf.len())])
+    if r != ERROR_SUCCESS {
+        return Stored::Unreadable(format!(
+            "HKLM\\{subkey}\\{name} cannot be read (error {})",
+            r.0
+        ));
+    }
+    Stored::Strings(decode_multi_sz(&buf[..(size as usize / 2).min(buf.len())]))
+}
+
+/// The value `name` of `subkey` exists, or *may* exist: anything but "no such value or key" counts, so a value that
+/// cannot even be asked about is never taken for absent.
+pub fn value_exists(subkey: &str, name: &str) -> bool {
+    let sk = wide(subkey);
+    let nm = wide(name);
+    let mut size = 0u32;
+    // SAFETY: a size query only; any type (a record of another type still exists).
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            pcwstr(&sk),
+            pcwstr(&nm),
+            RRF_RT_ANY,
+            None,
+            None,
+            Some(&mut size),
+        )
+    };
+    !is_missing(r)
 }
 
 /// Write the `REG_MULTI_SZ` `name` of `subkey` (the key is made when it is missing).
@@ -240,11 +304,12 @@ pub fn set_multi_string(subkey: &str, name: &str, items: &[String]) -> Res<()> {
     }
 }
 
-/// Delete the value `name` of `subkey` (errors ignored: a value that is not there is as good as gone).
-pub fn delete_value(subkey: &str, name: &str) {
+/// Delete the value `name` of `subkey`. The result is the system's: a value or key that is not there is
+/// [`is_missing`] (as good as gone), anything else is a failure.
+pub fn delete_value(subkey: &str, name: &str) -> WIN32_ERROR {
     let sk = wide(subkey);
     let nm = wide(name);
-    let _ = unsafe { RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, pcwstr(&sk), pcwstr(&nm)) };
+    unsafe { RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, pcwstr(&sk), pcwstr(&nm)) }
 }
 
 /// Delete `subkey` and everything below it.
@@ -283,6 +348,18 @@ mod tests {
         );
         // data that is cut off in the middle of a string still gives its text
         assert_eq!(decode_multi_sz(&[97, 98]), ["ab"]);
+    }
+
+    /// "Missing" and "unreadable" are told apart by the result code: only a value or key that is not there is an empty
+    /// record. A value of another type (1630), one that grew while it was read (`ERROR_MORE_DATA`), access denied and
+    /// every other code are values that exist and were not read: nobody acts on them or overwrites them.
+    #[test]
+    fn only_no_such_value_is_an_empty_record() {
+        assert!(is_missing(ERROR_FILE_NOT_FOUND));
+        assert!(is_missing(ERROR_PATH_NOT_FOUND));
+        for code in [0u32, 5, 234, 1630, 1450, 87] {
+            assert!(!is_missing(WIN32_ERROR(code)), "error {code}");
+        }
     }
 
     /// A state key that holds only the record of moved-aside folders is no registration.

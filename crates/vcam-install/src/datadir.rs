@@ -14,12 +14,17 @@
 //!   entries in `%ProgramData%`, and a program of theirs that holds an opportunistic lock on a file makes the plain
 //!   delete, rename and open of it wait. Deletes and renames go through handles ([`secure::remove_tree`],
 //!   [`secure::rename_no_wait`]); a file that is locked is left, named, and tried again at the next install. The
-//!   helper acts only on entries it made: it records the name of every data folder it moves aside and could not
-//!   delete (in the registry, where only administrators write), and sweeps exactly those names, each only while its
-//!   owner is still SYSTEM or Administrators and it is not a link. Other `BetterCam.old-*` entries are never looked at.
-//! * a frame file is a file of exactly [`vcam_protocol::FILE_SIZE`] bytes or it is replaced: the camera's user may
-//!   write to it, and so may extend it, and clearing the sparse flag of a file that is a hundred gigabytes long would
-//!   make Windows allocate all of it while the helper holds the machine-wide lock.
+//!   helper acts only on entries it made: a data folder that it moves aside is put on a record (in the registry,
+//!   where only administrators write) **before** the rename, with its identity (volume and file id, read on the
+//!   handle that is renamed), and only if it is neither a link nor owned by somebody but SYSTEM or Administrators.
+//!   The record is dropped again when the rename does not happen or the old copy is deleted at once. The sweep deletes
+//!   a recorded name only when name, identity, "not a link" and "owner trusted" all hold on the handle it deletes
+//!   through. Other `BetterCam.old-*` entries are never looked at (see [`crate::aside`]).
+//! * a frame file is a file of exactly [`vcam_protocol::FILE_SIZE`] bytes, not sparse, not compressed, with one stream
+//!   and one link, or it is replaced by a new file (a new file is never sparse). Nothing is ever cleared in place: the
+//!   camera's user may write to the file, so may extend it at any moment, and clearing the sparse flag of a file that
+//!   is a hundred gigabytes long at that moment would make Windows allocate all of it while the helper holds the
+//!   machine-wide lock.
 //!
 //! Nothing is ever left with the permissions it would inherit: a new object is created with its final security
 //! descriptor in the create call, and the order is the data folder first (its permissions are replaced before
@@ -41,6 +46,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 
 use crate::acl::{self, Object, Principals};
+use crate::aside::{self, AsideEntry, Ledger, NoLedger};
 use crate::log::Log;
 use crate::util::{werr, Paths, Res};
 
@@ -64,7 +70,8 @@ pub struct Facts {
     /// file makes it right. Folders have no such flags that matter.
     pub bad_attributes: bool,
     /// A file that is sparse or compressed (the DLL and the app refuse it too). A handle with only `FILE_WRITE_DATA`
-    /// can set both, so the mask of the frame file does not prevent it; the flags are cleared in place.
+    /// can set both, so the mask of the frame file does not prevent it; such a file is replaced, never cleared in
+    /// place (clearing the flag of a sparse file allocates its whole length).
     pub sparse_or_compressed: bool,
     /// A file with a data stream besides its own contents (`frames.bin:name`). A handle with only `FILE_WRITE_DATA`
     /// can create one, and what is in it would survive a Repair that kept the file.
@@ -116,7 +123,11 @@ pub fn decide(obj: Object, facts: Option<&Facts>) -> Plan {
     if !wants_dir && f.extra_streams {
         return Plan::Replace("it has an extra data stream".into());
     }
-    // `f.sparse_or_compressed` is not a reason to replace: the flags are cleared in place (see `ensure_exists`)
+    // only the frame file: the DLL and the app refuse it when it is sparse or compressed, and nothing reads the log
+    // for that
+    if obj == Object::FramesFile && f.sparse_or_compressed {
+        return Plan::Replace("it is sparse or compressed".into());
+    }
     // `logs` can hold files with permissions of their own, so other permissions on it mean the folder was
     // tampered with or made by an older version: start again. The data folder and frames.bin have no such
     // children: their permissions are replaced as a whole, nothing of the old ones survives.
@@ -222,6 +233,22 @@ pub fn remove_no_follow(p: &Path) -> std::io::Result<()> {
 /// rename goes through a handle opened like every other open here, so it never waits for a program that holds an
 /// opportunistic lock on the file ([`secure::rename_no_wait`]).
 pub fn move_aside(p: &Path) -> std::io::Result<PathBuf> {
+    move_aside_with(p, None)
+}
+
+/// What [`move_aside_with`] tells its caller about the entry it is about to rename, at the one moment that matters:
+/// after the entry is open and before it is renamed, on the handle that is renamed through.
+trait AsideHooks {
+    /// The access the handle needs besides what the rename needs (`READ_CONTROL` to read the owner).
+    fn access(&self) -> u32;
+    /// The entry behind `h` is about to be renamed to `name` (a name next to it).
+    fn before(&mut self, name: &str, h: HANDLE);
+    /// The rename to `name` did not happen (and is not still running).
+    fn failed(&mut self, name: &str);
+}
+
+/// [`move_aside`] with the hooks of [`AsideHooks`] (none: a plain rename).
+fn move_aside_with(p: &Path, mut hooks: Option<&mut dyn AsideHooks>) -> std::io::Result<PathBuf> {
     let name = p
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -233,18 +260,36 @@ pub fn move_aside(p: &Path) -> std::io::Result<PathBuf> {
         .unwrap_or(0);
     let mut last = None;
     for i in 0..8u32 {
-        let target = parent.join(format!("{name}.old-{stamp}-{i}"));
+        let target_name = format!("{name}.old-{stamp}-{i}");
+        let target = parent.join(&target_name);
         if std::fs::symlink_metadata(&target).is_ok() {
             continue;
         }
-        match secure::rename_no_wait(p, &target) {
-            Ok(()) => return Ok(target),
-            // gone: nothing to move, and waiting does not bring it back. Locked by another program: it was waited
-            // for already (up to the bound of the rename), and asking again does not make the holder answer
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound || secure::is_oplock_busy(&e) => {
-                return Err(e)
+        let result = match hooks.as_deref_mut() {
+            Some(h) => {
+                let access = h.access();
+                secure::rename_no_wait_checked(p, &target, access, &mut |handle| {
+                    h.before(&target_name, handle);
+                    Ok(())
+                })
             }
+            None => secure::rename_no_wait(p, &target),
+        };
+        match result {
+            Ok(()) => return Ok(target),
             Err(e) => {
+                // a rename that could not be cancelled may still happen: what was written down for it stays
+                if !secure::is_abandoned(&e) {
+                    if let Some(h) = hooks.as_deref_mut() {
+                        h.failed(&target_name);
+                    }
+                }
+                // gone: nothing to move, and waiting does not bring it back. Locked by another program: it was
+                // waited for already (up to the bound of the rename), and asking again does not make the holder
+                // answer
+                if e.kind() == std::io::ErrorKind::NotFound || secure::is_oplock_busy(&e) {
+                    return Err(e);
+                }
                 last = Some(e);
                 std::thread::sleep(Duration::from_millis(150));
             }
@@ -258,16 +303,147 @@ pub fn is_aside_name(name: &str) -> bool {
     name.contains(".old-")
 }
 
-/// Move `path` aside (stopping the camera service once when something holds it), then delete the old copy. Returns
-/// where the old copy is when it could not be deleted (`None`: it is gone).
+/// Where a data folder that is moved aside is written down (see [`crate::aside`]) and whose owners are trusted.
+pub struct Recording<'a> {
+    pub ledger: &'a mut dyn Ledger,
+    pub trusted: &'a [String],
+}
+
+/// What the entry that was renamed is, judged on the handle that was renamed through.
+enum Judged {
+    /// Not a link, owner trusted, identity read: it can be recorded.
+    Recordable(secure::FileIdentity),
+    Link,
+    Untrusted(String),
+    /// Something could not be read.
+    Unknown(String),
+}
+
+fn judge(h: HANDLE, trusted: &[String]) -> Judged {
+    let k = match secure::kind(h) {
+        Ok(k) => k,
+        Err(e) => return Judged::Unknown(format!("its kind cannot be read ({e})")),
+    };
+    if k.reparse_point {
+        return Judged::Link;
+    }
+    match acl::read_handle(h) {
+        Err(e) => return Judged::Unknown(format!("its owner cannot be read ({e})")),
+        Ok(s) if !acl::owner_trusted(&s.owner, trusted) => return Judged::Untrusted(s.owner),
+        Ok(_) => {}
+    }
+    match secure::file_identity(h) {
+        Ok(id) => Judged::Recordable(id),
+        Err(e) => Judged::Unknown(format!("its file id cannot be read ({e})")),
+    }
+}
+
+/// The hooks that put a data folder on the record before it is renamed, and take it off when the rename fails.
+struct Recorder<'a, 'b> {
+    ledger: &'a mut dyn Ledger,
+    trusted: &'a [String],
+    log: &'b mut dyn Log,
+    judged: Option<Judged>,
+    recorded: Option<String>,
+}
+
+impl AsideHooks for Recorder<'_, '_> {
+    fn access(&self) -> u32 {
+        READ_CONTROL
+    }
+
+    fn before(&mut self, name: &str, h: HANDLE) {
+        self.recorded = None;
+        let j = judge(h, self.trusted);
+        if let Judged::Recordable(identity) = &j {
+            let entry = AsideEntry {
+                name: name.to_string(),
+                identity: *identity,
+            };
+            match self.ledger.add(&entry) {
+                Ok(()) => self.recorded = Some(name.to_string()),
+                Err(e) => self.log.line(&format!(
+                    "could not put {name} on record ({e}); it stays where it is if it cannot be deleted"
+                )),
+            }
+        }
+        self.judged = Some(j);
+    }
+
+    fn failed(&mut self, name: &str) {
+        if self.recorded.as_deref() == Some(name) {
+            self.recorded = None;
+            if let Err(e) = self.ledger.remove(name) {
+                self.log.line(&format!(
+                    "could not take {name} off the record again ({e}); the sweep drops it as gone"
+                ));
+            }
+        }
+    }
+}
+
+/// An entry that was moved aside, and what became of its record.
+struct Moved {
+    to: PathBuf,
+    /// The name is on the record (written before the rename).
+    recorded: Option<String>,
+    /// Why it is not, when it is not.
+    not_recorded: String,
+}
+
+/// [`move_aside`] for an entry that may have to be recorded (`rec`): the facts are read on the handle that is
+/// renamed, and the record is written before the rename.
+fn move_aside_recorded(
+    path: &Path,
+    rec: Option<&mut Recording<'_>>,
+    log: &mut dyn Log,
+) -> std::io::Result<Moved> {
+    let Some(rec) = rec else {
+        return move_aside(path).map(|to| Moved {
+            to,
+            recorded: None,
+            not_recorded: String::new(),
+        });
+    };
+    let mut r = Recorder {
+        ledger: &mut *rec.ledger,
+        trusted: rec.trusted,
+        log,
+        judged: None,
+        recorded: None,
+    };
+    let to = move_aside_with(path, Some(&mut r))?;
+    let not_recorded = match &r.judged {
+        _ if r.recorded.is_some() => String::new(),
+        Some(Judged::Link) => "it is a link".into(),
+        Some(Judged::Untrusted(owner)) => {
+            format!("its owner is {owner}, not SYSTEM or Administrators")
+        }
+        Some(Judged::Unknown(why)) => why.clone(),
+        Some(Judged::Recordable(_)) => "the record could not be written".into(),
+        None => String::new(),
+    };
+    Ok(Moved {
+        to,
+        recorded: r.recorded.take(),
+        not_recorded,
+    })
+}
+
+/// Move `path` aside (stopping the camera service once when something holds it), then delete the old copy. A data
+/// folder (`rec`) is put on the record before it is renamed; the record is dropped again when the old copy is gone.
+/// A copy that could not be deleted stays on the record; one that is a link or has another owner is not recorded,
+/// and is left where it is with one line of the log.
 fn replace_aside(
     path: &Path,
     why: &str,
     stop_service: &mut dyn FnMut() -> bool,
     log: &mut dyn Log,
-) -> Res<Option<PathBuf>> {
+    mut rec: Option<&mut Recording<'_>>,
+) -> Res<()> {
     log.line(&format!("{}: {why}; moving it aside", path.display()));
-    let aside = match move_aside(path) {
+    let is_data_folder = rec.is_some();
+    let moved = match move_aside_recorded(path, rec.as_deref_mut(), log) {
         Ok(a) => a,
         // a program of the user holds a lock on it: stopping the camera service does not help against that
         Err(first) if secure::is_oplock_busy(&first) => return Err(locked_message(path)),
@@ -277,7 +453,7 @@ fn replace_aside(
                 path.display()
             ));
             stop_service();
-            move_aside(path).map_err(|e| {
+            move_aside_recorded(path, rec.as_deref_mut(), log).map_err(|e| {
                 if secure::is_oplock_busy(&e) {
                     locked_message(path)
                 } else {
@@ -289,19 +465,43 @@ fn replace_aside(
             })?
         }
     };
-    match remove_no_follow(&aside) {
+    match remove_no_follow(&moved.to) {
         Ok(()) => {
-            log.line(&format!("old copy deleted ({})", aside.display()));
-            Ok(None)
+            log.line(&format!("old copy deleted ({})", moved.to.display()));
+            if let (Some(name), Some(rec)) = (&moved.recorded, rec) {
+                if let Err(e) = rec.ledger.remove(name) {
+                    log.line(&format!(
+                        "could not take {name} off the record ({e}); the sweep drops it as gone"
+                    ));
+                }
+            }
         }
-        Err(e) => {
+        Err(e) if moved.recorded.is_some() => {
+            log.line(&format!(
+                "old copy kept as {} ({e}); it is on record, and the next install or removal deletes it",
+                moved.to.display()
+            ));
+        }
+        Err(e) if !is_data_folder => {
+            // inside the data folder: the next install deletes every old copy there by name
             log.line(&format!(
                 "old copy kept as {} ({e}); it is deleted by the next install",
-                aside.display()
+                moved.to.display()
             ));
-            Ok(Some(aside))
+        }
+        Err(e) => {
+            let reason = if moved.not_recorded.is_empty() {
+                String::new()
+            } else {
+                format!(": {}, so it is not put on record", moved.not_recorded)
+            };
+            log.line(&format!(
+                "old copy kept as {} ({e}); it is left where it is{reason}",
+                moved.to.display()
+            ));
         }
     }
+    Ok(())
 }
 
 /// The sentence for a file that another program holds an opportunistic lock on: said as it is, and not waited for.
@@ -411,15 +611,15 @@ pub(crate) fn create_new(paths: &Paths, obj: Object, p: &Principals) -> Res<Owne
 /// Make `obj` exist as the right kind of object and return its verified handle. A new object has its final
 /// permissions already; one that was kept gets them from [`lock`].
 ///
-/// A data folder that was moved aside and could not be deleted then has its name added to `moved` (the caller
-/// records it, so the next run sweeps exactly that name).
+/// A data folder that is moved aside is put on the record through `ledger` before the rename, and taken off again
+/// when the old copy is deleted at once or the rename does not happen (see [`replace_aside`]).
 fn ensure_exists(
     paths: &Paths,
     obj: Object,
     p: &Principals,
     stop_service: &mut dyn FnMut() -> bool,
     log: &mut dyn Log,
-    moved: &mut Vec<String>,
+    ledger: &mut dyn Ledger,
 ) -> Res<OwnedHandle> {
     let path = path_of(paths, obj);
     let facts = inspect(paths, obj, p)?;
@@ -427,11 +627,11 @@ fn ensure_exists(
     match plan {
         Plan::Keep => {
             let h = open_checked(paths, obj)?;
-            // the one thing the frame file's mask lets a user do to it that is put right in place, not by a new file
+            // looked at again on the handle that is kept (the camera's user can change the file at any moment)
             if obj == Object::FramesFile {
-                if let Err(why) = frame_file_in_shape(&h, &path, log) {
+                if let Err(why) = frame_file_in_shape(&h) {
                     drop(h);
-                    return replace(paths, obj, p, &why, stop_service, log, moved);
+                    return replace(paths, obj, p, &why, stop_service, log, ledger);
                 }
             }
             log.line(&format!("{}: kept", path.display()));
@@ -441,7 +641,7 @@ fn ensure_exists(
             log.line(&format!("{}: created", path.display()));
             create_new(paths, obj, p)
         }
-        Plan::Replace(why) => replace(paths, obj, p, &why, stop_service, log, moved),
+        Plan::Replace(why) => replace(paths, obj, p, &why, stop_service, log, ledger),
     }
 }
 
@@ -453,21 +653,18 @@ fn replace(
     why: &str,
     stop_service: &mut dyn FnMut() -> bool,
     log: &mut dyn Log,
-    moved: &mut Vec<String>,
+    ledger: &mut dyn Ledger,
 ) -> Res<OwnedHandle> {
     let path = path_of(paths, obj);
-    match replace_aside(&path, why, stop_service, log) {
-        Ok(kept) => {
-            // only a data folder lives next to `BetterCam`, in `%ProgramData%`; the others are inside it, where
-            // nobody but the helper can put anything
-            if let (Object::DataDir, Some(name)) = (
-                obj,
-                kept.as_ref()
-                    .and_then(|k| k.file_name())
-                    .map(|n| n.to_string_lossy().into_owned()),
-            ) {
-                moved.push(name);
-            }
+    // only a data folder lives next to `BetterCam`, in `%ProgramData%`, where a user can make entries; the others
+    // are inside it, where nobody but the helper can put anything: they need no record
+    let mut recording = Recording {
+        ledger,
+        trusted: &p.trusted_owners,
+    };
+    let rec = (obj == Object::DataDir).then_some(&mut recording);
+    match replace_aside(&path, why, stop_service, log, rec) {
+        Ok(()) => {
             log.line(&format!("{}: created", path.display()));
             create_new(paths, obj, p)
         }
@@ -492,44 +689,32 @@ fn length_of(h: &OwnedHandle) -> std::io::Result<u64> {
         .map(|m| m.len())
 }
 
-/// Make sure that the kept frame file is what the camera accepts, or say why it has to be replaced (`Err`).
+/// Say whether the kept frame file is what the camera accepts, or why it has to be replaced (`Err`). Nothing is
+/// changed on the file: a file that is not right is replaced by a new one, never put right in place.
 ///
-/// * Its length is exactly [`vcam_protocol::FILE_SIZE`], looked at *first*. The camera's user may write to the file,
-///   so may extend it (to a hundred gigabytes, sparse, which costs nothing); clearing the sparse flag of such a file
-///   makes Windows allocate its whole length at once, on the system drive, owned by the administrators, while the
-///   helper holds the machine-wide lock, and the DLL refuses a file longer than `MAX_FILE_SIZE` anyway. A file of
-///   another length is never kept, whatever else is the matter with it.
-/// * A sparse or compressed state (a handle with only `FILE_WRITE_DATA` can set both) is cleared through the handle;
-///   the contents are not touched and the file stays the same file. The length is read again after that: it is
-///   something the user can change at any moment, and a file that is not the right length now goes.
-fn frame_file_in_shape(h: &OwnedHandle, path: &Path, log: &mut dyn Log) -> Result<(), String> {
-    let wrong_length = |len: u64| {
-        format!(
-            "its length is {len} bytes, not {}",
-            vcam_protocol::FILE_SIZE
-        )
-    };
+/// * Its length is exactly [`vcam_protocol::FILE_SIZE`]. The camera's user may write to the file, so may extend it
+///   (to a hundred gigabytes, sparse, which costs nothing); a file of another length is never kept.
+/// * It is neither sparse nor compressed (a handle with only `FILE_WRITE_DATA` can set both). Clearing the flag in
+///   place is what the helper used to do, and it is the one thing that cannot be done safely: the length is
+///   something the user can change at any moment, also between a look at it and the clearing, and clearing the sparse
+///   flag of a file that is a hundred gigabytes long at that moment makes Windows allocate all of it, synchronously,
+///   on the system drive, while the helper holds the machine-wide lock. A new file is never sparse, and is made at
+///   the size it must have.
+fn frame_file_in_shape(h: &OwnedHandle) -> Result<(), String> {
     let len = length_of(h).map_err(|e| format!("its length cannot be read ({e})"))?;
     if len != vcam_protocol::FILE_SIZE {
-        return Err(wrong_length(len));
+        return Err(format!(
+            "its length is {len} bytes, not {}",
+            vcam_protocol::FILE_SIZE
+        ));
     }
     let attrs = secure::kind(secure::raw(h))
         .map_err(|e| format!("its attributes cannot be read ({e})"))?
         .attributes;
-    if attrs & (secure::ATTRIBUTE_SPARSE | secure::ATTRIBUTE_COMPRESSED) == 0 {
-        return Ok(());
+    if attrs & (secure::ATTRIBUTE_SPARSE | secure::ATTRIBUTE_COMPRESSED) != 0 {
+        return Err("it is sparse or compressed".into());
     }
-    log.line(&format!(
-        "{}: it is sparse or compressed; clearing that in place",
-        path.display()
-    ));
-    secure::clear_sparse_and_compression(secure::raw(h))
-        .map_err(|e| format!("it is sparse or compressed and that could not be cleared ({e})"))?;
-    match length_of(h) {
-        Ok(vcam_protocol::FILE_SIZE) => Ok(()),
-        Ok(len) => Err(wrong_length(len)),
-        Err(e) => Err(format!("its length cannot be read ({e})")),
-    }
+    Ok(())
 }
 
 /// A folder that is not a link of any kind.
@@ -596,12 +781,12 @@ fn sweep(paths: &Paths, log: &mut dyn Log) -> usize {
 }
 
 /// Delete the copies [`move_aside`] left next to `logs` and `frames.bin` that were still in use then, and the
-/// moved-aside data folders next to `BetterCam` itself ([`sweep_data_asides`]: the names in `recorded`, each only
-/// while owned by one of `trusted`).
+/// moved-aside data folders next to `BetterCam` itself ([`sweep_data_asides`]: the entries in `recorded`, each only
+/// while it is the folder that was recorded and owned by one of `trusted`).
 pub fn sweep_asides(
     paths: &Paths,
     trusted: &[String],
-    recorded: &[String],
+    recorded: &[AsideEntry],
     log: &mut dyn Log,
 ) -> AsideSweep {
     // inside the data folder: nobody but the helper can put anything there (it is locked first), so a name will do
@@ -636,9 +821,10 @@ fn owner_of(path: &Path) -> Option<String> {
     .map(|s| s.owner)
 }
 
-/// How many recorded names one sweep looks at. The record only grows when the helper moves a data folder aside and
-/// cannot delete the old copy, so it is short; the bound keeps a run short whatever is in it.
-const MAX_ASIDES_EXAMINED: usize = 32;
+/// How many recorded entries one sweep looks at. The record only grows when the helper moves a data folder aside and
+/// cannot delete the old copy, so it is short; the bound keeps a run short whatever is in it. The entries that are
+/// looked at and stay move to the end of the record ([`AsideSweep::kept`]), so every entry is reached in time.
+pub const MAX_ASIDES_EXAMINED: usize = 32;
 
 /// How many names of the entries that were left alone the one summary line shows.
 const NAMES_SHOWN: usize = 3;
@@ -649,17 +835,34 @@ pub struct AsideSweep {
     /// How many of the helper's own old copies are still there (in use, or locked by another program).
     pub left: usize,
     /// The recorded names that are done with: the folder is gone, or it is no longer the helper's (a link, another
-    /// owner). They are taken out of the record. A name that could not be looked at, one whose copy is still in use
-    /// and the names that were not examined this time stay.
+    /// owner, not the folder that was recorded, not a name the helper makes). They are taken out of the record.
     pub forget: Vec<String>,
+    /// The names that were looked at and stay on the record: the copy is still in use, or the entry could not be
+    /// looked at. They move to the end of the record, behind the names that were not looked at this time.
+    pub kept: Vec<String>,
 }
 
 /// What a recorded entry of `%ProgramData%` is now.
 enum Probe {
     Gone,
     Link,
-    Owner(String),
+    /// The owner, and the identity when it could be read.
+    Found {
+        owner: String,
+        identity: Option<secure::FileIdentity>,
+    },
+    /// The open was refused for a reason that says nothing about the entry (access denied, ...): tried again later.
     Unreadable,
+    /// The system says this is not a name (it can never be opened): the record is wrong.
+    InvalidName,
+}
+
+/// The errors of an open that mean "this is not a valid name or path": `ERROR_INVALID_NAME` (123),
+/// `ERROR_BAD_PATHNAME` (161), `ERROR_FILENAME_EXCED_RANGE` (206), or the refusal of a name that cannot be made
+/// absolute. A record that holds such a name will never lead anywhere.
+pub fn is_invalid_name_error(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::InvalidInput
+        || matches!(e.raw_os_error(), Some(123) | Some(161) | Some(206))
 }
 
 /// Look at `path` without following a link and without touching any lock (attributes and permissions only).
@@ -674,42 +877,41 @@ fn probe_entry(path: &Path) -> Probe {
     ) {
         Ok(h) => h,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Probe::Gone,
+        Err(e) if is_invalid_name_error(&e) => return Probe::InvalidName,
         Err(_) => return Probe::Unreadable,
     };
     match secure::kind(secure::raw(&h)) {
         Ok(k) if k.reparse_point => Probe::Link,
-        Ok(_) => acl::read(&h).map_or(Probe::Unreadable, |s| Probe::Owner(s.owner)),
+        Ok(_) => acl::read(&h).map_or(Probe::Unreadable, |s| Probe::Found {
+            owner: s.owner,
+            identity: secure::file_identity(secure::raw(&h)).ok(),
+        }),
         Err(_) => Probe::Unreadable,
     }
-}
-
-/// A name that can be one of the helper's old data folders: `BetterCam.old-...`, one path component, nothing that
-/// could lead elsewhere. The record is only written by administrators; this is for a record that is damaged.
-fn is_aside_data_name(name: &str) -> bool {
-    let prefix = format!("{}.old-", vcam_protocol::DATA_DIR_NAME).to_lowercase();
-    name.to_lowercase().starts_with(&prefix) && !name.contains(['\\', '/', ':'])
 }
 
 /// Delete the old data folders that the helper moved aside ([`move_aside`] of the data folder: it was a link, or had
 /// the wrong owner, ...) and could not delete then. They live *next to* `BetterCam`, in `%ProgramData%`, and the camera
 /// service can still have a file of one open. Called by install and by uninstall.
 ///
-/// `recorded` is the helper's own record of those names ([`crate::machine::Machine::aside_names`], kept where only
-/// administrators can write). **Only those names are looked at.** A standard user can create entries in
-/// `%ProgramData%` under any name, and an administrator-owned folder somewhere on the same volume that a user may
-/// delete can be moved to a name like `BetterCam.old-x`, so neither a name pattern nor an owner proves that the helper
-/// made an entry; the record does. A recorded entry is still checked on the way: it is deleted only while it is not
-/// a link and its owner is one of `trusted` (SYSTEM, Administrators), read through a handle that does not follow a
-/// link and does not touch a lock, and checked again on the handle the delete goes through. One that is not (or that
-/// is gone) is left exactly as it is and forgotten.
+/// `recorded` is the helper's own record of those folders ([`crate::aside`], kept where only administrators can
+/// write). **Only those entries are looked at.** A standard user can create entries in `%ProgramData%` under any
+/// name, and an administrator-owned folder somewhere on the same volume that a user may rename can be moved to a name
+/// like `BetterCam.old-x`, so neither a name pattern nor an owner proves that the helper made an entry; the record
+/// does, and it holds each folder's **identity** (volume and file id) as well as its name: a name that was freed and
+/// filled with another folder is not the recorded folder. A recorded entry is deleted only while name, identity, "not
+/// a link" and "owner is one of `trusted`" (SYSTEM, Administrators) all hold, read through a handle that does not
+/// follow a link and does not touch a lock, and checked again on the handle the delete goes through. One that is
+/// not (or that is gone, or whose name is not one the helper makes) is left exactly as it is and forgotten.
 ///
-/// At most [`MAX_ASIDES_EXAMINED`] names are examined per run, and the entries that were left alone are one line of
-/// the log, with the first few names and the count. The delete never waits for another program (see
-/// [`remove_no_follow`]): an entry that a program still has open or locked stays, and is tried again next time.
+/// At most [`MAX_ASIDES_EXAMINED`] entries are examined per run (the ones that stay move to the end of the record,
+/// see [`AsideSweep::kept`]), and the entries that were left alone are one line of the log, with the first few names
+/// and the count. The delete never waits for another program (see [`remove_no_follow`]): an entry that a program
+/// still has open or locked stays, and is tried again next time.
 pub fn sweep_data_asides(
     paths: &Paths,
     trusted: &[String],
-    recorded: &[String],
+    recorded: &[AsideEntry],
     log: &mut dyn Log,
 ) -> AsideSweep {
     sweep_data_asides_with(paths, trusted, recorded, log, &mut |_| None)
@@ -721,16 +923,20 @@ pub fn sweep_data_asides(
 pub fn sweep_data_asides_with(
     paths: &Paths,
     trusted: &[String],
-    recorded: &[String],
+    recorded: &[AsideEntry],
     log: &mut dyn Log,
     between: &mut dyn FnMut(&Path) -> Option<Vec<String>>,
 ) -> AsideSweep {
     let mut out = AsideSweep::default();
-    let mut skipped: Vec<&str> = Vec::new();
-    for name in recorded.iter().take(MAX_ASIDES_EXAMINED) {
-        if !is_aside_data_name(name) {
-            // not a name the helper ever made: never joined to a path
-            skipped.push(name);
+    // names left alone and dropped from the record, and names that could not be looked at and stay
+    let mut dropped: Vec<&str> = Vec::new();
+    let mut unreadable: Vec<&str> = Vec::new();
+    for entry in recorded.iter().take(MAX_ASIDES_EXAMINED) {
+        let name = &entry.name;
+        if !aside::is_aside_name(name) {
+            // not a name the helper ever made: never joined to a path, and forgotten (it would use up a slot of
+            // every run for ever)
+            dropped.push(name);
             out.forget.push(name.clone());
             continue;
         }
@@ -740,24 +946,34 @@ pub fn sweep_data_asides_with(
                 out.forget.push(name.clone());
                 continue;
             }
-            Probe::Link => {
-                skipped.push(name);
+            Probe::Link | Probe::InvalidName => {
+                dropped.push(name);
                 out.forget.push(name.clone());
                 continue;
             }
-            Probe::Owner(o) if !acl::owner_trusted(&o, trusted) => {
-                skipped.push(name);
+            Probe::Found { owner, .. } if !acl::owner_trusted(&owner, trusted) => {
+                dropped.push(name);
                 out.forget.push(name.clone());
                 continue;
             }
-            Probe::Unreadable => {
-                skipped.push(name);
+            // somebody else's folder under the recorded name: not the folder that was recorded
+            Probe::Found {
+                identity: Some(id), ..
+            } if id != entry.identity => {
+                dropped.push(name);
+                out.forget.push(name.clone());
                 continue;
             }
-            Probe::Owner(_) => {}
+            Probe::Unreadable | Probe::Found { identity: None, .. } => {
+                unreadable.push(name);
+                out.kept.push(name.clone());
+                continue;
+            }
+            Probe::Found { .. } => {}
         }
         let trusted_then = between(&path).unwrap_or_else(|| trusted.to_vec());
-        // the check again, on the handle that is deleted through (the entry may have been swapped meanwhile)
+        // the check again, on the handle that is deleted through (the entry may have been swapped meanwhile): the
+        // name was looked at, but what is deleted is whatever this handle is, so it must be the recorded folder
         let swapped = std::cell::Cell::new(false);
         let check = |h: HANDLE| -> std::io::Result<()> {
             let k = secure::kind(h)?;
@@ -766,14 +982,22 @@ pub fn sweep_data_asides_with(
                 return Err(secure::refused("it is a link now"));
             }
             let snap = acl::read_handle(h).map_err(secure::refused)?;
-            if acl::owner_trusted(&snap.owner, &trusted_then) {
-                Ok(())
-            } else {
+            if !acl::owner_trusted(&snap.owner, &trusted_then) {
                 swapped.set(true);
-                Err(secure::refused(format!(
+                return Err(secure::refused(format!(
                     "its owner is {}, not SYSTEM or Administrators",
                     snap.owner
-                )))
+                )));
+            }
+            match secure::file_identity(h) {
+                Ok(id) if id == entry.identity => Ok(()),
+                Ok(_) => {
+                    swapped.set(true);
+                    Err(secure::refused("it is not the folder that was recorded"))
+                }
+                Err(e) => Err(secure::refused(format!(
+                    "its identity cannot be read ({e})"
+                ))),
             }
         };
         let top = secure::Top {
@@ -786,30 +1010,48 @@ pub fn sweep_data_asides_with(
                 log.line(&format!("deleted old data folder {}", path.display()));
             }
             Err(_) if swapped.get() => {
-                skipped.push(name);
+                dropped.push(name);
                 out.forget.push(name.clone());
             }
             Err(err) => {
                 out.left += 1;
+                out.kept.push(name.clone());
                 log.line(&format!(
                     "old data folder {name} still in use ({err}); it is deleted by the next install or removal"
                 ));
             }
         }
     }
-    if !skipped.is_empty() {
-        let shown: Vec<&str> = skipped.iter().copied().take(NAMES_SHOWN).collect();
-        let more = skipped.len() - shown.len();
-        log.line(&format!(
-            "{} recorded old data folder(s) left alone (a link now, another owner than SYSTEM or Administrators, or not readable): {}{}",
-            skipped.len(),
+    let list = |names: &[&str]| {
+        let shown: Vec<&str> = names.iter().copied().take(NAMES_SHOWN).collect();
+        let more = names.len() - shown.len();
+        format!(
+            "{}{}",
             shown.join(", "),
-            if more > 0 { format!(" and {more} more") } else { String::new() }
+            if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            }
+        )
+    };
+    if !dropped.is_empty() {
+        log.line(&format!(
+            "{} recorded old data folder(s) left alone and dropped from the record (a link now, not the folder that was recorded, another owner than SYSTEM or Administrators, or not a name the helper makes): {}",
+            dropped.len(),
+            list(&dropped)
+        ));
+    }
+    if !unreadable.is_empty() {
+        log.line(&format!(
+            "{} recorded old data folder(s) could not be looked at; they stay on the record and are looked at again later: {}",
+            unreadable.len(),
+            list(&unreadable)
         ));
     }
     if recorded.len() > MAX_ASIDES_EXAMINED {
         log.line(&format!(
-            "{} more recorded old data folder(s) are looked at by the next run",
+            "{} more recorded old data folder(s) are looked at by the next runs (the ones that stay move to the end of the record)",
             recorded.len() - MAX_ASIDES_EXAMINED
         ));
     }
@@ -864,17 +1106,19 @@ pub fn prepare(
     stop_service: &mut dyn FnMut() -> bool,
     log: &mut dyn Log,
 ) -> Res<()> {
-    prepare_recording(paths, p, stop_service, log, &mut Vec::new())
+    prepare_recording(paths, p, stop_service, log, &mut NoLedger)
 }
 
-/// [`prepare`] that also tells which data folders it moved aside and could not delete: their names are added to
-/// `moved`, also when preparing fails after that, for the caller to record (see [`sweep_data_asides`]).
+/// [`prepare`] that puts a data folder it moves aside on the record through `ledger`: **before** the rename, with the
+/// identity read on the handle that is renamed, and only for a folder that is not a link and is owned by SYSTEM or
+/// Administrators; the entry is dropped again when the rename does not happen or the old copy is deleted at once. What
+/// stays on the record is what a later run sweeps (see [`sweep_data_asides`]), also when preparing fails after that.
 pub fn prepare_recording(
     paths: &Paths,
     p: &Principals,
     stop_service: &mut dyn FnMut() -> bool,
     log: &mut dyn Log,
-    moved: &mut Vec<String>,
+    ledger: &mut dyn Ledger,
 ) -> Res<()> {
     // a log file of ours inside `logs` would keep the folder from being moved: close it, lines wait meanwhile
     log.release_folder();
@@ -882,17 +1126,18 @@ pub fn prepare_recording(
         .map_err(|e| werr(&format!("create {}", paths.program_data.display()), e))?;
     // 1. the folder: held (no delete sharing) until the end, and locked right away: from here the user can neither
     // create nor rename anything in it, and what it hands down to new children is only what the helper wants
-    let data = ensure_exists(paths, Object::DataDir, p, stop_service, log, moved)?;
+    let data = ensure_exists(paths, Object::DataDir, p, stop_service, log, ledger)?;
     lock(&data, Object::DataDir, p, log)?;
     // 2. the folder's children, each with a protected DACL of its own
-    let logs = ensure_exists(paths, Object::LogsDir, p, stop_service, log, moved)?;
+    let logs = ensure_exists(paths, Object::LogsDir, p, stop_service, log, ledger)?;
     lock(&logs, Object::LogsDir, p, log)?;
     let mut trusted = p.trusted_owners.clone();
     trusted.extend([p.system.clone(), p.admins.clone(), p.local_service.clone()]);
     sweep_logs(paths, &trusted, log);
-    let frames = ensure_exists(paths, Object::FramesFile, p, stop_service, log, moved)?;
-    // a file that was kept already has the right length; a new one is empty. Whatever the length, the file ends at
-    // exactly the size the camera expects (the camera's user can extend it at any moment, so it is looked at again)
+    let frames = ensure_exists(paths, Object::FramesFile, p, stop_service, log, ledger)?;
+    // a file that was kept has the right length and is plain; a new one is empty (and never sparse). Whatever the
+    // length, the file ends at exactly the size the camera expects (the camera's user can extend it at any moment,
+    // so it is looked at again, and so is its sparse and compressed state: nothing is ever cleared in place)
     {
         let file = std::fs::File::from(
             frames
@@ -911,10 +1156,19 @@ pub fn prepare_recording(
                 "frames.bin is {len} bytes long, not {want}: somebody is changing it; run Repair again"
             ));
         }
+        let attrs = secure::kind(secure::raw(&frames))
+            .map_err(|e| werr("look at frames.bin", e))?
+            .attributes;
+        if attrs & (secure::ATTRIBUTE_SPARSE | secure::ATTRIBUTE_COMPRESSED) != 0 {
+            return Err(
+                "frames.bin is sparse or compressed: somebody is changing it; run Repair again"
+                    .into(),
+            );
+        }
     }
     lock(&frames, Object::FramesFile, p, log)?;
     // the helper's own log: a DACL of its own, so the service's inheritable modify right on `logs` stops short of it
-    let install_log = ensure_exists(paths, Object::InstallLog, p, stop_service, log, moved)?;
+    let install_log = ensure_exists(paths, Object::InstallLog, p, stop_service, log, ledger)?;
     lock(&install_log, Object::InstallLog, p, log)?;
     let left = sweep(paths, log);
     if left > 0 {

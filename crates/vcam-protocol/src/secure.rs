@@ -41,26 +41,26 @@ use windows::Wdk::Storage::FileSystem::{
     NTCREATEFILE_CREATE_OPTIONS,
 };
 use windows::Win32::Foundation::{
-    CloseHandle, RtlNtStatusToDosError, HANDLE, NTSTATUS, OBJECT_ATTRIBUTE_FLAGS,
-    STATUS_OPLOCK_BREAK_IN_PROGRESS, UNICODE_STRING,
+    CloseHandle, DuplicateHandle, RtlNtStatusToDosError, DUPLICATE_SAME_ACCESS, HANDLE, NTSTATUS,
+    OBJECT_ATTRIBUTE_FLAGS, STATUS_OPLOCK_BREAK_IN_PROGRESS, UNICODE_STRING,
 };
 use windows::Win32::Security::SECURITY_DESCRIPTOR;
 use windows::Win32::Storage::FileSystem::{
     FileDispositionInfo, FileDispositionInfoEx, FileFullDirectoryInfo,
-    FileFullDirectoryRestartInfo, FileRenameInfo, FileStreamInfo, GetDriveTypeW,
+    FileFullDirectoryRestartInfo, FileIdInfo, FileRenameInfo, FileStreamInfo, GetDriveTypeW,
     GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
     GetFullPathNameW, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, CREATE_NEW,
     FILE_ACCESS_RIGHTS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_CREATION_DISPOSITION, FILE_FLAGS_AND_ATTRIBUTES,
-    FILE_FULL_DIR_INFO, FILE_NAME_NORMALIZED, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_MODE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STREAM_INFO, GETFINALPATHNAMEBYHANDLE_FLAGS,
-    OPEN_ALWAYS, OPEN_EXISTING, SYNCHRONIZE, VOLUME_NAME_DOS,
+    FILE_FULL_DIR_INFO, FILE_ID_INFO, FILE_NAME_NORMALIZED, FILE_RENAME_INFO, FILE_SHARE_DELETE,
+    FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STREAM_INFO,
+    GETFINALPATHNAMEBYHANDLE_FLAGS, OPEN_ALWAYS, OPEN_EXISTING, SYNCHRONIZE, VOLUME_NAME_DOS,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Ioctl::{
     FILE_SET_SPARSE_BUFFER, FSCTL_SET_COMPRESSION, FSCTL_SET_SPARSE,
 };
-use windows::Win32::System::Threading::{GetCurrentThreadId, OpenThread, THREAD_TERMINATE};
+use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread};
 use windows::Win32::System::IO::{CancelSynchronousIo, DeviceIoControl, IO_STATUS_BLOCK};
 use windows::Win32::UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath, KNOWN_FOLDER_FLAG};
 
@@ -767,26 +767,48 @@ pub const ACCESS_OWNER_CHECK: u32 = ACCESS_READ_CONTROL;
 /// handle. A lock that another program holds gives the refusal of [`open_with`]; a file that another program has
 /// open without sharing delete (or a folder with such a file in it) gives the OS error.
 pub fn rename_no_wait(from: &Path, to: &Path) -> io::Result<()> {
-    rename_through_handle(from, to, false)
+    rename_through_handle(from, to, false, 0, None)
+}
+
+/// [`rename_no_wait`] that first runs `check` on the handle that is then renamed through (opened with `access` as
+/// well: `READ_CONTROL` to read the owner, for example). An `Err` from `check` stops the rename before anything is
+/// changed. This is how a caller learns facts about *exactly the object that is moved* (its owner, its file id) and
+/// writes them down before the move: the facts cannot belong to another object that took the name meanwhile.
+pub fn rename_no_wait_checked(
+    from: &Path,
+    to: &Path,
+    access: u32,
+    check: &mut dyn FnMut(HANDLE) -> io::Result<()>,
+) -> io::Result<()> {
+    rename_through_handle(from, to, false, access, Some(check))
 }
 
 /// [`rename_no_wait`] that replaces `to` when it exists (one atomic step: `to` is either the old file or the new
 /// one). Replacing a file that another program holds a lock on, or has open without sharing delete, is not done: the
 /// result is the refusal of [`open_with`], or the OS error.
 pub fn rename_replacing_no_wait(from: &Path, to: &Path) -> io::Result<()> {
-    rename_through_handle(from, to, true)
+    rename_through_handle(from, to, true, 0, None)
 }
 
-fn rename_through_handle(from: &Path, to: &Path, replace: bool) -> io::Result<()> {
+fn rename_through_handle(
+    from: &Path,
+    to: &Path,
+    replace: bool,
+    extra_access: u32,
+    check: Option<&mut dyn FnMut(HANDLE) -> io::Result<()>>,
+) -> io::Result<()> {
     let h = nt_open(
         from,
-        ACCESS_DELETE | ACCESS_READ_ATTRIBUTES,
+        ACCESS_DELETE | ACCESS_READ_ATTRIBUTES | extra_access,
         SHARE_ALL,
         FILE_OPEN,
         FILE_OPEN_REPARSE_POINT.0 | FILE_OPEN_FOR_BACKUP_INTENT.0,
         FILE_ATTRIBUTE_NORMAL.0,
         None,
     )?;
+    if let Some(check) = check {
+        check(raw(&h))?;
+    }
     // FILE_RENAME_INFO: a flag word (ReplaceIfExists), the root folder (none: `FileName` is a full path), the length
     // of the name in bytes and the name. A full path in the Win32 form is what SetFileInformationByHandle takes.
     let target = to_absolute(to)?;
@@ -804,22 +826,23 @@ fn rename_through_handle(from: &Path, to: &Path, replace: bool) -> io::Result<()
         (*info).FileNameLength = (units.len() * 2) as u32;
         std::ptr::copy_nonoverlapping(units.as_ptr(), base.add(header) as *mut u16, units.len());
     }
-    let handle = raw(&h).0 as usize;
-    let buf = &buf;
     // The open above never waits, but the rename itself can: a folder cannot be renamed while a program holds a
     // read-write-handle oplock on a file somewhere below it (the rename must break that lock first, and the
     // create flag cannot ask not to wait for that). The call is given a bound and cancelled when it is exceeded.
+    // The worker owns the handle and the buffer: they live exactly as long as the call, whoever stops waiting.
     bounded(RENAME_WAIT, move || {
-        // SAFETY: the handle outlives the scope that runs this; `buf` holds a complete FILE_RENAME_INFO.
-        unsafe {
+        // SAFETY: `h` is open until the end of this closure; `buf` holds a complete FILE_RENAME_INFO.
+        let r = unsafe {
             SetFileInformationByHandle(
-                HANDLE(handle as *mut c_void),
+                raw(&h),
                 FileRenameInfo,
                 buf.as_ptr() as *const c_void,
                 size as u32,
             )
         }
-        .map_err(win_err)
+        .map_err(win_err);
+        drop(h);
+        r
     })
 }
 
@@ -837,9 +860,13 @@ const CANCEL_AGAIN: std::time::Duration = std::time::Duration::from_millis(100);
 /// One cancel is not enough: when the worker has not entered the call yet, or the wait cannot be cancelled at that
 /// instant, `CancelSynchronousIo` finds nothing to cancel and the call then blocks for as long as the other program
 /// likes. The cancel is therefore repeated every [`CANCEL_AGAIN`] until the worker reports that it is finished.
-fn bounded<T: Send>(
+///
+/// The worker is a thread of its own that owns everything the call uses (hence `'static`). It is not joined: the
+/// caller stops waiting when it has a result, so a worker whose call cannot be cancelled never holds the caller up
+/// (see [`bounded_with`]).
+fn bounded<T: Send + 'static>(
     bound: std::time::Duration,
-    job: impl FnOnce() -> io::Result<T> + Send,
+    job: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
     bounded_with(
         bound,
@@ -850,62 +877,103 @@ fn bounded<T: Send>(
                 let _ = CancelSynchronousIo(HANDLE(thread as *mut c_void));
             }
         },
+        current_thread_handle,
         job,
     )
 }
 
-/// [`bounded`] with the cancel given: it gets the worker's thread handle (as a number) and is called every `again`
-/// from the moment `bound` has passed until the worker is done (a test gives one that ignores the first calls).
-fn bounded_with<T: Send>(
+/// A real handle (as a number) to the calling thread that `CancelSynchronousIo` accepts, or `None` when the system
+/// would not make one. A duplicate of the thread pseudo handle: it needs no thread id, no lookup by id and no access
+/// check of its own (`OpenThread` could be refused, and then nothing could ever be cancelled). The caller closes it.
+fn current_thread_handle() -> Option<usize> {
+    let mut out = HANDLE::default();
+    // SAFETY: both ends are this process; the pseudo handle needs no closing, the duplicate is the caller's.
+    unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            GetCurrentThread(),
+            GetCurrentProcess(),
+            &mut out,
+            0,
+            false,
+            DUPLICATE_SAME_ACCESS,
+        )
+    }
+    .ok()?;
+    (!out.is_invalid() && !out.0.is_null()).then_some(out.0 as usize)
+}
+
+/// The text added to the refusal when a call could not be cancelled and was left running (see [`is_abandoned`]).
+const ABANDONED: &str = "; the call was left running and may still complete later";
+
+/// True for the refusal of a call that [`bounded_with`] could not cancel (no thread handle) and stopped waiting for:
+/// it is still running in its worker thread, and **may complete after this error**. A caller that undoes something on
+/// failure must not undo it then. [`is_oplock_busy`] is true for it too.
+pub fn is_abandoned(e: &io::Error) -> bool {
+    e.get_ref()
+        .and_then(|i| i.downcast_ref::<Refused>())
+        .is_some_and(|r| r.0.contains(ABANDONED))
+}
+
+/// [`bounded`] with the cancel and the way to get the worker's thread handle given (a test gives a cancel that
+/// ignores the first calls, and a handle that is not available).
+///
+/// `cancel` gets the worker's thread handle (as a number) and is called every `again` from the moment `bound` has
+/// passed until the worker is done. `thread_handle` runs in the worker before the job and hands back the handle the
+/// cancel needs; the waiting thread closes it once the worker has finished the job.
+///
+/// **When no handle is available** nothing can be cancelled, and joining the worker would wait for as long as the
+/// other program likes. The worker is then *left running*: this returns the refusal of [`open_with`] marked as
+/// abandoned ([`is_abandoned`]) at the bound. The worker owns what its call uses and ends when the call returns (the
+/// holder answers, or the process ends); what the call does if it completes after that is up to the call.
+fn bounded_with<T: Send + 'static>(
     bound: std::time::Duration,
     again: std::time::Duration,
     cancel: &dyn Fn(usize),
-    job: impl FnOnce() -> io::Result<T> + Send,
+    thread_handle: impl FnOnce() -> Option<usize> + Send + 'static,
+    job: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
-    std::thread::scope(|scope| {
-        let (done, finished) = std::sync::mpsc::channel::<()>();
-        let (hand, handed) = std::sync::mpsc::channel::<usize>();
-        let worker = scope.spawn(move || {
-            // a real handle to this thread, for the one that waits to cancel its call with
-            // SAFETY: plain system calls; the handle is closed by the waiting thread.
-            let me = unsafe { OpenThread(THREAD_TERMINATE, false, GetCurrentThreadId()) };
-            let _ = hand.send(me.map_or(0, |h| h.0 as usize));
-            let r = job();
-            let _ = done.send(());
-            r
-        });
-        let thread = handed.recv().unwrap_or(0);
-        // an error here is the timeout; a closed channel (the job panicked) ends the wait too
-        if matches!(
-            finished.recv_timeout(bound),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        ) && thread != 0
-        {
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+    let (result_tx, result_rx) = channel::<io::Result<T>>();
+    let (hand, handed) = channel::<usize>();
+    std::thread::Builder::new()
+        .name("secure-bounded".into())
+        .spawn(move || {
+            let _ = hand.send(thread_handle().unwrap_or(0));
+            let _ = result_tx.send(job());
+        })?;
+    // 0: no handle (or the worker is gone before it sent one)
+    let thread = handed.recv().unwrap_or(0);
+    let received = match result_rx.recv_timeout(bound) {
+        Ok(r) => Some(Ok(r)),
+        // the job panicked: the sender is gone
+        Err(RecvTimeoutError::Disconnected) => Some(Err(())),
+        Err(RecvTimeoutError::Timeout) if thread != 0 => loop {
             // until the worker says it is done (or is gone): a cancel that found no call to abort is tried again
-            loop {
-                cancel(thread);
-                if !matches!(
-                    finished.recv_timeout(again),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                ) {
-                    break;
-                }
+            cancel(thread);
+            match result_rx.recv_timeout(again) {
+                Ok(r) => break Some(Ok(r)),
+                Err(RecvTimeoutError::Disconnected) => break Some(Err(())),
+                Err(RecvTimeoutError::Timeout) => {}
             }
+        },
+        // nothing to cancel with: stop waiting, leave the worker
+        Err(RecvTimeoutError::Timeout) => None,
+    };
+    if thread != 0 {
+        // the worker has finished the job (a result or a panic): nobody uses the handle any more
+        // SAFETY: made by `thread_handle` in the worker, closed once, here.
+        unsafe {
+            let _ = CloseHandle(HANDLE(thread as *mut c_void));
         }
-        let result = worker.join();
-        if thread != 0 {
-            // SAFETY: opened by the worker above, closed once.
-            unsafe {
-                let _ = CloseHandle(HANDLE(thread as *mut c_void));
-            }
-        }
-        match result {
-            // ERROR_OPERATION_ABORTED: our own cancel
-            Ok(Err(e)) if e.raw_os_error() == Some(995) => Err(refused(OPLOCK_BUSY)),
-            Ok(r) => r,
-            Err(_) => Err(io::Error::other("the system call panicked")),
-        }
-    })
+    }
+    match received {
+        // ERROR_OPERATION_ABORTED: our own cancel
+        Some(Ok(Err(e))) if e.raw_os_error() == Some(995) => Err(refused(OPLOCK_BUSY)),
+        Some(Ok(r)) => r,
+        Some(Err(())) => Err(io::Error::other("the system call panicked")),
+        None => Err(refused(format!("{OPLOCK_BUSY}{ABANDONED}"))),
+    }
 }
 
 /// The absolute form of `p` (`GetFullPathNameW`), without a trailing nul.
@@ -950,14 +1018,51 @@ pub fn read_file(path: &Path) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Make the *new* file `path` (it must not exist; a link is never followed) and write `bytes` to it. Others may read
-/// it meanwhile, nothing more. A failed write leaves the partial file: the caller deletes it.
+/// Make the *new* file `path` (it must not exist; a link is never followed) and write `bytes` to it, then flush it to
+/// disk (`FlushFileBuffers`; `File::flush` does nothing). Others may read it meanwhile, nothing more. A failed write
+/// or flush leaves the partial file: the caller deletes it.
 pub fn write_new_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    // SAFETY: no security descriptor is passed.
+    unsafe { write_new_file_with_sd(path, bytes, None) }
+}
+
+/// [`write_new_file`] for a file that gets the security descriptor `sd` in the create call (so it never exists with
+/// other permissions).
+///
+/// # Safety
+/// `sd`, when given, must point to a valid security descriptor that outlives the call.
+pub unsafe fn write_new_file_with_sd(
+    path: &Path,
+    bytes: &[u8],
+    sd: Option<*const c_void>,
+) -> io::Result<()> {
+    write_new_file_with(path, bytes, sd, &mut |f| f.sync_all())
+}
+
+/// [`write_new_file_with_sd`] with the flush to disk given (a test records it): called once, after all of `bytes` was
+/// written and while the file is still open; its error is the error of the write.
+fn write_new_file_with(
+    path: &Path,
+    bytes: &[u8],
+    sd: Option<*const c_void>,
+    flush_to_disk: &mut dyn FnMut(&std::fs::File) -> io::Result<()>,
+) -> io::Result<()> {
     use std::io::Write;
-    let h = open_with(path, ACCESS_GENERIC_WRITE, SHARE_READ, CREATE_NEW, false, 0)?;
+    // SAFETY: the caller of the public functions upholds the contract of `sd`.
+    let h = unsafe {
+        open_with_sd(
+            path,
+            ACCESS_GENERIC_WRITE,
+            SHARE_READ,
+            CREATE_NEW,
+            false,
+            0,
+            sd,
+        )
+    }?;
     let mut file = std::fs::File::from(h);
     file.write_all(bytes)?;
-    file.flush()
+    flush_to_disk(&file)
 }
 
 /// Delete the plain file `path` (a link, a folder or a missing file is not deleted) without waiting for anybody: the
@@ -1066,28 +1171,37 @@ pub const ATTRIBUTE_SPARSE: u32 = 0x200;
 /// `FILE_ATTRIBUTE_COMPRESSED`.
 pub const ATTRIBUTE_COMPRESSED: u32 = 0x800;
 
-/// Make the file behind `h` neither compressed nor sparse again, in place (the contents stay). `h` needs
-/// `FILE_READ_DATA | FILE_WRITE_DATA` (what compression needs). A sparse file with holes loses the flag too: the
-/// holes become zeros that have storage. `Ok(true)` when something was changed; an error means the caller must
-/// replace the file.
-pub fn clear_sparse_and_compression(h: HANDLE) -> io::Result<bool> {
-    let attrs = info(h)?.dwFileAttributes;
-    let mut changed = false;
-    if attrs & ATTRIBUTE_COMPRESSED != 0 {
-        set_compressed(h, false)?;
-        changed = true;
+/// Who an object is on its volume: the volume serial number and the 128-bit file id (`FILE_ID_INFO`). The same value
+/// on two handles means the same object; a folder that is deleted and another one renamed into its name have
+/// different ones (the id carries a sequence number, so a reused record is not the same id).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub volume: u64,
+    pub id: [u8; 16],
+}
+
+/// The identity of the object behind `h` (needs `FILE_READ_ATTRIBUTES`). An all-zero file id (a file system that
+/// has none) is an error: it would make every object "the same".
+pub fn file_identity(h: HANDLE) -> io::Result<FileIdentity> {
+    let mut i = FILE_ID_INFO::default();
+    // SAFETY: `i` is a FILE_ID_INFO and the size passed is its size.
+    unsafe {
+        GetFileInformationByHandleEx(
+            h,
+            FileIdInfo,
+            &mut i as *mut FILE_ID_INFO as *mut c_void,
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
     }
-    if attrs & ATTRIBUTE_SPARSE != 0 {
-        set_sparse(h, false)?;
-        changed = true;
+    .map_err(win_err)?;
+    let id = i.FileId.Identifier;
+    if id == [0u8; 16] {
+        return Err(io::Error::other("the file system gives no file id"));
     }
-    let now = info(h)?.dwFileAttributes;
-    if now & (ATTRIBUTE_SPARSE | ATTRIBUTE_COMPRESSED) != 0 {
-        return Err(io::Error::other(
-            "the file is still sparse or compressed after the flags were cleared",
-        ));
-    }
-    Ok(changed)
+    Ok(FileIdentity {
+        volume: i.VolumeSerialNumber,
+        id,
+    })
 }
 
 fn ioctl(h: HANDLE, code: u32, input: *const c_void, len: u32) -> io::Result<()> {
@@ -1776,6 +1890,7 @@ mod tests {
                         r.store(true, SeqCst);
                     }
                 },
+                current_thread_handle,
                 move || {
                     while !job_released.load(SeqCst) {
                         std::thread::sleep(Duration::from_millis(2));
@@ -1803,6 +1918,7 @@ mod tests {
             &|_| {
                 cancels.fetch_add(1, SeqCst);
             },
+            current_thread_handle,
             || Ok(7),
         );
         assert_eq!(ok.unwrap(), 7);
@@ -1812,11 +1928,85 @@ mod tests {
             &|_| {
                 cancels.fetch_add(1, SeqCst);
             },
+            current_thread_handle,
             || Err::<(), _>(io::Error::from_raw_os_error(5)),
         )
         .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(5));
         assert_eq!(cancels.load(SeqCst), 0);
+    }
+
+    /// The worker's thread handle could not be obtained (the old code asked `OpenThread`, which can be refused): there
+    /// is nothing to cancel with, and the old code then joined the worker without limit. Now the call returns at the
+    /// bound with a refusal that says it was left running; the worker ends by itself when its call returns.
+    #[test]
+    fn a_call_that_cannot_be_cancelled_does_not_hold_the_caller_up() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let cancels = Arc::new(AtomicU32::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let ended = Arc::new(AtomicBool::new(false));
+        let (c, r, e) = (cancels.clone(), release.clone(), ended.clone());
+        let started = std::time::Instant::now();
+        let result = within(
+            "bounded without a handle",
+            Duration::from_secs(10),
+            move || {
+                bounded_with(
+                    Duration::from_millis(100),
+                    Duration::from_millis(10),
+                    &|_| {
+                        c.fetch_add(1, SeqCst);
+                    },
+                    || None,
+                    move || {
+                        // a call that nobody can cancel: it ends when the other program answers
+                        while !r.load(SeqCst) {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        e.store(true, SeqCst);
+                        Ok(())
+                    },
+                )
+            },
+        );
+        let err = result.unwrap_err();
+        assert!(is_oplock_busy(&err), "{err}");
+        assert!(is_abandoned(&err), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(cancels.load(SeqCst), 0, "there was nothing to cancel with");
+        assert!(!ended.load(SeqCst), "the worker is still in its call");
+        // what happens to the worker: it ends when its call returns, nobody waits for it
+        release.store(true, SeqCst);
+        let t = std::time::Instant::now();
+        while !ended.load(SeqCst) {
+            assert!(
+                t.elapsed() < Duration::from_secs(5),
+                "the worker never ended"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // a cancelled call is not "abandoned"
+        let cancelled = io::Error::from(RemoveError {
+            path: PathBuf::from("x"),
+            error: refused(OPLOCK_BUSY),
+            more: 0,
+        });
+        assert!(!is_abandoned(&cancelled));
+    }
+
+    /// The real handle of the calling thread is made, is a different handle from the pseudo handle, and works with
+    /// `CancelSynchronousIo` (nothing to cancel: it answers "no such call" and does not fail on the handle itself).
+    #[test]
+    fn the_thread_handle_is_a_real_handle_that_can_be_closed() {
+        let h = current_thread_handle().expect("a duplicate of the thread handle");
+        assert_ne!(h, 0);
+        // SAFETY: a handle made above, used and closed once.
+        unsafe {
+            let _ = CancelSynchronousIo(HANDLE(h as *mut c_void));
+            assert!(CloseHandle(HANDLE(h as *mut c_void)).is_ok());
+        }
     }
 
     /// The conversion of a locked-file error keeps how many more entries stayed.
@@ -1950,71 +2140,81 @@ mod tests {
         assert_eq!(extra_streams(raw(&open_attributes(&f))).unwrap().len(), 41);
     }
 
-    /// A file with the sparse flag, the compressed flag, or both and holes in it, is made plain again through the
-    /// handle, and its contents stay.
+    /// The file is flushed to disk, once, after the last byte was written and before the file is let go of (the old
+    /// code called `File::flush`, which does nothing), and a flush that fails is the error of the write.
     #[test]
-    fn a_sparse_or_compressed_file_is_made_plain_in_place() {
-        use std::io::{Seek, SeekFrom, Write};
-        let (_root, dir) = sandbox("sparse");
-        let f = dir.join("frames.bin");
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&f)
-            .unwrap();
-        file.set_len(3 << 20).unwrap();
-        file.seek(SeekFrom::Start(100)).unwrap();
-        file.write_all(b"OLD FILE").unwrap();
-        let h = HANDLE(std::os::windows::io::AsRawHandle::as_raw_handle(&file));
-        let attrs = |h| info(h).unwrap().dwFileAttributes;
-        let id = |h| {
-            let i = info(h).unwrap();
-            (i.dwVolumeSerialNumber, i.nFileIndexHigh, i.nFileIndexLow)
-        };
-        let before = id(h);
-        // nothing to do
-        assert!(!clear_sparse_and_compression(h).unwrap());
-
-        // sparse, without holes (the flag only), then with holes (a zeroed range)
-        if set_sparse(h, true).is_err() {
-            eprintln!("cannot make a file sparse here: skipped");
-            return;
-        }
-        assert_ne!(attrs(h) & ATTRIBUTE_SPARSE, 0);
-        assert!(clear_sparse_and_compression(h).unwrap());
-        assert_eq!(attrs(h) & ATTRIBUTE_SPARSE, 0);
-
-        set_sparse(h, true).unwrap();
-        let zero = windows::Win32::System::Ioctl::FILE_ZERO_DATA_INFORMATION {
-            FileOffset: 1 << 20,
-            BeyondFinalZero: 2 << 20,
-        };
-        ioctl(
-            h,
-            windows::Win32::System::Ioctl::FSCTL_SET_ZERO_DATA,
-            &zero as *const _ as *const c_void,
-            std::mem::size_of_val(&zero) as u32,
-        )
+    fn a_new_file_is_flushed_to_disk_after_the_write() {
+        let (_root, dir) = sandbox("write-flush");
+        let f = dir.join("a.tmp");
+        let mut calls = Vec::new();
+        write_new_file_with(&f, b"all the bytes", None, &mut |_file| {
+            // the file is still open (the handle has no right to read its attributes: look by path), and
+            // everything is already in it
+            calls.push(std::fs::metadata(&f).unwrap().len());
+            Ok(())
+        })
         .unwrap();
-        assert!(clear_sparse_and_compression(h).unwrap());
-        assert_eq!(attrs(h) & ATTRIBUTE_SPARSE, 0, "still sparse");
+        assert_eq!(calls, [13], "one flush, after the last byte");
+        assert_eq!(std::fs::read(&f).unwrap(), b"all the bytes");
+        // a failing flush fails the write (the partial file is the caller's to delete)
+        let g = dir.join("b.tmp");
+        let e = write_new_file_with(&g, b"x", None, &mut |_| {
+            Err(io::Error::from_raw_os_error(1117))
+        })
+        .unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(1117));
+        // the real flush works on a plain file too
+        let h = dir.join("c.tmp");
+        write_new_file(&h, b"real").unwrap();
+        assert_eq!(std::fs::read(&h).unwrap(), b"real");
+    }
 
-        // compressed
-        if set_compressed(h, true).is_ok() {
-            assert_ne!(attrs(h) & ATTRIBUTE_COMPRESSED, 0);
-            assert!(clear_sparse_and_compression(h).unwrap());
-            assert_eq!(attrs(h) & ATTRIBUTE_COMPRESSED, 0);
-        } else {
-            eprintln!("cannot compress a file here: that part is skipped");
-        }
-        // the same file, the same contents and size
-        assert_eq!(id(h), before);
-        let bytes = std::fs::read(&f).unwrap();
-        assert_eq!(bytes.len(), 3 << 20);
-        assert_eq!(&bytes[100..108], b"OLD FILE");
-        assert!(bytes[108..].iter().all(|&b| b == 0));
+    /// The identity of an object is the same on every handle to it and survives a rename; another object that takes
+    /// its name has another one (the swap that makes a recorded name point at a different folder).
+    #[test]
+    fn an_object_keeps_its_identity_across_a_rename_and_a_swap_changes_it() {
+        let (_root, dir) = sandbox("identity");
+        let a = dir.join("a");
+        std::fs::create_dir_all(&a).unwrap();
+        let ident = |p: &Path| file_identity(raw(&open_attributes(p))).unwrap();
+        let id_a = ident(&a);
+        assert_eq!(id_a, ident(&a), "the same on a second handle");
+        assert_ne!(id_a.volume, 0);
+        let moved = dir.join("a.old-1-0");
+        rename_no_wait(&a, &moved).unwrap();
+        assert_eq!(ident(&moved), id_a, "a rename keeps the object");
+        // another folder under the old name
+        std::fs::create_dir_all(&a).unwrap();
+        assert_ne!(ident(&a), id_a);
+        // files have one too, and two files differ
+        std::fs::write(dir.join("f1"), b"x").unwrap();
+        std::fs::write(dir.join("f2"), b"x").unwrap();
+        assert_ne!(ident(&dir.join("f1")), ident(&dir.join("f2")));
+    }
+
+    /// The check of a checked rename runs on the handle that is renamed, before the rename, and can stop it.
+    #[test]
+    fn a_checked_rename_looks_at_the_object_it_moves_and_can_stop_before_the_move() {
+        let (_root, dir) = sandbox("checked-rename");
+        let a = dir.join("a");
+        std::fs::create_dir_all(&a).unwrap();
+        let want = file_identity(raw(&open_attributes(&a))).unwrap();
+        let to = dir.join("a.old-1-0");
+        let mut seen = None;
+        rename_no_wait_checked(&a, &to, ACCESS_READ_CONTROL, &mut |h| {
+            // before the move: the old name is still there
+            assert!(a.exists() && !to.exists());
+            seen = Some(file_identity(h)?);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, Some(want));
+        assert!(!a.exists() && to.exists());
+        // an error from the check: nothing is moved
+        let e =
+            rename_no_wait_checked(&to, &a, 0, &mut |_| Err(refused("not this one"))).unwrap_err();
+        assert!(is_refused(&e) && !is_oplock_busy(&e), "{e}");
+        assert!(to.exists() && !a.exists());
     }
 
     #[test]

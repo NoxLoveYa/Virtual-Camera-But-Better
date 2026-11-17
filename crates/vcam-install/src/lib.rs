@@ -11,6 +11,7 @@
 //! * [`elevate`]: `runas` launcher and the outcome of a launch.
 
 pub mod acl;
+pub mod aside;
 pub mod camera;
 pub mod datadir;
 pub mod elevate;

@@ -16,7 +16,7 @@
 //! file that blocks every other open of it; and the frame file gives no `FILE_WRITE_ATTRIBUTES` because that right
 //! lets a user hard-link the file from a folder of their own or set it read-only, after which the DLL and the app
 //! refuse it until a Repair. (Making it sparse or compressed, or giving it a data stream, only needs the data rights
-//! the user has; the installer puts those right again.)
+//! the user has; the installer replaces such a file by a new one, it never clears the state in place.)
 //!
 //! Everything here is applied and read back through a handle that [`vcam_protocol::secure`] verified, never by path.
 //! A new object is created with its final DACL in the create call ([`SecurityDescriptor`]), so it never exists with
@@ -28,12 +28,13 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HANDLE, HLOCAL};
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    ConvertStringSidToSidW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
+    ConvertStringSidToSidW, GetSecurityInfo, SetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
-    EqualSid, GetAce, GetSecurityDescriptorControl, LookupAccountSidW, SetKernelObjectSecurity,
-    ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SID_NAME_USE,
+    EqualSid, GetAce, GetSecurityDescriptorControl, InitializeAcl, LookupAccountSidW,
+    SetKernelObjectSecurity, ACL, ACL_REVISION, DACL_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SID_NAME_USE, UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 
 use crate::util::{pcwstr, werr, wide, Res};
@@ -60,8 +61,8 @@ pub const FILE_READ: u32 = 0x0012_0089;
 /// What the mask does **not** prevent, because the right it is done with is one the mask has: `FSCTL_SET_SPARSE` (a
 /// handle with `FILE_WRITE_DATA` is enough), `FSCTL_SET_COMPRESSION` (read and write data), and a data stream
 /// (`frames.bin:name`, created through `FILE_WRITE_DATA`). None of the three bothers the DLL or the app; the
-/// installer undoes them: a Repair clears the sparse and compressed state in place and replaces a file that has a
-/// stream (see `datadir`).
+/// installer undoes them by replacing the file: a Repair replaces a frame file that is sparse, compressed or has a
+/// stream (see `datadir`), and never clears a state in place.
 pub const FRAMES_READ_WRITE: u32 = 0x0012_008f;
 /// Read, write, execute and `DELETE` (a file the service made may be deleted by the service).
 pub const FILE_MODIFY: u32 = 0x0013_01bf;
@@ -442,6 +443,38 @@ pub(crate) fn apply_aces_to(h: &OwnedHandle, aces: &[Ace], owner: &str) -> Res<(
 #[cfg(test)]
 pub(crate) fn apply_aces(h: &OwnedHandle, aces: &[Ace], owner: &str) -> Res<()> {
     apply_aces_to(h, aces, owner)
+}
+
+/// Give the object behind `h` the permissions it would have if it had been made where it is: the explicit DACL is
+/// replaced by none, the DACL is no longer protected, and the inheritable entries of the folder around it apply
+/// (`SetSecurityInfo` with `UNPROTECTED_DACL_SECURITY_INFORMATION` and an empty DACL, on the handle). The owner is not
+/// changed. `h` needs `WRITE_DAC`.
+///
+/// This is what a file needs that was made with a protected DACL of its own (so that nobody else could open it
+/// while it was being written) and then moved to its final name: a rename keeps the security descriptor, so the file
+/// would stay unreadable to the accounts that the folder around its new name lets read it (the camera service reads the
+/// DLL as LOCAL SERVICE through `Program Files`' own permissions).
+pub fn restore_inheritance(h: &OwnedHandle) -> Res<()> {
+    // an ACL header (8 bytes) with no entries; 4-aligned
+    let mut empty = [0u32; 2];
+    let acl = empty.as_mut_ptr() as *mut ACL;
+    // SAFETY: `empty` is large enough for an ACL header and lives past both calls.
+    unsafe { InitializeAcl(acl, 8, ACL_REVISION) }.map_err(|e| werr("InitializeAcl", e))?;
+    let r = unsafe {
+        SetSecurityInfo(
+            HANDLE(h.as_raw_handle()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(acl as *const ACL),
+            None,
+        )
+    };
+    if r != ERROR_SUCCESS {
+        return Err(format!("SetSecurityInfo: error {}", r.0));
+    }
+    Ok(())
 }
 
 /// An ACE as stored on an object.
@@ -869,8 +902,8 @@ mod tests {
 
     /// What the mask `0x12008f` does *not* prevent (the reviewer's reproduction, on temp files with the same DACL):
     /// a handle with only `FILE_WRITE_DATA` makes the file sparse and can create a named stream; compression needs
-    /// read and write data, which the mask has. The installer therefore clears the first two states in place and
-    /// replaces a file that has a stream (`datadir` tests), and this test is the reason it has to.
+    /// read and write data, which the mask has. The installer therefore replaces such a file (`datadir` tests; it
+    /// never clears the state in place), and this test is the reason it has to.
     #[test]
     fn a_write_data_handle_can_still_make_the_frame_file_sparse_or_compressed_or_give_it_a_stream()
     {
@@ -941,23 +974,72 @@ mod tests {
         perm.set_readonly(true);
         assert!(std::fs::set_permissions(&path, perm).is_err());
 
-        // the way back, through the installer's own handle (read and write data, not the user's mask)
         drop((write_only, read_write));
-        // (the file has only `FRAMES_READ_WRITE`, so even the test asks for no more than that)
-        let mine = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .access_mode(0x3)
-            .open(&path)
-            .unwrap();
-        let changed = secure::clear_sparse_and_compression(HANDLE(mine.as_raw_handle())).unwrap();
-        assert!(changed);
-        let attrs = std::fs::metadata(&path).unwrap().file_attributes();
-        assert_eq!(
-            attrs & (secure::ATTRIBUTE_SPARSE | secure::ATTRIBUTE_COMPRESSED),
-            0
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file made with a protected DACL that only SYSTEM and Administrators have, then moved to its final name by a
+    /// rename, **keeps** that DACL (a rename does not recompute it): the camera service could not read such a DLL.
+    /// `restore_inheritance`, on a handle to the moved file, replaces it by what the folder around the new name hands
+    /// down: not protected, the inherited entries are there, and the owner is unchanged.
+    #[test]
+    fn a_rename_keeps_a_protected_dacl_and_restore_inheritance_gives_the_inherited_one() {
+        use vcam_protocol::secure::{self, DISP_OPEN_EXISTING};
+        let me = crate::current_user_sid().unwrap();
+        // a folder that hands down full control to the test and read to somebody else, to both files and folders
+        let (dir, h) = object_with(
+            &[ace(USER, FILE_READ, OBJECT_INHERIT | CONTAINER_INHERIT)],
+            "inherit",
         );
-        drop(mine);
+        drop(h);
+        let tmp = dir.join("a.dll.tmp");
+        let sd = SecurityDescriptor::from_aces(&[ace(&me, FULL, 0)]).unwrap();
+        // SAFETY: `sd` lives until the end of the call.
+        unsafe { secure::write_new_file_with_sd(&tmp, b"MZ-like", Some(sd.as_ptr())) }.unwrap();
+        let open = |p: &std::path::Path| {
+            secure::open_with(
+                p,
+                0x2_0000 | 0x4_0000 | 0x80,
+                secure::SHARE_ALL,
+                DISP_OPEN_EXISTING,
+                false,
+                0,
+            )
+            .unwrap()
+        };
+        // made with exactly its own DACL: protected, one entry
+        let snap = read(&open(&tmp)).unwrap();
+        assert!(snap.protected);
+        assert_eq!(snap.aces.len(), 1);
+        let dest = dir.join("a.dll");
+        secure::rename_replacing_no_wait(&tmp, &dest).unwrap();
+        // the rename kept it: the folder's entry for USER did not reach the file
+        let moved = read(&open(&dest)).unwrap();
+        assert!(moved.protected, "a rename recomputes nothing");
+        assert!(!moved.aces.iter().any(|a| sid_eq(&a.sid, USER)));
+        let before_owner = moved.owner.clone();
+        // the way to the folder's permissions
+        restore_inheritance(&open(&dest)).unwrap();
+        let after = read(&open(&dest)).unwrap();
+        assert!(!after.protected, "the DACL inherits again");
+        let user_ace = after
+            .aces
+            .iter()
+            .find(|a| sid_eq(&a.sid, USER))
+            .expect("the entry the folder hands down is there");
+        assert_eq!(user_ace.mask & FILE_READ, FILE_READ);
+        assert_ne!(
+            user_ace.flags & INHERITED_ACE,
+            0,
+            "and it is an inherited one"
+        );
+        assert_eq!(after.owner, before_owner, "the owner is not changed");
+        // the explicit entry of the protected DACL is gone: what is there is the folder's
+        assert!(
+            after.aces.iter().all(|a| a.flags & INHERITED_ACE != 0),
+            "{:?}",
+            after.aces
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

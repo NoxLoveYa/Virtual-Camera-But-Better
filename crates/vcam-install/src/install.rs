@@ -4,11 +4,13 @@
 //! The steps run against a [`Machine`] and a set of [`Paths`], so their order and their rollback are tested with a
 //! fake machine and temp folders; [`install`] and [`uninstall`] are the same code on the real machine.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use vcam_protocol::secure;
 
-use crate::acl::{valid_sid, Principals};
+use crate::acl::{self, valid_sid, Ace, Principals, SecurityDescriptor, FULL};
+use crate::aside;
 use crate::datadir;
 use crate::log::Log;
 use crate::machine::{Machine, RealMachine, Registration};
@@ -155,27 +157,21 @@ pub fn install_with(
         .read_registration()
         .filter(|r| Path::new(&r.dll).is_file());
 
-    // 1. the data folder (no registration exists because of this step, nothing to undo)
-    let mut moved = Vec::new();
-    let prepared = datadir::prepare_recording(
-        paths,
-        &principals,
-        &mut || m.stop_frame_server(),
-        log,
-        &mut moved,
-    );
-    // a data folder that was moved aside and could not be deleted is the helper's: its name goes on record (also when
-    // preparing failed later), and the sweep of a later run deletes exactly the names on record
-    for name in &moved {
-        match m.record_aside(name) {
-            Ok(()) => log.line(&format!(
-                "{name} is on record; the next install or removal deletes it"
-            )),
-            Err(e) => log.line(&format!(
-                "could not put {name} on record ({e}); it stays where it is"
-            )),
-        }
-    }
+    // 1. the data folder (no registration exists because of this step, nothing to undo). A data folder that is moved
+    // aside is put on the record by the preparation itself, before the rename (with its identity), and taken off
+    // again when the move does not happen or the old copy is deleted at once: what stays on the record is what a
+    // later run deletes, also when preparing fails after that.
+    let prepared = {
+        let machine: RefCell<&mut dyn Machine> = RefCell::new(&mut *m);
+        let mut ledger = aside::MachineLedger(&machine);
+        datadir::prepare_recording(
+            paths,
+            &principals,
+            &mut || machine.borrow_mut().stop_frame_server(),
+            log,
+            &mut ledger,
+        )
+    };
     if let Err(e) = prepared {
         // The log was let go of while the folder was worked on: whatever the caller writes about this failure (the
         // `ERROR:` line the app shows) must reach the file, so make it ready again before returning.
@@ -186,7 +182,7 @@ pub fn install_with(
     log.line(&format!("data folder ready: {}", paths.data.display()));
 
     // 2. the DLL
-    let copied_new = copy_dll(&bytes, &dest, log)?;
+    let copied_new = copy_dll(&bytes, &dest, &principals, log)?;
 
     // 3. + 4. registration and camera, with rollback
     let reg = Registration {
@@ -212,11 +208,9 @@ pub fn install_with(
 
     // 5. only now the older DLLs
     let pending = remove_old_dlls(&paths.install, &dest, m, log);
-    let recorded = m.aside_names();
-    let swept = datadir::sweep_asides(paths, &principals.trusted_owners, &recorded, log);
-    for name in &swept.forget {
-        m.forget_aside(name);
-    }
+    sweep_recorded(&mut *m, log, |recorded, log| {
+        datadir::sweep_asides(paths, &principals.trusted_owners, recorded, log)
+    });
     Ok(if pending {
         log.line(
             "installed; the camera service still has an older build loaded: the new one takes effect after that service restarts or Windows restarts",
@@ -227,13 +221,86 @@ pub fn install_with(
     })
 }
 
+/// Read the record of moved-aside data folders, run `sweep` on its entries, and apply what it found to the record (the
+/// entries it is done with go, the ones that stay move to the end). A record that cannot be read is not acted on and
+/// not touched afterwards (`sweep` then gets no entries); a record that cannot be written is a line of the log: it
+/// never fails an install or a removal.
+fn sweep_recorded(
+    m: &mut dyn Machine,
+    log: &mut dyn Log,
+    sweep: impl FnOnce(&[aside::AsideEntry], &mut dyn Log) -> datadir::AsideSweep,
+) -> datadir::AsideSweep {
+    let recorded = aside::load_logged(&mut *m, log);
+    let swept = sweep(recorded.as_deref().unwrap_or(&[]), log);
+    if recorded.is_some() {
+        if let Err(e) = aside::finish_sweep(m, &swept) {
+            log.line(&format!(
+                "the record of old data folders was not updated: {e}"
+            ));
+        }
+    }
+    swept
+}
+
+/// The sentence for a rename of `from` to `to` that failed with `e`. Both files are named: a lock of another program
+/// on either one (the open of the one that is moved, or the replace of the one that is there) gives the same refusal,
+/// and the person who reads it must know which two files it is about.
+fn rename_error(from: &Path, to: &Path, e: &std::io::Error) -> String {
+    if secure::is_oplock_busy(e) {
+        format!(
+            "cannot move {} to {}: one of the two files is locked by another program (it holds an opportunistic lock); not waiting for it. Close the program that has it open and try again",
+            from.display(),
+            to.display()
+        )
+    } else {
+        werr(&format!("move {} to {}", from.display(), to.display()), e)
+    }
+}
+
+/// Give the DLL copy at `dest` the permissions of the folder it is in (`Program Files`'): the camera service reads it
+/// as LOCAL SERVICE through them. A rename keeps the security descriptor of the file that was moved, which is the
+/// protected one the temporary file was made with, so this runs after every rename (see
+/// [`acl::restore_inheritance`]). The file is looked at on the handle that is changed: a plain file, one link.
+fn inherit_permissions(dest: &Path) -> Res<()> {
+    // READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES: nothing that breaks a lock
+    let h = secure::open_with(
+        dest,
+        0x0002_0000 | 0x0004_0000 | 0x80,
+        secure::SHARE_ALL,
+        secure::DISP_OPEN_EXISTING,
+        false,
+        0,
+    )
+    .map_err(|e| file_error("open", dest, &e))?;
+    secure::verify_file(secure::raw(&h), None).map_err(|e| werr(&dest.display().to_string(), e))?;
+    acl::restore_inheritance(&h).map_err(|e| werr(&dest.display().to_string(), e))
+}
+
 /// Write `bytes` to `dest` unless it is already there. Returns true when a new file was made.
 ///
 /// `Program Files` can be read by a standard user, so a program of theirs can hold an opportunistic lock on the copy
 /// that is there (or on a leftover temporary file), which makes a plain read, write or rename wait with the
 /// machine-wide lock taken. Nothing here waits: the copy is read through [`secure::read_file`], the temporary file is
 /// made and moved into place through handles, and a file that is locked is an error that names it.
-fn copy_dll(bytes: &[u8], dest: &Path, log: &mut dyn Log) -> Res<bool> {
+///
+/// The temporary file is made with a protected DACL that grants only SYSTEM and Administrators (a standard user
+/// cannot open it, so cannot lock it between the write and the rename), written, flushed to disk and renamed over
+/// `dest`; the rename keeps that DACL, so the final file then gets the permissions its folder hands down
+/// ([`inherit_permissions`]). A file whose permissions could not be set is deleted again: a copy that the camera
+/// service cannot read must not be taken for a good one by the next Repair.
+fn copy_dll(bytes: &[u8], dest: &Path, p: &Principals, log: &mut dyn Log) -> Res<bool> {
+    copy_dll_with(bytes, dest, p, log, &mut |_| {})
+}
+
+/// [`copy_dll`] with a hook that runs between the write of the temporary file and its rename (tests look at the
+/// file as it is then).
+fn copy_dll_with(
+    bytes: &[u8],
+    dest: &Path,
+    p: &Principals,
+    log: &mut dyn Log,
+    between: &mut dyn FnMut(&Path),
+) -> Res<bool> {
     match secure::read_file(dest) {
         Ok(there) if there == bytes => {
             log.line(&format!("dll already present: {}", dest.display()));
@@ -253,19 +320,44 @@ fn copy_dll(bytes: &[u8], dest: &Path, log: &mut dyn Log) -> Res<bool> {
     let result = (|| -> Res<()> {
         // what an earlier run left behind (the file is made new, so that nothing of it stays in the copy)
         delete_file(&tmp).map_err(|e| file_error("remove the old", &tmp, &e))?;
-        secure::write_new_file(&tmp, bytes).map_err(|e| file_error("write", &tmp, &e))?;
+        let sd = SecurityDescriptor::from_aces(&[
+            Ace {
+                sid: p.system.clone(),
+                mask: FULL,
+                flags: 0,
+            },
+            Ace {
+                sid: p.admins.clone(),
+                mask: FULL,
+                flags: 0,
+            },
+        ])?;
+        // SAFETY: `sd` lives until the end of the call.
+        unsafe { secure::write_new_file_with_sd(&tmp, bytes, Some(sd.as_ptr())) }
+            .map_err(|e| file_error("write", &tmp, &e))?;
+        between(&tmp);
         // one step: `dest` is the old file or the new one, never none
-        secure::rename_replacing_no_wait(&tmp, dest).map_err(|e| file_error("write", dest, &e))
+        secure::rename_replacing_no_wait(&tmp, dest).map_err(|e| rename_error(&tmp, dest, &e))
     })();
     if result.is_err() {
         let _ = delete_file(&tmp);
     }
     result?;
+    if let Err(e) = inherit_permissions(dest) {
+        let _ = delete_file(dest);
+        return Err(format!(
+            "the copy {} could not be given the permissions of its folder, and was deleted again: {e}",
+            dest.display()
+        ));
+    }
     log.line(&format!("dll copied: {}", dest.display()));
     Ok(true)
 }
 
 /// Undo a failed registration or camera step. Returns the text to append to the error.
+///
+/// The record of moved-aside data folders is not part of this: `Machine::delete_registration` never touches it, so a
+/// record that cannot be written (or read) is never a reason for an incomplete rollback.
 fn rollback(
     before: &Option<Registration>,
     dest: &Path,
@@ -489,11 +581,9 @@ pub fn uninstall_trusting(
         left.push(why);
     }
     // a data folder that an install moved out of the way lives next to `BetterCam`, not in it
-    let recorded = m.aside_names();
-    let swept = datadir::sweep_data_asides(paths, trusted, &recorded, log);
-    for name in &swept.forget {
-        m.forget_aside(name);
-    }
+    let swept = sweep_recorded(&mut *m, log, |recorded, log| {
+        datadir::sweep_data_asides(paths, trusted, recorded, log)
+    });
     if swept.left > 0 {
         left.push(format!(
             "an old copy of the data folder in {} (in use)",
