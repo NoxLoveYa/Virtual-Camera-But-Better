@@ -7,7 +7,8 @@
 //!   OBS finds them (`nvvfx-load.h`). [`Runtime::open`] hands out one shared copy; it stays loaded as long as somebody
 //!   holds the `Arc`, and unloads when the last holder drops it. Function pointers taken from it are valid only while
 //!   the `Arc` they came from is alive: keep both together.
-//! * [`run_install`] downloads NVIDIA's redistributable, checks the signature and runs it (`install_nvidia.ps1`).
+//! * [`run_install`] downloads NVIDIA's redistributable, accepts it by a valid NVIDIA signature or by its pinned
+//!   SHA-256 ([`pins`]) and runs it (`install_nvidia.ps1`).
 
 use libloading::os::windows::{Library, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR};
 use serde::Serialize;
@@ -359,11 +360,52 @@ pub fn installer_url(arch: &str) -> Option<String> {
     })
 }
 
+/// A file Better Cam accepts at one address by its fingerprint: the size and the SHA-256 (upper case hex).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pin {
+    pub url: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
+/// Why pins exist: NVIDIA's own signature on these four installers does not chain to a root Windows trusts (the
+/// signer is the internal `CN=NVIDIA DVS Dev Signing`, issued by `NVIDIA DVS Dev Intermediate`, expired 2026-03-27,
+/// thumbprint F3F62BE053B6812E2E1AEC4EA8EB7FB4B955B5AB; `Get-AuthenticodeSignature` says `UnknownError`), so the
+/// signature check alone would refuse the genuine files. The script therefore also accepts exactly these files,
+/// whose size and SHA-256 were taken from NVIDIA's download host over HTTPS on 2026-11-17 (and checked a second time
+/// the same day). A properly signed future file is accepted without a pin. Per generation: (arch, size, SHA-256).
+const PINNED: [(&str, u64, &str); 4] = [
+    ("turing", 759_745_272, "D51D8789F96A82375B04BCCA6914EEE301AD5B6CC45137D7B86FC45DDB205F2D"),
+    ("ampere", 775_486_112, "93BDF4FFEC7C393037936349678D1864897FEF45D7BA2AB81D4B1563E1328512"),
+    ("ada", 767_555_072, "4761FE1579E82DE6D45EFEC8DC09492CF2CC601867269955E129707AC8EA8546"),
+    ("blackwell", 783_058_432, "CEF45592E16D0EA91DBFF12A828B31874AB83829ADF9A431466DFB88B714618D"),
+];
+
+/// The built-in pins, each tied to the address of its own generation: a hash never validates another address.
+pub fn pins() -> Vec<Pin> {
+    PINNED
+        .iter()
+        .filter_map(|(arch, size, sha)| Some(Pin { url: installer_url(arch)?, size: *size, sha256: (*sha).into() }))
+        .collect()
+}
+
 /// A test hook of debug builds: `BETTER_CAM_TEST_NVIDIA_URL` replaces the download address, but only with a loopback
 /// address (never a real host). Release builds have no such thing.
 #[cfg(debug_assertions)]
 pub fn test_url_override() -> Option<String> {
     std::env::var("BETTER_CAM_TEST_NVIDIA_URL").ok().filter(|u| u.starts_with("http://127.0.0.1:"))
+}
+
+/// Debug builds only: `BETTER_CAM_TEST_NVIDIA_PIN=<size>:<sha256>` is the pin of the loopback test address. It
+/// replaces the built-in table, so a test file can be accepted without touching the real pins.
+#[cfg(debug_assertions)]
+pub fn test_pins(url: &str) -> Option<Vec<Pin>> {
+    if !url.starts_with("http://127.0.0.1:") {
+        return None;
+    }
+    let v = std::env::var("BETTER_CAM_TEST_NVIDIA_PIN").ok()?;
+    let (size, sha) = v.split_once(':')?;
+    Some(vec![Pin { url: url.into(), size: size.trim().parse().ok()?, sha256: sha.trim().to_ascii_uppercase() }])
 }
 
 /// What the `nvidia-install` event carries: `download` with bytes done and total, or a stage (`verify`, `install`)
@@ -382,6 +424,9 @@ pub enum ScriptLine {
     Stage(String),
     /// What the signature check found: PowerShell's status (`Valid`, `NotSigned`, ...) and the signer's name.
     Signature { status: String, signer: String },
+    /// The file passed the check, by `signature` (valid, NVIDIA Corporation) or by `pin` (the recorded fingerprint);
+    /// `detail` is the signer or the computed SHA-256.
+    Accepted { rule: String, detail: String },
     Error(String),
 }
 
@@ -396,6 +441,10 @@ pub fn parse_line(line: &str) -> Option<ScriptLine> {
         "SIGNATURE" => {
             let (status, signer) = rest.split_once(' ').unwrap_or((rest, "-"));
             Some(ScriptLine::Signature { status: status.into(), signer: signer.trim().into() })
+        }
+        "ACCEPTED" => {
+            let (rule, detail) = rest.split_once(' ').unwrap_or((rest, ""));
+            Some(ScriptLine::Accepted { rule: rule.into(), detail: detail.trim().into() })
         }
         "ERROR" => Some(ScriptLine::Error(rest.trim().into())),
         _ => None,
@@ -415,10 +464,11 @@ impl ScriptLine {
 
 const INSTALL_SCRIPT: &str = include_str!("../install_nvidia.ps1");
 
-/// Downloads `url`, checks that the file is signed by NVIDIA and runs it elevated; waits until the installer closes.
-/// Every line the script prints goes to `on_line`. `temp` replaces `%TEMP%` for the script (tests). The file is
-/// deleted at the end, whatever happened, and a file with a bad signature is never run.
-pub fn run_install(url: &str, temp: Option<&Path>, mut on_line: impl FnMut(&ScriptLine)) -> Result<(), String> {
+/// Downloads `url`, accepts the file only when it is validly signed by NVIDIA Corporation or when it is the file the
+/// entry of `pins` for this very `url` describes (size and SHA-256), and runs it elevated; waits until the installer
+/// closes. Every line the script prints goes to `on_line`. `temp` replaces `%TEMP%` for the script (tests). The file is
+/// deleted at the end, whatever happened, and a file that passes neither check is never run.
+pub fn run_install(url: &str, pins: &[Pin], temp: Option<&Path>, mut on_line: impl FnMut(&ScriptLine)) -> Result<(), String> {
     use std::io::{BufRead, BufReader};
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -426,8 +476,14 @@ pub fn run_install(url: &str, temp: Option<&Path>, mut on_line: impl FnMut(&Scri
     if !url.is_ascii() || url.contains(|c: char| c == '\'' || c.is_whitespace() || c.is_control()) {
         return Err("The download address is not valid.".into());
     }
+    let (size, sha) = match pins.iter().find(|p| p.url == url) {
+        Some(p) if p.size > 0 && p.sha256.len() == 64 && p.sha256.chars().all(|c| c.is_ascii_hexdigit()) => (p.size, p.sha256.to_ascii_uppercase()),
+        Some(_) => return Err("The recorded fingerprint for this download is not valid.".into()),
+        None => (0, String::new()),
+    };
+    let script = INSTALL_SCRIPT.replace("{SIZE}", &format!("{size}L")).replace("{SHA256}", &sha).replace("{URL}", url);
     let mut cmd = Command::new("powershell");
-    cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &INSTALL_SCRIPT.replace("{URL}", url)])
+    cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script])
         .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -650,6 +706,12 @@ mod tests {
         let p = parse_line("STAGE install").unwrap().progress().unwrap();
         assert_eq!(p, Progress { stage: "install".into(), done: 0, total: 0 });
         assert!(parse_line("ERROR x").unwrap().progress().is_none());
+        assert_eq!(parse_line("ACCEPTED pin D51D"), Some(ScriptLine::Accepted { rule: "pin".into(), detail: "D51D".into() }));
+        assert_eq!(
+            parse_line("ACCEPTED signature NVIDIA Corporation"),
+            Some(ScriptLine::Accepted { rule: "signature".into(), detail: "NVIDIA Corporation".into() })
+        );
+        assert!(parse_line("ACCEPTED pin D51D").unwrap().progress().is_none());
     }
 
     // ---- the script, against a server on this PC ---------------------------------------------------------------
@@ -681,11 +743,15 @@ mod tests {
     /// Runs the script with its own `%TEMP%`; returns the lines it printed, its result, and whether the temp folder
     /// still holds the download folder afterwards.
     fn run_script(url: &str, name: &str) -> (Vec<ScriptLine>, Result<(), String>, bool) {
+        run_script_pinned(url, &[], name)
+    }
+
+    fn run_script_pinned(url: &str, pins: &[Pin], name: &str) -> (Vec<ScriptLine>, Result<(), String>, bool) {
         let temp = std::env::temp_dir().join(format!("bc-nv-script-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let mut lines = Vec::new();
-        let result = run_install(url, Some(&temp), |l| lines.push(l.clone()));
+        let result = run_install(url, pins, Some(&temp), |l| lines.push(l.clone()));
         let leftover = temp.join("better-cam-nvidia").exists();
         let _ = std::fs::remove_dir_all(&temp);
         (lines, result, leftover)
@@ -726,8 +792,129 @@ mod tests {
 
     #[test]
     fn nvidia_a_bad_download_address_is_not_passed_to_the_script() {
-        assert!(run_install("http://127.0.0.1:1/x' ; calc ; '", None, |_| {}).is_err());
-        assert!(run_install("http://127.0.0.1:1/a b", None, |_| {}).is_err());
+        assert!(run_install("http://127.0.0.1:1/x' ; calc ; '", &[], None, |_| {}).is_err());
+        assert!(run_install("http://127.0.0.1:1/a b", &[], None, |_| {}).is_err());
+    }
+
+    // ---- pins ----------------------------------------------------------------------------------------------------
+
+    /// SHA-256 of `bytes` by Windows' own tool, not by the script under test.
+    fn sha256_of(bytes: &[u8]) -> String {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let f = std::env::temp_dir().join(format!("bc-nv-hash-{}-{}.bin", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
+        std::fs::write(&f, bytes).unwrap();
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &format!("(Get-FileHash -Algorithm SHA256 -LiteralPath '{}').Hash", f.display())])
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&f);
+        String::from_utf8_lossy(&out.stdout).trim().to_ascii_uppercase()
+    }
+
+    /// A harmless program that Windows signs (so the signature rule cannot be what accepts it: its signer is not
+    /// NVIDIA). The "installer" of the pin tests: it prints the user name and exits.
+    fn harmless() -> Vec<u8> {
+        std::fs::read(Path::new(&std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())).join(r"System32\whoami.exe")).unwrap()
+    }
+
+    fn pin(url: &str, bytes: &[u8]) -> Pin {
+        Pin { url: url.into(), size: bytes.len() as u64, sha256: sha256_of(bytes) }
+    }
+
+    #[test]
+    fn nvidia_the_built_in_pins_match_the_url_table() {
+        let all = pins();
+        assert_eq!(all.len(), 4);
+        for (arch, p) in ["turing", "ampere", "ada", "blackwell"].iter().zip(&all) {
+            assert_eq!(Some(&p.url), installer_url(arch).as_ref());
+            assert!(p.sha256.len() == 64 && p.sha256.chars().all(|c| matches!(c, '0'..='9' | 'A'..='F')), "{}", p.sha256);
+            assert!(p.size > 700_000_000 && p.size < 800_000_000);
+        }
+        let mut hashes: Vec<_> = all.iter().map(|p| &p.sha256).collect();
+        hashes.sort();
+        hashes.dedup();
+        assert_eq!(hashes.len(), 4, "every generation has its own file");
+    }
+
+    #[test]
+    fn nvidia_a_file_that_matches_its_pin_is_accepted_and_run() {
+        let bytes = harmless();
+        let base = serve(bytes.clone());
+        let url = format!("{base}/file");
+        let p = pin(&url, &bytes);
+        let (lines, result, leftover) = run_script_pinned(&url, std::slice::from_ref(&p), "pin-ok");
+        assert_eq!(result, Ok(()), "{lines:?}");
+        assert!(lines.contains(&ScriptLine::Accepted { rule: "pin".into(), detail: p.sha256.clone() }), "{lines:?}");
+        assert!(lines.contains(&ScriptLine::Stage("install".into())), "{lines:?}");
+        assert!(!leftover, "the download folder must be gone");
+    }
+
+    #[test]
+    fn nvidia_a_file_with_one_byte_changed_is_refused_and_deleted() {
+        let good = harmless();
+        let mut bad = good.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 1;
+        let base = serve(bad);
+        let url = format!("{base}/file");
+        let (lines, result, leftover) = run_script_pinned(&url, &[pin(&url, &good)], "pin-byte");
+        let err = result.unwrap_err();
+        assert!(err.contains("not the file Better Cam has on record") && err.contains("SHA-256") && err.ends_with("so it was not run."), "{err}");
+        assert!(!lines.iter().any(|l| matches!(l, ScriptLine::Accepted { .. })) && !lines.contains(&ScriptLine::Stage("install".into())), "{lines:?}");
+        assert!(!leftover);
+    }
+
+    #[test]
+    fn nvidia_a_right_hash_with_a_wrong_size_is_refused() {
+        let bytes = harmless();
+        let base = serve(bytes.clone());
+        let url = format!("{base}/file");
+        let mut p = pin(&url, &bytes);
+        p.size += 1;
+        let (lines, result, leftover) = run_script_pinned(&url, &[p], "pin-size");
+        let err = result.unwrap_err();
+        assert!(err.contains("its size is") && err.contains("expected"), "{err}");
+        assert!(!lines.contains(&ScriptLine::Stage("install".into())), "{lines:?}");
+        assert!(!leftover);
+    }
+
+    #[test]
+    fn nvidia_a_pin_for_another_address_does_not_validate_the_file() {
+        let bytes = harmless();
+        let base = serve(bytes.clone());
+        let url = format!("{base}/file");
+        // The pin is exactly right for these bytes, but belongs to another generation's address.
+        let other = pin(&format!("{base}/other"), &bytes);
+        let (lines, result, leftover) = run_script_pinned(&url, &[other], "pin-other-url");
+        let err = result.unwrap_err();
+        assert!(err.starts_with("The downloaded installer is signed by ") && err.ends_with("so it was not run."), "{err}");
+        assert!(!lines.iter().any(|l| matches!(l, ScriptLine::Accepted { .. })) && !lines.contains(&ScriptLine::Stage("install".into())), "{lines:?}");
+        assert!(!leftover);
+        // And the built-in table knows nothing about a loopback address.
+        let (lines, result, _) = run_script_pinned(&url, &pins(), "pin-builtin");
+        assert!(result.is_err() && !lines.contains(&ScriptLine::Stage("install".into())), "{lines:?}");
+    }
+
+    #[test]
+    fn nvidia_a_file_without_pin_or_nvidia_signature_is_refused() {
+        // Unsigned and no pin entry at all, with the pin table of other files around.
+        let base = serve(std::fs::read(std::env::current_exe().unwrap()).unwrap());
+        let url = format!("{base}/file");
+        let (lines, result, leftover) = run_script_pinned(&url, &[pin(&format!("{base}/x"), b"x")], "pin-none");
+        assert_eq!(result, Err("The downloaded installer failed the signature check (NotSigned, signer -), so it was not run.".into()), "{lines:?}");
+        assert!(!lines.contains(&ScriptLine::Stage("install".into())));
+        assert!(!leftover);
+    }
+
+    #[test]
+    fn nvidia_a_malformed_pin_is_refused_before_the_script_runs() {
+        let url = "http://127.0.0.1:1/file";
+        for sha in ["", "ABC", &"G".repeat(64), &format!("{}'; calc; '", "A".repeat(40))] {
+            let p = Pin { url: url.into(), size: 10, sha256: sha.into() };
+            assert_eq!(run_install(url, &[p], None, |_| {}), Err("The recorded fingerprint for this download is not valid.".into()));
+        }
+        let p = Pin { url: url.into(), size: 0, sha256: "A".repeat(64) };
+        assert!(run_install(url, &[p], None, |_| {}).is_err());
     }
 
     /// Runs against the real runtime; skipped on a PC where it is not installed.
@@ -740,8 +927,11 @@ mod tests {
         }
         let t = std::time::Instant::now();
         let rt = Runtime::shared(&layout.dir).expect("load the runtime");
-        eprintln!("runtime {} loaded in {:?} from {}", format_version(rt.version()), t.elapsed(), rt.dir().display());
+        eprintln!("runtime {} (raw {:#010x}) loaded in {:?} from {}", format_version(rt.version()), rt.version(), t.elapsed(), rt.dir().display());
         assert!(version_ok(rt.version()));
+        // `open` is what the filters call: same folder, same shared copy.
+        let opened = Runtime::open().expect("Runtime::open");
+        assert!(Arc::ptr_eq(&rt, &opened));
         // The same copy is handed out while somebody holds it.
         assert!(Arc::ptr_eq(&rt, &Runtime::shared(&layout.dir).unwrap()));
         let create: Result<unsafe extern "C" fn(*const std::ffi::c_char, *mut *mut std::ffi::c_void) -> i32, String> =

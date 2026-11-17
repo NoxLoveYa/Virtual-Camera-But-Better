@@ -4,7 +4,7 @@ import { useStore } from "../store";
 const mb = (n: number) => `${Math.round(n / 1048576)} MB`;
 
 const STATUS = {
-  verify: "Checking NVIDIA's signature…",
+  verify: "Verifying the download…",
   install: "Waiting for the NVIDIA installer. Finish it in its window.",
 } as const;
 
@@ -35,7 +35,10 @@ export function NvidiaPrompt() {
         </p>
         <ul>
           <li>Downloads about 725–750 MB from nvidia.com.</li>
-          <li>Checks that the installer is signed by NVIDIA, then asks for administrator rights.</li>
+          <li>
+            Checks the download against a fingerprint recorded by Better Cam, because Windows can't check NVIDIA's own signature
+            on this file, then asks for administrator rights.
+          </li>
         </ul>
 
         {busy && (

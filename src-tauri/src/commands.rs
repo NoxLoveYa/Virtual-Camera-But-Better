@@ -198,9 +198,9 @@ pub async fn nvidia_gpu() -> Result<Option<nvidia::Gpu>, String> {
 /// One install at a time.
 static NVIDIA_INSTALLING: AtomicBool = AtomicBool::new(false);
 
-/// Downloads NVIDIA's Video Effects redistributable for `arch`, checks that it is signed by NVIDIA and runs it
-/// elevated. Progress goes out as `nvidia-install` events `{stage, done, total}`; resolves when the installer has
-/// closed, rejects with a sentence otherwise.
+/// Downloads NVIDIA's Video Effects redistributable for `arch`, accepts it only by a valid NVIDIA signature or its
+/// pinned fingerprint, and runs it elevated. Progress goes out as `nvidia-install` events `{stage, done, total}`;
+/// resolves when the installer has closed, rejects with a sentence otherwise.
 #[tauri::command]
 pub async fn install_nvidia_sdk(app: AppHandle, arch: String) -> Result<(), String> {
     use tauri::Emitter;
@@ -208,15 +208,20 @@ pub async fn install_nvidia_sdk(app: AppHandle, arch: String) -> Result<(), Stri
     let url = nvidia::installer_url(&arch).ok_or("Unknown GPU generation.")?;
     #[cfg(debug_assertions)]
     let url = nvidia::test_url_override().unwrap_or(url);
+    let pins = nvidia::pins();
+    #[cfg(debug_assertions)]
+    let pins = nvidia::test_pins(&url).unwrap_or(pins);
     if NVIDIA_INSTALLING.swap(true, Ordering::SeqCst) {
         return Err("The NVIDIA installer is already running.".into());
     }
     let result = blocking(move || {
-        nvidia::run_install(&url, None, |line| {
+        nvidia::run_install(&url, &pins, None, |line| {
             if let Some(p) = line.progress() {
                 let _ = app.emit("nvidia-install", p);
             } else if let nvidia::ScriptLine::Signature { status, signer } = line {
                 eprintln!("[nvidia] installer signature: {status}, signer {signer}");
+            } else if let nvidia::ScriptLine::Accepted { rule, detail } = line {
+                eprintln!("[nvidia] installer accepted by {rule}: {detail}");
             }
         })
     })

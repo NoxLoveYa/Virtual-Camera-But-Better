@@ -40,10 +40,25 @@ try {
     $signer = '-'
     if ($sig.SignerCertificate) { $signer = $sig.SignerCertificate.GetNameInfo('SimpleName', $false) }
     'SIGNATURE {0} {1}' -f $sig.Status, $signer
-    if ($sig.Status -ne 'Valid') {
+    # Two ways in, nothing else: a fully valid signature by NVIDIA Corporation, or exactly the file whose size and
+    # SHA-256 Better Cam has on record for this address (the pin; empty when there is none).
+    $pinSize = {SIZE}
+    $pinHash = '{SHA256}'
+    if ($sig.Status -eq 'Valid' -and $signer -eq 'NVIDIA Corporation') {
+        'ACCEPTED signature NVIDIA Corporation'
+    } elseif ($pinHash) {
+        if ($lock.Length -ne $pinSize) {
+            throw ('The downloaded installer is not the file Better Cam has on record (its size is {0} bytes, expected {1}), and its signature could not vouch for it ({2}, signer {3}), so it was not run.' -f $lock.Length, $pinSize, $sig.Status, $signer)
+        }
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try { $actual = [BitConverter]::ToString($sha.ComputeHash($lock)).Replace('-', '') } finally { $sha.Dispose() }
+        if ($actual -ne $pinHash) {
+            throw ('The downloaded installer is not the file Better Cam has on record (its SHA-256 is {0}, expected {1}), and its signature could not vouch for it ({2}, signer {3}), so it was not run.' -f $actual, $pinHash, $sig.Status, $signer)
+        }
+        'ACCEPTED pin {0}' -f $actual
+    } elseif ($sig.Status -ne 'Valid') {
         throw ('The downloaded installer failed the signature check ({0}, signer {1}), so it was not run.' -f $sig.Status, $signer)
-    }
-    if ($signer -ne 'NVIDIA Corporation') {
+    } else {
         throw ('The downloaded installer is signed by {0}, not by NVIDIA Corporation, so it was not run.' -f $signer)
     }
 
