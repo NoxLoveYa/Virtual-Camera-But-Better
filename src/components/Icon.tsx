@@ -9,6 +9,9 @@ const PATHS = {
   undo: "M6 3.5L3 6.5l3 3M3 6.5h6a3.5 3.5 0 010 7H6",
   reset: "M13 8a5 5 0 11-1.5-3.5M12 2v3H9",
   grip: "M6 4v.01M6 8v.01M6 12v.01M10 4v.01M10 8v.01M10 12v.01",
+  play: "M5 3.5v9l7.5-4.5z",
+  stop: "M4.5 4.5h7v7h-7z",
+  pause: "M5.5 3.5v9M10.5 3.5v9",
 } as const;
 
 export type IconName = keyof typeof PATHS;

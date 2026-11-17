@@ -1,11 +1,23 @@
 import { create } from "zustand";
-import { api } from "./api";
+import { api, type EngineState, type Stats } from "./api";
 import { FILTERS, defaultChain, makeFilter, type FilterCfg, type FilterKind, type ParamValue } from "./filters/schema";
 import { normalizeChain, signature } from "./filters/chain";
+import {
+  DEFAULT_OUTPUT,
+  DEFAULT_SOURCE,
+  normalizeOutput,
+  normalizeSource,
+  repairSource,
+  type CameraInfo,
+  type OutputCfg,
+  type SourceCfg,
+} from "./camera/schema";
 
 const STORAGE_KEY = "better-cam";
 
 interface Saved {
+  source: SourceCfg;
+  output: OutputCfg;
   chain: FilterCfg[];
   closeToTray: boolean;
   /** Whether the "launch on startup" default has been applied once; after that the OS entry is the truth. */
@@ -13,6 +25,8 @@ interface Saved {
   /** The preset the chain was last loaded from or saved as, and what it looked like then (see `signature`). */
   activePreset: string | null;
   presetBaseline: string | null;
+  /** Whether the engine was running when the app last ran, so the next launch starts it again. */
+  wasRunning: boolean;
 }
 
 /** What "Undo" restores after loading a preset or resetting. */
@@ -22,25 +36,56 @@ interface Snapshot {
   presetBaseline: string | null;
 }
 
+/** The engine's state as the last `engine-state` event said it. Pause is not part of it (see `paused`). */
+export interface EngineInfo {
+  state: EngineState["state"];
+  reason: string | null;
+}
+
+const STOPPED: EngineInfo = { state: "stopped", reason: null };
+const isRunning = (e: EngineInfo) => e.state !== "stopped";
+
 const loadSaved = (): Saved => {
   const fresh: Saved = {
+    source: DEFAULT_SOURCE,
+    output: DEFAULT_OUTPUT,
     chain: defaultChain(),
     closeToTray: false,
     autostartDefaulted: false,
     activePreset: null,
     presetBaseline: null,
+    wasRunning: false,
   };
   try {
     const s = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "");
-    if (Array.isArray(s.chain)) return { ...fresh, ...s, chain: normalizeChain(s.chain) };
+    if (s && typeof s === "object") {
+      return {
+        source: normalizeSource(s.source),
+        output: normalizeOutput(s.output),
+        chain: Array.isArray(s.chain) ? normalizeChain(s.chain) : fresh.chain,
+        closeToTray: s.closeToTray === true,
+        autostartDefaulted: s.autostartDefaulted === true,
+        activePreset: typeof s.activePreset === "string" ? s.activePreset : null,
+        presetBaseline: typeof s.presetBaseline === "string" ? s.presetBaseline : null,
+        wasRunning: s.wasRunning === true,
+      };
+    }
   } catch {
     /* first run or corrupt data */
   }
   return fresh;
 };
 
+/** The 4 Hz stats live in their own store, so only the footer re-renders for them. */
+export const useStats = create<{ stats: Stats | null }>(() => ({ stats: null }));
+
 interface State extends Saved {
   autostart: boolean;
+  /** `null` until the first `list_cameras` answer. */
+  cameras: CameraInfo[] | null;
+  engine: EngineInfo;
+  /** Pause is not an engine state and no event reports it: the store keeps the flag; Start and Stop clear it. */
+  paused: boolean;
   error: string | null;
   notice: string | null;
   /** Bumped on every toast so repeating the same message restarts its timer. */
@@ -50,6 +95,14 @@ interface State extends Saved {
   presets: string[];
 
   init: () => Promise<void>;
+  refreshCameras: () => Promise<void>;
+  /** Changes camera settings (repaired against the device), persists them and, while running, sends them at once. */
+  patchSource: (patch: Partial<SourceCfg>) => void;
+  patchOutput: (patch: Partial<OutputCfg>) => void;
+  /** Like `patchOutput({ background_color })`, but the running engine hears of it at most every ~100 ms (colour pickers). */
+  setBackground: (abgr: number) => void;
+  toggleRun: () => Promise<void>;
+  togglePause: () => void;
   setAutostart: (on: boolean) => Promise<void>;
   setCloseToTray: (on: boolean) => void;
   dismissError: () => void;
@@ -75,8 +128,11 @@ interface State extends Saved {
 
 export const useStore = create<State>((set, get) => {
   const persist = () => {
-    const { chain, closeToTray, autostartDefaulted, activePreset, presetBaseline } = get();
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ chain, closeToTray, autostartDefaulted, activePreset, presetBaseline }));
+    const { source, output, chain, closeToTray, autostartDefaulted, activePreset, presetBaseline, wasRunning } = get();
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ source, output, chain, closeToTray, autostartDefaulted, activePreset, presetBaseline, wasRunning }),
+    );
   };
 
   const setChain = (chain: FilterCfg[]) => {
@@ -100,9 +156,65 @@ export const useStore = create<State>((set, get) => {
     setChain(chain);
   };
 
+  const running = () => isRunning(get().engine);
+  const pushSource = () => {
+    if (running()) api.setSource(get().source).catch(fail);
+  };
+  const pushOutput = () => {
+    if (running()) api.setOutput(get().output).catch(fail);
+  };
+
+  /** One `list_cameras` at a time; a request that arrives meanwhile makes the running one go round again. */
+  let listing: Promise<void> | null = null;
+  let relist = false;
+  const loadCameras = async () => {
+    const cameras = await api.listCameras();
+    set({ cameras });
+    const prev = get().source;
+    const next = repairSource(prev, cameras);
+    if (JSON.stringify(next) === JSON.stringify(prev)) return;
+    set({ source: next });
+    persist();
+    pushSource();
+    // The very first pick of a camera is no news; later changes are the camera not offering what was saved.
+    if (prev.video_device_id) say("Camera settings adjusted to what the camera offers");
+  };
+
+  let backgroundTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /** Starts the engine with the saved state; false when the call was rejected (the error banner says why). */
+  const begin = async (): Promise<boolean> => {
+    const { source, output, chain } = get();
+    try {
+      await api.startEngine(source, output, chain);
+      // The events may already have said more than "standby"; only fill in when they have not.
+      if (!running()) set({ engine: { state: "standby", reason: "opening" } });
+      set({ error: null, paused: false, wasRunning: true });
+      persist();
+      return true;
+    } catch (e) {
+      fail(e);
+      return false;
+    }
+  };
+
+  const finish = async () => {
+    try {
+      await api.stopEngine();
+      set({ engine: STOPPED, paused: false, wasRunning: false });
+      useStats.setState({ stats: null });
+      persist();
+    } catch (e) {
+      fail(e);
+    }
+  };
+
   return {
     ...loadSaved(),
     autostart: false,
+    cameras: null,
+    engine: STOPPED,
+    paused: false,
     error: null,
     notice: null,
     noticeSeq: 0,
@@ -111,7 +223,19 @@ export const useStore = create<State>((set, get) => {
     presets: [],
 
     init: async () => {
-      await get().refreshPresets().catch(fail);
+      await api.onEngineState((e) => {
+        set({ engine: { state: e.state, reason: e.reason ?? null }, ...(e.state === "stopped" && { paused: false }) });
+        if (e.state === "stopped") useStats.setState({ stats: null });
+      });
+      await api.onEngineError((error) => {
+        api.stopEngine().catch(() => {});
+        set({ error, engine: STOPPED, paused: false, wasRunning: false });
+        useStats.setState({ stats: null });
+        persist();
+      });
+      await api.onStats((stats) => useStats.setState({ stats }));
+      await api.onDevicesChanged(() => void get().refreshCameras());
+      await Promise.all([get().refreshCameras(), get().refreshPresets()]).catch(fail);
 
       // Work out which saved preset (if any) the restored chain still matches, so the toolbar shows the right name.
       const { presets } = get();
@@ -139,6 +263,73 @@ export const useStore = create<State>((set, get) => {
       } catch (e) {
         fail(e);
       }
+
+      // Both a login launch and a manual one start again when the engine was running at the last exit. Right after
+      // login the engine may not be ready yet, so a login launch keeps trying for a while.
+      if (get().wasRunning) {
+        const login = await api.launchedAtStartup().catch(() => false);
+        for (let i = 0; i < (login ? 10 : 1) && !running(); i++) {
+          if (!(await begin()) && login) await new Promise((r) => setTimeout(r, 3000));
+        }
+      }
+    },
+
+    refreshCameras: () => {
+      if (listing) {
+        relist = true;
+        return listing;
+      }
+      listing = (async () => {
+        try {
+          do {
+            relist = false;
+            await loadCameras();
+          } while (relist);
+        } catch (e) {
+          set((s) => ({ cameras: s.cameras ?? [] }));
+          fail(e);
+        }
+      })().finally(() => {
+        listing = null;
+      });
+      return listing;
+    },
+
+    patchSource: (patch) => {
+      const prev = get().source;
+      const next = { ...prev, ...patch };
+      const { cameras } = get();
+      const fixed = cameras ? repairSource(next, cameras) : next;
+      if (JSON.stringify(fixed) === JSON.stringify(prev)) return;
+      set({ source: fixed });
+      persist();
+      pushSource();
+    },
+
+    patchOutput: (patch) => {
+      set({ output: { ...get().output, ...patch } });
+      persist();
+      clearTimeout(backgroundTimer);
+      pushOutput();
+    },
+
+    setBackground: (abgr) => {
+      set({ output: { ...get().output, background_color: abgr } });
+      persist();
+      clearTimeout(backgroundTimer);
+      backgroundTimer = setTimeout(pushOutput, 100);
+    },
+
+    toggleRun: async () => {
+      if (running()) await finish();
+      else await begin();
+    },
+
+    togglePause: () => {
+      if (!running()) return;
+      const paused = !get().paused;
+      set({ paused });
+      api.setPause(paused).catch(fail);
     },
 
     setAutostart: async (on) => {

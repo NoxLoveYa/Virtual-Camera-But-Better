@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useStore } from "../store";
+import { useStore, type EngineInfo } from "../store";
+import { Icon as Glyph } from "./Icon";
 import { Popover } from "./Popover";
 
 const win = getCurrentWindow();
@@ -41,7 +42,7 @@ function Settings() {
     >
       <Setting
         title="Launch on Windows startup"
-        hint="Starts in the tray."
+        hint="Starts in the tray and turns the camera on if it was running."
         on={autostart}
         onToggle={() => setAutostart(!autostart)}
       />
@@ -55,8 +56,25 @@ function Settings() {
   );
 }
 
+/** What the title bar says about the engine. Pause counts while the camera is on; a reopen after a setting change is still live. */
+function statusOf(state: EngineInfo["state"], reason: string | null, paused: boolean) {
+  const live = state === "live" || (state === "standby" && reason === "reopening");
+  if (live && paused) return { text: "Paused", dot: "warn", tone: "warn-text" };
+  if (live) return { text: "Live", dot: "live", tone: "live-text" };
+  if (state === "reconnecting") return { text: "Reconnecting", dot: "warn", tone: "warn-text" };
+  if (state === "standby") return { text: "Standby", dot: "standby", tone: "" };
+  return { text: "Idle", dot: "", tone: "" };
+}
+
 export function TitleBar() {
+  const state = useStore((s) => s.engine.state);
+  const reason = useStore((s) => s.engine.reason);
+  const paused = useStore((s) => s.paused);
+  const toggleRun = useStore((s) => s.toggleRun);
+  const togglePause = useStore((s) => s.togglePause);
   const [maximized, setMaximized] = useState(false);
+  const running = state !== "stopped";
+  const status = statusOf(state, reason, paused);
 
   useEffect(() => {
     const sync = () => win.isMaximized().then(setMaximized);
@@ -70,11 +88,25 @@ export function TitleBar() {
   return (
     <div className="titlebar" data-tauri-drag-region>
       <div className="brand">
-        <span className="dot" />
+        <span className={`dot ${status.dot}`} />
         <span className="name">Better Cam</span>
-        <span className="status">Idle</span>
+        <span className={`status ${status.tone}`}>{status.text}</span>
       </div>
       <div className="actions">
+        <button
+          className={paused ? "active" : ""}
+          disabled={!running}
+          onClick={togglePause}
+          aria-pressed={paused}
+          title="Show the “Camera paused” slate to apps. The camera stays open."
+        >
+          <Glyph name="pause" size={12} />
+          {paused ? "Paused" : "Pause"}
+        </button>
+        <button className={running ? "danger" : "primary"} onClick={toggleRun}>
+          <Glyph name={running ? "stop" : "play"} size={12} />
+          {running ? "Stop" : "Start"}
+        </button>
         <Settings />
       </div>
       <div className="wc">

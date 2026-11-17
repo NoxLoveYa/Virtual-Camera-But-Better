@@ -68,8 +68,12 @@ body {
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); transition: all 0.3s; }
 .dot.live { background: var(--accent); box-shadow: var(--glow), 0 0 3px var(--accent); }
 .live-text { color: var(--accent); }
+.warn-text { color: var(--warn); }
+.dot.warn { background: var(--warn); box-shadow: 0 0 9px rgba(255, 184, 77, 0.35), 0 0 3px var(--warn); }
+.dot.standby { background: transparent; box-shadow: inset 0 0 0 1.5px var(--accent); }
 .titlebar .actions { display: flex; gap: 8px; }
 .titlebar .actions > button, .titlebar .pop > button { height: 28px; }
+.titlebar .actions > button { display: inline-flex; align-items: center; gap: 6px; }
 .titlebar { position: relative; z-index: 10; }
 
 /* ---------- dropdown menus ---------- */
@@ -200,6 +204,40 @@ button.ghost:hover:not(:disabled) { color: var(--text); box-shadow: none; border
 .devices { display: flex; gap: 16px; align-items: flex-end; }
 .devices label { display: flex; flex-direction: column; gap: 8px; flex: 1; min-width: 0; }
 .devices > button { display: inline-flex; align-items: center; gap: 6px; flex: none; }
+
+/* ---------- two-column body ---------- */
+/* Each column scrolls on its own. They reuse .scroll and .app (padding, gap), so the right column's content still lines
+   up with the toolbar and footer. Below 1100 px the columns dissolve into one scroll: camera, output, then the chain,
+   with the banners pulled to the top. */
+.cols { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(440px, 6fr) minmax(0, 7fr); grid-template-rows: minmax(0, 1fr); }
+.col { min-width: 0; min-height: 0; }
+.col-right { border-left: 1px solid var(--line); }
+.banners { display: flex; flex-direction: column; gap: 10px; }
+.chain-block { display: flex; flex-direction: column; gap: 20px; }
+
+/* ---------- camera and output panels ---------- */
+.source, .output { display: flex; flex-direction: column; gap: 14px; }
+.panel-title { display: block; }
+.field { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 16px; }
+.fields.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.fields.three.rates { grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr) minmax(0, 1fr); }
+.fields .wide { grid-column: 1 / -1; }
+.source .devices { align-items: flex-end; }
+.source .card-title.fold { margin: 0 0 -4px -4px; }
+.toggles { display: flex; flex-direction: column; gap: 2px; }
+.toggle { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 30px; color: var(--dim); cursor: pointer; }
+.toggle:hover { color: var(--text); }
+
+/* Background colour: a field-looking box whose native colour input covers it, so a click or the keyboard opens the picker. */
+.swatch { position: relative; display: flex; align-items: center; gap: 10px; height: 32px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: var(--r); transition: border-color 0.15s, box-shadow 0.15s; }
+.swatch:hover, .swatch:focus-within { border-color: rgba(46, 230, 214, 0.55); box-shadow: var(--glow-soft); }
+.swatch input[type="color"] { position: absolute; inset: 0; width: 100%; height: 100%; padding: 0; border: 0; opacity: 0; cursor: pointer; }
+.swatch .chip { flex: none; width: 18px; height: 18px; border-radius: 2px; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.2); }
+.swatch .hex { color: var(--dim); font-variant-numeric: tabular-nums; }
+
+/* ---------- stats (footer line) ---------- */
+.stats { overflow: hidden; color: var(--dim); font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ---------- meters ---------- */
 .meters { display: flex; flex-direction: column; gap: 12px; }
@@ -372,9 +410,18 @@ button.link:hover:not(:disabled) { box-shadow: none; text-decoration: underline;
 .toast .toast-undo { display: flex; align-items: center; gap: 6px; height: 28px; color: var(--accent); }
 @keyframes toast-in { from { opacity: 0; translate: -50% 8px; } to { opacity: 1; translate: -50% 0; } }
 
+/* ---------- narrow windows: the columns stack ---------- */
+@media (max-width: 1099px) {
+  .cols { display: flex; flex-direction: column; gap: 20px; padding: 20px 28px 40px; overflow-y: auto; scrollbar-gutter: stable; }
+  .col { display: contents; }
+  .banners { order: -1; }
+  .chain-block { order: 1; }
+}
+
 /* ---------- small windows (the window can't go below 720x520) ---------- */
 @media (max-width: 860px) {
   .app { padding-left: 20px; padding-right: 20px; }
+  .cols { padding-left: 20px; padding-right: 20px; }
   .toolbar { padding: 8px 32px 8px 20px; }
   .devices { gap: 12px; }
   .devices .btn-text { display: none; }
@@ -387,6 +434,7 @@ button.link:hover:not(:disabled) { box-shadow: none; text-decoration: underline;
 }
 @media (max-height: 640px) {
   .app { padding-top: 12px; gap: 12px; }
+  .cols { padding-top: 12px; gap: 12px; }
   .panel { padding: 12px; }
   .devices label { gap: 6px; }
   .toolbar { padding-top: 6px; padding-bottom: 6px; }
