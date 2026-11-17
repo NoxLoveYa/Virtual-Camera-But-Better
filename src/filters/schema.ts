@@ -138,7 +138,7 @@ const CATALOGUE = {
         options: ["None", "Base (Canvas) Resolution", "16:9", "16:10", "4:3", "1:1"],
         pattern: /^([1-9]\d{0,4}x[1-9]\d{0,4}|[1-9]\d{0,2}:[1-9]\d{0,2})$/,
         placeholder: "1280x720 or 4:3",
-        hint: "An aspect ratio keeps the height and sets the width",
+        hint: "A wider aspect ratio keeps the height and sets the width; a narrower one keeps the width and sets the height",
       },
       {
         type: "bool",

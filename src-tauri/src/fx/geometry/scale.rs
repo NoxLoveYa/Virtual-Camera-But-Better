@@ -23,8 +23,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //! `resolution` is one of
 //! * `None` (or anything that is not a size): no change. OBS skips the filter then too.
 //! * `Base (Canvas) Resolution`: the output resolution of the engine ([`GpuFilter::set_canvas`]).
-//! * an aspect ratio `A:B` (`16:9`, `16:10`, `4:3`, `1:1`, or typed): the height stays and the width becomes
-//!   `height * A / B`. A picture that has the aspect already passes through.
+//! * an aspect ratio `A:B` (`16:9`, `16:10`, `4:3`, `1:1`, or typed): as in OBS, a ratio wider than the picture
+//!   keeps the height and sets the width to `height * A / B`; any other ratio keeps the width and sets the height to
+//!   `width / (A / B)` (4:3 on 1920x1080 gives 1920x1440). Both are truncated to whole pixels. A picture that has
+//!   the aspect already (within 0.0001) passes through.
 //! * `WxH`: that size.
 //!
 //! [`plan`] is `scale_filter_tick`: it picks the effect from the input size, the output size and `sampling`:
@@ -34,9 +36,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //! large as the input in both directions).
 //!
 //! Where Better Cam differs from OBS:
-//! * An aspect ratio narrower than the picture's keeps the height and narrows the width (the plan's rule, 4:3 on
-//!   1920x1080 gives 1440x1080). OBS's `scale_filter_tick` keeps the width and shortens the height in that case
-//!   (1920x1440 for the same input); a wider ratio is the same in both. [`aspect_size`] is the one place to change.
 //! * A size that does not change is copied, for every sampling mode. OBS runs the effect, which for point, bilinear,
 //!   bicubic and lanczos returns the same texels, so the result is the same without the work.
 //! * A size of zero or below, and a size above [`super::MAX_SIDE`], pass through or clamp ([`super::clamp_size`]).
@@ -184,11 +183,16 @@ pub struct Plan {
     pub undistort_factor: f32,
 }
 
-/// The size an aspect ratio `new_aspect` (width over height) gives a picture of `input`: the height stays, the width
-/// is `height * new_aspect`. (See the module notes: OBS keeps the width instead when the new aspect is narrower.)
+/// The size an aspect ratio `new_aspect` (width over height) gives a picture of `input`, as in OBS's
+/// `scale_filter_tick`: a wider aspect keeps the height and the width is `height * new_aspect`; otherwise the width
+/// stays and the height is `width / new_aspect`. The `as` casts truncate like C's `(int)`.
 pub fn aspect_size(input: (u32, u32), new_aspect: f64) -> (i64, i64) {
-    let cy = input.1 as f64;
-    ((cy * new_aspect) as i64, input.1 as i64)
+    let (cx, cy) = (input.0 as f64, input.1 as f64);
+    if new_aspect > cx / cy {
+        ((cy * new_aspect) as i64, input.1 as i64)
+    } else {
+        (input.0 as i64, (cx / new_aspect) as i64)
+    }
 }
 
 /// `scale_filter_tick`. `canvas` is the base resolution, when it is known.

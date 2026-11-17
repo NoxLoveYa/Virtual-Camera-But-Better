@@ -433,18 +433,32 @@ fn geometry_scale_sizes() {
     let size = |res: &str, input: (u32, u32), canvas: Option<(u32, u32)>| {
         scale::plan(Target::parse(res), Sampling::Bicubic, false, canvas, input).size
     };
-    // an aspect ratio keeps the height and sets the width
-    assert_eq!(size("4:3", (1920, 1080), None), (1440, 1080));
-    assert_eq!(size("16:10", (1920, 1080), None), (1728, 1080));
-    assert_eq!(size("1:1", (1920, 1080), None), (1080, 1080));
+    // an aspect ratio, as scale_filter_tick: wider than the picture keeps the height and sets the width
+    // (cy * new_aspect); otherwise the width stays and the height is cx / new_aspect; both truncated
     assert_eq!(size("21:9", (1920, 1080), None), (2520, 1080));
-    assert_eq!(
-        size("4:3", (640, 480), None),
-        (640, 480),
-        "already that aspect: nothing to do"
-    );
+    assert_eq!(size("21:9", (640, 480), None), (1120, 480));
+    assert_eq!(size("16:9", (640, 480), None), (853, 480), "truncated");
+    assert_eq!(size("16:10", (640, 480), None), (768, 480));
+    assert_eq!(size("3:2", (640, 480), None), (720, 480));
+    // narrower than the picture: the width stays and the height grows
+    assert_eq!(size("4:3", (1920, 1080), None), (1920, 1440));
+    assert_eq!(size("4:3", (1280, 720), None), (1280, 960));
+    assert_eq!(size("16:10", (1920, 1080), None), (1920, 1200));
+    assert_eq!(size("3:2", (1920, 1080), None), (1920, 1280));
+    assert_eq!(size("9:16", (1920, 1080), None), (1920, 3413), "truncated");
+    // 1:1 is narrower than both 16:9 and 4:3
+    assert_eq!(size("1:1", (1920, 1080), None), (1920, 1920));
+    assert_eq!(size("1:1", (640, 480), None), (640, 640));
+    assert_eq!(size("1:1", (1280, 720), None), (1280, 1280));
+    // the aspect the picture has already: nothing to do
+    assert_eq!(size("4:3", (640, 480), None), (640, 480));
     assert_eq!(size("16:9", (1920, 1080), None), (1920, 1080));
     assert_eq!(size("16:9", (1280, 720), None), (1280, 720));
+    // within OBS's EPSILON (0.0001) of the picture's aspect: nothing to do
+    assert_eq!(size("17778:10000", (1920, 1080), None), (1920, 1080));
+    assert_eq!(size("17777:10000", (1920, 1080), None), (1920, 1080));
+    // outside it the rule applies: 1.779 is wider, 1080 * 1.779 = 1921.3
+    assert_eq!(size("17790:10000", (1920, 1080), None), (1921, 1080));
     assert_eq!(size("0:5", (1920, 1080), None), (1920, 1080));
     assert_eq!(size("5:0", (1920, 1080), None), (1920, 1080));
     // a typed size
@@ -859,11 +873,12 @@ fn geometry_scale_4_3_on_a_picture() {
         scale_params("bicubic", "4:3", false),
         &img,
     );
-    assert_eq!((out.w, out.h), (144, 108));
+    // 4:3 is narrower than 16:9: the width stays and the height is 192 / (4/3) = 144
+    assert_eq!((out.w, out.h), (192, 144));
     expect_close(
         "4:3",
         &out,
-        &reference(&img, 144, 108, Kernel::Bicubic),
+        &reference(&img, 192, 144, Kernel::Bicubic),
         2.0,
     );
 }
@@ -1430,13 +1445,13 @@ fn geometry_a_chain_of_crop_scale_and_transform_passes_the_sizes_along() {
         cfg("s", "scale_filter", scale_params("bilinear", "4:3", false)),
         cfg("t", "transform", json!({ "rotation": 90 })),
     ];
-    // crop: 160 x 80; scale 4:3 keeps the height: 106 x 80; the turn: 80 x 106
+    // crop: 160 x 80; scale 4:3 (narrower than 2.0) keeps the width: 160 x 120; the turn: 120 x 160
     let out = run_chain(&r, &filters, None, &img);
-    assert_eq!((out.w, out.h), (80, 106));
+    assert_eq!((out.w, out.h), (120, 160));
 
     // order matters: the same filters the other way round
     let reversed = [filters[2].clone(), filters[1].clone(), filters[0].clone()];
-    // turn: 100 x 200; scale 4:3 (aspect 0.5 < 1.33: the height stays, the width is 266); crop 20/10 -> 226 x 180
+    // turn: 100 x 200; scale 4:3 (1.33 is wider than 0.5: the height stays, the width is 266); crop 20/10 -> 226 x 180
     let out = run_chain(&r, &reversed, None, &img);
     assert_eq!((out.w, out.h), (266 - 40, 200 - 20));
 

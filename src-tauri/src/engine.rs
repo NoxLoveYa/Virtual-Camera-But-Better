@@ -22,6 +22,11 @@
 //!
 //! Pause is not a state: the camera stays open, the writer shows `Paused`, frames are read and dropped.
 //!
+//! Order: the control thread sets the writer's slate (`Paused`, `Starting`) before it changes `Engine::state` and
+//! before the event for the new state goes out (`Control::enter_slate`), so an observer of the state or the event
+//! never finds the old slate in the file. `Live` is the other way round on purpose: the state says the camera is
+//! open, and the writer leaves `Starting` only when the first frame is published.
+//!
 //! With `deactivate_when_not_showing` the camera is open only while a consumer is attached or the window is visible;
 //! after `standby_delay` (5 s) with neither a `Live` or `Reconnecting` engine goes to `Standby` and closes the camera.
 
@@ -879,7 +884,15 @@ impl Control {
         self.shared.cv.notify_all();
     }
 
-    /// The writer state while no frames flow: `Paused` when stopped or paused, else `Starting`.
+    /// [`Control::set_phase`] for a phase in which no frames flow (`Stopped`, idle `Standby`, `Reconnecting`): the
+    /// writer shows its slate first, so whoever sees the state or its event finds the writer already there.
+    fn enter_slate(&mut self, phase: EngineState, reason: Option<String>) {
+        self.set_slate();
+        self.set_phase(phase, reason);
+    }
+
+    /// The writer state while no frames flow: `Paused` when stopped or paused, else `Starting`. Depends on `cfg` and
+    /// the pause flag, not on the phase.
     fn set_slate(&self) {
         let paused = self.shared.paused.load(Ordering::Acquire);
         self.writer.set_state(if self.cfg.is_none() || paused {
@@ -935,8 +948,7 @@ impl Control {
         self.idle_since = None;
         self.next_retry = None;
         self.retrying = false;
-        self.set_phase(EngineState::Stopped, None);
-        self.set_slate();
+        self.enter_slate(EngineState::Stopped, None);
         self.emit_stats();
     }
 
@@ -950,9 +962,11 @@ impl Control {
         self.idle_since = None;
         self.next_retry = None;
         self.retrying = false;
-        emit(&self.shared, EngineEvent::Error(message));
-        self.set_phase(EngineState::Stopped, Some("error".into()));
+        // The slate first: neither the error nor the `Stopped` event may be seen with the writer still `Starting`.
+        // The slate first: neither the error nor the `Stopped` event may be seen with the writer still `Starting`.
         self.set_slate();
+        emit(&self.shared, EngineEvent::Error(message));
+        self.enter_slate(EngineState::Stopped, Some("error".into()));
         self.emit_stats();
     }
 
@@ -1024,6 +1038,11 @@ impl Control {
         self.attempt_started = Instant::now();
         self.retrying = mode == OpenMode::Retry;
         self.next_retry = None;
+        if mode == OpenMode::Fresh {
+            // Before the session thread exists: its first published frame sets `Live`, and the slate must not
+            // overwrite that.
+            self.set_slate();
+        }
         match std::thread::Builder::new()
             .name("render".into())
             .spawn(move || session_thread(ctx))
@@ -1042,10 +1061,7 @@ impl Control {
             }
         }
         match mode {
-            OpenMode::Fresh => {
-                self.set_phase(EngineState::Standby, Some("opening".into()));
-                self.set_slate();
-            }
+            OpenMode::Fresh => self.set_phase(EngineState::Standby, Some("opening".into())),
             OpenMode::Reopen => self.set_phase(EngineState::Standby, Some("reopening".into())),
             OpenMode::Retry => {}
         }
@@ -1066,8 +1082,7 @@ impl Control {
         self.idle_since = None;
         self.next_retry = None;
         self.retrying = false;
-        self.set_phase(EngineState::Standby, Some("idle".into()));
-        self.set_slate();
+        self.enter_slate(EngineState::Standby, Some("idle".into()));
         self.advertise_idle();
     }
 
@@ -1080,8 +1095,7 @@ impl Control {
         };
         self.retrying = false;
         self.next_retry = Some((base + self.timings.retry_interval).max(Instant::now()));
-        self.set_phase(EngineState::Reconnecting, Some(reason));
-        self.set_slate();
+        self.enter_slate(EngineState::Reconnecting, Some(reason));
         self.advertise_idle();
     }
 
@@ -2634,6 +2648,8 @@ mod tests {
         fake: Arc<Fake>,
         file: MappedFile,
         events: Arc<Mutex<Vec<(Instant, EngineEvent)>>>,
+        /// Every state and error event with the file's writer state at the moment the sink got it.
+        writer_at: Arc<Mutex<Vec<(EngineEvent, u32)>>>,
         started: Instant,
     }
 
@@ -2657,10 +2673,16 @@ mod tests {
                 opened: Default::default(),
                 closed: Default::default(),
             });
+            let probe = writer.clone();
             let engine = Engine::build(gpu, writer, timings, fake.clone(), opener).unwrap();
             let events: Arc<Mutex<Vec<(Instant, EngineEvent)>>> = Arc::default();
-            let sink = events.clone();
+            let writer_at: Arc<Mutex<Vec<(EngineEvent, u32)>>> = Arc::default();
+            let (sink, seen) = (events.clone(), writer_at.clone());
             engine.set_event_sink(Arc::new(move |e: EngineEvent| {
+                if matches!(e, EngineEvent::State(_) | EngineEvent::Error(_)) {
+                    let w = probe.shared().header().writer_state;
+                    seen.lock().unwrap().push((e.clone(), w));
+                }
                 sink.lock().unwrap().push((Instant::now(), e));
             }));
             Rig {
@@ -2668,6 +2690,7 @@ mod tests {
                 fake,
                 file: MappedFile::open(&path, Access::ReadWrite).unwrap(),
                 events,
+                writer_at,
                 started: Instant::now(),
             }
         }
@@ -2682,6 +2705,20 @@ mod tests {
 
         fn alive(&self) -> u32 {
             self.fake.alive.load(Ordering::SeqCst)
+        }
+
+        /// For each state event so far with `state`: its reason and the writer state that was in the file at the
+        /// moment the sink got it.
+        fn writer_at_state(&self, state: EngineState) -> Vec<(Option<String>, u32)> {
+            self.writer_at
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(e, w)| match e {
+                    EngineEvent::State(s) if s.state == state => Some((s.reason.clone(), *w)),
+                    _ => None,
+                })
+                .collect()
         }
 
         /// `(state, reason)` of every state event so far.
@@ -3267,6 +3304,101 @@ mod tests {
         assert_eq!(rig.engine.last_error(), None);
     }
 
+    /// The writer state is what other apps see ("Camera paused", "starting"); the state event is what the UI shows.
+    /// The writer is set first, so no observer sees the new state with the old slate.
+    #[test]
+    fn the_writer_is_set_before_the_state_that_goes_with_it() {
+        // a fatal start: opening (starting), then the error and Stopped (paused)
+        let rig = Rig::new("sm-order-fatal.bin", fast());
+        rig.fake
+            .failures
+            .lock()
+            .unwrap()
+            .push_back(Failure::Fatal("no such mode".into()));
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(5)).unwrap_err();
+        assert!(rig.engine.wait_stopped(Duration::from_secs(5)));
+        assert_eq!(
+            rig.writer_at_state(EngineState::Standby),
+            vec![(Some("opening".into()), STARTING)],
+            "Standby/opening: the slate says starting"
+        );
+        assert_eq!(
+            rig.writer_at_state(EngineState::Stopped),
+            vec![(Some("error".into()), PAUSED)],
+            "Stopped/error: the slate says paused"
+        );
+        let error_seen_with: Vec<u32> = rig
+            .writer_at
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(e, _)| matches!(e, EngineEvent::Error(_)))
+            .map(|(_, w)| *w)
+            .collect();
+        assert_eq!(error_seen_with, vec![PAUSED], "engine-error");
+
+        // Stop while live: the file has gone from live to paused when Stopped is announced
+        let rig = Rig::new("sm-order-stop.bin", fast());
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("video", Duration::from_secs(10), |r| {
+            r.writer_state() == LIVE
+        });
+        rig.engine.stop();
+        assert!(rig.engine.wait_stopped(Duration::from_secs(5)));
+        assert_eq!(
+            rig.writer_at_state(EngineState::Stopped),
+            vec![(None, PAUSED)]
+        );
+
+        // a capture change keeps the last frame on the file: still live when "reopening" is announced
+        let rig = Rig::new("sm-order-reopen.bin", fast());
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("video", Duration::from_secs(10), |r| {
+            r.writer_state() == LIVE
+        });
+        rig.engine.set_source(SourceUpdate {
+            source: bars(25),
+            flip_vertical: false,
+            color: ColorSettings::default(),
+            deactivate_when_not_showing: false,
+        });
+        rig.wait("the reopen", Duration::from_secs(5), |r| {
+            r.states().len() >= 4
+        });
+        assert_eq!(
+            rig.writer_at_state(EngineState::Standby)[1],
+            (Some("reopening".into()), LIVE)
+        );
+
+        // a camera lost while live: starting is on the file when Reconnecting is announced
+        let rig = Rig::new("sm-order-lost.bin", fast());
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("video", Duration::from_secs(10), |r| {
+            r.writer_state() == LIVE
+        });
+        rig.fake.gone.store(true, Ordering::SeqCst);
+        rig.wait_state(EngineState::Reconnecting, Duration::from_secs(5));
+        let seen = rig.writer_at_state(EngineState::Reconnecting);
+        assert!(!seen.is_empty());
+        assert!(
+            seen.iter().all(|(_, w)| *w == STARTING),
+            "Reconnecting events saw {seen:?}"
+        );
+
+        // nobody watching: idle standby says starting for whoever comes
+        let rig = Rig::new("sm-order-idle.bin", fast());
+        rig.engine.start(settings(bars(30), true));
+        rig.wait_state(EngineState::Standby, Duration::from_secs(5));
+        assert_eq!(
+            rig.writer_at_state(EngineState::Standby),
+            vec![(Some("idle".into()), STARTING)]
+        );
+    }
+
     #[test]
     fn set_source_reopens_only_for_capture_changes() {
         let rig = Rig::new("sm-source.bin", fast());
@@ -3424,21 +3556,67 @@ mod tests {
                 })
                 .collect()
         };
-        std::thread::sleep(Duration::from_millis(2000));
-        let none = stats_since(mark, &rig);
+        // The statistics window closes about once a second; the counters are stored with the rates computed from
+        // them. Watch two closings: the second window runs from the first closing to the second, so the test can
+        // compute the rate the engine should report from its own clock.
+        let next_window = |rig: &Rig, after: u64| -> (EngineStats, Instant) {
+            let t = Instant::now();
+            loop {
+                let s = rig.engine.stats();
+                if s.published > after {
+                    return (s, Instant::now());
+                }
+                assert!(t.elapsed() < Duration::from_secs(10), "no stats window");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let (a, ta) = next_window(&rig, rig.engine.stats().published);
+        let (b, tb) = next_window(&rig, a.published);
+        // the 4 Hz count is taken over exactly two seconds of the events' own timestamps: a test thread that
+        // oversleeps on a busy machine does not add events
+        if let Some(rest) = (mark + Duration::from_secs(2)).checked_duration_since(Instant::now()) {
+            std::thread::sleep(rest);
+        }
+        let end = mark + Duration::from_secs(2);
+        let none: Vec<StatsEvent> = rig
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(at, _)| *at >= mark && *at < end)
+            .filter_map(|(_, e)| match e {
+                EngineEvent::Stats(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
         // 4 per second: 8 in two seconds, give or take the timer
         assert!(
             (7..=9).contains(&none.len()),
             "{} stats events in 2 s",
             none.len()
         );
+        // The frame rates are per window over its real elapsed time, so they follow what the machine managed (13 fps
+        // for a 30 fps source was seen with every core busy): compare them with the counters and the test's own
+        // clock, not with a fixed rate.
+        let secs = tb.duration_since(ta).as_secs_f64();
+        for (name, reported, frames) in [
+            ("capture", b.capture_fps, b.captured - a.captured),
+            ("publish", b.publish_fps, b.published - a.published),
+        ] {
+            let measured = frames as f64 / secs;
+            assert!(
+                (reported - measured).abs() <= measured * 0.25,
+                "{name}: the engine says {reported:.1} fps, {frames} frames in {secs:.2} s are {measured:.1}"
+            );
+            assert!((3.0..=36.0).contains(&reported), "{name} {reported:.1} fps");
+        }
         let s = none.last().unwrap();
         assert_eq!((s.capture.width, s.capture.height), (320, 180));
         assert_eq!(s.capture.format, "nv12");
         assert_eq!(s.capture.decode, "none");
-        assert!(s.capture.fps > 20.0, "{s:?}");
+        assert!((3.0..=36.0).contains(&s.capture.fps), "{s:?}");
         assert_eq!((s.output.width, s.output.height), (320, 180));
-        assert!(s.output.fps > 20.0, "{s:?}");
+        assert!((3.0..=36.0).contains(&s.output.fps), "{s:?}");
         assert!(s.latency_p95_ms > 0.0, "{s:?}");
         assert_eq!(s.consumers, 0);
         // every key of plan 5.6 is in the JSON

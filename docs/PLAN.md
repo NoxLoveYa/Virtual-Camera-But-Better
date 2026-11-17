@@ -929,7 +929,7 @@ Negative values pad with transparent pixels. Width/height 0 in absolute mode mea
 | `resolution` | Resolution | combo | None, Base (Canvas) Resolution, 16:9, 16:10, 4:3, 1:1, `WxH` | None |
 | `undistort` | Undistort center of image when scaling from ultrawide | bool | | false |
 
-"Base (Canvas) Resolution" means the output resolution. Aspect values keep the height and set the width.
+"Base (Canvas) Resolution" means the output resolution. Aspect values follow OBS: an aspect wider than the picture keeps the height and sets the width; otherwise the width stays and the height is set.
 
 **Transform** — `transform` (Better Cam; mirrors OBS Edit Transform). Hint: "Mirror or rotate the image".
 
@@ -1303,7 +1303,7 @@ the trivial conflict.
 - Decisions: 6.4 entries, `output_size` changes sizes downstream.
 - Check: `cargo test -p better-cam geometry` passes: crop 10 px each side on 100×100 → 80×80; −10 → 120×120 with
   transparent border; absolute 50×40 at (5,5) → 50×40; rotation 90 on 160×90 → 90×160; flip_h mirrors a known
-  pixel; scale "4:3" on 1920×1080 → 1440×1080; each sampling mode runs. Manual: each filter visibly correct in
+  pixel; scale "4:3" on 1920×1080 → 1920×1440; each sampling mode runs. Manual: each filter visibly correct in
   preview and the Camera app.
 
 ### P11 — Sharpen and Apply LUT (parallel)
