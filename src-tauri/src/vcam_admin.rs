@@ -10,14 +10,20 @@
 //!   waits, and turns the outcome into a sentence ([`outcome_to_result`]).
 //!
 //! Helper exit codes: [`EXIT_OK`] 0, [`EXIT_FAILED`] 1 (see `install.log`), [`EXIT_USAGE`] 2 (bad arguments),
-//! [`EXIT_NOT_ELEVATED`] 5 (started without administrator rights).
+//! [`EXIT_NOT_ELEVATED`] 5 (started without administrator rights), [`EXIT_PENDING`] 10 (done, but it takes effect
+//! only after the camera service restarts or Windows restarts).
+//!
+//! The app waits for the helper to *exit*, however long the Windows prompt stays open: there is no timeout, so the
+//! guard that refuses a second action is held for exactly as long as a helper may still be running.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::SystemTime;
 
 use serde::Serialize;
 use vcam_install::log::Log;
-use vcam_install::{LaunchOutcome, Launcher};
+use vcam_install::{InstallOutcome, LaunchOutcome, Launcher, UninstallOutcome};
+
+use crate::api::Service;
 
 pub const ARG_INSTALL: &str = "--vcam-install";
 pub const ARG_UNINSTALL: &str = "--vcam-uninstall";
@@ -27,9 +33,8 @@ pub const EXIT_OK: i32 = 0;
 pub const EXIT_FAILED: i32 = 1;
 pub const EXIT_USAGE: i32 = 2;
 pub const EXIT_NOT_ELEVATED: i32 = 5;
-
-/// How long the app waits for the UAC prompt and the helper (the helper itself needs seconds).
-pub const HELPER_WAIT: Duration = Duration::from_secs(5 * 60);
+/// Done, but the camera service still has the old build loaded (install) or a file waits for a restart (remove).
+pub const EXIT_PENDING: i32 = 10;
 
 /// What the helper was asked to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,15 +90,10 @@ pub fn run_helper(cmd: HelperCommand) -> i32 {
         eprintln!("the virtual camera helper needs administrator rights");
         return EXIT_NOT_ELEVATED;
     }
-    let install = matches!(cmd, HelperCommand::Install { .. });
-    let mut log = match vcam_install::FileLog::open(install) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("{e}");
-            return EXIT_FAILED;
-        }
-    };
-    let result = match cmd {
+    // Opens install.log only when the folder is already there and as it must be; the install makes it and the log
+    // follows (see `FileLog`). Nothing here creates or follows anything in the data folder.
+    let mut log = vcam_install::FileLog::open();
+    let result: Result<i32, String> = match cmd {
         HelperCommand::Install { user_sid } => {
             let user_sid = user_sid.or_else(|| vcam_install::current_user_sid().ok());
             log.line(&format!(
@@ -110,15 +110,22 @@ pub fn run_helper(cmd: HelperCommand) -> i32 {
                     &dll,
                     &mut log,
                 )
+                .map(|o| match o {
+                    InstallOutcome::Done => EXIT_OK,
+                    InstallOutcome::PendingServiceRestart => EXIT_PENDING,
+                })
             })
         }
         HelperCommand::Uninstall => {
             log.line("---- uninstall: elevated");
-            vcam_install::uninstall(&mut log)
+            vcam_install::uninstall(&mut log).map(|o| match o {
+                UninstallOutcome::Done => EXIT_OK,
+                UninstallOutcome::PendingReboot => EXIT_PENDING,
+            })
         }
     };
     match result {
-        Ok(()) => EXIT_OK,
+        Ok(code) => code,
         Err(e) => {
             log.line(&format!("ERROR: {e}"));
             EXIT_FAILED
@@ -216,20 +223,36 @@ pub fn helper_args(action: Action, user_sid: &str) -> Vec<String> {
     }
 }
 
-/// A sentence for what happened, or `Ok` when the helper succeeded. `log_tail` is the end of `install.log`.
-pub fn outcome_to_result(action: Action, outcome: &LaunchOutcome, log_tail: &[String]) -> Result<(), String> {
+/// How an action that did not fail ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionDone {
+    Done,
+    /// Installed (or removed), but it takes effect only after the camera service restarts or Windows restarts.
+    PendingRestart,
+}
+
+impl ActionDone {
+    /// The word the frontend gets from the command.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ActionDone::Done => "done",
+            ActionDone::PendingRestart => "pending_restart",
+        }
+    }
+}
+
+/// A sentence for what happened, or how it went when the helper succeeded. `log_tail` is the end of `install.log`.
+pub fn outcome_to_result(action: Action, outcome: &LaunchOutcome, log_tail: &[String]) -> Result<ActionDone, String> {
     let verb = action.verb();
     match outcome {
-        LaunchOutcome::Exited(c) if *c as i32 == EXIT_OK => Ok(()),
+        LaunchOutcome::Exited(c) if *c as i32 == EXIT_OK => Ok(ActionDone::Done),
+        LaunchOutcome::Exited(c) if *c as i32 == EXIT_PENDING => Ok(ActionDone::PendingRestart),
         LaunchOutcome::Cancelled => Err(format!(
             "You declined the administrator prompt, so the virtual camera was not {}.",
             match action {
                 Action::Install => "installed",
                 Action::Uninstall => "removed",
             }
-        )),
-        LaunchOutcome::TimedOut => Err(format!(
-            "The administrator step to {verb} the virtual camera did not finish in time."
         )),
         LaunchOutcome::Exited(c) => {
             let code = *c as i32;
@@ -256,30 +279,46 @@ fn strip_stamp(line: &str) -> &str {
 }
 
 /// Start the helper with `launcher`, wait, and read what happened. Blocks until the UAC prompt is answered and the
-/// helper is done.
-pub fn run_action(launcher: &dyn Launcher, exe: &str, action: Action, user_sid: &str) -> Result<(), String> {
-    let outcome = launcher.run_elevated(exe, &helper_args(action, user_sid), HELPER_WAIT);
+/// helper has exited, however long that takes (see the module docs).
+pub fn run_action(launcher: &dyn Launcher, exe: &str, action: Action, user_sid: &str) -> Result<ActionDone, String> {
+    let started = SystemTime::now();
+    let outcome = launcher.run_elevated(exe, &helper_args(action, user_sid));
     let tail = match &outcome {
-        LaunchOutcome::Exited(0) => Vec::new(),
-        _ => vcam_install::log::log_tail(8),
+        LaunchOutcome::Exited(c) if *c as i32 == EXIT_OK || *c as i32 == EXIT_PENDING => Vec::new(),
+        // only what this run wrote: an older run's last lines say nothing about it
+        _ => vcam_install::log::log_tail_since(started, 8),
     };
     outcome_to_result(action, &outcome, &tail)
 }
 
+/// [`run_action`] under the claim on the virtual camera: one change at a time, the engine (and its handle on
+/// `frames.bin`, which the helper may have to replace) released first. The claim is dropped when the helper has
+/// exited, not before, so a second action is refused for as long as a helper (or its prompt) is alive.
+pub fn run_claimed(
+    svc: &Service,
+    launcher: &dyn Launcher,
+    exe: &str,
+    action: Action,
+    user_sid: &str,
+) -> Result<ActionDone, String> {
+    let _change = svc.begin_vcam_change(true)?;
+    run_action(launcher, exe, action, user_sid)
+}
+
 /// Install, update or repair: asks for administrator rights once. The DLL is looked for first, so a copy of the
 /// app without it never shows a prompt.
-pub fn install(launcher: &dyn Launcher) -> Result<(), String> {
-    locate_dll()?;
+pub fn install(svc: &Service, launcher: &dyn Launcher) -> Result<ActionDone, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let sid = vcam_install::current_user_sid().unwrap_or_default();
+    let _change = svc.begin_vcam_change(true)?;
+    locate_dll()?;
     run_action(launcher, &exe.to_string_lossy(), Action::Install, &sid)
 }
 
 /// Remove: the engine is shut down first (frame file closed), then one prompt.
-pub fn uninstall(svc: &crate::api::Service, launcher: &dyn Launcher) -> Result<(), String> {
+pub fn uninstall(svc: &Service, launcher: &dyn Launcher) -> Result<ActionDone, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let _change = svc.begin_vcam_change(true)?;
-    run_action(launcher, &exe.to_string_lossy(), Action::Uninstall, "")
+    run_claimed(svc, launcher, &exe.to_string_lossy(), Action::Uninstall, "")
 }
 
 #[cfg(test)]
@@ -411,7 +450,7 @@ mod tests {
     }
 
     impl Launcher for Fake {
-        fn run_elevated(&self, exe: &str, a: &[String], _: Duration) -> LaunchOutcome {
+        fn run_elevated(&self, exe: &str, a: &[String]) -> LaunchOutcome {
             self.seen.borrow_mut().push((exe.into(), a.to_vec()));
             self.outcome.clone()
         }
@@ -437,9 +476,7 @@ mod tests {
 
     #[test]
     fn other_outcomes_do_not_look_like_a_refusal() {
-        assert!(outcome_to_result(Action::Install, &LaunchOutcome::Exited(0), &[]).is_ok());
-        let e = outcome_to_result(Action::Install, &LaunchOutcome::TimedOut, &[]).unwrap_err();
-        assert!(e.contains("did not finish") && !e.contains("declined"), "{e}");
+        assert_eq!(outcome_to_result(Action::Install, &LaunchOutcome::Exited(0), &[]), Ok(ActionDone::Done));
         let e = outcome_to_result(Action::Install, &LaunchOutcome::Failed("boom".into()), &[]).unwrap_err();
         assert!(e.contains("boom") && !e.contains("declined"), "{e}");
         let e = outcome_to_result(Action::Uninstall, &LaunchOutcome::Exited(EXIT_NOT_ELEVATED as u32), &[]).unwrap_err();
@@ -457,6 +494,88 @@ mod tests {
         assert!(e.contains("exit code 1") && e.ends_with("MFCreateVirtualCamera: boom"), "{e}");
         let e = outcome_to_result(Action::Install, &LaunchOutcome::Exited(1), &[]).unwrap_err();
         assert!(e.contains("exit code 1"), "{e}");
+    }
+
+    #[test]
+    fn a_pending_exit_code_is_a_success_with_a_different_word() {
+        let done = outcome_to_result(Action::Install, &LaunchOutcome::Exited(EXIT_PENDING as u32), &[]);
+        assert_eq!(done, Ok(ActionDone::PendingRestart));
+        assert_eq!(ActionDone::PendingRestart.as_str(), "pending_restart");
+        assert_eq!(ActionDone::Done.as_str(), "done");
+        assert_ne!(EXIT_PENDING, EXIT_OK);
+        assert_ne!(EXIT_PENDING, EXIT_FAILED);
+        // for a remove too
+        assert_eq!(
+            outcome_to_result(Action::Uninstall, &LaunchOutcome::Exited(EXIT_PENDING as u32), &[]),
+            Ok(ActionDone::PendingRestart)
+        );
+        // an ordinary failure stays a failure
+        assert!(outcome_to_result(Action::Install, &LaunchOutcome::Exited(1), &[]).is_err());
+    }
+
+    // ---- one helper at a time
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+
+    /// A launcher whose prompt stays open until the test lets it go: "the user has not answered yet", for as long as
+    /// the test wants (the old code gave up after five minutes and let a second helper start).
+    struct Prompt {
+        calls: AtomicUsize,
+        entered: Mutex<mpsc::Sender<()>>,
+        answer: Mutex<mpsc::Receiver<LaunchOutcome>>,
+    }
+
+    impl Launcher for Prompt {
+        fn run_elevated(&self, _: &str, _: &[String]) -> LaunchOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.lock().unwrap().send(()).unwrap();
+            self.answer.lock().unwrap().recv().unwrap()
+        }
+    }
+
+    #[test]
+    fn a_second_action_is_refused_for_as_long_as_the_first_helper_has_not_exited() {
+        let svc = Arc::new(Service::new());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (answer_tx, answer_rx) = mpsc::channel();
+        let prompt = Arc::new(Prompt {
+            calls: AtomicUsize::new(0),
+            entered: Mutex::new(entered_tx),
+            answer: Mutex::new(answer_rx),
+        });
+        let first = {
+            let (svc, prompt) = (svc.clone(), prompt.clone());
+            std::thread::spawn(move || run_claimed(&svc, &*prompt, r"C:\app\better-cam.exe", Action::Install, SID))
+        };
+        entered_rx.recv().unwrap(); // the prompt is open
+
+        // the prompt sits there for a while: nothing times out, nothing else may start
+        for _ in 0..5 {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            let e = run_claimed(&svc, &*prompt, r"C:\app\better-cam.exe", Action::Uninstall, "").unwrap_err();
+            assert!(e.contains("already running"), "{e}");
+            let e = run_claimed(&svc, &*prompt, r"C:\app\better-cam.exe", Action::Install, SID).unwrap_err();
+            assert!(e.contains("already running"), "{e}");
+            assert!(svc.begin_vcam_change(false).is_err());
+            assert!(svc.engine().is_err(), "no engine may map frames.bin while a helper may replace it");
+        }
+        assert_eq!(prompt.calls.load(Ordering::SeqCst), 1, "a second helper was started");
+
+        // the prompt is answered, the helper exits: the claim is free again and the first call reports its result
+        answer_tx.send(LaunchOutcome::Exited(0)).unwrap();
+        assert_eq!(first.join().unwrap(), Ok(ActionDone::Done));
+        let again = svc.begin_vcam_change(false);
+        assert!(again.is_ok());
+    }
+
+    #[test]
+    fn a_declined_prompt_frees_the_claim_too() {
+        let svc = Service::new();
+        let f = fake(LaunchOutcome::Cancelled);
+        assert!(run_claimed(&svc, &f, "x.exe", Action::Install, SID).is_err());
+        assert!(svc.begin_vcam_change(true).is_ok());
     }
 
     #[test]

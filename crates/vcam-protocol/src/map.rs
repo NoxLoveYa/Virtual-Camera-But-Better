@@ -1,16 +1,13 @@
 //! Windows side of the transport: map `frames.bin`, QPC helpers, and the [`Writer`] the app uses.
 
 use std::io;
-use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::IntoRawHandle;
 use std::path::{Path, PathBuf};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, GetFileAttributesW, GetFileSizeEx, SetEndOfFile, SetFileAttributesW,
-    SetFilePointerEx, FILE_ATTRIBUTE_TEMPORARY, FILE_BEGIN, FILE_FLAGS_AND_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, INVALID_FILE_ATTRIBUTES, OPEN_ALWAYS,
+    GetFileSizeEx, SetEndOfFile, SetFilePointerEx, FILE_ATTRIBUTE_TEMPORARY, FILE_BEGIN,
 };
 use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, VirtualQuery, FILE_MAP_ALL_ACCESS,
@@ -61,7 +58,9 @@ pub fn hns_to_qpc(hns: i64) -> u64 {
     (hns.max(0) as u128 * qpc_frequency() as u128 / 10_000_000).min(u64::MAX as u128) as u64
 }
 
+#[cfg(test)]
 fn wide(p: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
     p.as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
@@ -70,6 +69,12 @@ fn wide(p: &Path) -> Vec<u16> {
 
 fn win_err(e: windows::core::Error) -> io::Error {
     io::Error::from_raw_os_error(e.code().0 & 0xFFFF)
+}
+
+/// True when `path` names the production frame file (compared without case).
+fn is_default_path(path: &Path) -> bool {
+    path.to_string_lossy()
+        .eq_ignore_ascii_case(&frames_path().to_string_lossy())
 }
 
 #[cfg(test)]
@@ -310,38 +315,65 @@ pub struct Writer {
 }
 
 impl Writer {
-    /// Create (or reuse) the file at `path` with `FILE_ATTRIBUTE_TEMPORARY`, size it to [`FILE_SIZE`], map it and
-    /// write a fresh header (state `closed`, no advertised types).
+    /// Open the frame file at `path`, size it to [`FILE_SIZE`], map it and write a fresh header (state `closed`, no
+    /// advertised types).
+    ///
+    /// `%ProgramData%\BetterCam\frames.bin` is made by the installer and the app has only read and write access to
+    /// it (no right to create or delete anything in that folder), so for that path this opens the existing file and
+    /// never creates it or its folder: a missing file is `NotFound` (the virtual camera is not installed). Any other
+    /// `path` (tests, a scratch folder) is created when missing, with its folders. Either way a link, a directory or
+    /// a file with more than one hard link is refused ([`secure`]), and for the default path the file must really be
+    /// below `%ProgramData%`.
     ///
     /// An existing file is never truncated: a running DLL may have it mapped, and Windows refuses to shrink a mapped
     /// file. A larger existing file is used as is.
     pub fn create(path: &Path) -> io::Result<Writer> {
+        if is_default_path(path) {
+            return Self::open_precreated(path, Some(&secure::program_data_dir()));
+        }
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let w = wide(path);
-        let file = unsafe {
-            CreateFileW(
-                PCWSTR(w.as_ptr()),
-                GENERIC_READ.0 | GENERIC_WRITE.0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                None,
-                OPEN_ALWAYS,
-                FILE_FLAGS_AND_ATTRIBUTES(FILE_ATTRIBUTE_TEMPORARY.0),
-                None,
-            )
-        }
-        .map_err(win_err)?;
-        // an existing file keeps its attributes on OPEN_ALWAYS: make sure it is temporary too
-        let attrs = unsafe { GetFileAttributesW(PCWSTR(w.as_ptr())) };
-        if attrs != INVALID_FILE_ATTRIBUTES && attrs & FILE_ATTRIBUTE_TEMPORARY.0 == 0 {
-            let _ = unsafe {
-                SetFileAttributesW(
-                    PCWSTR(w.as_ptr()),
-                    FILE_FLAGS_AND_ATTRIBUTES(attrs | FILE_ATTRIBUTE_TEMPORARY.0),
+        Self::open_file(path, secure::DISP_OPEN_ALWAYS, None)
+    }
+
+    /// Open the file the installer made at `path` (it must exist), as [`Writer::create`] does for the default path.
+    /// With `pin = Some(root)` the file must really be `path` below the canonical folder `root`.
+    pub fn open_precreated(path: &Path, pin: Option<&Path>) -> io::Result<Writer> {
+        Self::open_file(path, secure::DISP_OPEN_EXISTING, pin).map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "{} does not exist: the virtual camera is not installed (install or repair it)",
+                        path.display()
+                    ),
                 )
-            };
-        }
+            } else {
+                e
+            }
+        })
+    }
+
+    fn open_file(
+        path: &Path,
+        disposition: windows::Win32::Storage::FileSystem::FILE_CREATION_DISPOSITION,
+        pin: Option<&Path>,
+    ) -> io::Result<Writer> {
+        let expect = match pin {
+            Some(root) => Some(secure::expected_path(root, path)?),
+            None => None,
+        };
+        let h = secure::open_with(
+            path,
+            GENERIC_READ.0 | GENERIC_WRITE.0,
+            secure::SHARE_ALL,
+            disposition,
+            false,
+            FILE_ATTRIBUTE_TEMPORARY.0,
+        )?;
+        secure::verify_file(secure::raw(&h), expect.as_deref())?;
+        let file = HANDLE(h.into_raw_handle());
         let mut size = 0i64;
         let grow = unsafe { GetFileSizeEx(file, &mut size) }.and_then(|_| {
             if (size as u64) < FILE_SIZE {
@@ -365,7 +397,7 @@ impl Writer {
         Ok(Writer { map })
     }
 
-    /// [`Writer::create`] at `%ProgramData%\BetterCam\frames.bin`.
+    /// [`Writer::create`] at `%ProgramData%\BetterCam\frames.bin`: opens the file the installer made.
     pub fn create_default() -> io::Result<Writer> {
         Writer::create(&frames_path())
     }
@@ -436,11 +468,124 @@ mod tests {
     use crate::header::{SUBTYPE_NV12, SUBTYPE_RGB32};
     use crate::seqlock::{Disposition, Read};
     use crate::validate::validate_header;
+    use windows::Win32::Storage::FileSystem::GetFileAttributesW;
 
     fn temp_file(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("bettercam-proto-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
+    }
+
+    /// A fresh folder for one test, with the temp dir below it as the trusted root of a pin.
+    fn sandbox(name: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("bettercam-writer-{}", std::process::id()));
+        let dir = root.join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        (root, dir)
+    }
+
+    fn junction(link: &Path, target: &Path) {
+        let out = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "mklink /J failed");
+    }
+
+    #[test]
+    fn a_writer_opens_the_precreated_file_and_never_creates_one() {
+        let (root, dir) = sandbox("precreated");
+        let f = dir.join("frames.bin");
+        // the installer's file: sized, no header
+        {
+            let file = std::fs::File::create(&f).unwrap();
+            file.set_len(FILE_SIZE).unwrap();
+        }
+        let w = Writer::open_precreated(&f, Some(&root)).unwrap();
+        assert_eq!(w.shared().header().latest_slot, crate::NO_SLOT);
+        assert_eq!(w.shared().header().writer_state, WriterState::Closed as u32);
+        w.set_state(WriterState::Live);
+        drop(w);
+        // a short pre-created file is grown through the handle
+        std::fs::write(&f, b"").unwrap();
+        let w = Writer::open_precreated(&f, Some(&root)).unwrap();
+        assert_eq!(std::fs::metadata(&f).unwrap().len(), FILE_SIZE);
+        drop(w);
+
+        // a missing file is a clean NotFound that says what to do; nothing is created
+        let missing = dir.join("nope").join("frames.bin");
+        let e = Writer::open_precreated(&missing, Some(&root))
+            .err()
+            .expect("must fail");
+        assert_eq!(e.kind(), io::ErrorKind::NotFound, "{e}");
+        assert!(e.to_string().contains("not installed"), "{e}");
+        assert!(
+            !missing.parent().unwrap().exists(),
+            "the folder was created"
+        );
+        let missing = dir.join("absent.bin");
+        assert!(Writer::open_precreated(&missing, None).is_err());
+        assert!(!missing.exists(), "the file was created");
+    }
+
+    #[test]
+    fn only_the_production_path_takes_the_strict_route() {
+        // `create` on this path opens the installer's file and never makes one; every other path (tests) is created
+        assert!(is_default_path(&frames_path()));
+        assert!(is_default_path(Path::new(
+            &frames_path().to_string_lossy().to_uppercase()
+        )));
+        assert!(!is_default_path(&temp_file("frames.bin")));
+        assert!(!is_default_path(&data_dir()));
+    }
+
+    #[test]
+    fn a_writer_refuses_links_and_hard_links() {
+        let (root, dir) = sandbox("links");
+        // a hard-linked file
+        let f = dir.join("frames.bin");
+        std::fs::write(&f, vec![0u8; 8192]).unwrap();
+        std::fs::hard_link(&f, dir.join("other.bin")).unwrap();
+        let e = Writer::open_precreated(&f, Some(&root)).err().unwrap();
+        assert!(secure::is_refused(&e), "{e}");
+        let e = Writer::create(&f).err().unwrap();
+        assert!(secure::is_refused(&e), "{e}");
+        assert_eq!(
+            std::fs::metadata(&f).unwrap().len(),
+            8192,
+            "must not be touched"
+        );
+
+        // a junction in the folder chain: refused with a pin (the production path), the target stays untouched
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("frames.bin"), vec![0u8; 8192]).unwrap();
+        let link = dir.join("link");
+        junction(&link, &real);
+        let e = Writer::open_precreated(&link.join("frames.bin"), Some(&root))
+            .err()
+            .unwrap();
+        assert!(secure::is_refused(&e), "{e}");
+        assert_eq!(
+            std::fs::metadata(real.join("frames.bin")).unwrap().len(),
+            8192
+        );
+        let _ = std::fs::remove_dir(&link);
+
+        // a symbolic link as the file (when the account may make one)
+        let target = dir.join("target.bin");
+        std::fs::write(&target, vec![0u8; 8192]).unwrap();
+        let sym = dir.join("sym.bin");
+        if std::os::windows::fs::symlink_file(&target, &sym).is_ok() {
+            let e = Writer::open_precreated(&sym, Some(&root)).err().unwrap();
+            assert!(secure::is_refused(&e), "{e}");
+            let e = Writer::create(&sym).err().unwrap();
+            assert!(secure::is_refused(&e), "{e}");
+            assert_eq!(std::fs::metadata(&target).unwrap().len(), 8192);
+        }
     }
 
     #[test]

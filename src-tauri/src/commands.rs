@@ -152,23 +152,22 @@ pub async fn vcam_status() -> Result<VcamStatus, String> {
     blocking(|| Ok(vcam_admin::status())).await
 }
 
-/// Install, update or repair the virtual camera: one UAC prompt. Rejects with a readable sentence when the prompt is
-/// declined or the helper fails.
+/// Install, update or repair the virtual camera: the engine stops and `frames.bin` closes first (the helper may have to
+/// replace it), then one UAC prompt. Resolves when the helper has exited, however long the prompt stays open; a
+/// second call meanwhile is refused. Resolves to `"done"`, or `"pending_restart"` when it takes effect only after
+/// the camera service restarts; rejects with a readable sentence when the prompt is declined or the helper fails.
 #[tauri::command]
-pub async fn vcam_install(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn vcam_install(state: State<'_, AppState>) -> Result<String, String> {
     let svc = state.service.clone();
-    blocking(move || {
-        let _change = svc.begin_vcam_change(false)?;
-        vcam_admin::install(&vcam_install::ShellLauncher)
-    })
-    .await
+    blocking(move || vcam_admin::install(&svc, &vcam_install::ShellLauncher).map(|d| d.as_str().to_string())).await
 }
 
-/// Remove the virtual camera: the engine stops and `frames.bin` closes first, then one UAC prompt.
+/// Remove the virtual camera: the engine stops and `frames.bin` closes first, then one UAC prompt. Resolves like
+/// [`vcam_install`].
 #[tauri::command]
-pub async fn vcam_uninstall(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn vcam_uninstall(state: State<'_, AppState>) -> Result<String, String> {
     let svc = state.service.clone();
-    blocking(move || vcam_admin::uninstall(&svc, &vcam_install::ShellLauncher)).await
+    blocking(move || vcam_admin::uninstall(&svc, &vcam_install::ShellLauncher).map(|d| d.as_str().to_string())).await
 }
 
 /// The native "open file" dialog (plan 5.5), owned by the app window: `kind` is `"image"` (PNG, JPEG, BMP, GIF) or

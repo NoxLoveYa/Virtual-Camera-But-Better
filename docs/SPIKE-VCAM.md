@@ -639,3 +639,78 @@ feed by default and no feeder was running; they were run for their consumer side
   could give the user only modify rights on `frames.bin` (not create or delete rights in the folder) and make `logs`
   writable by LOCAL SERVICE only; that needs the installer to create `frames.bin` first, and the app's `Writer::create`
   (which still creates the folder and opens with `OPEN_ALWAYS`, following links) would then only open it.
+
+# P-hardening 2: the installer and the folder permissions (review fixes)
+
+A second review found that the elevated helper trusted a folder the installing user could rearrange, plus several
+smaller faults of install and uninstall. All fixed, each with a test. No change to the frame-file layout,
+`PROTOCOL_VERSION`, the helper's command line or its exit codes 0, 1, 2, 5; no change to `crates/vcam-source`.
+New exit code **10**: done, but the old build is still loaded by the camera service (install) or a file waits for a
+restart (remove); the app shows a message that says so (`"pending_restart"` from the commands).
+
+## The permission design
+
+Applied by the elevated helper, always with a protected DACL (nothing inherited from `%ProgramData%`) and the owner
+set to Administrators, through a handle that was opened without following links and verified (not a reparse point,
+the right kind, one hard link, final path exactly `<ProgramData>\BetterCam[\...]`). Read back with `GetAce` and
+`EqualSid`. The masks are in `crates/vcam-install/src/acl.rs`.
+
+| object | ACE | rights | why |
+|---|---|---|---|
+| `BetterCam` | SYSTEM, Administrators | full control, this folder only | the installer works here |
+| | LOCAL SERVICE, installing user | read and traverse (`0x1200a9`), this folder only | reach `frames.bin` and `logs`, list them; **no** create, delete, rename, change of permissions |
+| `logs` | SYSTEM, Administrators | full control, inherited (OI CI) | the helper's `install.log`, clean-up |
+| | LOCAL SERVICE | read, traverse and create files (`0x1200ab`), this folder only | the service writes `vcam-<pid>.log` |
+| | LOCAL SERVICE | modify (`0x1301bf`), files only (OI IO) | read, write and prune (delete) the logs it made |
+| | installing user | read and traverse, this folder only; read (`0x120089`) on files (OI IO) | read the logs and `install.log`; **cannot** create or delete in `logs` (a consumer process that runs as the user logs nothing, which the DLL tolerates) |
+| `frames.bin` | SYSTEM, Administrators | full control | |
+| | LOCAL SERVICE, installing user | read and write data and attributes (`0x12019f`) | the DLL maps it read-write (consumer fields), the app maps it read-write; **no** delete, rename or `WRITE_DAC` |
+
+Owner of all three (and of `install.log`): Administrators. The data folder has no inheritable ACE for the user, so
+nothing the user could leave in it inherits anything. The installer pre-creates `frames.bin` (full size,
+`FILE_ATTRIBUTE_TEMPORARY`); `Writer::create_default` (the app) only opens it and returns a clear `NotFound` when
+it is missing; `Writer::create(path)` still creates a file for any other path (tests, scratch folders).
+
+## What changed
+
+| # | Finding | Fix | Tests |
+|---|---|---|---|
+| 1 | Elevated code followed links in a folder the user could rearrange | the permissions above; `datadir.rs` opens every object with `FILE_FLAG_OPEN_REPARSE_POINT`, verifies the handle, sets and reads permissions with `SetSecurityInfo` / `GetSecurityInfo` on it; the folder is held without delete sharing meanwhile; `install.log` is written only through a verified handle (`FileLog`); deleting never recurses through a link (`remove_no_follow`); `Writer` opens the pre-created file | `datadir::tests::a_data_folder_that_is_a_junction_is_moved_aside_and_its_target_is_left_alone`, `a_logs_folder_that_is_a_junction_is_replaced_and_its_target_is_left_alone`, `a_hard_linked_frame_file_is_replaced_and_the_other_name_is_left_alone`, `a_frame_file_that_is_a_symbolic_link_is_replaced_when_one_can_be_made`, `strangers_in_the_data_folder_are_removed_without_following_links`, `deleting_never_recurses_through_a_link`, `a_path_based_acl_call_follows_a_junction_which_is_why_nothing_here_uses_one` (the reviewer's reproduction), `acl::tests::the_*_acl_*`, `log::tests::*` (junction, hard link, symlink, tail), `map::tests::a_writer_opens_the_precreated_file_and_never_creates_one`, `a_writer_refuses_links_and_hard_links`, `only_the_production_path_takes_the_strict_route` |
+| 2 | Existing folder kept its owner and explicit ACEs | `datadir::decide`: a link, wrong kind, extra hard links, a path that is not where it says, or an owner that is not SYSTEM/Administrators means "move aside and make again"; `logs` with other permissions too; the data folder and `frames.bin` have no children whose ACEs could survive, so their DACL is replaced as a whole and the owner always set; strangers in the data folder are deleted; this is also the upgrade path | `datadir::tests::a_missing_object_is_created_and_a_good_one_is_kept`, `links_wrong_kinds_hard_links_and_foreign_owners_are_replaced`, `other_permissions_replace_logs_but_only_rewrite_the_folder_and_the_file`, `an_owner_who_is_not_trusted_loses_the_object`, `a_logs_folder_with_other_permissions_is_replaced`, `preparing_again_keeps_what_is_there_and_its_contents` |
+| 3 | Read-back searched SDDL text for the raw SID | `acl::check` reads the ACEs with `GetAce` and compares SIDs with `EqualSid` | `acl::tests::what_was_applied_reads_back_and_checks_even_for_accounts_sddl_prints_as_aliases` (asserts that the stored SDDL says `LA`/`LG`, i.e. the old search could not find them), `a_dacl_with_anything_else_does_not_check` |
+| 4 | Uninstall reported success after a failed removal | a camera that is still listed after a failed `Remove` stops the uninstall before anything else is removed (keys and files stay, Repair or Remove can finish); everything else that cannot be removed is logged, done last and returned as an error (exit 1); a file that waits for a restart is exit 10 | `install::tests::a_failed_remove_stops_the_uninstall_and_keeps_the_keys_and_files`, `registry_keys_that_stay_are_an_error_after_everything_else_was_done`, `a_data_folder_that_cannot_be_deleted_is_an_error`, `a_dll_that_waits_for_a_restart_is_a_pending_result`, `a_half_installed_state_is_cleaned_up_although_remove_says_there_is_no_camera` |
+| 5 | A timeout let two helpers run at once | no timeout: `Launcher::run_elevated` returns when the helper has exited (`LaunchOutcome::TimedOut` is gone); the claim on the camera is held across that call and the engine stays released | `vcam_admin::tests::a_second_action_is_refused_for_as_long_as_the_first_helper_has_not_exited`, `a_declined_prompt_frees_the_claim_too` |
+| 6a | `valid_sid` | only `S-1-5-21-<3>-<rid>` and Entra ID `S-1-12-1-<4>`, each part canonical `u32`; `confirm_user_account` (`LookupAccountSidW`, `SidTypeUser`); both before any change | `acl::tests::only_user_account_sids_pass`, `a_group_of_this_machine_is_not_a_user_account`, `install::tests::a_bad_sid_stops_the_install_before_anything_is_touched`, `a_sid_that_is_not_a_user_account_is_refused_before_anything_is_touched` |
+| 6b | Paths from environment variables | `SHGetKnownFolderPath` for Program Files and ProgramData | `secure::tests::program_data_comes_from_the_shell_and_exists` (existing); the environment is no longer read |
+| 6c | Service not stopped: install returned plain Ok | `InstallOutcome::PendingServiceRestart`, exit 10, a message in the app | `install::tests::a_locked_old_dll_and_a_service_that_will_not_stop_is_a_pending_result_not_a_plain_ok`, `a_locked_old_dll_that_goes_once_the_service_stopped_is_done`, `vcam_admin::tests::a_pending_exit_code_is_a_success_with_a_different_word` |
+| 6d | `vcam-tool` result file in `%TEMP%` | opened without following links, `CREATE_NEW` when missing, a plain one-link file when present, emptied through the handle | `vcam-tool util::tests::*` |
+| 6e | Partial install | order: validate, data folder, DLL (temp name + rename), registration, camera, only then old DLLs; a failure puts the earlier registration back (or removes ours) and deletes the copy it made | `install::tests::a_failed_registration_on_a_clean_machine_leaves_nothing_registered`, `a_failed_camera_on_a_clean_machine_*`, `a_camera_that_will_not_start_*`, `a_failed_update_puts_the_earlier_registration_back_at_every_step`, `a_data_folder_that_cannot_be_prepared_*`, `a_dll_that_cannot_be_copied_*`, `a_rollback_that_fails_says_so` |
+
+Tests that need a symbolic link are skipped without the privilege (this machine: unelevated run); they were run
+elevated (`vcam_install`, `vcam_protocol`, `vcam_tool` test binaries as administrator) and pass.
+
+## Things found only by running it
+
+* **A folder cannot be renamed while any file in it is open, even one opened with delete sharing** (PowerShell
+  `Rename-Item` with a child opened `ReadWrite, Delete`: access denied). Every process that loaded the DLL keeps its
+  `vcam-<pid>.log` open, and so did the helper's own `install.log`: the first live upgrade failed at "move `logs`
+  aside". The helper now lets go of its log before it replaces anything (the lines wait and are replayed into the new
+  file), stops the camera service once, and as a last resort empties `logs` and resets it in place through the held
+  handle (links removed as links). Test `a_logs_folder_that_cannot_be_moved_is_emptied_and_reset_in_place`, `the_install_log_of_the_helper_does_not_keep_logs_from_being_replaced`.
+* **`IMFVirtualCamera::Remove` on a camera that is not registered fails** (`0xC00D36B2`). Treating every failed
+  `Remove` as "stop" would make Remove useless after a failed install, so only a camera that Windows still lists
+  stops the uninstall.
+* On this machine `ConsentPromptBehaviorAdmin = 0` (elevate without prompting): `runas` shows no prompt at all, so a
+  prompt that stays open could not be produced live; it is covered by the test with a launcher whose prompt stays
+  open.
+
+## Notes for packaging
+
+* The helper must be started with `--vcam-install --user-sid <SID of the user who will run the app>`; without a SID
+  only LOCAL SERVICE and the administrators can use the frame file. The SID must be a user account (`S-1-5-21-...`
+  or `S-1-12-1-...`); an installer that runs as another account must pass the right one.
+* Exit code 10 is success with a pending restart (not an error).
+* When the helper fails the app shows the last error line of `%ProgramData%\BetterCam\logs\install.log`; it reads the
+  file through the same verified open and ignores a file that is older than the run (another run's text).
+* `better-cam.exe` (the app) can no longer create `frames.bin`: an app started on a machine without the installed
+  camera does not create the folder; "Start" says the virtual camera is not installed.

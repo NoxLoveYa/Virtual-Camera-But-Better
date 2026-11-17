@@ -1,9 +1,13 @@
 //! Small helpers: wide strings, COM and Media Foundation start-up, the folders of the virtual camera.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use windows::Win32::Media::MediaFoundation::{MFShutdown, MFStartup, MFSTARTUP_FULL, MF_VERSION};
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::{
+    CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED,
+};
+use windows::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath, KNOWN_FOLDER_FLAG};
 use windows_core::PCWSTR;
 
 /// Error type of the install code: a sentence that can be shown to a person.
@@ -69,23 +73,90 @@ impl Drop for MfSession {
     }
 }
 
+/// `%ProgramFiles%` from the shell's known folder database, not from the environment: the elevated helper runs with
+/// the environment of whoever started it. Falls back to `C:\Program Files`.
+pub fn program_files_dir() -> PathBuf {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let known =
+            unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, KNOWN_FOLDER_FLAG(0), None) };
+        match known {
+            Ok(p) => {
+                let s = unsafe { p.to_string() };
+                unsafe { CoTaskMemFree(Some(p.0 as *const core::ffi::c_void)) };
+                match s {
+                    Ok(s) if !s.is_empty() => PathBuf::from(s),
+                    _ => PathBuf::from(r"C:\Program Files"),
+                }
+            }
+            Err(_) => PathBuf::from(r"C:\Program Files"),
+        }
+    })
+    .clone()
+}
+
 /// `%ProgramFiles%\Better Cam\vcam`.
 pub fn install_dir() -> PathBuf {
-    let pf = std::env::var_os("ProgramFiles").unwrap_or_else(|| "C:\\Program Files".into());
-    PathBuf::from(pf)
+    program_files_dir()
         .join(vcam_protocol::INSTALL_DIR_COMPANY)
         .join(vcam_protocol::INSTALL_DIR_VCAM)
 }
 
-/// `%ProgramData%\BetterCam`.
+/// `%ProgramData%\BetterCam` (`%ProgramData%` from the shell, see [`vcam_protocol::secure::program_data_dir`]).
 pub fn data_dir() -> PathBuf {
-    let pd = std::env::var_os("ProgramData").unwrap_or_else(|| "C:\\ProgramData".into());
-    PathBuf::from(pd).join(vcam_protocol::DATA_DIR_NAME)
+    vcam_protocol::frames_dir()
 }
 
 /// `%ProgramData%\BetterCam\logs`.
 pub fn log_dir() -> PathBuf {
     data_dir().join(vcam_protocol::LOG_DIR_NAME)
+}
+
+/// Every folder the installer works in. [`Paths::system`] is the machine; tests build their own below a temp folder.
+#[derive(Clone, Debug)]
+pub struct Paths {
+    /// The trusted folder the data folder must really lie in (`%ProgramData%`).
+    pub program_data: PathBuf,
+    /// `<program_data>\BetterCam`.
+    pub data: PathBuf,
+    /// Where the versioned DLL copies go (`%ProgramFiles%\Better Cam\vcam`).
+    pub install: PathBuf,
+}
+
+impl Paths {
+    /// This machine's folders.
+    pub fn system() -> Paths {
+        Paths {
+            program_data: vcam_protocol::secure::program_data_dir(),
+            data: data_dir(),
+            install: install_dir(),
+        }
+    }
+
+    /// Folders below `root` (tests): `root\ProgramData\BetterCam` and `root\ProgramFiles\Better Cam\vcam`.
+    pub fn below(root: &std::path::Path) -> Paths {
+        let program_data = root.join("ProgramData");
+        Paths {
+            data: program_data.join(vcam_protocol::DATA_DIR_NAME),
+            program_data,
+            install: root
+                .join("ProgramFiles")
+                .join(vcam_protocol::INSTALL_DIR_COMPANY)
+                .join(vcam_protocol::INSTALL_DIR_VCAM),
+        }
+    }
+
+    pub fn logs(&self) -> PathBuf {
+        self.data.join(vcam_protocol::LOG_DIR_NAME)
+    }
+
+    pub fn frames(&self) -> PathBuf {
+        self.data.join(vcam_protocol::FRAMES_FILE_NAME)
+    }
+
+    pub fn install_log(&self) -> PathBuf {
+        self.logs().join("install.log")
+    }
 }
 
 /// FNV-1a 64 over `bytes`, folded to 8 hex digits: the "build" part of the versioned DLL name.

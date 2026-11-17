@@ -28,6 +28,9 @@ export interface Stats {
 /** `missing`: not installed or not listed by Windows; `outdated`: another build than the DLL shipped with the app. */
 export type VcamState = "missing" | "outdated" | "ok";
 
+/** How an install or removal that did not fail ended: `pending_restart` takes effect after the camera service or Windows restarts. */
+export type VcamResult = "done" | "pending_restart";
+
 export interface VcamStatus {
   state: VcamState;
   /** Windows lists the camera. */
@@ -59,10 +62,15 @@ export const api = {
   previewAck: (frame: number) => invoke<void>("preview_ack", { frame }),
   /** No elevation; takes a moment (Media Foundation enumeration). */
   vcamStatus: () => invoke<VcamStatus>("vcam_status"),
-  /** Installs, updates or repairs the virtual camera: one UAC prompt. Rejects with a sentence when declined or failed. */
-  vcamInstall: () => invoke<void>("vcam_install"),
-  /** Stops the engine, then removes the virtual camera: one UAC prompt. Rejects like `vcamInstall`. */
-  vcamUninstall: () => invoke<void>("vcam_uninstall"),
+  /**
+   * Stops the engine, then installs, updates or repairs the virtual camera: one UAC prompt. Resolves when the helper
+   * has exited, however long the prompt stays open (a second call meanwhile is refused): `"done"`, or
+   * `"pending_restart"` when it takes effect only after the camera service or Windows restarts. Rejects with a
+   * sentence when declined or failed.
+   */
+  vcamInstall: () => invoke<VcamResult>("vcam_install"),
+  /** Stops the engine, then removes the virtual camera: one UAC prompt. Resolves and rejects like `vcamInstall`. */
+  vcamUninstall: () => invoke<VcamResult>("vcam_uninstall"),
   /** The native "open file" dialog: the full path of the chosen file, `null` when cancelled. The page keeps running while it is open. */
   pickFile: (kind: "image" | "lut") => invoke<string | null>("pick_file", { kind }),
   getAutostart: () => invoke<boolean>("get_autostart"),

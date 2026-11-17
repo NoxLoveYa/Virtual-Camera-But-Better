@@ -433,17 +433,28 @@ export const useStore = create<State>((set, get) => {
 
     runVcam: async (action) => {
       if (get().vcamBusy) return;
-      set({ vcamBusy: action });
+      // The backend lets go of the frame file before it asks for administrator rights (the helper may have to replace
+      // it), so a running engine stops; it starts again afterwards. The prompt may stay open as long as it likes: the
+      // buttons stay disabled until the helper has exited, and nothing else in the window waits for it.
+      const resume = running();
+      set({ vcamBusy: action, ...(resume && { engine: STOPPED, paused: false }) });
+      if (resume) useStats.setState({ stats: null });
       try {
-        await api.vcamInstall();
+        const result = await api.vcamInstall();
         // A Start that was refused for want of the camera left its error up; it is no longer true.
         if (get().error?.includes("virtual camera is not installed")) set({ error: null });
-        say(action === "repair" ? "Virtual camera repaired" : action === "update" ? "Virtual camera updated" : "Virtual camera installed");
+        const what = action === "repair" ? "repaired" : action === "update" ? "updated" : "installed";
+        say(
+          result === "pending_restart"
+            ? `Virtual camera ${what}. It takes effect after the camera service restarts (close the apps that use a camera) or after Windows restarts.`
+            : `Virtual camera ${what}`,
+        );
       } catch (e) {
         say(String(e));
       } finally {
         set((s) => ({ vcamBusy: null, vcamEpoch: s.vcamEpoch + 1 }));
         await get().refreshVcam();
+        if (resume && get().vcam?.state !== "missing") await begin();
       }
     },
 
@@ -454,8 +465,12 @@ export const useStore = create<State>((set, get) => {
       useStats.setState({ stats: null });
       persist();
       try {
-        await api.vcamUninstall();
-        say("Virtual camera removed");
+        const result = await api.vcamUninstall();
+        say(
+          result === "pending_restart"
+            ? "Virtual camera removed. A file it used is deleted when Windows restarts."
+            : "Virtual camera removed",
+        );
       } catch (e) {
         say(String(e));
       } finally {

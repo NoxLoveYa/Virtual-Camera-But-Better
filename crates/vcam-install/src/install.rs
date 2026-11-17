@@ -1,32 +1,43 @@
 //! Elevated work of install and uninstall (plan 4.3 "Registration and unregistration"). Both functions need an
 //! elevated process; they are shared by `better-cam.exe --vcam-install / --vcam-uninstall` and `vcam-tool`.
+//!
+//! The steps run against a [`Machine`] and a set of [`Paths`], so their order and their rollback are tested with a
+//! fake machine and temp folders; [`install`] and [`uninstall`] are the same code on the real machine.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
-use windows::Win32::System::Services::{
-    CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
-    SC_MANAGER_CONNECT, SERVICE_CONTROL_STOP, SERVICE_QUERY_STATUS, SERVICE_STATUS, SERVICE_STOP,
-    SERVICE_STOPPED,
-};
-use windows_core::PCWSTR;
-
-use crate::acl::{ensure_frames_access, valid_sid};
-use crate::camera::{add_dshow_class, create_virtual_camera};
+use crate::acl::{valid_sid, Principals};
+use crate::datadir;
 use crate::log::Log;
-use crate::registry;
-use crate::util::{
-    content_tag, data_dir, init_com_and_mf, install_dir, log_dir, pcwstr, werr, wide, Res,
-};
+use crate::machine::{Machine, RealMachine, Registration};
+use crate::util::{content_tag, werr, Paths, Res};
 
 /// Options of [`install`].
 #[derive(Clone, Debug, Default)]
 pub struct InstallOptions {
-    /// SID of the user who asked; gets modify access to the data folder.
+    /// SID of the user who asked; gets read and write access to the frame file.
     pub user_sid: Option<String>,
     /// Also `AddProperty(DEVPKEY_Device_ClassGuid, GUID_DEVCLASS_CAMERA)` before `Start` (DirectShow fallback).
     pub dshow_class: bool,
+}
+
+/// How an install ended when it did not fail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallOutcome {
+    /// Installed and in effect.
+    Done,
+    /// Installed, but the camera service still has the old DLL loaded and could not be stopped: the new build takes
+    /// effect when that service restarts (it does when the next app opens a camera after it was stopped) or after a
+    /// restart of Windows.
+    PendingServiceRestart,
+}
+
+/// How an uninstall ended when it did not fail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UninstallOutcome {
+    Done,
+    /// Removed, but a file that the camera service holds is deleted at the next restart of Windows.
+    PendingReboot,
 }
 
 /// Smallest size a real `better_cam_vcam.dll` can have; build placeholders are tiny.
@@ -59,16 +70,47 @@ fn is_ours(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Install or repair: copy the DLL under a versioned name, register it, prepare the data folder, create and start
-/// the virtual camera, retire older DLLs. Running it again on a healthy install repairs it.
-pub fn install(opts: &InstallOptions, dll_src: &Path, log: &mut dyn Log) -> Res<()> {
-    if let Some(sid) = &opts.user_sid {
-        if !valid_sid(sid) {
-            return Err(format!("'{sid}' is not a user SID"));
-        }
-    }
+/// Install or repair on this machine: prepare the data folder, copy the DLL under a versioned name, register it,
+/// create and start the virtual camera, retire older DLLs. Running it again on a healthy install repairs it.
+pub fn install(opts: &InstallOptions, dll_src: &Path, log: &mut dyn Log) -> Res<InstallOutcome> {
+    install_with(
+        opts,
+        dll_src,
+        &Paths::system(),
+        None,
+        &mut RealMachine::new(),
+        log,
+    )
+}
 
-    // 1. copy the DLL under a versioned name
+/// [`install`] against any machine and folders. `principals` replaces the real set of accounts (tests); `None`
+/// builds it from `opts.user_sid`, which must be a user account.
+///
+/// Order, chosen so that a failure leaves the machine as it was: validate everything; prepare the data folder; copy
+/// the DLL (to a temporary name, then renamed); write the registration; create and start the camera; only then
+/// delete old DLLs. A failure after the registration was written puts the earlier registration back (or removes
+/// ours when there was none) and deletes the DLL copy it made, so a registered class never names a missing file.
+pub fn install_with(
+    opts: &InstallOptions,
+    dll_src: &Path,
+    paths: &Paths,
+    principals: Option<Principals>,
+    m: &mut dyn Machine,
+    log: &mut dyn Log,
+) -> Res<InstallOutcome> {
+    // 0. everything that can be checked without changing anything
+    let principals = match principals {
+        Some(p) => p,
+        None => {
+            if let Some(sid) = &opts.user_sid {
+                if !valid_sid(sid) {
+                    return Err(format!("'{sid}' is not a user SID"));
+                }
+                m.confirm_user(sid)?;
+            }
+            Principals::machine(opts.user_sid.as_deref())
+        }
+    };
     let bytes =
         std::fs::read(dll_src).map_err(|e| werr(&format!("read {}", dll_src.display()), e))?;
     if !looks_like_dll(&bytes) {
@@ -78,68 +120,133 @@ pub fn install(opts: &InstallOptions, dll_src: &Path, log: &mut dyn Log) -> Res<
         ));
     }
     let tag = content_tag(&bytes);
-    let dir = install_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| werr("create install dir", e))?;
-    let dest = dir.join(vcam_protocol::versioned_dll_name(&tag));
-    let same = std::fs::read(&dest).map(|d| d == bytes).unwrap_or(false);
-    if same {
-        log.line(&format!("dll already present: {}", dest.display()));
+    let dest = paths.install.join(vcam_protocol::versioned_dll_name(&tag));
+    m.start()?;
+    // the registration to go back to: only one whose DLL is really there
+    let before = m
+        .read_registration()
+        .filter(|r| Path::new(&r.dll).is_file());
+
+    // 1. the data folder (no registration exists because of this step, nothing to undo)
+    datadir::prepare(paths, &principals, &mut || m.stop_frame_server(), log)?;
+    log.folder_ready();
+    log.line(&format!("data folder ready: {}", paths.data.display()));
+
+    // 2. the DLL
+    let copied_new = copy_dll(&bytes, &dest, log)?;
+
+    // 3. + 4. registration and camera, with rollback
+    let reg = Registration {
+        dll: dest.to_string_lossy().into_owned(),
+        build: tag,
+        protocol: vcam_protocol::PROTOCOL_VERSION,
+    };
+    let step = (|| -> Res<()> {
+        m.write_registration(&reg)?;
+        log.line(&format!(
+            "registered: HKLM\\{} -> {}",
+            vcam_protocol::clsid_key(),
+            reg.dll
+        ));
+        m.create_camera(opts.dshow_class)?;
+        log.line("camera created and started");
+        Ok(())
+    })();
+    if let Err(cause) = step {
+        let tail = rollback(&before, &dest, copied_new, m, log);
+        return Err(format!("{cause}{tail}"));
+    }
+
+    // 5. only now the older DLLs
+    let pending = remove_old_dlls(&paths.install, &dest, m, log);
+    datadir::sweep_asides(paths, log);
+    Ok(if pending {
+        log.line(
+            "installed; the camera service still has an older build loaded: the new one takes effect after that service restarts or Windows restarts",
+        );
+        InstallOutcome::PendingServiceRestart
     } else {
-        std::fs::write(&dest, &bytes).map_err(|e| werr(&format!("write {}", dest.display()), e))?;
-        log.line(&format!("dll copied: {}", dest.display()));
+        InstallOutcome::Done
+    })
+}
+
+/// Write `bytes` to `dest` unless it is already there. Returns true when a new file was made.
+fn copy_dll(bytes: &[u8], dest: &Path, log: &mut dyn Log) -> Res<bool> {
+    if std::fs::read(dest).map(|d| d == bytes).unwrap_or(false) {
+        log.line(&format!("dll already present: {}", dest.display()));
+        return Ok(false);
     }
-
-    // 2. COM registration in HKLM
-    let key = vcam_protocol::clsid_key();
-    registry::set_string(&key, None, vcam_protocol::CLSID_DESCRIPTION)?;
-    let inproc = format!(r"{key}\InprocServer32");
-    registry::set_string(&inproc, None, &dest.to_string_lossy())?;
-    registry::set_string(&inproc, Some("ThreadingModel"), "Both")?;
-    log.line(&format!("clsid key written: HKLM\\{key}"));
-
-    // 3. state key
-    registry::set_string(
-        vcam_protocol::VCAM_STATE_KEY,
-        Some("DllPath"),
-        &dest.to_string_lossy(),
-    )?;
-    registry::set_dword(
-        vcam_protocol::VCAM_STATE_KEY,
-        "Protocol",
-        vcam_protocol::PROTOCOL_VERSION,
-    )?;
-    registry::set_string(vcam_protocol::VCAM_STATE_KEY, Some("Build"), &tag)?;
-
-    // 4. data folders with an explicit ACL
-    let logs = log_dir();
-    std::fs::create_dir_all(&logs).map_err(|e| werr("create log dir", e))?;
-    ensure_frames_access(opts.user_sid.as_deref(), log)?;
-    log.line(&format!("data dir ready: {}", logs.display()));
-
-    // 5. + 6. virtual camera
-    init_com_and_mf().map_err(|e| werr("MFStartup", e))?;
-    let cam = create_virtual_camera()?;
-    log.line("registered");
-    if opts.dshow_class {
-        add_dshow_class(&cam)?;
-        log.line("added DEVPKEY_Device_ClassGuid = GUID_DEVCLASS_CAMERA");
+    if let Some(dir) = dest.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| werr("create install dir", e))?;
     }
-    unsafe { cam.Start(None) }.map_err(|e| werr("IMFVirtualCamera::Start", e))?;
-    log.line("started");
-    let _ = unsafe { cam.Shutdown() };
+    // a name that is never registered, then a rename: a failed copy leaves no half DLL under the real name
+    let tmp = dest.with_extension("dll.tmp");
+    let result = std::fs::write(&tmp, bytes)
+        .and_then(|()| std::fs::rename(&tmp, dest))
+        .map_err(|e| werr(&format!("write {}", dest.display()), e));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result?;
+    log.line(&format!("dll copied: {}", dest.display()));
+    Ok(true)
+}
 
-    // 7. older DLLs
-    remove_old_dlls(&dir, &dest, log);
-    Ok(())
+/// Undo a failed registration or camera step. Returns the text to append to the error.
+fn rollback(
+    before: &Option<Registration>,
+    dest: &Path,
+    copied_new: bool,
+    m: &mut dyn Machine,
+    log: &mut dyn Log,
+) -> String {
+    let mut complete = true;
+    match before {
+        Some(prev) => match m.write_registration(prev) {
+            Ok(()) => log.line(&format!(
+                "rolled back to the earlier registration ({})",
+                prev.dll
+            )),
+            Err(e) => {
+                complete = false;
+                log.line(&format!("rollback of the registration failed: {e}"));
+            }
+        },
+        None => {
+            let left = m.delete_registration();
+            if left.is_empty() {
+                log.line("rolled back: registration removed");
+            } else {
+                complete = false;
+                log.line(&format!("rollback left registry keys: {}", left.join(", ")));
+            }
+        }
+    }
+    // the DLL we copied goes, unless the registration we kept names it
+    let in_use = before.as_ref().is_some_and(|b| Path::new(&b.dll) == dest);
+    if copied_new && !in_use && complete {
+        match std::fs::remove_file(dest) {
+            Ok(()) => log.line(&format!("rolled back: deleted {}", dest.display())),
+            Err(e) => log.line(&format!("could not delete {}: {e}", dest.display())),
+        }
+    }
+    if complete {
+        " (nothing was changed: the earlier state is back)".into()
+    } else {
+        " (the rollback was incomplete: run Repair)".into()
+    }
 }
 
 /// Retire the DLL versions other than `keep`. One that Frame Server still has loaded cannot be deleted, and Frame
 /// Server also keeps serving new camera users from it (a loaded class is not looked up again in the registry), so
 /// the update would not take effect until a reboot. Stopping the service fixes both: it starts again by itself the
 /// next time an app opens a camera. Apps that have the camera open lose their stream and have to open it again.
-fn remove_old_dlls(dir: &Path, keep: &Path, log: &mut dyn Log) {
+///
+/// Returns true when an older build is still loaded afterwards (the service could not be stopped, or a file waits
+/// for a restart).
+fn remove_old_dlls(dir: &Path, keep: &Path, m: &mut dyn Machine, log: &mut dyn Log) -> bool {
     let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
+        return false;
     };
     let mut locked = Vec::new();
     for e in rd.flatten() {
@@ -152,127 +259,108 @@ fn remove_old_dlls(dir: &Path, keep: &Path, log: &mut dyn Log) {
             }
         }
     }
-    if !locked.is_empty() {
-        log.line("an older DLL is loaded by Frame Server; stopping the service so the new build loads");
-        stop_frame_server(log);
-        for p in &locked {
-            delete_or_delay(p, log);
+    if locked.is_empty() {
+        return false;
+    }
+    log.line("an older DLL is loaded by Frame Server; stopping the service so the new build loads");
+    let stopped = m.stop_frame_server();
+    log.line(&format!("FrameServer stopped: {stopped}"));
+    let mut waiting = !stopped;
+    for p in &locked {
+        if delete_or_delay(p, m, log) != Removal::Deleted {
+            waiting = true;
         }
     }
+    waiting
 }
 
-/// Delete `p`; a file that is locked (Frame Server has the DLL loaded) is scheduled for deletion at the next reboot.
-fn delete_or_delay(p: &Path, log: &mut dyn Log) {
+/// What became of a file that was to be deleted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Removal {
+    Deleted,
+    /// Locked: it goes at the next restart of Windows.
+    AtReboot,
+    /// Locked and even that could not be scheduled.
+    Left,
+}
+
+/// Delete `p`; a file that is locked is scheduled for deletion at the next reboot.
+fn delete_or_delay(p: &Path, m: &mut dyn Machine, log: &mut dyn Log) -> Removal {
     match std::fs::remove_file(p) {
-        Ok(()) => log.line(&format!("deleted {}", p.display())),
-        Err(_) => {
-            let w = wide(&p.to_string_lossy());
-            let r = unsafe { MoveFileExW(pcwstr(&w), PCWSTR::null(), MOVEFILE_DELAY_UNTIL_REBOOT) };
-            match r {
-                Ok(()) => log.line(&format!(
+        Ok(()) => {
+            log.line(&format!("deleted {}", p.display()));
+            Removal::Deleted
+        }
+        Err(_) => match m.delete_at_reboot(p) {
+            Ok(()) => {
+                log.line(&format!(
                     "locked, delete scheduled at reboot: {}",
                     p.display()
-                )),
-                Err(e) => log.line(&format!("could not delete {}: {e}", p.display())),
+                ));
+                Removal::AtReboot
             }
-        }
-    }
-}
-
-/// Stop the `FrameServer` service (needs elevation). Returns true when it is stopped.
-fn stop_frame_server(log: &mut dyn Log) -> bool {
-    unsafe {
-        let Ok(scm) = OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) else {
-            return false;
-        };
-        let name = wide("FrameServer");
-        let svc = OpenServiceW(scm, pcwstr(&name), SERVICE_STOP | SERVICE_QUERY_STATUS);
-        let mut stopped = false;
-        if let Ok(svc) = svc {
-            let mut st = SERVICE_STATUS::default();
-            let _ = ControlService(svc, SERVICE_CONTROL_STOP, &mut st);
-            for _ in 0..50 {
-                if QueryServiceStatus(svc, &mut st).is_ok() && st.dwCurrentState == SERVICE_STOPPED
-                {
-                    stopped = true;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
+            Err(e) => {
+                log.line(&format!("could not delete {}: {e}", p.display()));
+                Removal::Left
             }
-            let _ = CloseServiceHandle(svc);
-        }
-        let _ = CloseServiceHandle(scm);
-        log.line(&format!("FrameServer stop requested, stopped: {stopped}"));
-        stopped
+        },
     }
 }
 
-/// Delete the data folder; tries a few times because a stream that just ended may still hold `frames.bin`.
-fn try_remove_dir(dir: &Path) -> bool {
-    for attempt in 0..6 {
-        if !dir.exists() || std::fs::remove_dir_all(dir).is_ok() {
-            return true;
-        }
-        if attempt < 5 {
-            std::thread::sleep(Duration::from_millis(300));
-        }
-    }
-    !dir.exists()
+/// Remove the virtual camera, the HKLM keys, the DLLs and the data folder from this machine.
+pub fn uninstall(log: &mut dyn Log) -> Res<UninstallOutcome> {
+    uninstall_with(&Paths::system(), &mut RealMachine::new(), log)
 }
 
-/// Remove `%ProgramData%\BetterCam`. When something still holds a file in it, Frame Server is the usual suspect (it
-/// has `frames.bin` mapped while a consumer is attached): stop it (once) and try again.
-fn remove_data_dir(frame_server_stopped: bool, log: &mut dyn Log) {
-    let dir = data_dir();
-    if try_remove_dir(&dir) {
-        return;
-    }
-    if !frame_server_stopped {
-        log.line("the data folder is in use; stopping Frame Server");
-        stop_frame_server(log);
-        if try_remove_dir(&dir) {
-            return;
-        }
-    }
-    log.line(&format!(
-        "could not remove {} (a file is in use); it is harmless and the next install reuses it",
-        dir.display()
-    ));
-}
-
-/// Remove the virtual camera, the HKLM keys, the DLLs and the data folder, in that order (the camera first, so
-/// nothing recreates what is deleted behind it). The caller must have closed `frames.bin` in its own process.
-pub fn uninstall(log: &mut dyn Log) -> Res<()> {
-    init_com_and_mf().map_err(|e| werr("MFStartup", e))?;
-    match create_virtual_camera() {
-        Ok(cam) => {
-            match unsafe { cam.Remove() } {
-                Ok(()) => log.line("removed"),
-                Err(e) => log.line(&format!("Remove failed: {e}")),
+/// [`uninstall`] against any machine and folders, in this order: the camera first (so nothing recreates what is
+/// deleted behind it), then the registry, the DLLs and the data folder.
+///
+/// A camera that Windows would not remove stops everything: the keys and files stay, so the class the camera
+/// names still exists and a later Repair or Remove can finish the job. Whatever else could not be removed is
+/// logged and returned as an error after the other steps ran. The caller must have closed `frames.bin` in its own
+/// process.
+pub fn uninstall_with(
+    paths: &Paths,
+    m: &mut dyn Machine,
+    log: &mut dyn Log,
+) -> Res<UninstallOutcome> {
+    m.start()?;
+    match m.remove_camera() {
+        Ok(()) => log.line("camera removed"),
+        Err(e) => {
+            log.line(&format!("Remove failed: {e}"));
+            // Remove also fails on a camera that is not registered (a half installed state, or a second remove),
+            // and then everything else still has to be cleaned up: only a camera that is still listed stops it.
+            if m.camera_listed() {
+                return Err(format!(
+                    "Windows did not remove the virtual camera ({e}). Nothing else was removed; try again"
+                ));
             }
-            let _ = unsafe { cam.Shutdown() };
+            log.line("Windows does not list the camera: it is gone, going on");
         }
-        Err(e) => log.line(&format!("could not open the virtual camera: {e}")),
     }
+
+    let mut left: Vec<String> = Vec::new();
+    let mut pending = false;
 
     // registry
-    let clsid = vcam_protocol::clsid_key();
-    let r = registry::delete_tree(&clsid);
-    log.line(&format!("delete HKLM\\{clsid}: {r:?}"));
-    let r = registry::delete_tree(vcam_protocol::VCAM_STATE_KEY);
+    let failed = m.delete_registration();
     log.line(&format!(
-        "delete HKLM\\{}: {r:?}",
-        vcam_protocol::VCAM_STATE_KEY
+        "registry keys deleted{}",
+        if failed.is_empty() {
+            String::new()
+        } else {
+            format!(", except {}", failed.join(", "))
+        }
     ));
-    registry::delete_key_if_empty(r"SOFTWARE\BetterCam");
+    left.extend(failed);
 
-    // DLLs: delete; if locked by Frame Server stop the service and retry; else delay-delete
-    let dir = install_dir();
-    let dlls: Vec<PathBuf> = std::fs::read_dir(&dir)
+    // DLLs: delete; one that Frame Server holds: stop the service and retry, else delete at the next restart
+    let dlls: Vec<PathBuf> = std::fs::read_dir(&paths.install)
         .map(|rd| {
             rd.flatten()
                 .map(|e| e.path())
-                .filter(|p| p.extension().map(|x| x == "dll").unwrap_or(false))
+                .filter(|p| is_ours(p))
                 .collect()
         })
         .unwrap_or_default();
@@ -284,73 +372,54 @@ pub fn uninstall(log: &mut dyn Log) -> Res<()> {
             locked.push(p.clone());
         }
     }
-    let mut frame_server_stopped = false;
+    let mut stopped = false;
     if !locked.is_empty() {
         log.line("some DLLs are loaded by Frame Server; stopping the service");
-        frame_server_stopped = stop_frame_server(log);
+        stopped = m.stop_frame_server();
         for p in &locked {
-            delete_or_delay(p, log);
+            match delete_or_delay(p, m, log) {
+                Removal::Deleted => {}
+                Removal::AtReboot => pending = true,
+                Removal::Left => left.push(p.display().to_string()),
+            }
         }
     }
-    let _ = std::fs::remove_dir(&dir);
-    if let Some(parent) = dir.parent() {
+    let _ = std::fs::remove_dir(&paths.install);
+    if let Some(parent) = paths.install.parent() {
         let _ = std::fs::remove_dir(parent);
     }
 
     // the data folder, last: the log of this run lives in it
-    remove_data_dir(frame_server_stopped, log);
-    log.line("unregistered");
-    Ok(())
+    log.release_folder();
+    let mut gone = datadir::remove_all(paths);
+    if !gone && !stopped {
+        log.line("the data folder is in use; stopping Frame Server");
+        m.stop_frame_server();
+        gone = datadir::remove_all(paths);
+    }
+    if !gone {
+        log.folder_ready();
+        let why = format!("{} (a file in it is in use)", paths.data.display());
+        log.line(&format!("could not remove {why}"));
+        left.push(why);
+    }
+
+    if left.is_empty() {
+        log.line("unregistered");
+        Ok(if pending {
+            log.line("some files are deleted at the next restart of Windows");
+            UninstallOutcome::PendingReboot
+        } else {
+            UninstallOutcome::Done
+        })
+    } else {
+        log.line(&format!("left behind: {}", left.join("; ")));
+        Err(format!(
+            "The virtual camera was removed from Windows, but this was left behind: {}",
+            left.join("; ")
+        ))
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_a_big_mz_file_is_a_dll() {
-        let mut real = vec![0u8; MIN_DLL_BYTES];
-        real[0] = b'M';
-        real[1] = b'Z';
-        assert!(looks_like_dll(&real));
-        assert!(!looks_like_dll(&real[..MIN_DLL_BYTES - 1]));
-        assert!(!looks_like_dll(b"placeholder"));
-        assert!(!looks_like_dll(&vec![0u8; MIN_DLL_BYTES]));
-    }
-
-    #[test]
-    fn our_dll_names_are_recognised() {
-        assert!(is_ours(Path::new(r"C:\x\better_cam_vcam_1.abcd1234.dll")));
-        assert!(!is_ours(Path::new(r"C:\x\better_cam_vcam.dll")));
-        assert!(!is_ours(Path::new(r"C:\x\other_1.abcd1234.dll")));
-        assert!(!is_ours(Path::new(r"C:\x\better_cam_vcam_1.abcd1234.txt")));
-    }
-
-    #[test]
-    fn a_bad_sid_stops_the_install_before_anything_is_touched() {
-        let opts = InstallOptions {
-            user_sid: Some("S-1-5-21-1)(A;;FA;;;WD".into()),
-            dshow_class: false,
-        };
-        let mut log = crate::log::VecLog::default();
-        let err = install(&opts, Path::new(r"C:\does\not\exist.dll"), &mut log).unwrap_err();
-        assert!(err.contains("not a user SID"), "{err}");
-        assert!(log.0.is_empty());
-    }
-
-    #[test]
-    fn a_missing_or_placeholder_dll_is_refused_before_anything_is_touched() {
-        let mut log = crate::log::VecLog::default();
-        let opts = InstallOptions::default();
-        assert!(install(&opts, Path::new(r"C:\does\not\exist.dll"), &mut log).is_err());
-        let dir = std::env::temp_dir().join(format!("vcam-install-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let fake = dir.join("better_cam_vcam.dll");
-        std::fs::write(&fake, b"placeholder").unwrap();
-        let err = install(&opts, &fake, &mut log).unwrap_err();
-        assert!(err.contains("not the virtual camera DLL"), "{err}");
-        assert!(!file_looks_like_dll(&fake));
-        assert!(log.0.is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
+mod tests;

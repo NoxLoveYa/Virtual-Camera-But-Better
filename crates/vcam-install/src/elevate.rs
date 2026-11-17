@@ -1,11 +1,7 @@
 //! Elevation: ask for administrator rights (`runas`), wait for the elevated process, and tell the caller what
 //! happened. The launcher is a trait so the callers can be tested with a fake that refuses.
 
-use std::time::Duration;
-
-use windows::Win32::Foundation::{
-    CloseHandle, ERROR_CANCELLED, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
-};
+use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{
     GetTokenInformation, TokenElevation, TokenUser, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
@@ -26,23 +22,25 @@ pub enum LaunchOutcome {
     Exited(u32),
     /// The user declined the UAC prompt (`ERROR_CANCELLED`, 1223).
     Cancelled,
-    /// The elevated program did not finish in time.
-    TimedOut,
     /// The program could not be started, or its result could not be read.
     Failed(String),
 }
 
-/// Starts a program with administrator rights and waits for it.
+/// Starts a program with administrator rights and waits until it has exited.
+///
+/// There is no timeout, on purpose: a timeout while the prompt is open (or while the helper runs) would hand control
+/// back to a caller that then believes nothing is running and may start a second helper. The call returns when the
+/// prompt was declined, the program could not be started, or the program has really ended.
 pub trait Launcher {
-    fn run_elevated(&self, exe: &str, args: &[String], timeout: Duration) -> LaunchOutcome;
+    fn run_elevated(&self, exe: &str, args: &[String]) -> LaunchOutcome;
 }
 
 /// The real thing: `ShellExecuteExW` with the verb `runas`.
 pub struct ShellLauncher;
 
 impl Launcher for ShellLauncher {
-    fn run_elevated(&self, exe: &str, args: &[String], timeout: Duration) -> LaunchOutcome {
-        run_elevated(exe, args, timeout)
+    fn run_elevated(&self, exe: &str, args: &[String]) -> LaunchOutcome {
+        run_elevated(exe, args)
     }
 }
 
@@ -122,8 +120,8 @@ pub fn outcome_for_shell_error(e: &windows_core::Error) -> LaunchOutcome {
     }
 }
 
-/// Run `exe args...` elevated and wait up to `timeout`.
-pub fn run_elevated(exe: &str, args: &[String], timeout: Duration) -> LaunchOutcome {
+/// Run `exe args...` elevated and wait until it has exited (see [`Launcher`]).
+pub fn run_elevated(exe: &str, args: &[String]) -> LaunchOutcome {
     let params = args.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ");
     let verb = wide("runas");
     let file = wide(exe);
@@ -145,20 +143,14 @@ pub fn run_elevated(exe: &str, args: &[String], timeout: Duration) -> LaunchOutc
     if process.is_invalid() {
         return LaunchOutcome::Failed("ShellExecuteExW returned no process handle".into());
     }
-    let wait = unsafe {
-        WaitForSingleObject(
-            process,
-            timeout.as_millis().min(u32::MAX as u128 - 1) as u32,
-        )
-    };
+    // INFINITE: the process handle is kept until the helper has really exited
+    let wait = unsafe { WaitForSingleObject(process, u32::MAX) };
     let result = if wait == WAIT_OBJECT_0 {
         let mut code = 0u32;
         match unsafe { GetExitCodeProcess(process, &mut code) } {
             Ok(()) => LaunchOutcome::Exited(code),
             Err(e) => LaunchOutcome::Failed(format!("GetExitCodeProcess failed: {e}")),
         }
-    } else if wait == WAIT_TIMEOUT {
-        LaunchOutcome::TimedOut
     } else {
         LaunchOutcome::Failed("WaitForSingleObject failed".into())
     };

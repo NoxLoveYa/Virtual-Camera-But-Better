@@ -94,9 +94,11 @@ impl Service {
         }
     }
 
-    /// Claim the right to change the virtual camera (install, repair, remove); one change at a time. With `remove`
-    /// the engine is shut down first (camera and `frames.bin` released) and cannot be created until the guard drops.
-    pub fn begin_vcam_change(&self, remove: bool) -> Result<VcamChange<'_>, String> {
+    /// Claim the right to change the virtual camera (install, repair, remove); one change at a time. With
+    /// `release_engine` the engine is shut down first (camera and `frames.bin` released: the helper may have to
+    /// replace the file) and cannot be created until the guard drops. The claim is held until the helper has really
+    /// exited (see `vcam_admin`), so nothing else starts meanwhile.
+    pub fn begin_vcam_change(&self, release_engine: bool) -> Result<VcamChange<'_>, String> {
         if self
             .vcam_busy
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -105,7 +107,7 @@ impl Service {
             return Err("Another change of the virtual camera is already running.".into());
         }
         let guard = VcamChange { svc: self };
-        if remove {
+        if release_engine {
             self.engine_blocked.store(true, Ordering::Release);
             self.shutdown();
         }
@@ -123,7 +125,8 @@ impl Service {
             if self.engine_blocked.load(Ordering::Acquire) {
                 return Err(VCAM_BEING_CHANGED.into());
             }
-            if !vcam_install::registry::clsid_key_present() || !vcam_install::util::data_dir().is_dir() {
+            // the installer makes the frame file; the app only opens it
+            if !vcam_install::registry::clsid_key_present() || !vcam_protocol::frames_path().is_file() {
                 return Err(VCAM_NOT_INSTALLED.into());
             }
             let e = Arc::new(Engine::new()?);

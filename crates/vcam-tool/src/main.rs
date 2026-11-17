@@ -12,15 +12,14 @@ mod status;
 mod util;
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use util::Out;
-use vcam_install::{LaunchOutcome, Launcher, ShellLauncher};
+use vcam_install::{InstallOutcome, LaunchOutcome, Launcher, ShellLauncher, UninstallOutcome};
 
 /// Exit code when the UAC prompt was declined.
 const EXIT_DECLINED: i32 = 3;
-/// Exit code when the UAC prompt was not answered in time.
-const EXIT_TIMEOUT: i32 = 4;
+/// Exit code when it worked but takes effect only after the camera service or Windows restarts.
+const EXIT_PENDING: i32 = 10;
 
 const USAGE: &str = "usage: vcam-tool <command>
   register [--dshow-class]   install DLL + registry + virtual camera (asks for elevation)
@@ -33,9 +32,6 @@ const USAGE: &str = "usage: vcam-tool <command>
                              write the test pattern into frames.bin like the app would
   stats                      print the counters in frames.bin
   gen-slates [--preview DIR] render the slates into crates/vcam-source/assets/slates";
-
-/// How long the parent waits for the UAC prompt and the elevated work.
-const ELEVATION_WAIT: Duration = Duration::from_secs(5 * 60);
 
 struct ElevatedArgs {
     elevated: bool,
@@ -90,7 +86,8 @@ fn elevate_self(verb: &str, args: &ElevatedArgs) -> i32 {
         child_args.push("--dshow-class".into());
     }
     println!("requesting elevation for '{verb}' (UAC prompt)...");
-    let outcome = ShellLauncher.run_elevated(&exe, &child_args, ELEVATION_WAIT);
+    // waits until the elevated child has exited, however long the prompt stays open
+    let outcome = ShellLauncher.run_elevated(&exe, &child_args);
     if let Ok(text) = std::fs::read_to_string(&result) {
         print!("{text}");
     }
@@ -100,12 +97,6 @@ fn elevate_self(verb: &str, args: &ElevatedArgs) -> i32 {
         LaunchOutcome::Cancelled => {
             eprintln!("elevation declined (UAC prompt cancelled)");
             EXIT_DECLINED
-        }
-        LaunchOutcome::TimedOut => {
-            eprintln!(
-                "elevated process did not finish within {ELEVATION_WAIT:?} (UAC prompt unanswered?)"
-            );
-            EXIT_TIMEOUT
         }
         LaunchOutcome::Failed(why) => {
             eprintln!("{why}");
@@ -130,12 +121,19 @@ fn dll_next_to_exe() -> Result<PathBuf, String> {
 
 /// Elevated side of `register` / `unregister`.
 fn do_elevated(verb: &str, args: &ElevatedArgs) -> i32 {
-    let mut out = Out::new(args.result.as_deref());
+    let mut out = match Out::new(args.result.as_deref()) {
+        Ok(o) => o,
+        Err(e) => {
+            // the console of the elevated child is hidden; the parent prints what is in the result file
+            eprintln!("{e}");
+            return 1;
+        }
+    };
     out.line(&format!(
         "{verb}: running elevated: {}",
         vcam_install::is_elevated()
     ));
-    let r = if verb == "register" {
+    let r: Result<i32, String> = if verb == "register" {
         dll_next_to_exe().and_then(|dll| {
             vcam_install::install(
                 &vcam_install::InstallOptions {
@@ -148,12 +146,19 @@ fn do_elevated(verb: &str, args: &ElevatedArgs) -> i32 {
                 &dll,
                 &mut out,
             )
+            .map(|o| match o {
+                InstallOutcome::Done => 0,
+                InstallOutcome::PendingServiceRestart => EXIT_PENDING,
+            })
         })
     } else {
-        vcam_install::uninstall(&mut out)
+        vcam_install::uninstall(&mut out).map(|o| match o {
+            UninstallOutcome::Done => 0,
+            UninstallOutcome::PendingReboot => EXIT_PENDING,
+        })
     };
     match r {
-        Ok(()) => 0,
+        Ok(code) => code,
         Err(e) => {
             out.line(&format!("ERROR: {e}"));
             1

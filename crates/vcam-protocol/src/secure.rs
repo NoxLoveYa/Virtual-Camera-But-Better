@@ -104,13 +104,40 @@ pub fn open_no_follow(
     directory: bool,
     share: FILE_SHARE_MODE,
 ) -> io::Result<OwnedHandle> {
-    let w = wide(path);
     let access = if write {
         GENERIC_READ.0 | GENERIC_WRITE.0
     } else {
         GENERIC_READ.0
     };
-    let mut flags = FILE_ATTRIBUTE_NORMAL.0 | FILE_FLAG_OPEN_REPARSE_POINT.0;
+    open_with(path, access, share, OPEN_EXISTING, directory, 0)
+}
+
+/// How [`open_with`] treats a missing file.
+pub use windows::Win32::Storage::FileSystem::{
+    CREATE_NEW as DISP_CREATE_NEW, OPEN_ALWAYS as DISP_OPEN_ALWAYS,
+    OPEN_EXISTING as DISP_OPEN_EXISTING,
+};
+
+/// The general form of [`open_no_follow`]: any `access` mask (`WRITE_DAC` and `WRITE_OWNER` included, which the
+/// installer needs to set permissions through the handle), a creation disposition and extra attribute flags
+/// (for example `FILE_ATTRIBUTE_TEMPORARY`). The last path component is never followed: a link is opened as the
+/// link (and `CREATE_NEW` fails on one).
+pub fn open_with(
+    path: &Path,
+    access: u32,
+    share: FILE_SHARE_MODE,
+    disposition: windows::Win32::Storage::FileSystem::FILE_CREATION_DISPOSITION,
+    directory: bool,
+    extra_flags: u32,
+) -> io::Result<OwnedHandle> {
+    let w = wide(path);
+    // FILE_ATTRIBUTE_NORMAL is valid only on its own
+    let base = if extra_flags == 0 {
+        FILE_ATTRIBUTE_NORMAL.0
+    } else {
+        0
+    };
+    let mut flags = base | FILE_FLAG_OPEN_REPARSE_POINT.0 | extra_flags;
     if directory {
         flags |= FILE_FLAG_BACKUP_SEMANTICS.0;
     }
@@ -120,7 +147,7 @@ pub fn open_no_follow(
             access,
             share,
             None,
-            OPEN_EXISTING,
+            disposition,
             FILE_FLAGS_AND_ATTRIBUTES(flags),
             None,
         )
@@ -128,6 +155,24 @@ pub fn open_no_follow(
     .map_err(win_err)?;
     // SAFETY: CreateFileW returned a valid handle that nothing else owns.
     Ok(unsafe { OwnedHandle::from_raw_handle(h.0) })
+}
+
+/// What an opened handle is, from `GetFileInformationByHandle`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Kind {
+    pub reparse_point: bool,
+    pub directory: bool,
+    pub links: u32,
+}
+
+/// The kind of the object behind `h`.
+pub fn kind(h: HANDLE) -> io::Result<Kind> {
+    let i = info(h)?;
+    Ok(Kind {
+        reparse_point: i.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0,
+        directory: i.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0,
+        links: i.nNumberOfLinks,
+    })
 }
 
 /// Share mode of the frame file: everybody may read, write and delete it while it is open.
@@ -211,6 +256,11 @@ fn check_place(h: HANDLE, expect: Option<&str>) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The final path of `h` must be exactly `expect` (case aside) on a local fixed disk: no link anywhere in the way.
+pub fn verify_place(h: HANDLE, expect: &str) -> io::Result<()> {
+    check_place(h, Some(expect))
 }
 
 /// Check an opened file: a plain file (no reparse point, not a directory) with exactly one hard link, and, with
