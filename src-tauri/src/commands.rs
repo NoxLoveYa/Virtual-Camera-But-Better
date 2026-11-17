@@ -1,8 +1,11 @@
 use better_cam::api::Service;
+use better_cam::camera_controls::ControlInfoDto;
 use better_cam::config::{CameraDto, OutputCfg, SourceCfg};
+use better_cam::preview::Sink;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_autostart::ManagerExt;
 
@@ -34,7 +37,8 @@ pub async fn list_cameras(state: State<'_, AppState>) -> Result<Vec<CameraDto>, 
 }
 
 /// Start the engine: Standby, then Live (at once, or when an app or the window watches with
-/// `deactivate_when_not_showing`). `controls` and `chain` are accepted and ignored for now.
+/// `deactivate_when_not_showing`). `controls` is the record of the changed camera controls, re-applied after every
+/// camera open; `chain` is accepted and ignored for now.
 #[tauri::command]
 pub async fn start_engine(
     state: State<'_, AppState>,
@@ -53,9 +57,49 @@ pub async fn stop_engine(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 /// Reopens the camera only when a capture setting changed (device, size, rate, format, hw decode, buffering).
+/// `controls` (optional) replaces the record of changed camera controls, for a camera that was just selected.
 #[tauri::command]
-pub async fn set_source(state: State<'_, AppState>, source: SourceCfg) -> Result<(), String> {
+pub async fn set_source(
+    state: State<'_, AppState>,
+    source: SourceCfg,
+    controls: Option<serde_json::Value>,
+) -> Result<(), String> {
+    state.service.set_control_record(controls)?;
     state.service.set_source(source)
+}
+
+/// What the camera `id` supports (plan 5.5): ranges, values, Auto flags. Opens the device briefly when the engine has
+/// no camera open.
+#[tauri::command]
+pub async fn get_camera_controls(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<ControlInfoDto>, String> {
+    let svc = state.service.clone();
+    blocking(move || svc.get_camera_controls(&id)).await
+}
+
+/// Set one control: a manual `value`, or Auto on (`auto`). Returns the control as the device reports it.
+#[tauri::command]
+pub async fn set_camera_control(
+    state: State<'_, AppState>,
+    id: String,
+    key: String,
+    value: i32,
+    auto: bool,
+) -> Result<ControlInfoDto, String> {
+    let svc = state.service.clone();
+    blocking(move || svc.set_camera_control(&id, &key, value, auto)).await
+}
+
+/// Every control back to the device's default, Auto on where the device has Auto.
+#[tauri::command]
+pub async fn reset_camera_controls(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<ControlInfoDto>, String> {
+    let svc = state.service.clone();
+    blocking(move || svc.reset_camera_controls(&id)).await
 }
 
 #[tauri::command]
@@ -66,6 +110,28 @@ pub async fn set_output(state: State<'_, AppState>, output: OutputCfg) -> Result
 #[tauri::command]
 pub async fn set_pause(state: State<'_, AppState>, on: bool) -> Result<(), String> {
     state.service.set_pause(on)
+}
+
+/// Start or stop the live preview. Frames of at most `width` x `height` pixels (and 960x540) arrive on `channel` as
+/// raw bytes: a 16-byte header and RGBA pixels (see `better_cam::preview`). A new call replaces the old stream; the
+/// webview acknowledges each frame with `preview_ack`.
+#[tauri::command]
+pub async fn set_preview(
+    state: State<'_, AppState>,
+    on: bool,
+    width: u32,
+    height: u32,
+    channel: Channel<InvokeResponseBody>,
+) -> Result<(), String> {
+    let svc = state.service.clone();
+    let sink: Sink = Arc::new(move |bytes| channel.send(InvokeResponseBody::Raw(bytes)).is_ok());
+    // Creating the engine can still be in progress on first use.
+    blocking(move || svc.set_preview(on, width, height, sink)).await
+}
+
+#[tauri::command]
+pub fn preview_ack(state: State<AppState>, frame: u32) {
+    state.service.preview_ack(frame);
 }
 
 #[tauri::command]

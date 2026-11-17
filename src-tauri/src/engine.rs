@@ -37,6 +37,10 @@ use vcam_protocol::{qpc_to_hns, Writer, WriterState};
 use windows::core::HRESULT;
 use windows::Win32::Media::MediaFoundation::{MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX};
 
+use crate::camera_controls::{
+    CameraControls, ControlInfoDto, ControlsHub, ControlsOpener, DeviceOpener,
+};
+use crate::capture::controls::DeviceControls;
 use crate::capture::hotplug::{HotplugEvent, HotplugWatcher};
 use crate::capture::reader::{
     CaptureReader, DecodeKind, Frame, FrameData, OpenOptions, RecvError, StopReason,
@@ -368,6 +372,8 @@ pub enum EngineEvent {
     Stats(StatsEvent),
     /// A camera arrived or left.
     DevicesChanged,
+    /// The camera's controls (`controls-changed`): about once a second while one is on Auto, and after a re-apply.
+    Controls(Vec<ControlInfoDto>),
 }
 
 /// Receives [`EngineEvent`]s on the control thread: return quickly.
@@ -424,6 +430,8 @@ struct Shared {
     camera_link: Mutex<Option<String>>,
     /// Last advertised `(width, height, fps)`, for a consumer that attaches while the camera is closed.
     advertised: Mutex<Option<(u32, u32, u32)>>,
+    /// Device controls: the open camera's, the stored record, the lease for calls while no camera is open.
+    hub: Arc<ControlsHub>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -443,6 +451,8 @@ pub struct Engine {
     shared: Arc<Shared>,
     writer: Arc<Writer>,
     control: Mutex<Option<JoinHandle<()>>>,
+    /// Reads the controls that are on Auto once a second and closes an idle lease.
+    poller: Mutex<Option<(Arc<AtomicBool>, JoinHandle<()>)>>,
 }
 
 impl Engine {
@@ -465,7 +475,13 @@ impl Engine {
         writer: Arc<Writer>,
         timings: Timings,
     ) -> Result<Engine, String> {
-        Engine::build(gpu, writer, timings, Arc::new(DefaultFactory))
+        Engine::build(
+            gpu,
+            writer,
+            timings,
+            Arc::new(DefaultFactory),
+            Arc::new(DeviceOpener),
+        )
     }
 
     fn build(
@@ -473,6 +489,7 @@ impl Engine {
         writer: Arc<Writer>,
         timings: Timings,
         factory: Arc<dyn SourceFactory>,
+        opener: Arc<dyn ControlsOpener>,
     ) -> Result<Engine, String> {
         let renderer = Arc::new(Renderer::new(gpu).map_err(|e| e.to_string())?);
         renderer.shaders.warm_up().map_err(|e| e.to_string())?;
@@ -493,7 +510,9 @@ impl Engine {
             sink: Mutex::new(None),
             camera_link: Mutex::new(None),
             advertised: Mutex::new(None),
+            hub: Arc::new(ControlsHub::new(opener)),
         });
+        let poller = spawn_poller(shared.clone()).map_err(|e| e.to_string())?;
         let (tx, rx) = mpsc::channel();
         let (events_tx, events_rx) = mpsc::channel();
         let control = {
@@ -530,7 +549,14 @@ impl Engine {
             shared,
             writer,
             control: Mutex::new(Some(control)),
+            poller: Mutex::new(Some(poller)),
         })
+    }
+
+    /// The device controls (plan 5.5): calls for the camera the engine has open, or a lease on one it has not, and
+    /// the record that is re-applied after every open.
+    pub fn controls(&self) -> &Arc<ControlsHub> {
+        &self.shared.hub
     }
 
     /// Where the engine reports to (replaces the previous sink). Events come from the control thread.
@@ -661,6 +687,12 @@ impl Engine {
             let _ = self.tx.send(Msg::Shutdown);
             let _ = h.join();
         }
+        let poller = lock(&self.poller).take();
+        if let Some((stop, h)) = poller {
+            stop.store(true, Ordering::Release);
+            let _ = h.join();
+        }
+        self.shared.hub.release_lease();
     }
 }
 
@@ -934,6 +966,8 @@ impl Control {
         };
         let (source, readback) = (cfg.source.clone(), cfg.readback);
         self.end_session();
+        // A lease on the camera (a control call while no camera was open) makes way for the engine.
+        self.shared.hub.release_lease();
         self.gen += 1;
         let (stop, removed) = (
             Arc::new(AtomicBool::new(false)),
@@ -1292,6 +1326,7 @@ enum SourceEvent {
     Stopped(Failure),
 }
 
+#[derive(Clone)]
 struct SourceInfo {
     description: String,
     width: u32,
@@ -1343,9 +1378,15 @@ trait Source {
     fn next(&mut self, timeout: Duration) -> SourceEvent;
     /// Frames the source made / replaced before they were taken.
     fn counters(&self) -> (u64, u64);
+    /// The camera's device controls, when it has any (a synthetic source has none).
+    fn controls(&self) -> Option<Arc<dyn CameraControls>> {
+        None
+    }
 }
 
 struct CameraInput {
+    // Before `reader`: the controls hold the camera's media source and go first (plan 4.1, `DeviceControls`).
+    controls: Option<Arc<DeviceControls>>,
     reader: CaptureReader,
     info: SourceInfo,
     drained: u64,
@@ -1380,6 +1421,12 @@ impl Source for CameraInput {
         let s = self.reader.stats();
         (s.produced, s.dropped + self.drained)
     }
+
+    fn controls(&self) -> Option<Arc<dyn CameraControls>> {
+        self.controls
+            .as_ref()
+            .map(|c| c.clone() as Arc<dyn CameraControls>)
+    }
 }
 
 fn open_camera(spec: &CameraSpec, gpu: &Arc<GpuDevice>) -> Result<CameraInput, Failure> {
@@ -1389,6 +1436,14 @@ fn open_camera(spec: &CameraSpec, gpu: &Arc<GpuDevice>) -> Result<CameraInput, F
     // A queue of one is the latest-frame mailbox: a newer frame replaces the one the render thread has not taken.
     opts.queue_len = 1;
     let reader = CaptureReader::open(opts).map_err(|e| Failure::from_capture(&e))?;
+    // A camera that offers no controls simply has none to show.
+    let controls = match DeviceControls::from_reader(&reader) {
+        Ok(c) => Some(Arc::new(c)),
+        Err(e) => {
+            eprintln!("[engine] no device controls: {e}");
+            None
+        }
+    };
     let i = reader.info().clone();
     let color = read_color(&reader);
     let (vw, vh) = visible_size(&i);
@@ -1431,6 +1486,7 @@ fn open_camera(spec: &CameraSpec, gpu: &Arc<GpuDevice>) -> Result<CameraInput, F
             },
             link: Some(spec.link.clone()),
         },
+        controls,
         reader,
         drained: 0,
     })
@@ -1575,6 +1631,103 @@ impl Source for SyntheticInput {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// Device controls
+
+/// The open camera's controls, handed to the hub while the session runs, and the helper thread that re-applies the
+/// stored record. Dropping it (before the camera closes) cancels the helper and waits for it.
+struct ControlsGuard {
+    hub: Arc<ControlsHub>,
+    token: u64,
+    cancel: Arc<AtomicBool>,
+    apply: Option<JoinHandle<()>>,
+}
+
+impl Drop for ControlsGuard {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        self.hub.detach(self.token);
+        if let Some(h) = self.apply.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Hand the camera's controls to the hub and re-apply the record on a helper thread: a first write to white
+/// balance, focus or exposure takes 200-700 ms, which must not hold up the first frame.
+fn attach_controls(shared: &Arc<Shared>, source: &dyn Source) -> Option<ControlsGuard> {
+    let device = source.controls()?;
+    let link = source.info().link.clone()?;
+    let hub = shared.hub.clone();
+    let token = hub.attach(&link, device.clone());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let apply = {
+        let (shared, hub, cancel) = (shared.clone(), hub.clone(), cancel.clone());
+        std::thread::Builder::new()
+            .name("controls apply".into())
+            .spawn(move || {
+                ensure_com();
+                match hub.apply_on_open(token, &link, &device, &cancel) {
+                    Ok((report, infos)) => {
+                        if !report.applied.is_empty() {
+                            eprintln!(
+                                "[engine] stored controls applied after open: {}",
+                                report
+                                    .applied
+                                    .iter()
+                                    .map(|a| match (a.auto, a.value) {
+                                        (Some(on), None) => format!("{}=auto {on}", a.key),
+                                        (_, Some(v)) => format!("{}={v}", a.key),
+                                        _ => a.key.to_string(),
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
+                        }
+                        for (key, why) in &report.skipped {
+                            eprintln!("[engine] stored control {key} not applied: {why}");
+                        }
+                        if !cancel.load(Ordering::Acquire) {
+                            emit(&shared, EngineEvent::Controls(infos));
+                        }
+                    }
+                    Err(e) => eprintln!("[engine] device controls: {e}"),
+                }
+            })
+            .ok()
+    };
+    Some(ControlsGuard {
+        hub,
+        token,
+        cancel,
+        apply,
+    })
+}
+
+/// The engine's background thread for the controls: every second the controls that are on Auto are read again and
+/// sent as `controls-changed` (so sliders follow the device), and a lease that has been idle for a while is closed.
+fn spawn_poller(shared: Arc<Shared>) -> std::io::Result<(Arc<AtomicBool>, JoinHandle<()>)> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    let join = std::thread::Builder::new()
+        .name("controls poll".into())
+        .spawn(move || {
+            ensure_com();
+            let mut last_poll = Instant::now();
+            while !flag.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(100));
+                shared.hub.expire_lease();
+                if last_poll.elapsed() >= Duration::from_secs(1) {
+                    last_poll = Instant::now();
+                    if let Some(infos) = shared.hub.poll() {
+                        emit(&shared, EngineEvent::Controls(infos));
+                    }
+                }
+            }
+        })?;
+    Ok((stop, join))
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // Statistics
 
 /// Latency samples: a sliding window and the whole run.
@@ -1693,6 +1846,8 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
     if stop.load(Ordering::Acquire) {
         return Ok(());
     }
+    // After `source`, so it is dropped first: the controls are handed back before the camera closes.
+    let _controls = attach_controls(shared, source.as_ref());
     let (description, src_h, camera_color, capture_info) = {
         let i = source.info();
         (
@@ -2086,6 +2241,7 @@ fn maybe_publish_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::camera_controls::fake::FakeControls;
     use crate::gpu::pattern::{bar_edges, bgrx_to_rgb, max_diff, nv12_to_rgb, smpte_bars};
     use std::path::PathBuf;
     use vcam_protocol::{
@@ -2283,10 +2439,17 @@ mod tests {
         /// The camera is unplugged: open fails and open sources stop.
         gone: Arc<AtomicBool>,
         specs: Mutex<Vec<SourceSpec>>,
+        /// The device controls of the fake camera.
+        controls: Arc<FakeControls>,
     }
+
+    /// The symbolic link the fake camera has.
+    const FAKE_LINK: &str = "\\\\?\\usb#vid_0c45&pid_636d&mi_00#9&3171a958&0&0000#{e5323777-f976-4f5b-9b55-b94699c46e44}\\global";
 
     struct FakeSource {
         inner: SyntheticInput,
+        info: SourceInfo,
+        controls: Arc<FakeControls>,
         gone: Arc<AtomicBool>,
         alive: Arc<std::sync::atomic::AtomicU32>,
     }
@@ -2299,7 +2462,10 @@ mod tests {
 
     impl Source for FakeSource {
         fn info(&self) -> &SourceInfo {
-            self.inner.info()
+            &self.info
+        }
+        fn controls(&self) -> Option<Arc<dyn CameraControls>> {
+            Some(self.controls.clone())
         }
         fn next(&mut self, timeout: Duration) -> SourceEvent {
             if self.gone.load(Ordering::SeqCst) {
@@ -2334,8 +2500,17 @@ mod tests {
                 return Err(Failure::Fatal("the fake opens synthetic sources".into()));
             };
             self.alive.fetch_add(1, Ordering::SeqCst);
+            let inner = SyntheticInput::new(*s)?;
+            let info = SourceInfo {
+                link: Some(FAKE_LINK.into()),
+                ..inner.info().clone()
+            };
+            // A camera that was closed and opened again has forgotten its controls (plan 4.1).
+            self.controls.forget();
             Ok(Box::new(FakeSource {
-                inner: SyntheticInput::new(*s)?,
+                inner,
+                info,
+                controls: self.controls.clone(),
                 gone: self.gone.clone(),
                 alive: self.alive.clone(),
             }))
@@ -2362,8 +2537,15 @@ mod tests {
                 failures: Mutex::new(VecDeque::new()),
                 gone: Arc::new(AtomicBool::new(false)),
                 specs: Mutex::new(Vec::new()),
+                controls: crate::camera_controls::fake::camera(),
             });
-            let engine = Engine::build(gpu, writer, timings, fake.clone()).unwrap();
+            let opener = Arc::new(crate::camera_controls::fake::FakeOpener {
+                camera: fake.controls.clone(),
+                link: FAKE_LINK.into(),
+                opened: Default::default(),
+                closed: Default::default(),
+            });
+            let engine = Engine::build(gpu, writer, timings, fake.clone(), opener).unwrap();
             let events: Arc<Mutex<Vec<(Instant, EngineEvent)>>> = Arc::default();
             let sink = events.clone();
             engine.set_event_sink(Arc::new(move |e: EngineEvent| {
@@ -2666,6 +2848,133 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1000));
         assert_eq!(rig.engine.state(), EngineState::Live);
         assert_eq!(rig.opens(), 1);
+    }
+
+    /// The stored controls of the tests below, as the frontend sends them.
+    fn controls_record(gain: i32) -> crate::capture::controls::ControlSnapshot {
+        crate::camera_controls::parse_record(Some(&serde_json::json!({
+            "id": FAKE_LINK,
+            "name": "W4GS",
+            "controls": {
+                "gain": { "value": gain, "auto": false },
+                "exposure": { "value": -3, "auto": false },
+                "focus": { "value": 400, "auto": true },
+                "brightness": { "value": 25 }
+            }
+        })))
+        .unwrap()
+        .unwrap()
+    }
+
+    fn applied(gain: i32) -> Vec<String> {
+        // Auto flags first (exposure leaves Auto), then the manual values; a control left on Auto is not written
+        vec![
+            "auto:exposure:false".into(),
+            "value:brightness:25".into(),
+            format!("value:gain:{gain}"),
+            "value:exposure:-3".into(),
+        ]
+    }
+
+    #[test]
+    fn stored_controls_are_applied_after_every_open() {
+        let rig = Rig::new("sm-controls.bin", fast());
+        let cam = rig.fake.controls.clone();
+        let hub = rig.engine.controls().clone();
+        hub.set_record(Some(controls_record(40)));
+        let wait_applied = |rig: &Rig, want: Vec<String>, what: &str| {
+            rig.wait(what, Duration::from_secs(10), |_| cam.log() == want);
+        };
+
+        // 1. the first wake-up (the window shows): opened, then the record is applied
+        rig.engine.start(settings(bars(30), true));
+        rig.wait_state(EngineState::Standby, Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(cam.log().is_empty(), "no camera open, nothing written");
+        rig.engine.set_window_visible(true);
+        rig.wait_state(EngineState::Live, Duration::from_secs(5));
+        wait_applied(&rig, applied(40), "the record after the first open");
+        // the UI hears of the result
+        rig.wait("controls-changed", Duration::from_secs(5), |r| {
+            r.events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, e)| matches!(e, EngineEvent::Controls(c) if c.len() == 4))
+        });
+
+        // the user changes a value while live: the next open applies that one, not the one that was sent at the start
+        let r = hub.set(FAKE_LINK, "gain", 55, false).unwrap();
+        assert_eq!(r.value, 55);
+        assert_eq!(rig.opens(), 1, "the calls used the open camera");
+
+        // 2. a capture setting changes: the camera reopens
+        cam.clear_log();
+        rig.engine.set_source(SourceUpdate {
+            source: bars(25),
+            flip_vertical: false,
+            color: ColorSettings::default(),
+            deactivate_when_not_showing: true,
+        });
+        rig.wait("the reopen", Duration::from_secs(5), |r| r.opens() == 2);
+        wait_applied(&rig, applied(55), "the record after the format reopen");
+
+        // 3. the camera is unplugged and plugged in again
+        rig.fake.gone.store(true, Ordering::SeqCst);
+        rig.wait_state(EngineState::Reconnecting, Duration::from_secs(5));
+        cam.clear_log();
+        rig.fake.gone.store(false, Ordering::SeqCst);
+        rig.wait_state(EngineState::Live, Duration::from_secs(5));
+        wait_applied(&rig, applied(55), "the record after the reconnect");
+
+        // 4. the window hides, the camera goes to standby, and the next wake-up applies it again
+        rig.engine.set_window_visible(false);
+        rig.wait_state(EngineState::Standby, Duration::from_secs(5));
+        cam.clear_log();
+        rig.engine.set_window_visible(true);
+        rig.wait_state(EngineState::Live, Duration::from_secs(5));
+        wait_applied(&rig, applied(55), "the record after the standby wake-up");
+        assert_eq!(rig.opens(), 4);
+
+        // Reset all forgets the record: the next open writes nothing
+        hub.reset(FAKE_LINK).unwrap();
+        assert!(hub.record().unwrap().is_empty());
+        cam.clear_log();
+        rig.engine.set_source(SourceUpdate {
+            source: bars(20),
+            flip_vertical: false,
+            color: ColorSettings::default(),
+            deactivate_when_not_showing: true,
+        });
+        rig.wait("the reopen", Duration::from_secs(5), |r| r.opens() == 5);
+        rig.wait_state(EngineState::Live, Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(cam.log().is_empty(), "{:?}", cam.log());
+        assert_eq!(
+            cam.get(crate::capture::controls::ControlKey::Gain).value,
+            10
+        );
+    }
+
+    #[test]
+    fn the_camera_closes_with_its_controls_and_a_lease_makes_way_for_it() {
+        let rig = Rig::new("sm-lease.bin", fast());
+        let hub = rig.engine.controls().clone();
+        // not running: a call opens the device for a moment
+        hub.set(FAKE_LINK, "gain", 70, false).unwrap();
+        assert!(hub.has_lease());
+        // Start: the lease is closed before the engine opens the camera
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        assert!(!hub.has_lease());
+        // and a stop hands the controls back with the camera
+        hub.get(FAKE_LINK).unwrap();
+        rig.engine.stop();
+        assert!(rig.engine.wait_stopped(Duration::from_secs(10)));
+        assert_eq!(rig.alive(), 0);
+        assert!(hub.poll().is_none(), "no camera, nothing to poll");
+        hub.get(FAKE_LINK).unwrap();
+        assert!(hub.has_lease());
     }
 
     #[test]

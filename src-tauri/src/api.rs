@@ -10,8 +10,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::Value;
 
+use crate::camera_controls::{parse_record, ControlInfoDto};
 use crate::config::{self, CameraDto, OutputCfg, SourceCfg};
 use crate::engine::{Engine, EventSink, ReadbackPolicy, Settings, SourceSpec, SourceUpdate};
+use crate::preview::{Preview, Sink};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -23,6 +25,7 @@ pub struct Service {
     engine: Mutex<Option<Arc<Engine>>>,
     sink: Mutex<Option<Arc<dyn EventSink>>>,
     window_visible: AtomicBool,
+    preview: Preview,
 }
 
 /// The engine's settings for a pair of configs. Rejects what could never open.
@@ -102,8 +105,9 @@ impl Service {
         config::list_camera_dtos()
     }
 
-    /// `start_engine(source, output, controls, chain)`: `controls` and `chain` are accepted and ignored until the
-    /// phases that use them.
+    /// `start_engine(source, output, controls, chain)`: `controls` is the record of what the user changed on the
+    /// selected camera (see [`crate::camera_controls::parse_record`]), re-applied after every camera open; `chain` is
+    /// accepted and ignored until the phase that uses it.
     pub fn start_engine(
         &self,
         source: SourceCfg,
@@ -111,10 +115,44 @@ impl Service {
         controls: Option<Value>,
         chain: Option<Value>,
     ) -> Result<(), String> {
-        let _ = (controls, chain);
+        let _ = chain;
         let settings = settings_from(&source, &output)?;
-        self.engine()?.start(settings);
+        let record = parse_record(controls.as_ref())?;
+        let engine = self.engine()?;
+        engine.controls().set_record(record);
+        engine.start(settings);
         Ok(())
+    }
+
+    /// The record of a camera's changed controls, sent along with `set_source` when the camera changed (`None`
+    /// leaves the record as it is).
+    pub fn set_control_record(&self, controls: Option<Value>) -> Result<(), String> {
+        if let (Some(record), Some(e)) = (parse_record(controls.as_ref())?, self.existing()) {
+            e.controls().set_record(Some(record));
+        }
+        Ok(())
+    }
+
+    /// `get_camera_controls(id)`: what the camera supports, with the device's ranges and values. Uses the open camera,
+    /// or opens the device for a few seconds.
+    pub fn get_camera_controls(&self, id: &str) -> Result<Vec<ControlInfoDto>, String> {
+        self.engine()?.controls().get(id)
+    }
+
+    /// `set_camera_control(id, key, value, auto)`: applied at once; returns the control as the device reports it.
+    pub fn set_camera_control(
+        &self,
+        id: &str,
+        key: &str,
+        value: i32,
+        auto: bool,
+    ) -> Result<ControlInfoDto, String> {
+        self.engine()?.controls().set(id, key, value, auto)
+    }
+
+    /// `reset_camera_controls(id)`: the device's defaults, Auto on where the device has Auto; forgets the record.
+    pub fn reset_camera_controls(&self, id: &str) -> Result<Vec<ControlInfoDto>, String> {
+        self.engine()?.controls().reset(id)
     }
 
     /// `stop_engine`.
@@ -151,10 +189,32 @@ impl Service {
         Ok(())
     }
 
+    /// `set_preview(on, width, height, channel)`: frames of at most `width` x `height` pixels (and 960x540) go to
+    /// `sink` while `on`; `on: false` stops them and drops the tap. Starting again replaces the stream.
+    pub fn set_preview(&self, on: bool, width: u32, height: u32, sink: Sink) -> Result<(), String> {
+        if on {
+            self.preview.start(&*self.engine()?, (width, height), sink)
+        } else {
+            self.preview.stop(self.existing().as_deref());
+            Ok(())
+        }
+    }
+
+    /// `preview_ack(frame)`: the webview drew `frame`; the next one may go out.
+    pub fn preview_ack(&self, frame: u32) {
+        self.preview.ack(frame);
+    }
+
+    /// The preview's counters and the window flag (frames sent so far).
+    pub fn preview(&self) -> &Preview {
+        &self.preview
+    }
+
     /// The app window is shown (and not minimized) or not. Never blocks: when the engine is being created the flag is
     /// applied right after.
     pub fn set_window_visible(&self, visible: bool) {
         self.window_visible.store(visible, Ordering::Release);
+        self.preview.set_hidden(!visible);
         if let Ok(g) = self.engine.try_lock() {
             if let Some(e) = g.as_ref() {
                 e.set_window_visible(visible);
@@ -164,6 +224,7 @@ impl Service {
 
     /// Stop the engine and release the camera and `frames.bin` (the app quits).
     pub fn shutdown(&self) {
+        self.preview.stop(None);
         let e = lock(&self.engine).take();
         if let Some(e) = e {
             e.close();
@@ -241,6 +302,9 @@ mod tests {
         assert!(svc.set_source(SourceCfg::default()).is_ok());
         assert!(svc.set_output(OutputCfg::default()).is_ok());
         svc.set_window_visible(true);
+        let nowhere: Sink = Arc::new(|_| true);
+        assert!(svc.set_preview(false, 0, 0, nowhere).is_ok());
+        svc.preview_ack(1);
         svc.shutdown();
     }
 

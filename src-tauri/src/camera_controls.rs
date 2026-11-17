@@ -1,0 +1,1177 @@
+//! Device controls of the app (plan 5.5, 5.6, 6.2, 4.1 "Persistence across reconnects"): everything between the
+//! Tauri commands and [`crate::capture::controls`].
+//!
+//! * [`ControlsHub`] knows the controls of the camera the engine has open ([`ControlsHub::attach`]) and, when the
+//!   engine has none open, a short-lived **lease**: the device is opened for a call and kept for [`LEASE_IDLE`]
+//!   after the last one, so a slider drag does not open and close the camera for every write. The engine closes the
+//!   lease before it opens the camera itself ([`ControlsHub::release_lease`]).
+//! * The hub keeps the **record**: the values and Auto flags the user changed for the selected camera. The frontend
+//!   sends it with `start_engine` and `set_source`; every `set_camera_control` and `reset_camera_controls` updates
+//!   it, so a reopen never re-applies a stale value. The engine applies it after every camera open
+//!   ([`ControlsHub::apply_on_open`]): Auto flags first, then manual values.
+//! * Calls that write (user and re-apply) pass one gate, so a re-apply that runs in the background after an open
+//!   can never overwrite a value the user set meanwhile.
+//! * [`ControlsHub::poll`] re-reads the controls that are on Auto, for the `controls-changed` event.
+//!
+//! Every device call blocks for one USB transfer (2-7 ms; the first write to white balance, focus or exposure after
+//! an open takes 200-700 ms), so callers are never the UI or the render thread.
+
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::capture::controls::{
+    apply_snapshot, ApplyReport, ControlDevice, ControlError, ControlInfo, ControlKey,
+    ControlSnapshot, DeviceControls, StoredControl,
+};
+use crate::capture::{
+    create_source, links_match, list_camera_keys, parse_vid_pid, Agile, CaptureError, DeviceKey,
+    KeyMatch,
+};
+use crate::config::pick_device;
+
+/// How long a lease stays open after its last use.
+pub const LEASE_IDLE: Duration = Duration::from_secs(3);
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Device seam
+
+/// What the hub needs from a camera's controls: [`ControlDevice`] plus a full read. [`DeviceControls`] implements it;
+/// tests plug in a fake.
+pub trait CameraControls: ControlDevice + Send + Sync {
+    fn read_all(&self) -> Result<Vec<ControlInfo>, ControlError>;
+}
+
+impl CameraControls for DeviceControls {
+    fn read_all(&self) -> Result<Vec<ControlInfo>, ControlError> {
+        DeviceControls::read_all(self)
+    }
+}
+
+/// A device opened for a lease. `close` runs when the lease ends (after the device is dropped).
+pub struct Leased {
+    pub link: String,
+    pub device: Arc<dyn CameraControls>,
+    pub close: Box<dyn FnOnce() + Send>,
+}
+
+/// Opens a camera for a lease. The app uses [`DeviceOpener`]; tests plug in a fake.
+pub trait ControlsOpener: Send + Sync {
+    /// Open the camera `id` names (the exact link, else the same vid/pid on another port).
+    fn open(&self, id: &str) -> Result<Leased, String>;
+
+    /// The key (link, vid/pid, friendly name) of the present camera with this link; a cheap enumeration, no camera
+    /// is opened.
+    fn key_of(&self, link: &str) -> Option<DeviceKey>;
+}
+
+/// Opens the real camera without streaming it: the media source alone serves the controls.
+pub struct DeviceOpener;
+
+impl ControlsOpener for DeviceOpener {
+    fn key_of(&self, link: &str) -> Option<DeviceKey> {
+        list_camera_keys()
+            .ok()?
+            .into_iter()
+            .find(|k| links_match(&k.symbolic_link, link))
+    }
+
+    fn open(&self, id: &str) -> Result<Leased, String> {
+        let keys = list_camera_keys().map_err(|e| e.to_string())?;
+        let key = pick_device(&keys, Some(id)).ok_or_else(|| "camera not found".to_string())?;
+        let source = create_source(&key.symbolic_link).map_err(|e| e.to_string())?;
+        let device = match DeviceControls::new(&source) {
+            Ok(d) => d,
+            Err(e) => {
+                // SAFETY: plain call on the source this function created.
+                let _ = unsafe { source.Shutdown() };
+                return Err(e.to_string());
+            }
+        };
+        let source = Agile(source);
+        Ok(Leased {
+            link: key.symbolic_link.clone(),
+            device: Arc::new(device),
+            close: Box::new(move || {
+                // The whole wrapper moves in (a closure would capture only its field, which is not `Send`).
+                let source = source;
+                // SAFETY: plain call; the controls were dropped before this runs. The media source is
+                // free-threaded.
+                let _ = unsafe { source.0.Shutdown() };
+            }),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Wire types
+
+/// One entry of the `get_camera_controls` / `controls-changed` payloads (plan 5.5): `ControlInfo` with the field
+/// names the frontend uses.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ControlInfoDto {
+    pub key: ControlKey,
+    pub min: i32,
+    pub max: i32,
+    pub step: i32,
+    pub def: i32,
+    pub value: i32,
+    pub auto: bool,
+    pub can_auto: bool,
+    pub can_manual: bool,
+}
+
+impl From<&ControlInfo> for ControlInfoDto {
+    fn from(i: &ControlInfo) -> Self {
+        ControlInfoDto {
+            key: i.key,
+            min: i.min,
+            max: i.max,
+            step: i.step,
+            def: i.default,
+            value: i.value,
+            auto: i.auto,
+            can_auto: i.can_auto,
+            can_manual: i.can_manual,
+        }
+    }
+}
+
+pub fn dtos(infos: &[ControlInfo]) -> Vec<ControlInfoDto> {
+    infos.iter().map(ControlInfoDto::from).collect()
+}
+
+/// The `controls` argument of `start_engine` and `set_source`: what the user changed on one camera.
+///
+/// ```json
+/// { "id": "\\\\?\\usb#vid_0c45&pid_636d...", "name": "W4GS",
+///   "controls": { "brightness": { "value": 20, "auto": false }, "focus": { "value": 300, "auto": true } } }
+/// ```
+///
+/// `auto: true` keeps the device's own Auto mode (the value is not written); `auto: false` switches it off and
+/// writes `value`. Controls the app does not know are ignored.
+#[derive(Debug, Deserialize)]
+struct WireRecord {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    controls: BTreeMap<String, WireControl>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireControl {
+    #[serde(default)]
+    value: Option<i32>,
+    #[serde(default)]
+    auto: Option<bool>,
+}
+
+/// Parse the `controls` argument. `null` or a missing argument is no record.
+pub fn parse_record(v: Option<&Value>) -> Result<Option<ControlSnapshot>, String> {
+    let Some(v) = v.filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let w: WireRecord = serde_json::from_value(v.clone()).map_err(|e| format!("controls: {e}"))?;
+    let mut snap = ControlSnapshot::new(DeviceKey::new(&w.id, &w.name));
+    for key in ControlKey::ALL {
+        let Some(c) = w.controls.get(key.key()) else {
+            continue;
+        };
+        if c.auto.is_none() && c.value.is_none() {
+            continue;
+        }
+        snap.controls.push(StoredControl {
+            key,
+            auto: c.auto,
+            value: if c.auto == Some(true) { None } else { c.value },
+        });
+    }
+    Ok(Some(snap))
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Matching
+
+/// Whether the camera `id` (a symbolic link from the frontend) is the camera with this link: the same link, else
+/// the same `vid_xxxx&pid_xxxx` (it moved to another USB port).
+pub fn same_camera(link: &str, id: &str) -> bool {
+    links_match(link, id)
+        || matches!((parse_vid_pid(link), parse_vid_pid(id)), (Some(a), Some(b)) if a == b)
+}
+
+/// Whether `record` is meant for the open camera `link`: the same link, or the same vid/pid and friendly name (the
+/// camera sits on another port). `present` looks the camera's key up and is only called when the link differs but
+/// the vid/pid agree.
+pub fn record_applies(
+    record: &DeviceKey,
+    link: &str,
+    present: impl FnOnce() -> Option<DeviceKey>,
+) -> Option<KeyMatch> {
+    if !record.symbolic_link.is_empty() && links_match(&record.symbolic_link, link) {
+        return Some(KeyMatch::Exact);
+    }
+    let vid_pid = parse_vid_pid(link)?;
+    if record.vid_pid.as_deref() != Some(vid_pid.as_str()) {
+        return None;
+    }
+    record.matches(&present()?)
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The hub
+
+/// The camera the engine has open.
+struct Attached {
+    token: u64,
+    link: String,
+    device: Arc<dyn CameraControls>,
+    /// The last values read or written, for [`ControlsHub::poll`].
+    last: Vec<ControlInfo>,
+}
+
+struct Lease {
+    link: String,
+    device: Arc<dyn CameraControls>,
+    close: Option<Box<dyn FnOnce() + Send>>,
+    last_used: Instant,
+}
+
+impl Lease {
+    fn end(self) {
+        let Lease { device, close, .. } = self;
+        // The device goes first: it holds the media source the close function shuts down.
+        drop(device);
+        if let Some(c) = close {
+            c();
+        }
+    }
+}
+
+/// Where a call's device came from.
+enum Source {
+    /// The engine's open camera (token for the cache).
+    Engine(u64),
+    Lease,
+}
+
+pub struct ControlsHub {
+    attached: Mutex<Option<Attached>>,
+    lease: Mutex<Option<Lease>>,
+    record: Mutex<Option<ControlSnapshot>>,
+    /// Held by every write, user or re-apply.
+    gate: Mutex<()>,
+    next_token: AtomicU64,
+    /// Calls that are running on a device now; an idle lease is kept while there are any.
+    calls: AtomicUsize,
+    lease_idle: Duration,
+    opener: Arc<dyn ControlsOpener>,
+}
+
+/// Counts a running call for [`ControlsHub::expire_lease`].
+struct Call<'a>(&'a AtomicUsize);
+
+impl<'a> Call<'a> {
+    fn begin(n: &'a AtomicUsize) -> Call<'a> {
+        n.fetch_add(1, Ordering::SeqCst);
+        Call(n)
+    }
+}
+
+impl Drop for Call<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl ControlsHub {
+    pub fn new(opener: Arc<dyn ControlsOpener>) -> ControlsHub {
+        ControlsHub {
+            attached: Mutex::new(None),
+            lease: Mutex::new(None),
+            record: Mutex::new(None),
+            gate: Mutex::new(()),
+            next_token: AtomicU64::new(1),
+            calls: AtomicUsize::new(0),
+            lease_idle: LEASE_IDLE,
+            opener,
+        }
+    }
+
+    /// How long an unused lease stays open (tests shorten it).
+    pub fn with_lease_idle(mut self, idle: Duration) -> ControlsHub {
+        self.lease_idle = idle;
+        self
+    }
+
+    // ---- the record
+
+    /// Replace the record (`start_engine`, `set_source`).
+    pub fn set_record(&self, record: Option<ControlSnapshot>) {
+        *lock(&self.record) = record;
+    }
+
+    pub fn record(&self) -> Option<ControlSnapshot> {
+        lock(&self.record).clone()
+    }
+
+    /// The record entry for `id`, made if the record belongs to another camera. `name` is looked up only then.
+    fn with_record<R>(&self, id: &str, f: impl FnOnce(&mut ControlSnapshot) -> R) -> R {
+        let mut g = lock(&self.record);
+        let mine = g
+            .as_ref()
+            .is_some_and(|r| same_camera(&r.device.symbolic_link, id));
+        if !mine {
+            let key = self
+                .opener
+                .key_of(id)
+                .unwrap_or_else(|| DeviceKey::new(id, ""));
+            *g = Some(ControlSnapshot::new(key));
+        }
+        f(g.as_mut().expect("the record was just made"))
+    }
+
+    /// Note what the device now says about `info` in the record: nothing when it is the device's own default state
+    /// (Auto on where there is Auto, else the default value), else the Auto flag and the manual value.
+    fn note(&self, id: &str, info: &ControlInfo) {
+        let default_state = info.auto == info.can_auto && (info.auto || info.value == info.default);
+        self.with_record(id, |r| {
+            r.forget(info.key);
+            if default_state {
+                return;
+            }
+            if info.can_auto {
+                r.record_auto(info.key, info.auto);
+            }
+            if !info.auto {
+                r.record_value(info.key, info.value);
+            }
+        });
+    }
+
+    // ---- the engine's camera
+
+    /// The engine opened a camera. Returns a token for [`detach`](Self::detach).
+    pub fn attach(&self, link: &str, device: Arc<dyn CameraControls>) -> u64 {
+        let token = self.next_token.fetch_add(1, Ordering::SeqCst);
+        *lock(&self.attached) = Some(Attached {
+            token,
+            link: link.to_string(),
+            device,
+            last: Vec::new(),
+        });
+        token
+    }
+
+    /// The engine is about to close the camera: drop the hub's reference first.
+    pub fn detach(&self, token: u64) {
+        let mut g = lock(&self.attached);
+        if g.as_ref().is_some_and(|a| a.token == token) {
+            *g = None;
+        }
+    }
+
+    fn set_last(&self, token: u64, infos: Vec<ControlInfo>) {
+        if let Some(a) = lock(&self.attached).as_mut().filter(|a| a.token == token) {
+            a.last = infos;
+        }
+    }
+
+    fn update_last(&self, token: u64, info: &ControlInfo) {
+        if let Some(a) = lock(&self.attached).as_mut().filter(|a| a.token == token) {
+            match a.last.iter_mut().find(|i| i.key == info.key) {
+                Some(slot) => *slot = info.clone(),
+                None => a.last.push(info.clone()),
+            }
+        }
+    }
+
+    /// Re-apply the record to a camera the engine just opened (any thread but the render thread; it blocks). Does
+    /// nothing when the record belongs to another camera. Reads everything afterwards so [`poll`](Self::poll)
+    /// knows what is on Auto; returns that state for the `controls-changed` event.
+    ///
+    /// `cancel` is set when the camera closes: the remaining writes are skipped.
+    pub fn apply_on_open(
+        &self,
+        token: u64,
+        link: &str,
+        device: &Arc<dyn CameraControls>,
+        cancel: &AtomicBool,
+    ) -> Result<(ApplyReport, Vec<ControlInfoDto>), ControlError> {
+        let _gate = lock(&self.gate);
+        let mut report = ApplyReport::default();
+        let record = self.record();
+        if let Some(rec) = record.filter(|r| !r.is_empty()) {
+            let mut present = None;
+            let hit = record_applies(&rec.device, link, || {
+                present = self.opener.key_of(link);
+                present.clone()
+            });
+            if let Some(m) = hit {
+                if m == KeyMatch::Fallback {
+                    // Another port: from now on the record names this link.
+                    if let (Some(key), Some(r)) = (present, lock(&self.record).as_mut()) {
+                        r.device = key;
+                    }
+                }
+                report = apply_snapshot(
+                    &Cancellable {
+                        inner: device.as_ref(),
+                        cancel,
+                    },
+                    &rec,
+                )?;
+            }
+        }
+        let infos = device.read_all()?;
+        let out = dtos(&infos);
+        self.set_last(token, infos);
+        Ok((report, out))
+    }
+
+    /// The engine's camera when `id` names it.
+    fn engine_device(&self, id: &str) -> Option<(u64, Arc<dyn CameraControls>)> {
+        lock(&self.attached)
+            .as_ref()
+            .filter(|a| same_camera(&a.link, id))
+            .map(|a| (a.token, a.device.clone()))
+    }
+
+    // ---- the lease
+
+    /// Close the lease (the engine is about to open the camera). Blocks until it is closed.
+    pub fn release_lease(&self) {
+        let lease = lock(&self.lease).take();
+        if let Some(l) = lease {
+            l.end();
+        }
+    }
+
+    /// Close the lease when it has been idle for [`LEASE_IDLE`]. Called about every 100 ms.
+    pub fn expire_lease(&self) {
+        let expired = {
+            let mut g = lock(&self.lease);
+            let idle = g
+                .as_ref()
+                .is_some_and(|l| l.last_used.elapsed() >= self.lease_idle);
+            if idle && self.calls.load(Ordering::SeqCst) == 0 {
+                g.take()
+            } else {
+                None
+            }
+        };
+        if let Some(l) = expired {
+            l.end();
+        }
+    }
+
+    /// Whether a lease is open (tests, diagnostics).
+    pub fn has_lease(&self) -> bool {
+        lock(&self.lease).is_some()
+    }
+
+    /// The device for `id`: the engine's open camera, else the lease (opened if needed).
+    fn device(&self, id: &str) -> Result<(Source, Arc<dyn CameraControls>), String> {
+        if let Some((token, d)) = self.engine_device(id) {
+            return Ok((Source::Engine(token), d));
+        }
+        let mut g = lock(&self.lease);
+        if let Some(l) = g.as_mut().filter(|l| same_camera(&l.link, id)) {
+            l.last_used = Instant::now();
+            return Ok((Source::Lease, l.device.clone()));
+        }
+        if let Some(old) = g.take() {
+            old.end();
+        }
+        let leased = self.opener.open(id)?;
+        let device = leased.device.clone();
+        *g = Some(Lease {
+            link: leased.link,
+            device: leased.device,
+            close: Some(leased.close),
+            last_used: Instant::now(),
+        });
+        Ok((Source::Lease, device))
+    }
+
+    /// Run `f` on the device for `id`. A device that went away (the lease was released for the engine, the camera
+    /// was unplugged) is looked up again once.
+    fn run<R>(
+        &self,
+        id: &str,
+        f: impl Fn(&Source, &Arc<dyn CameraControls>) -> Result<R, ControlError>,
+    ) -> Result<R, String> {
+        let mut last = String::new();
+        for attempt in 0..2 {
+            let (src, dev) = self.device(id)?;
+            let call = Call::begin(&self.calls);
+            let result = f(&src, &dev);
+            if let Source::Lease = src {
+                // The idle time counts from the end of the call.
+                if let Some(l) = lock(&self.lease).as_mut() {
+                    l.last_used = Instant::now();
+                }
+            }
+            drop(call);
+            match result {
+                Ok(r) => return Ok(r),
+                Err(e @ ControlError::Capture(_)) => {
+                    last = e.to_string();
+                    if let Source::Lease = src {
+                        // A broken lease is not worth keeping.
+                        self.release_lease();
+                    }
+                    if attempt == 0 {
+                        std::thread::sleep(Duration::from_millis(60));
+                    }
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        Err(last)
+    }
+
+    // ---- the three commands
+
+    /// `get_camera_controls`.
+    pub fn get(&self, id: &str) -> Result<Vec<ControlInfoDto>, String> {
+        let infos = self.run(id, |src, dev| {
+            let infos = dev.read_all()?;
+            if let Source::Engine(t) = src {
+                self.set_last(*t, infos.clone());
+            }
+            Ok(infos)
+        })?;
+        Ok(dtos(&infos))
+    }
+
+    /// `set_camera_control`: Auto on (`auto`), or a manual `value` (clamped to the device's range). Returns the
+    /// control as the device reports it. The record follows.
+    pub fn set(
+        &self,
+        id: &str,
+        key: &str,
+        value: i32,
+        auto: bool,
+    ) -> Result<ControlInfoDto, String> {
+        let key = ControlKey::from_key(key).ok_or_else(|| format!("unknown control '{key}'"))?;
+        let _gate = lock(&self.gate);
+        let info = self.run(id, |src, dev| {
+            let info = if auto {
+                dev.set_auto(key, true)?
+            } else {
+                dev.set_value(key, value)?
+            };
+            if let Source::Engine(t) = src {
+                self.update_last(*t, &info);
+            }
+            Ok(info)
+        })?;
+        self.note(id, &info);
+        Ok(ControlInfoDto::from(&info))
+    }
+
+    /// `reset_camera_controls`: every control back to the device's default (its default value, and Auto on where
+    /// the device has Auto). The record for the camera is cleared.
+    pub fn reset(&self, id: &str) -> Result<Vec<ControlInfoDto>, String> {
+        let _gate = lock(&self.gate);
+        let infos = self.run(id, |src, dev| {
+            for i in dev.read_all()? {
+                if i.auto == i.can_auto && i.value == i.default {
+                    continue;
+                }
+                if i.can_manual && (i.value != i.default || i.auto) {
+                    dev.set_value(i.key, i.default)?;
+                }
+                if i.can_auto {
+                    dev.set_auto(i.key, true)?;
+                }
+            }
+            let infos = dev.read_all()?;
+            if let Source::Engine(t) = src {
+                self.set_last(*t, infos.clone());
+            }
+            Ok(infos)
+        })?;
+        self.with_record(id, |r| r.controls.clear());
+        Ok(dtos(&infos))
+    }
+
+    // ---- the poller
+
+    /// Re-read the engine camera's controls that are on Auto; `None` when no camera is open or nothing is on Auto.
+    /// The payload is the whole list, as `controls-changed` carries it. One control at a time, so a write that comes
+    /// in waits for one read, not for all.
+    pub fn poll(&self) -> Option<Vec<ControlInfoDto>> {
+        let (token, device, auto_keys) = {
+            let g = lock(&self.attached);
+            let a = g.as_ref()?;
+            let keys: Vec<ControlKey> = a.last.iter().filter(|i| i.auto).map(|i| i.key).collect();
+            (a.token, a.device.clone(), keys)
+        };
+        if auto_keys.is_empty() {
+            return None;
+        }
+        for key in auto_keys {
+            if let Ok(Some(info)) = device.read(key) {
+                self.update_last(token, &info);
+            }
+        }
+        let g = lock(&self.attached);
+        let a = g.as_ref().filter(|a| a.token == token)?;
+        Some(dtos(&a.last))
+    }
+}
+
+/// Lets a re-apply stop at the next control once the camera is closing.
+struct Cancellable<'a> {
+    inner: &'a dyn CameraControls,
+    cancel: &'a AtomicBool,
+}
+
+impl Cancellable<'_> {
+    fn check(&self) -> Result<(), ControlError> {
+        if self.cancel.load(Ordering::Acquire) {
+            Err(ControlError::Capture(CaptureError::Timeout(
+                "the camera is closing",
+            )))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl ControlDevice for Cancellable<'_> {
+    fn read(&self, key: ControlKey) -> Result<Option<ControlInfo>, ControlError> {
+        self.check()?;
+        self.inner.read(key)
+    }
+    fn set_auto(&self, key: ControlKey, auto: bool) -> Result<ControlInfo, ControlError> {
+        self.check()?;
+        self.inner.set_auto(key, auto)
+    }
+    fn set_value(&self, key: ControlKey, value: i32) -> Result<ControlInfo, ControlError> {
+        self.check()?;
+        self.inner.set_value(key, value)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod fake {
+    //! A camera with controls that lives in memory.
+    use super::*;
+
+    /// Behaves like a device: `set_value` clamps and switches to manual, `set_auto` flips the flag. Every call that
+    /// writes is logged as `auto:<key>:<on>` or `value:<key>:<v>`.
+    pub struct FakeControls {
+        pub state: Mutex<Vec<ControlInfo>>,
+        pub log: Mutex<Vec<String>>,
+        pub fail: AtomicBool,
+    }
+
+    pub fn info(key: ControlKey, min: i32, max: i32, def: i32, can_auto: bool) -> ControlInfo {
+        ControlInfo {
+            key,
+            min,
+            max,
+            step: 1,
+            default: def,
+            value: def,
+            can_auto,
+            can_manual: true,
+            auto: can_auto,
+            path: crate::capture::controls::AccessPath::Ks,
+        }
+    }
+
+    /// Brightness, gain, exposure (Auto) and focus (Auto): enough to see the order.
+    pub fn camera() -> Arc<FakeControls> {
+        Arc::new(FakeControls {
+            state: Mutex::new(vec![
+                info(ControlKey::Brightness, -64, 64, 0, false),
+                info(ControlKey::Gain, 0, 100, 10, false),
+                info(ControlKey::Exposure, -13, -1, -6, true),
+                info(ControlKey::Focus, 1, 1023, 500, true),
+            ]),
+            log: Mutex::new(Vec::new()),
+            fail: AtomicBool::new(false),
+        })
+    }
+
+    impl FakeControls {
+        /// The camera was closed and opened: every control is back at its default, on Auto where it has Auto.
+        pub fn forget(&self) {
+            for i in lock(&self.state).iter_mut() {
+                i.value = i.default;
+                i.auto = i.can_auto;
+            }
+            lock(&self.log).clear();
+        }
+        pub fn log(&self) -> Vec<String> {
+            lock(&self.log).clone()
+        }
+        pub fn clear_log(&self) {
+            lock(&self.log).clear();
+        }
+        pub fn get(&self, key: ControlKey) -> ControlInfo {
+            lock(&self.state)
+                .iter()
+                .find(|i| i.key == key)
+                .unwrap()
+                .clone()
+        }
+        fn broken(&self) -> Result<(), ControlError> {
+            if self.fail.load(Ordering::SeqCst) {
+                Err(ControlError::Capture(CaptureError::Timeout("fake failure")))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl ControlDevice for FakeControls {
+        fn read(&self, key: ControlKey) -> Result<Option<ControlInfo>, ControlError> {
+            self.broken()?;
+            Ok(lock(&self.state).iter().find(|i| i.key == key).cloned())
+        }
+        fn set_auto(&self, key: ControlKey, auto: bool) -> Result<ControlInfo, ControlError> {
+            self.broken()?;
+            let mut s = lock(&self.state);
+            let i = s
+                .iter_mut()
+                .find(|i| i.key == key)
+                .ok_or(ControlError::NotSupported(key))?;
+            if i.auto == auto {
+                return Ok(i.clone());
+            }
+            if auto && !i.can_auto {
+                return Err(ControlError::AutoNotSupported(key));
+            }
+            i.auto = auto;
+            lock(&self.log).push(format!("auto:{}:{auto}", key.key()));
+            Ok(i.clone())
+        }
+        fn set_value(&self, key: ControlKey, value: i32) -> Result<ControlInfo, ControlError> {
+            self.broken()?;
+            let mut s = lock(&self.state);
+            let i = s
+                .iter_mut()
+                .find(|i| i.key == key)
+                .ok_or(ControlError::NotSupported(key))?;
+            i.value = i.clamp(value);
+            i.auto = false;
+            lock(&self.log).push(format!("value:{}:{}", key.key(), i.value));
+            Ok(i.clone())
+        }
+    }
+
+    impl CameraControls for FakeControls {
+        fn read_all(&self) -> Result<Vec<ControlInfo>, ControlError> {
+            self.broken()?;
+            Ok(lock(&self.state).clone())
+        }
+    }
+
+    /// Opens leases on one fake camera and counts opens and closes.
+    pub struct FakeOpener {
+        pub camera: Arc<FakeControls>,
+        pub link: String,
+        pub opened: Arc<AtomicU64>,
+        pub closed: Arc<AtomicU64>,
+    }
+
+    impl ControlsOpener for FakeOpener {
+        fn key_of(&self, link: &str) -> Option<DeviceKey> {
+            Some(DeviceKey::new(link, "W4GS"))
+        }
+
+        fn open(&self, id: &str) -> Result<Leased, String> {
+            if !same_camera(&self.link, id) {
+                return Err("camera not found".into());
+            }
+            self.opened.fetch_add(1, Ordering::SeqCst);
+            let closed = self.closed.clone();
+            Ok(Leased {
+                link: self.link.clone(),
+                device: self.camera.clone(),
+                close: Box::new(move || {
+                    closed.fetch_add(1, Ordering::SeqCst);
+                }),
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fake::*;
+    use super::*;
+    use serde_json::json;
+
+    const LINK: &str = "\\\\?\\usb#vid_0c45&pid_636d&mi_00#9&3171a958&0&0000#{e5323777-f976-4f5b-9b55-b94699c46e44}\\global";
+    const LINK_MOVED: &str = "\\\\?\\usb#vid_0c45&pid_636d&mi_00#6&bbbb&0&0001#{e5323777-f976-4f5b-9b55-b94699c46e44}\\global";
+    const OTHER: &str = "\\\\?\\usb#vid_046d&pid_085e&mi_00#6&aaaa&0&0003#{e5323777-f976-4f5b-9b55-b94699c46e44}\\global";
+
+    fn hub() -> (
+        ControlsHub,
+        Arc<FakeControls>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+    ) {
+        let camera = camera();
+        let (opened, closed) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let hub = ControlsHub::new(Arc::new(FakeOpener {
+            camera: camera.clone(),
+            link: LINK.into(),
+            opened: opened.clone(),
+            closed: closed.clone(),
+        }));
+        (hub, camera, opened, closed)
+    }
+
+    fn record(entries: Value) -> ControlSnapshot {
+        parse_record(Some(
+            &json!({ "id": LINK, "name": "W4GS", "controls": entries }),
+        ))
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn the_record_arrives_as_the_frontend_stores_it() {
+        let r = record(json!({
+            "gain": { "value": 40, "auto": false },
+            "focus": { "value": 300, "auto": true },
+            "brightness": { "value": 12 },
+            "nonsense": { "value": 1 },
+            "contrast": {}
+        }));
+        assert_eq!(r.device.name, "W4GS");
+        assert_eq!(r.device.vid_pid.as_deref(), Some("vid_0c45&pid_636d"));
+        // in the order of plan 6.2, unknown and empty entries gone, a control on Auto keeps no value
+        let keys: Vec<_> = r.controls.iter().map(|c| c.key).collect();
+        assert_eq!(
+            keys,
+            [ControlKey::Brightness, ControlKey::Gain, ControlKey::Focus]
+        );
+        assert_eq!(r.get(ControlKey::Focus).unwrap().value, None);
+        assert_eq!(r.get(ControlKey::Gain).unwrap().auto, Some(false));
+        assert_eq!(r.get(ControlKey::Brightness).unwrap().auto, None);
+
+        assert_eq!(parse_record(None).unwrap(), None);
+        assert_eq!(parse_record(Some(&Value::Null)).unwrap(), None);
+        assert!(parse_record(Some(&json!({ "name": "no id" }))).is_err());
+        assert!(parse_record(Some(&json!("text"))).is_err());
+    }
+
+    #[test]
+    fn a_record_follows_its_camera_to_another_port() {
+        let rec = DeviceKey::new(LINK, "W4GS");
+        // same link (also written differently): no lookup at all
+        assert_eq!(
+            record_applies(&rec, &LINK.to_uppercase(), || panic!("no lookup needed")),
+            Some(KeyMatch::Exact)
+        );
+        // another port: the same vid/pid and name
+        let moved = DeviceKey::new(LINK_MOVED, "w4gs");
+        assert_eq!(
+            record_applies(&rec, LINK_MOVED, || Some(moved.clone())),
+            Some(KeyMatch::Fallback)
+        );
+        // the same vid/pid but another name is another camera
+        let other_name = DeviceKey::new(LINK_MOVED, "Other cam");
+        assert_eq!(record_applies(&rec, LINK_MOVED, || Some(other_name)), None);
+        // another model: no lookup
+        assert_eq!(
+            record_applies(&rec, OTHER, || panic!("no lookup needed")),
+            None
+        );
+        // a camera that cannot be found
+        assert_eq!(record_applies(&rec, LINK_MOVED, || None), None);
+
+        assert!(same_camera(LINK, LINK_MOVED));
+        assert!(!same_camera(LINK, OTHER));
+    }
+
+    #[test]
+    fn a_reopen_applies_auto_flags_then_values() {
+        let (hub, cam, ..) = hub();
+        hub.set_record(Some(record(json!({
+            "gain": { "value": 40, "auto": false },
+            "exposure": { "value": -3, "auto": false },
+            "focus": { "value": 0, "auto": true },
+            "brightness": { "value": 25, "auto": false }
+        }))));
+        // the device forgot everything: exposure is on Auto, focus on Auto
+        let dev: Arc<dyn CameraControls> = cam.clone();
+        let cancel = AtomicBool::new(false);
+        let token = hub.attach(LINK, dev.clone());
+        let (report, infos) = hub.apply_on_open(token, LINK, &dev, &cancel).unwrap();
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        // Auto flags first (in plan order), then the manual values (in plan order)
+        assert_eq!(
+            cam.log(),
+            [
+                "auto:exposure:false",
+                "value:brightness:25",
+                "value:gain:40",
+                "value:exposure:-3"
+            ]
+        );
+        assert_eq!(cam.get(ControlKey::Exposure).value, -3);
+        assert!(cam.get(ControlKey::Focus).auto);
+        // the state read afterwards is what the event carries
+        assert_eq!(infos.len(), 4);
+        assert_eq!(
+            infos
+                .iter()
+                .find(|i| i.key == ControlKey::Gain)
+                .unwrap()
+                .value,
+            40
+        );
+
+        // a record for another camera is not applied
+        cam.clear_log();
+        hub.set_record(Some(
+            parse_record(Some(&json!({"id": OTHER, "name": "Other", "controls": {"gain": {"value": 99, "auto": false}}})))
+                .unwrap()
+                .unwrap(),
+        ));
+        hub.apply_on_open(token, LINK, &dev, &cancel).unwrap();
+        assert!(cam.log().is_empty());
+        // a closing camera stops the writes
+        hub.set_record(Some(record(
+            json!({ "gain": { "value": 7, "auto": false } }),
+        )));
+        cancel.store(true, Ordering::SeqCst);
+        let (report, _) = hub.apply_on_open(token, LINK, &dev, &cancel).unwrap();
+        assert!(cam.log().is_empty());
+        assert_eq!(report.skipped.len(), 1);
+    }
+
+    #[test]
+    fn a_record_applies_after_the_camera_moved_to_another_port() {
+        let (hub, cam, ..) = hub();
+        hub.set_record(Some(record(
+            json!({ "gain": { "value": 40, "auto": false } }),
+        )));
+        let dev: Arc<dyn CameraControls> = cam.clone();
+        let token = hub.attach(LINK_MOVED, dev.clone());
+        hub.apply_on_open(token, LINK_MOVED, &dev, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(cam.log(), ["value:gain:40"]);
+        // the record names the new link from now on
+        assert_eq!(hub.record().unwrap().device.symbolic_link, LINK_MOVED);
+    }
+
+    #[test]
+    fn set_writes_and_records_what_differs_from_the_default() {
+        let (hub, cam, ..) = hub();
+        hub.set_record(Some(record(json!({}))));
+
+        let r = hub.set(LINK, "brightness", 30, false).unwrap();
+        assert_eq!(
+            (r.key, r.value, r.auto),
+            (ControlKey::Brightness, 30, false)
+        );
+        // values are clamped by the device
+        assert_eq!(hub.set(LINK, "brightness", 1000, false).unwrap().value, 64);
+        // exposure to manual with a value
+        let e = hub.set(LINK, "exposure", -4, false).unwrap();
+        assert!(!e.auto && e.value == -4 && e.can_auto);
+        // Auto on for focus changes nothing in the record (it is the default state)
+        hub.set(LINK, "focus", 0, true).unwrap();
+
+        let rec = hub.record().unwrap();
+        assert_eq!(rec.get(ControlKey::Brightness).unwrap().value, Some(64));
+        assert_eq!(rec.get(ControlKey::Brightness).unwrap().auto, None);
+        let ex = rec.get(ControlKey::Exposure).unwrap();
+        assert_eq!((ex.auto, ex.value), (Some(false), Some(-4)));
+        assert!(rec.get(ControlKey::Focus).is_none());
+
+        // back to the device's own state: forgotten
+        hub.set(LINK, "brightness", 0, false).unwrap();
+        hub.set(LINK, "exposure", 0, true).unwrap();
+        let rec = hub.record().unwrap();
+        assert!(rec.get(ControlKey::Brightness).is_none());
+        assert_eq!(
+            rec.get(ControlKey::Exposure).and_then(|c| c.auto),
+            None,
+            "Auto on is the device default"
+        );
+
+        // errors are strings for the frontend
+        assert!(hub
+            .set(LINK, "pan", 0, false)
+            .unwrap_err()
+            .contains("not supported"));
+        assert!(hub
+            .set(LINK, "nonsense", 0, false)
+            .unwrap_err()
+            .contains("unknown control"));
+        assert!(hub.set(LINK, "gain", 0, true).unwrap_err().contains("Auto"));
+        assert!(hub.set(OTHER, "gain", 5, false).is_err());
+        let _ = cam;
+    }
+
+    #[test]
+    fn reset_returns_the_device_defaults_and_clears_the_record() {
+        let (hub, cam, ..) = hub();
+        hub.set_record(Some(record(json!({}))));
+        hub.set(LINK, "brightness", 50, false).unwrap();
+        hub.set(LINK, "gain", 70, false).unwrap();
+        hub.set(LINK, "exposure", -2, false).unwrap();
+        hub.set(LINK, "focus", 900, false).unwrap();
+        assert_eq!(hub.record().unwrap().controls.len(), 4);
+
+        let all = hub.reset(LINK).unwrap();
+        assert_eq!(all.len(), 4);
+        for i in &all {
+            let c = cam.get(i.key);
+            assert_eq!(i.value, c.value);
+            assert_eq!(i.auto, c.can_auto, "{} is on Auto where it has Auto", i.key);
+            if !i.auto {
+                assert_eq!(i.value, i.def, "{}", i.key);
+            }
+        }
+        // Auto controls had their default value written first, so the manual fallback is the default too
+        assert_eq!(cam.get(ControlKey::Exposure).value, -6);
+        assert_eq!(cam.get(ControlKey::Focus).value, 500);
+        assert!(
+            hub.record().unwrap().is_empty(),
+            "the stored record is empty"
+        );
+        // the camera is at its defaults: a second reset writes nothing
+        cam.clear_log();
+        hub.reset(LINK).unwrap();
+        assert!(cam.log().is_empty());
+    }
+
+    #[test]
+    fn the_camera_is_opened_once_for_a_run_of_calls_and_closed_when_idle() {
+        let (hub, _cam, opened, closed) = hub();
+        for v in 0..10 {
+            hub.set(LINK, "gain", v, false).unwrap();
+        }
+        assert_eq!(opened.load(Ordering::SeqCst), 1, "one open for ten writes");
+        assert!(hub.has_lease());
+        hub.expire_lease();
+        assert!(hub.has_lease(), "not idle yet");
+        // the engine wants the camera
+        hub.release_lease();
+        assert!(!hub.has_lease());
+        assert_eq!(closed.load(Ordering::SeqCst), 1);
+        // and the next call opens it again
+        hub.get(LINK).unwrap();
+        assert_eq!(opened.load(Ordering::SeqCst), 2);
+        // an unknown camera is an error, not a panic
+        assert!(hub.get(OTHER).is_err());
+        assert!(
+            !hub.has_lease(),
+            "a camera that cannot be opened leaves no lease"
+        );
+    }
+
+    #[test]
+    fn an_idle_lease_closes_but_not_during_a_call() {
+        let camera = camera();
+        let closed = Arc::new(AtomicU64::new(0));
+        let hub = ControlsHub::new(Arc::new(FakeOpener {
+            camera,
+            link: LINK.into(),
+            opened: Default::default(),
+            closed: closed.clone(),
+        }))
+        .with_lease_idle(Duration::from_millis(30));
+        hub.get(LINK).unwrap();
+        // a long call (Reset all with slow first writes) is running: the lease stays
+        let call = Call::begin(&hub.calls);
+        std::thread::sleep(Duration::from_millis(60));
+        hub.expire_lease();
+        assert!(hub.has_lease());
+        assert_eq!(closed.load(Ordering::SeqCst), 0);
+        drop(call);
+        // the idle time counts from the end of the last call, then the lease closes
+        std::thread::sleep(Duration::from_millis(60));
+        hub.expire_lease();
+        assert!(!hub.has_lease());
+        assert_eq!(closed.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn calls_use_the_engines_camera_while_it_is_open() {
+        let (hub, cam, opened, _closed) = hub();
+        let dev: Arc<dyn CameraControls> = cam.clone();
+        let token = hub.attach(LINK_MOVED, dev.clone());
+        hub.set(LINK, "gain", 33, false).unwrap();
+        assert_eq!(
+            opened.load(Ordering::SeqCst),
+            0,
+            "no second open of the camera"
+        );
+        // the poller sees what is on Auto after a full read
+        assert!(hub.poll().is_none(), "nothing read yet");
+        hub.get(LINK).unwrap();
+        let polled = hub.poll().expect("exposure and focus are on Auto");
+        assert_eq!(polled.len(), 4);
+        // the device moves the lens: the poll sees it
+        lock(&cam.state)
+            .iter_mut()
+            .find(|i| i.key == ControlKey::Focus)
+            .unwrap()
+            .value = 321;
+        let polled = hub.poll().unwrap();
+        assert_eq!(
+            polled
+                .iter()
+                .find(|i| i.key == ControlKey::Focus)
+                .unwrap()
+                .value,
+            321
+        );
+        // nothing on Auto: nothing to poll
+        hub.set(LINK, "focus", 321, false).unwrap();
+        hub.set(LINK, "exposure", -5, false).unwrap();
+        assert!(hub.poll().is_none());
+        hub.detach(token);
+        assert!(hub.poll().is_none());
+        // after the camera closes the calls go to a lease again
+        hub.set(LINK, "gain", 1, false).unwrap();
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_device_error_reaches_the_caller_and_drops_the_lease() {
+        let (hub, cam, _opened, closed) = hub();
+        hub.get(LINK).unwrap();
+        cam.fail.store(true, Ordering::SeqCst);
+        let err = hub.set(LINK, "gain", 5, false).unwrap_err();
+        assert!(!err.is_empty());
+        assert!(!hub.has_lease());
+        assert!(closed.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn the_payload_has_the_shape_of_plan_5_5() {
+        let i = fake::info(ControlKey::WhiteBalance, 2800, 6500, 4600, true);
+        let v = serde_json::to_value(ControlInfoDto::from(&i)).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "key": "white_balance", "min": 2800, "max": 6500, "step": 1, "def": 4600,
+                "value": 4600, "auto": true, "can_auto": true, "can_manual": true
+            })
+        );
+        let list = serde_json::to_value(dtos(&[i])).unwrap();
+        assert!(list.as_array().is_some_and(|a| a.len() == 1));
+    }
+}

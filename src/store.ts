@@ -5,19 +5,33 @@ import { normalizeChain, signature } from "./filters/chain";
 import {
   DEFAULT_OUTPUT,
   DEFAULT_SOURCE,
+  normalizeControls,
   normalizeOutput,
   normalizeSource,
   repairSource,
+  controlsRecord,
+  findCamera,
+  forgetControls,
+  rememberControl,
+  sortControls,
   type CameraInfo,
+  type ControlInfo,
+  type ControlKey,
   type OutputCfg,
   type SourceCfg,
+  type StoredControls,
 } from "./camera/schema";
 
 const STORAGE_KEY = "better-cam";
 
+/** `npm run tauri dev` (the Vite dev server); false in a release build. The project has no `vite/client` types. */
+const IS_DEV_BUILD = (import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV === true;
+
 interface Saved {
   source: SourceCfg;
   output: OutputCfg;
+  /** Only the camera controls the user changed, per camera. Re-applied by the engine on every open. */
+  controls: StoredControls;
   chain: FilterCfg[];
   closeToTray: boolean;
   /** Whether the "launch on startup" default has been applied once; after that the OS entry is the truth. */
@@ -27,6 +41,8 @@ interface Saved {
   presetBaseline: string | null;
   /** Whether the engine was running when the app last ran, so the next launch starts it again. */
   wasRunning: boolean;
+  /** The live preview in the window; off saves the IPC and the CPU it costs. */
+  previewOn: boolean;
 }
 
 /** What "Undo" restores after loading a preset or resetting. */
@@ -49,12 +65,14 @@ const loadSaved = (): Saved => {
   const fresh: Saved = {
     source: DEFAULT_SOURCE,
     output: DEFAULT_OUTPUT,
+    controls: {},
     chain: defaultChain(),
     closeToTray: false,
     autostartDefaulted: false,
     activePreset: null,
     presetBaseline: null,
     wasRunning: false,
+    previewOn: true,
   };
   try {
     const s = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "");
@@ -62,12 +80,14 @@ const loadSaved = (): Saved => {
       return {
         source: normalizeSource(s.source),
         output: normalizeOutput(s.output),
+        controls: normalizeControls(s.controls),
         chain: Array.isArray(s.chain) ? normalizeChain(s.chain) : fresh.chain,
         closeToTray: s.closeToTray === true,
         autostartDefaulted: s.autostartDefaulted === true,
         activePreset: typeof s.activePreset === "string" ? s.activePreset : null,
         presetBaseline: typeof s.presetBaseline === "string" ? s.presetBaseline : null,
         wasRunning: s.wasRunning === true,
+        previewOn: s.previewOn !== false,
       };
     }
   } catch {
@@ -93,9 +113,23 @@ interface State extends Saved {
   undo: Snapshot | null;
   collapsed: Record<string, boolean>;
   presets: string[];
+  /** What the selected camera's controls say now; `null` until they were read. */
+  controlInfos: ControlInfo[] | null;
+  /** The camera `controlInfos` belong to. */
+  controlsFor: string | null;
+  controlsError: string | null;
+  /** Reset all is running. */
+  controlsResetting: boolean;
 
   init: () => Promise<void>;
   refreshCameras: () => Promise<void>;
+  /** Reads the selected camera's controls (from the open camera, else by opening the device for a moment). */
+  refreshControls: () => Promise<void>;
+  /** A manual value (the control leaves Auto), or the Auto flag alone. Applied at once, at most ~20 writes a second per control. */
+  setControl: (key: ControlKey, patch: { value?: number; auto?: boolean }) => void;
+  /** One control back to the device's default (Auto on where it has Auto). */
+  resetControl: (key: ControlKey) => void;
+  resetAllControls: () => Promise<void>;
   /** Changes camera settings (repaired against the device), persists them and, while running, sends them at once. */
   patchSource: (patch: Partial<SourceCfg>) => void;
   patchOutput: (patch: Partial<OutputCfg>) => void;
@@ -105,6 +139,7 @@ interface State extends Saved {
   togglePause: () => void;
   setAutostart: (on: boolean) => Promise<void>;
   setCloseToTray: (on: boolean) => void;
+  setPreviewOn: (on: boolean) => void;
   dismissError: () => void;
   dismissNotice: () => void;
   undoChain: () => void;
@@ -128,10 +163,10 @@ interface State extends Saved {
 
 export const useStore = create<State>((set, get) => {
   const persist = () => {
-    const { source, output, chain, closeToTray, autostartDefaulted, activePreset, presetBaseline, wasRunning } = get();
+    const { source, output, controls, chain, closeToTray, autostartDefaulted, activePreset, presetBaseline, wasRunning, previewOn } = get();
     localStorage.setItem(
       STORAGE_KEY,
-      JSON.stringify({ source, output, chain, closeToTray, autostartDefaulted, activePreset, presetBaseline, wasRunning }),
+      JSON.stringify({ source, output, controls, chain, closeToTray, autostartDefaulted, activePreset, presetBaseline, wasRunning, previewOn }),
     );
   };
 
@@ -157,8 +192,14 @@ export const useStore = create<State>((set, get) => {
   };
 
   const running = () => isRunning(get().engine);
+  /** The camera the saved source names, among the connected ones. */
+  const selectedCam = () => {
+    const { cameras, source } = get();
+    return cameras ? findCamera(cameras, source.video_device_id) : null;
+  };
+  const record = () => controlsRecord(get().controls, selectedCam());
   const pushSource = () => {
-    if (running()) api.setSource(get().source).catch(fail);
+    if (running()) api.setSource(get().source, record()).catch(fail);
   };
   const pushOutput = () => {
     if (running()) api.setOutput(get().output).catch(fail);
@@ -186,7 +227,7 @@ export const useStore = create<State>((set, get) => {
   const begin = async (): Promise<boolean> => {
     const { source, output, chain } = get();
     try {
-      await api.startEngine(source, output, chain);
+      await api.startEngine(source, output, chain, record());
       // The events may already have said more than "standby"; only fill in when they have not.
       if (!running()) set({ engine: { state: "standby", reason: "opening" } });
       set({ error: null, paused: false, wasRunning: true });
@@ -196,6 +237,79 @@ export const useStore = create<State>((set, get) => {
       fail(e);
       return false;
     }
+  };
+
+  // ---- camera controls: each control has a small queue so a drag sends at most ~20 writes a second, never piles up
+  // behind a slow one (the first write to white balance, focus or exposure takes up to 700 ms), and always ends with
+  // the value the slider stopped at.
+  const CONTROL_GAP_MS = 50;
+  interface Step {
+    id: string;
+    value: number;
+    auto: boolean;
+  }
+  interface Pump {
+    pending: Step[];
+    busy: Promise<void> | null;
+    last: number;
+    timer?: ReturnType<typeof setTimeout>;
+  }
+  const pumps = new Map<ControlKey, Pump>();
+  let controlsSeq = 0;
+
+  const pumpOf = (key: ControlKey): Pump => {
+    let p = pumps.get(key);
+    if (!p) pumps.set(key, (p = { pending: [], busy: null, last: 0 }));
+    return p;
+  };
+  const queued = (key: ControlKey) => {
+    const p = pumps.get(key);
+    return !!p && (p.busy !== null || p.pending.length > 0);
+  };
+  const putControl = (info: ControlInfo) =>
+    set((s) => (s.controlInfos ? { controlInfos: s.controlInfos.map((i) => (i.key === info.key ? info : i)) } : {}));
+
+  /** Sends the next queued step of `key` when the previous one is done and the gap has passed. */
+  const drain = (key: ControlKey) => {
+    const p = pumpOf(key);
+    if (p.busy || p.pending.length === 0 || p.timer !== undefined) return;
+    const wait = CONTROL_GAP_MS - (performance.now() - p.last);
+    if (wait > 0) {
+      p.timer = setTimeout(() => {
+        p.timer = undefined;
+        drain(key);
+      }, wait);
+      return;
+    }
+    const step = p.pending.shift()!;
+    p.last = performance.now();
+    p.busy = api
+      .setCameraControl(step.id, key, step.value, step.auto)
+      .then((info) => {
+        if (p.pending.length === 0 && get().controlsFor === step.id) putControl(info);
+      })
+      .catch((e) => {
+        p.pending = [];
+        say(`${key.replace(/_/g, " ")}: ${String(e)}`);
+        void get().refreshControls();
+      })
+      .finally(() => {
+        p.busy = null;
+        drain(key);
+      });
+  };
+
+  /** Queues steps for `key`; steps that were not sent yet are replaced (the newest slider position wins). */
+  const queueControl = (key: ControlKey, id: string, steps: Omit<Step, "id">[]) => {
+    pumpOf(key).pending = steps.map((s) => ({ ...s, id }));
+    drain(key);
+  };
+
+  /** Shows `info` for its control now and stores it when it differs from the device's own state. */
+  const showControl = (cam: { id: string; name: string }, info: ControlInfo) => {
+    putControl(info);
+    set({ controls: rememberControl(get().controls, cam, info) });
+    persist();
   };
 
   const finish = async () => {
@@ -221,6 +335,10 @@ export const useStore = create<State>((set, get) => {
     undo: null,
     collapsed: {},
     presets: [],
+    controlInfos: null,
+    controlsFor: null,
+    controlsError: null,
+    controlsResetting: false,
 
     init: async () => {
       await api.onEngineState((e) => {
@@ -235,6 +353,12 @@ export const useStore = create<State>((set, get) => {
       });
       await api.onStats((stats) => useStats.setState({ stats }));
       await api.onDevicesChanged(() => void get().refreshCameras());
+      await api.onControlsChanged((infos) => {
+        // The values the device reports now: a control that has writes waiting keeps what the user set.
+        const cur = get().controlInfos;
+        const next = sortControls(infos).map((i) => (queued(i.key) ? (cur?.find((c) => c.key === i.key) ?? i) : i));
+        if (JSON.stringify(next) !== JSON.stringify(cur)) set({ controlInfos: next, controlsFor: selectedCam()?.id ?? get().controlsFor });
+      });
       await Promise.all([get().refreshCameras(), get().refreshPresets()]).catch(fail);
 
       // Work out which saved preset (if any) the restored chain still matches, so the toolbar shows the right name.
@@ -253,7 +377,9 @@ export const useStore = create<State>((set, get) => {
       persist();
 
       try {
-        if (!get().autostartDefaulted) {
+        // Release builds start with Windows by default. A dev build is not installed anywhere, and its Run entry would
+        // launch `target\debug\better-cam.exe` at login without the dev server: it stays off unless set by hand.
+        if (!get().autostartDefaulted && !IS_DEV_BUILD) {
           await api.setAutostart(true);
           set({ autostartDefaulted: true });
           persist();
@@ -293,6 +419,66 @@ export const useStore = create<State>((set, get) => {
         listing = null;
       });
       return listing;
+    },
+
+    refreshControls: async () => {
+      const cam = selectedCam();
+      const seq = ++controlsSeq;
+      if (!cam) {
+        set({ controlInfos: null, controlsFor: null, controlsError: null });
+        return;
+      }
+      if (get().controlsFor !== cam.id) set({ controlInfos: null, controlsFor: cam.id, controlsError: null });
+      try {
+        const infos = await api.getCameraControls(cam.id);
+        if (seq === controlsSeq) set({ controlInfos: sortControls(infos), controlsError: null });
+      } catch (e) {
+        if (seq === controlsSeq) set({ controlInfos: [], controlsError: String(e) });
+      }
+    },
+
+    setControl: (key, patch) => {
+      const cam = selectedCam();
+      const info = get().controlInfos?.find((i) => i.key === key);
+      if (!cam || !info || get().controlsFor !== cam.id) return;
+      const value = patch.value === undefined ? info.value : Math.min(info.max, Math.max(info.min, Math.round(patch.value)));
+      const auto = patch.auto ?? (patch.value === undefined ? info.auto : false);
+      if (value === info.value && auto === info.auto) return;
+      showControl(cam, { ...info, value, auto });
+      queueControl(key, cam.id, [{ value, auto }]);
+    },
+
+    resetControl: (key) => {
+      const cam = selectedCam();
+      const info = get().controlInfos?.find((i) => i.key === key);
+      if (!cam || !info || get().controlsFor !== cam.id) return;
+      showControl(cam, { ...info, value: info.def, auto: info.can_auto });
+      // The device's default value first, so the manual value behind an Auto control is the default too, then Auto.
+      queueControl(key, cam.id, [{ value: info.def, auto: false }, ...(info.can_auto ? [{ value: info.def, auto: true }] : [])]);
+    },
+
+    resetAllControls: async () => {
+      const cam = selectedCam();
+      if (!cam || get().controlsResetting) return;
+      set({ controlsResetting: true });
+      try {
+        for (const p of pumps.values()) {
+          p.pending = [];
+          clearTimeout(p.timer);
+          p.timer = undefined;
+        }
+        await Promise.all([...pumps.values()].map((p) => p.busy));
+        set({ controls: forgetControls(get().controls, cam) });
+        persist();
+        const infos = await api.resetCameraControls(cam.id);
+        if (get().controlsFor === cam.id) set({ controlInfos: sortControls(infos), controlsError: null });
+        say("Camera controls reset to the device defaults");
+      } catch (e) {
+        say(`Reset failed: ${String(e)}`);
+        void get().refreshControls();
+      } finally {
+        set({ controlsResetting: false });
+      }
     },
 
     patchSource: (patch) => {
@@ -345,6 +531,11 @@ export const useStore = create<State>((set, get) => {
       set({ closeToTray });
       persist();
       api.setCloseToTray(closeToTray).catch(fail);
+    },
+
+    setPreviewOn: (previewOn) => {
+      set({ previewOn });
+      persist();
     },
 
     dismissError: () => set({ error: null, notice: null, undo: null }),

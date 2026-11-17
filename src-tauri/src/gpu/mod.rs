@@ -13,6 +13,7 @@
 //! Threading: all draw calls belong on one render thread; the shader cache and the texture pool are thread safe.
 
 pub mod convert;
+pub mod downscale;
 pub mod output;
 pub mod pattern;
 #[cfg(test)]
@@ -285,10 +286,11 @@ pub enum ShaderId {
     EncodeNv12,
     EncodeBgra,
     OutputFit,
+    PreviewDown,
 }
 
 impl ShaderId {
-    pub const ALL: [ShaderId; 9] = [
+    pub const ALL: [ShaderId; 10] = [
         ShaderId::FullscreenVs,
         ShaderId::ConvertNv12,
         ShaderId::ConvertP010,
@@ -298,6 +300,7 @@ impl ShaderId {
         ShaderId::EncodeNv12,
         ShaderId::EncodeBgra,
         ShaderId::OutputFit,
+        ShaderId::PreviewDown,
     ];
 
     pub fn name(self) -> &'static str {
@@ -311,6 +314,7 @@ impl ShaderId {
             ShaderId::EncodeNv12 => "encode_nv12",
             ShaderId::EncodeBgra => "encode_bgra",
             ShaderId::OutputFit => "output_fit",
+            ShaderId::PreviewDown => "preview_down",
         }
     }
 
@@ -327,6 +331,7 @@ impl ShaderId {
             ShaderId::EncodeNv12 => include_str!("shaders/encode_nv12.hlsl"),
             ShaderId::EncodeBgra => include_str!("shaders/encode_bgra.hlsl"),
             ShaderId::OutputFit => include_str!("shaders/output_fit.hlsl"),
+            ShaderId::PreviewDown => include_str!("shaders/preview_down.hlsl"),
         };
         match self {
             ShaderId::ConvertNv12

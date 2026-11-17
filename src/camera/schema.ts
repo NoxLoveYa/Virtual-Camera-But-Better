@@ -347,3 +347,170 @@ export function normalizeOutput(raw: unknown): OutputCfg {
     extra_sizes: bool(r.extra_sizes, d.extra_sizes),
   };
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Device controls (plan 5.5, 6.2): what the camera reports, how it is shown, and what is stored per camera
+
+/** The controls of plan 6.2, in the order the card lists them. */
+export const CONTROL_KEYS = [
+  "brightness", "contrast", "hue", "saturation", "sharpness", "gamma", "color_enable", "white_balance", "backlight_compensation",
+  "gain", "powerline_frequency", "pan", "tilt", "roll", "zoom", "exposure", "iris", "focus", "low_light_compensation",
+] as const;
+export type ControlKey = (typeof CONTROL_KEYS)[number];
+
+export const CONTROL_LABELS: Record<ControlKey, string> = {
+  brightness: "Brightness",
+  contrast: "Contrast",
+  hue: "Hue",
+  saturation: "Saturation",
+  sharpness: "Sharpness",
+  gamma: "Gamma",
+  color_enable: "Color",
+  white_balance: "White balance",
+  backlight_compensation: "Backlight compensation",
+  gain: "Gain",
+  powerline_frequency: "Powerline frequency",
+  pan: "Pan",
+  tilt: "Tilt",
+  roll: "Roll",
+  zoom: "Zoom",
+  exposure: "Exposure",
+  iris: "Iris",
+  focus: "Focus",
+  low_light_compensation: "Low light compensation",
+};
+
+/** How a control is drawn: a slider, an on/off switch (0 or 1), or a list. */
+export type ControlKind = "slider" | "switch" | "select";
+export const controlKind = (key: ControlKey): ControlKind =>
+  key === "color_enable" || key === "low_light_compensation" ? "switch" : key === "powerline_frequency" ? "select" : "slider";
+
+/** One control as the device reports it (`get_camera_controls`, `set_camera_control`, `controls-changed`). */
+export interface ControlInfo {
+  key: ControlKey;
+  min: number;
+  max: number;
+  step: number;
+  /** The device's default. */
+  def: number;
+  value: number;
+  auto: boolean;
+  can_auto: boolean;
+  can_manual: boolean;
+}
+
+/** Exposure is log2 of seconds: -6 is "1/64 s", -1 is "1/2 s", 0 is "1 s", 2 is "4 s". */
+export const exposureText = (log2Seconds: number): string => {
+  const v = Math.round(log2Seconds);
+  return v < 0 ? `1/${2 ** -v} s` : `${2 ** v} s`;
+};
+
+export const whiteBalanceText = (kelvin: number): string => `${Math.round(kelvin)} K`;
+
+/** Powerline frequency values (UVC): Auto (3) only exists on devices whose range reaches it. */
+const POWERLINE_LABELS: Record<number, string> = { 0: "Disabled", 1: "50 Hz", 2: "60 Hz", 3: "Auto" };
+export const powerlineOptions = (info: Pick<ControlInfo, "min" | "max">): Option[] =>
+  [0, 1, 2, 3]
+    .filter((v) => v >= info.min && v <= info.max)
+    .map((v) => ({ value: String(v), label: POWERLINE_LABELS[v] }));
+
+/** The text next to a control's label: a shutter time, kelvin, or the plain number. */
+export const controlValueText = (info: Pick<ControlInfo, "key" | "value" | "min" | "max">): string => {
+  switch (info.key) {
+    case "exposure":
+      return exposureText(info.value);
+    case "white_balance":
+      return whiteBalanceText(info.value);
+    case "powerline_frequency":
+      return powerlineOptions(info).find((o) => o.value === String(info.value))?.label ?? String(info.value);
+    case "color_enable":
+    case "low_light_compensation":
+      return info.value ? "On" : "Off";
+    default:
+      return String(info.value);
+  }
+};
+
+/** A control in the state the device starts in: Auto on where it has Auto, else its default value. Only other states are stored. */
+export const isDefaultState = (i: Pick<ControlInfo, "value" | "def" | "auto" | "can_auto">): boolean =>
+  i.auto === i.can_auto && (i.auto || i.value === i.def);
+
+/** The device's values in the order of plan 6.2, and the ones it does not know dropped. */
+export const sortControls = (infos: ControlInfo[]): ControlInfo[] =>
+  CONTROL_KEYS.flatMap((k) => infos.filter((i) => i.key === k));
+
+/** What the user changed on one control. `value` is kept while Auto is on (the last manual value). */
+export interface StoredControl {
+  value: number;
+  auto: boolean;
+}
+
+/** The changed controls of one camera, with the name the camera had (a camera on another USB port has another id). */
+export interface StoredDevice {
+  name: string;
+  values: Partial<Record<ControlKey, StoredControl>>;
+}
+
+/** Plan 5.1 `controls`, keyed by the camera's id (symbolic link). */
+export type StoredControls = Record<string, StoredDevice>;
+
+/** The stored camera that `cam` is: the same id, else the same vid/pid and name (it moved to another port). */
+export const findStored = (stored: StoredControls, cam: { id: string; name: string }): { id: string; device: StoredDevice } | null => {
+  const exact = stored[cam.id] ? cam.id : Object.keys(stored).find((id) => linkKey(id) === linkKey(cam.id));
+  if (exact) return { id: exact, device: stored[exact] };
+  const vp = vidPid(cam.id);
+  if (!vp) return null;
+  const id = Object.keys(stored).find((k) => vidPid(k) === vp && stored[k].name.toLowerCase() === cam.name.toLowerCase());
+  return id ? { id, device: stored[id] } : null;
+};
+
+/** `stored` with `info` noted for `cam`: nothing is kept for a control in the device's own state. A moved camera is re-keyed. */
+export const rememberControl = (
+  stored: StoredControls,
+  cam: { id: string; name: string },
+  info: Pick<ControlInfo, "key" | "value" | "def" | "auto" | "can_auto">,
+): StoredControls => {
+  const found = findStored(stored, cam);
+  const next = { ...stored };
+  if (found && found.id !== cam.id) delete next[found.id];
+  const values = { ...(found?.device.values ?? {}) };
+  if (isDefaultState(info)) delete values[info.key];
+  else values[info.key] = { value: info.value, auto: info.auto };
+  if (Object.keys(values).length === 0) delete next[cam.id];
+  else next[cam.id] = { name: cam.name, values };
+  return next;
+};
+
+/** `stored` without the camera's changes (Reset all). */
+export const forgetControls = (stored: StoredControls, cam: { id: string; name: string }): StoredControls => {
+  const found = findStored(stored, cam);
+  if (!found) return stored;
+  const next = { ...stored };
+  delete next[found.id];
+  return next;
+};
+
+/** The `controls` argument of `start_engine` and `set_source`: the stored changes of `cam`, even if there are none. */
+export const controlsRecord = (stored: StoredControls, cam: { id: string; name: string } | null) => {
+  if (!cam) return null;
+  return { id: cam.id, name: cam.name, controls: findStored(stored, cam)?.device.values ?? {} };
+};
+
+/** Reads the saved `controls`: every entry is checked, so a hand-edited or old save can't send the backend something it rejects. */
+export function normalizeControls(raw: unknown): StoredControls {
+  const out: StoredControls = {};
+  if (!raw || typeof raw !== "object") return out;
+  for (const [id, dev] of Object.entries(raw as Record<string, unknown>)) {
+    if (!dev || typeof dev !== "object") continue;
+    const d = dev as Record<string, unknown>;
+    const values: StoredDevice["values"] = {};
+    for (const key of CONTROL_KEYS) {
+      const v = (d.values && typeof d.values === "object" ? (d.values as Record<string, unknown>)[key] : undefined) as
+        | Record<string, unknown>
+        | undefined;
+      if (v && Number.isInteger(v.value) && typeof v.auto === "boolean") values[key] = { value: v.value as number, auto: v.auto };
+    }
+    if (Object.keys(values).length > 0) out[id] = { name: typeof d.name === "string" ? d.name : "", values };
+  }
+  return out;
+}

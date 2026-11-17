@@ -77,7 +77,7 @@ impl EventSink for LogSink {
             ),
             EngineEvent::Error(m) => println!("[t={t:7.3}] engine-error {m:?}"),
             EngineEvent::DevicesChanged => println!("[t={t:7.3}] devices-changed"),
-            EngineEvent::Stats(_) => {}
+            EngineEvent::Stats(_) | EngineEvent::Controls(_) => {}
         }
         self.0.events.lock().unwrap().push(Logged {
             at: Instant::now(),

@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { useStore } from "./store";
 import { AddFilter } from "./components/AddFilter";
+import { ControlsCard } from "./components/ControlsCard";
 import { FilterCard } from "./components/FilterCard";
 import { OutputPanel } from "./components/OutputPanel";
 import { PresetMenu } from "./components/PresetMenu";
+import { Preview } from "./components/Preview";
 import { SourcePanel } from "./components/SourcePanel";
 import { Stats } from "./components/Stats";
 import { TitleBar } from "./components/TitleBar";
@@ -42,9 +44,9 @@ export default function App() {
       {/* Two columns that scroll on their own; below 1100 px they stack (camera, output, then the chain) in one scroll. */}
       <div className="cols">
         <div className="scroll app col col-left">
-          {/* The live preview goes here, above the camera panel. */}
+          <Preview />
           <SourcePanel />
-          {/* The camera-controls card goes here, between the camera and the output panel. */}
+          <ControlsCard />
           <OutputPanel />
         </div>
 

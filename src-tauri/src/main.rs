@@ -38,6 +38,7 @@ fn forward_events(app: &AppHandle) -> Arc<dyn better_cam::engine::EventSink> {
             EngineEvent::Error(message) => app.emit("engine-error", message),
             EngineEvent::Stats(s) => app.emit("stats", s),
             EngineEvent::DevicesChanged => app.emit("devices-changed", ()),
+            EngineEvent::Controls(c) => app.emit("controls-changed", c),
         };
     })
 }
@@ -113,6 +114,11 @@ fn main() {
             commands::set_source,
             commands::set_output,
             commands::set_pause,
+            commands::get_camera_controls,
+            commands::set_camera_control,
+            commands::reset_camera_controls,
+            commands::set_preview,
+            commands::preview_ack,
             commands::get_autostart,
             commands::set_autostart,
             commands::launched_at_startup,

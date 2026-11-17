@@ -1,7 +1,10 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { FilterCfg } from "./filters/schema";
-import type { CameraInfo, OutputCfg, SourceCfg } from "./camera/schema";
+import type { CameraInfo, ControlInfo, OutputCfg, SourceCfg } from "./camera/schema";
+
+/** The changed controls of the selected camera, as `start_engine` and `set_source` take them (see `controlsRecord`). */
+export type ControlsRecord = { id: string; name: string; controls: Record<string, { value: number; auto: boolean }> } | null;
 
 export type EngineStateName = "stopped" | "standby" | "live" | "reconnecting";
 
@@ -23,11 +26,25 @@ export interface Stats {
 
 export const api = {
   listCameras: () => invoke<CameraInfo[]>("list_cameras"),
-  startEngine: (source: SourceCfg, output: OutputCfg, chain: FilterCfg[]) => invoke<void>("start_engine", { source, output, chain }),
+  startEngine: (source: SourceCfg, output: OutputCfg, chain: FilterCfg[], controls: ControlsRecord = null) =>
+    invoke<void>("start_engine", { source, output, chain, controls }),
   stopEngine: () => invoke<void>("stop_engine"),
-  setSource: (source: SourceCfg) => invoke<void>("set_source", { source }),
+  setSource: (source: SourceCfg, controls: ControlsRecord = null) => invoke<void>("set_source", { source, controls }),
+  /** What the camera supports, with its own ranges; opens the device for a moment when the engine has no camera open. */
+  getCameraControls: (id: string) => invoke<ControlInfo[]>("get_camera_controls", { id }),
+  /** A manual value, or Auto on; resolves to the control as the device reports it. */
+  setCameraControl: (id: string, key: string, value: number, auto: boolean) =>
+    invoke<ControlInfo>("set_camera_control", { id, key, value, auto }),
+  resetCameraControls: (id: string) => invoke<ControlInfo[]>("reset_camera_controls", { id }),
   setOutput: (output: OutputCfg) => invoke<void>("set_output", { output }),
   setPause: (on: boolean) => invoke<void>("set_pause", { on }),
+  /** Starts, resizes (a new call replaces the stream) or stops the preview; `onFrame` gets each frame: 16-byte header + RGBA pixels. */
+  setPreview: (on: boolean, width: number, height: number, onFrame: (frame: ArrayBuffer) => void = () => {}) => {
+    const channel = new Channel<ArrayBuffer>();
+    channel.onmessage = onFrame;
+    return invoke<void>("set_preview", { on, width, height, channel });
+  },
+  previewAck: (frame: number) => invoke<void>("preview_ack", { frame }),
   getAutostart: () => invoke<boolean>("get_autostart"),
   setAutostart: (on: boolean) => invoke<void>("set_autostart", { on }),
   launchedAtStartup: () => invoke<boolean>("launched_at_startup"),
@@ -40,4 +57,6 @@ export const api = {
   onEngineError: (cb: (msg: string) => void) => listen<string>("engine-error", (e) => cb(e.payload)),
   onStats: (cb: (s: Stats) => void) => listen<Stats>("stats", (e) => cb(e.payload)),
   onDevicesChanged: (cb: () => void) => listen("devices-changed", () => cb()),
+  /** About once a second while the camera is open and a control is on Auto, and after the stored values were re-applied. */
+  onControlsChanged: (cb: (infos: ControlInfo[]) => void) => listen<ControlInfo[]>("controls-changed", (e) => cb(e.payload)),
 };
