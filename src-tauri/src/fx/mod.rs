@@ -23,6 +23,7 @@ pub mod geometry;
 pub mod keys;
 pub mod lut;
 pub mod mask;
+pub mod nvidia;
 pub mod shader_filter;
 pub mod sharpen;
 #[cfg(test)]

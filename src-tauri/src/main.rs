@@ -151,6 +151,9 @@ fn main() {
             commands::vcam_install,
             commands::vcam_uninstall,
             commands::pick_file,
+            commands::nvidia_status,
+            commands::nvidia_gpu,
+            commands::install_nvidia_sdk,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Better Cam")

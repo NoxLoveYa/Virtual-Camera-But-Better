@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { api, type EngineState, type Stats, type VcamStatus } from "./api";
+import { api, type EngineState, type NvidiaGpu, type NvidiaInstallProgress, type NvidiaStatus, type Stats, type VcamStatus } from "./api";
 import { FILTERS, defaultChain, makeFilter, type FilterCfg, type FilterKind, type ParamValue } from "./filters/schema";
 import { normalizeChain, signature } from "./filters/chain";
 import {
@@ -38,6 +38,8 @@ interface Saved {
   closeToTray: boolean;
   /** Whether the "launch on startup" default has been applied once; after that the OS entry is the truth. */
   autostartDefaulted: boolean;
+  /** Set once the NVIDIA install prompt was closed, so it does not come back on every launch. */
+  nvidiaPromptDismissed: boolean;
   /** The preset the chain was last loaded from or saved as, and what it looked like then (see `signature`). */
   activePreset: string | null;
   presetBaseline: string | null;
@@ -75,6 +77,7 @@ const loadSaved = (): Saved => {
     collapsed: {},
     closeToTray: false,
     autostartDefaulted: false,
+    nvidiaPromptDismissed: false,
     activePreset: null,
     presetBaseline: null,
     wasRunning: false,
@@ -93,6 +96,7 @@ const loadSaved = (): Saved => {
         collapsed: Object.fromEntries(chain.filter((f) => folded[f.id] === true).map((f) => [f.id, true])),
         closeToTray: s.closeToTray === true,
         autostartDefaulted: s.autostartDefaulted === true,
+        nvidiaPromptDismissed: s.nvidiaPromptDismissed === true,
         activePreset: typeof s.activePreset === "string" ? s.activePreset : null,
         presetBaseline: typeof s.presetBaseline === "string" ? s.presetBaseline : null,
         wasRunning: s.wasRunning === true,
@@ -136,8 +140,24 @@ interface State extends Saved {
   vcamBusy: VcamAction | null;
   /** Bumped when the virtual camera was installed, removed or changed state: the engine behind the preview is new. */
   vcamEpoch: number;
+  /** NVIDIA's Video Effects runtime as `nvidia_status` last said; `null` until the first answer. */
+  nvidia: NvidiaStatus | null;
+  /** The installed RTX GPU; `null` when there is none (or until it was read). Filter cards offer the install only with one. */
+  gpu: NvidiaGpu | null;
+  /** The install dialog is open. */
+  nvidiaPrompt: boolean;
+  /** The install is running; `stage` is `download`, `verify` or `install`. */
+  nvidiaInstall: NvidiaInstallProgress | null;
+  nvidiaError: string | null;
 
   init: () => Promise<void>;
+  /** Reads the GPU (until one was found) and `nvidia_status`. Cheap enough for every window focus. */
+  refreshNvidia: () => Promise<void>;
+  openNvidiaPrompt: () => void;
+  /** Closing the dialog is remembered: it does not open by itself again. */
+  closeNvidiaPrompt: () => void;
+  /** Downloads and runs NVIDIA's installer (administrator prompt), then reads the status again. */
+  installNvidia: () => Promise<void>;
   /** Reads `vcam_status` (skipped while an action runs: its end reads it again). */
   refreshVcam: () => Promise<void>;
   /** Install, update or repair: one UAC prompt. A refusal or failure shows a toast; the banner stays. */
@@ -185,13 +205,13 @@ interface State extends Saved {
 
 export const useStore = create<State>((set, get) => {
   const persist = () => {
-    const { source, output, controls, chain, closeToTray, autostartDefaulted, activePreset, presetBaseline, wasRunning, previewOn } = get();
+    const { source, output, controls, chain, closeToTray, autostartDefaulted, nvidiaPromptDismissed, activePreset, presetBaseline, wasRunning, previewOn } = get();
     // Only the folded cards that still exist; entries of removed filters and "expanded" flags are not worth keeping.
     const folded = get().collapsed;
     const collapsed = Object.fromEntries(chain.filter((f) => folded[f.id]).map((f) => [f.id, true]));
     localStorage.setItem(
       STORAGE_KEY,
-      JSON.stringify({ source, output, controls, chain, collapsed, closeToTray, autostartDefaulted, activePreset, presetBaseline, wasRunning, previewOn }),
+      JSON.stringify({ source, output, controls, chain, collapsed, closeToTray, autostartDefaulted, nvidiaPromptDismissed, activePreset, presetBaseline, wasRunning, previewOn }),
     );
   };
 
@@ -418,6 +438,48 @@ export const useStore = create<State>((set, get) => {
     vcam: null,
     vcamBusy: null,
     vcamEpoch: 0,
+    nvidia: null,
+    gpu: null,
+    nvidiaPrompt: false,
+    nvidiaInstall: null,
+    nvidiaError: null,
+
+    refreshNvidia: async () => {
+      try {
+        const nvidia = await api.nvidiaStatus();
+        set({ nvidia });
+        if (!get().gpu) set({ gpu: await api.nvidiaGpu() });
+      } catch {
+        /* the dialog and the cards keep what they showed; the next focus asks again */
+      }
+    },
+
+    openNvidiaPrompt: () => set({ nvidiaPrompt: true, nvidiaError: null }),
+
+    closeNvidiaPrompt: () => {
+      set({ nvidiaPrompt: false, nvidiaPromptDismissed: true });
+      persist();
+    },
+
+    installNvidia: async () => {
+      const { gpu, nvidiaInstall } = get();
+      if (!gpu || nvidiaInstall) return;
+      set({ nvidiaInstall: { stage: "download", done: 0, total: 0 }, nvidiaError: null });
+      try {
+        await api.installNvidiaSdk(gpu.arch);
+        const nvidia = await api.nvidiaStatus();
+        set({
+          nvidia,
+          nvidiaPrompt: !nvidia.available,
+          nvidiaError: nvidia.available ? null : `The installer closed, but the runtime is not ready: ${nvidia.detail}`,
+        });
+        if (nvidia.available) say("NVIDIA video effects installed");
+      } catch (e) {
+        set({ nvidiaError: String(e) });
+      } finally {
+        set({ nvidiaInstall: null });
+      }
+    },
 
     refreshVcam: async () => {
       if (get().vcamBusy) return;
@@ -507,6 +569,7 @@ export const useStore = create<State>((set, get) => {
         if (get().chain.some((f) => f.id === id)) set((s) => ({ filterErrors: { ...s.filterErrors, [id]: message } }));
       });
       await api.onStats((stats) => useStats.setState({ stats }));
+      await api.onNvidiaInstall((p) => get().nvidiaInstall && set({ nvidiaInstall: p }));
       await api.onDevicesChanged(() => void get().refreshCameras());
       await api.onControlsChanged((infos) => {
         // The values the device reports now: a control that has writes waiting keeps what the user set.
@@ -518,6 +581,15 @@ export const useStore = create<State>((set, get) => {
       // (a repair by hand, or `vcam-tool`, shows up without a restart).
       const vcamRead = get().refreshVcam();
       window.addEventListener("focus", () => void get().refreshVcam());
+      // NVIDIA's runtime is read at startup (the install dialog opens from this, once: "Not now" is remembered), after an
+      // install and whenever the window gets focus back, so installing it by hand shows up without a restart.
+      void get()
+        .refreshNvidia()
+        .then(() => {
+          const { gpu, nvidia, nvidiaPromptDismissed } = get();
+          if (gpu && nvidia && !nvidia.available && !nvidiaPromptDismissed) set({ nvidiaPrompt: true });
+        });
+      window.addEventListener("focus", () => void get().refreshNvidia());
       await Promise.all([get().refreshCameras(), get().refreshPresets()]).catch(fail);
 
       // Work out which saved preset (if any) the restored chain still matches, so the toolbar shows the right name.

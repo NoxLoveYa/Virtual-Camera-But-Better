@@ -3,6 +3,7 @@ import { useStore } from "./store";
 import { AddFilter } from "./components/AddFilter";
 import { ControlsCard } from "./components/ControlsCard";
 import { FilterCard } from "./components/FilterCard";
+import { NvidiaPrompt } from "./components/NvidiaPrompt";
 import { OutputPanel } from "./components/OutputPanel";
 import { PresetMenu } from "./components/PresetMenu";
 import { Preview } from "./components/Preview";
@@ -99,6 +100,7 @@ export default function App() {
         <Toast />
         <Stats />
       </footer>
+      <NvidiaPrompt />
     </>
   );
 }

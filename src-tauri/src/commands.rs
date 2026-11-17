@@ -2,6 +2,7 @@ use better_cam::api::Service;
 use better_cam::camera_controls::ControlInfoDto;
 use better_cam::config::{CameraDto, OutputCfg, SourceCfg};
 use better_cam::file_dialog;
+use better_cam::fx::nvidia;
 use better_cam::preview::Sink;
 use better_cam::vcam_admin::{self, VcamStatus};
 use std::path::PathBuf;
@@ -179,6 +180,49 @@ pub async fn pick_file(window: tauri::WebviewWindow, kind: String) -> Result<Opt
     // The window handle as an integer: Tauri's `windows` crate need not be the one this crate builds against.
     let owner = window.hwnd().ok().map(|h| h.0 as isize);
     blocking(move || file_dialog::pick_file(kind, owner)).await
+}
+
+/// Whether NVIDIA's Video Effects runtime is usable (plan 4.6): `{available, detail, version}`. Reads the GPU and the
+/// runtime folder and loads the runtime DLL for a moment to ask its version, so it runs off the UI thread.
+#[tauri::command]
+pub async fn nvidia_status() -> Result<nvidia::Status, String> {
+    blocking(|| Ok(nvidia::probe())).await
+}
+
+/// The installed RTX GPU with the redistributable build that fits it, or `null` (`nvidia-smi` takes a second or so).
+#[tauri::command]
+pub async fn nvidia_gpu() -> Result<Option<nvidia::Gpu>, String> {
+    blocking(|| Ok(nvidia::detect_gpu())).await
+}
+
+/// One install at a time.
+static NVIDIA_INSTALLING: AtomicBool = AtomicBool::new(false);
+
+/// Downloads NVIDIA's Video Effects redistributable for `arch`, checks that it is signed by NVIDIA and runs it
+/// elevated. Progress goes out as `nvidia-install` events `{stage, done, total}`; resolves when the installer has
+/// closed, rejects with a sentence otherwise.
+#[tauri::command]
+pub async fn install_nvidia_sdk(app: AppHandle, arch: String) -> Result<(), String> {
+    use tauri::Emitter;
+
+    let url = nvidia::installer_url(&arch).ok_or("Unknown GPU generation.")?;
+    #[cfg(debug_assertions)]
+    let url = nvidia::test_url_override().unwrap_or(url);
+    if NVIDIA_INSTALLING.swap(true, Ordering::SeqCst) {
+        return Err("The NVIDIA installer is already running.".into());
+    }
+    let result = blocking(move || {
+        nvidia::run_install(&url, None, |line| {
+            if let Some(p) = line.progress() {
+                let _ = app.emit("nvidia-install", p);
+            } else if let nvidia::ScriptLine::Signature { status, signer } = line {
+                eprintln!("[nvidia] installer signature: {status}, signer {signer}");
+            }
+        })
+    })
+    .await;
+    NVIDIA_INSTALLING.store(false, Ordering::SeqCst);
+    result
 }
 
 #[tauri::command]

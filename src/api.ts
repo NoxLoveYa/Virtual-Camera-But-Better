@@ -39,6 +39,27 @@ export interface VcamStatus {
   consumers: number;
 }
 
+/** `nvidia_status`: whether NVIDIA's Video Effects runtime is usable. `detail` says in plain words what is missing. */
+export interface NvidiaStatus {
+  available: boolean;
+  detail: string;
+  /** The runtime's own version (`0.7.6`) when it could be read. */
+  version: string | null;
+}
+
+/** `nvidia_gpu`: the installed RTX GPU and the redistributable build that fits it. */
+export interface NvidiaGpu {
+  name: string;
+  arch: "turing" | "ampere" | "ada" | "blackwell";
+}
+
+/** `nvidia-install`: `download` with bytes done and total (total 0 when unknown), then the stages `verify` and `install`. */
+export interface NvidiaInstallProgress {
+  stage: string;
+  done: number;
+  total: number;
+}
+
 export const api = {
   listCameras: () => invoke<CameraInfo[]>("list_cameras"),
   startEngine: (source: SourceCfg, output: OutputCfg, chain: FilterCfg[], controls: ControlsRecord = null) =>
@@ -73,6 +94,17 @@ export const api = {
   vcamUninstall: () => invoke<VcamResult>("vcam_uninstall"),
   /** The native "open file" dialog: the full path of the chosen file, `null` when cancelled. The page keeps running while it is open. */
   pickFile: (kind: "image" | "lut") => invoke<string | null>("pick_file", { kind }),
+  /** Reads the GPU and the runtime folder and asks the runtime for its version; takes a moment. */
+  nvidiaStatus: () => invoke<NvidiaStatus>("nvidia_status"),
+  /** The installed RTX GPU, `null` when there is none. */
+  nvidiaGpu: () => invoke<NvidiaGpu | null>("nvidia_gpu"),
+  /**
+   * Downloads NVIDIA's Video Effects runtime for `arch`, checks that NVIDIA signed it and runs it (administrator prompt).
+   * Progress arrives through `onNvidiaInstall`; resolves when the installer has closed, rejects with a sentence.
+   */
+  installNvidiaSdk: (arch: NvidiaGpu["arch"]) => invoke<void>("install_nvidia_sdk", { arch }),
+  onNvidiaInstall: (cb: (p: NvidiaInstallProgress) => void) =>
+    listen<NvidiaInstallProgress>("nvidia-install", (e) => cb(e.payload)),
   getAutostart: () => invoke<boolean>("get_autostart"),
   setAutostart: (on: boolean) => invoke<void>("set_autostart", { on }),
   launchedAtStartup: () => invoke<boolean>("launched_at_startup"),
