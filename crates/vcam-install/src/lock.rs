@@ -134,33 +134,74 @@ fn open_namespace(
     boundary: HANDLE,
     alias: &[u16],
 ) -> Res<HANDLE> {
-    let ns = unsafe { CreatePrivateNamespaceW(Some(attributes), boundary.0, pcwstr(alias)) };
-    if !ns.is_invalid() {
-        return Ok(ns);
-    }
-    let created = std::io::Error::last_os_error();
-    match created.raw_os_error() {
-        // another process made the namespace: open it
-        Some(e) if e == ERROR_ALREADY_EXISTS.0 as i32 => {
+    open_namespace_with(
+        &mut || {
+            let ns =
+                unsafe { CreatePrivateNamespaceW(Some(attributes), boundary.0, pcwstr(alias)) };
+            if ns.is_invalid() {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(ns)
+            }
+        },
+        &mut || {
             let ns = unsafe { OpenPrivateNamespaceW(boundary.0, pcwstr(alias)) };
-            if !ns.is_invalid() {
-                return Ok(ns);
+            if ns.is_invalid() {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(ns)
             }
-            let opened = std::io::Error::last_os_error();
-            // the alias is bound in this process already (see below)
-            if opened.raw_os_error() == Some(ERROR_DUP_NAME.0 as i32) {
-                return Ok(HANDLE::default());
+        },
+    )
+}
+
+/// How often the create-or-open sequence is tried before it gives up.
+const NAMESPACE_ATTEMPTS: u32 = 20;
+
+/// [`open_namespace`] with the two system calls given (tests make them race).
+///
+/// A namespace lives only as long as some process has a handle to it. So "create fails because it exists, then open
+/// it" can lose a race: the process that made it closes its last handle in between, and the open finds nothing,
+/// although nobody holds the lock any more. That is not an error and not a busy lock: the sequence starts again
+/// (the next create makes it), a bounded number of times.
+fn open_namespace_with(
+    create: &mut dyn FnMut() -> std::io::Result<HANDLE>,
+    open: &mut dyn FnMut() -> std::io::Result<HANDLE>,
+) -> Res<HANDLE> {
+    let mut lost_race = None;
+    for _ in 0..NAMESPACE_ATTEMPTS {
+        let created = match create() {
+            Ok(ns) => return Ok(ns),
+            Err(e) => e,
+        };
+        match created.raw_os_error() {
+            // another process made the namespace: open it
+            Some(e) if e == ERROR_ALREADY_EXISTS.0 as i32 => match open() {
+                Ok(ns) => return Ok(ns),
+                // the alias is bound in this process already (see below)
+                Err(opened) if opened.raw_os_error() == Some(ERROR_DUP_NAME.0 as i32) => {
+                    return Ok(HANDLE::default())
+                }
+                // gone again: the holder ended between the two calls
+                Err(opened) => {
+                    lost_race = Some(opened);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            },
+            // this process has the alias bound already (a lock held by another thread of it): the name resolves,
+            // there is nothing to open; the mutex below is found and the answer is "busy"
+            Some(e) if e == ERROR_DUP_NAME.0 as i32 => return Ok(HANDLE::default()),
+            _ => {
+                return Err(werr(
+                    "install lock: private namespace (is this process elevated?)",
+                    created,
+                ))
             }
-            return Err(werr("install lock: open namespace", opened));
         }
-        // this process has the alias bound already (a lock held by another thread of it): the name resolves, there
-        // is nothing to open; the mutex below is found and the answer is "busy"
-        Some(e) if e == ERROR_DUP_NAME.0 as i32 => return Ok(HANDLE::default()),
-        _ => {}
     }
     Err(werr(
-        "install lock: private namespace (is this process elevated?)",
-        created,
+        "install lock: open namespace",
+        lost_race.unwrap_or_else(|| std::io::Error::other("no attempt was made")),
     ))
 }
 
@@ -300,6 +341,140 @@ mod tests {
         assert!(e.contains("install lock"), "{e}");
     }
 
+    fn code(c: windows::Win32::Foundation::WIN32_ERROR) -> std::io::Error {
+        std::io::Error::from_raw_os_error(c.0 as i32)
+    }
+
+    /// The holder of the namespace closes its last handle between our failed create ("already exists") and our open:
+    /// nobody holds the lock, and the helper must take it, not exit with an error.
+    #[test]
+    fn a_namespace_that_goes_away_between_the_create_and_the_open_is_created_again() {
+        use std::cell::Cell;
+        let creates = Cell::new(0);
+        let opens = Cell::new(0);
+        let made = HANDLE(0x77 as *mut core::ffi::c_void);
+        let got = open_namespace_with(
+            &mut || {
+                creates.set(creates.get() + 1);
+                // the first two creates find it there, the third finds it gone and makes it
+                if creates.get() < 3 {
+                    Err(code(ERROR_ALREADY_EXISTS))
+                } else {
+                    Ok(made)
+                }
+            },
+            &mut || {
+                opens.set(opens.get() + 1);
+                Err(code(windows::Win32::Foundation::ERROR_FILE_NOT_FOUND))
+            },
+        )
+        .expect("a lock nobody holds must be taken");
+        assert_eq!(got, made);
+        assert_eq!((creates.get(), opens.get()), (3, 2));
+    }
+
+    /// The retry is bounded: an open that keeps failing is reported, with its error.
+    #[test]
+    fn a_namespace_that_cannot_be_opened_is_reported_after_a_bounded_number_of_tries() {
+        let creates = std::cell::Cell::new(0);
+        let e = open_namespace_with(
+            &mut || {
+                creates.set(creates.get() + 1);
+                Err(code(ERROR_ALREADY_EXISTS))
+            },
+            &mut || Err(code(windows::Win32::Foundation::ERROR_ACCESS_DENIED)),
+        )
+        .unwrap_err();
+        assert_eq!(creates.get(), NAMESPACE_ATTEMPTS);
+        assert!(e.contains("open namespace"), "{e}");
+        // a create that fails for any other reason is not retried
+        let creates = std::cell::Cell::new(0);
+        let e = open_namespace_with(
+            &mut || {
+                creates.set(creates.get() + 1);
+                Err(code(windows::Win32::Foundation::ERROR_ACCESS_DENIED))
+            },
+            &mut || panic!("no open after a refused create"),
+        )
+        .unwrap_err();
+        assert_eq!(creates.get(), 1);
+        assert!(e.contains("private namespace"), "{e}");
+        // the alias bound in this process already means "held here", from the create or from the open
+        let held =
+            open_namespace_with(&mut || Err(code(ERROR_DUP_NAME)), &mut || panic!()).unwrap();
+        assert!(held.is_invalid());
+        let held = open_namespace_with(&mut || Err(code(ERROR_ALREADY_EXISTS)), &mut || {
+            Err(code(ERROR_DUP_NAME))
+        })
+        .unwrap();
+        assert!(held.is_invalid());
+    }
+
+    /// With the real calls, in several processes (a namespace alias is bound once per process, so threads of one
+    /// process would hit that rule instead): helpers take the lock and let go of it in a tight loop. The answer is
+    /// "held" or "busy" every time; the old sequence ("create fails because it exists", then "open it") met a
+    /// namespace that had just been closed by the last holder and ended with an error although nobody held the lock.
+    #[test]
+    fn racing_helpers_never_see_an_error_when_nobody_holds_the_lock() {
+        let name = unique("R");
+        let exe = std::env::current_exe().unwrap();
+        let children: Vec<_> = (0..3)
+            .map(|_| {
+                std::process::Command::new(&exe)
+                    .args([
+                        "--exact",
+                        "lock::tests::race_worker",
+                        "--nocapture",
+                        "--ignored",
+                    ])
+                    .env("BETTERCAM_LOCK_TEST_NAME", &name)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let mut held = 0u32;
+        for c in children {
+            let out = c.wait_with_output().unwrap();
+            let text = String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success() && text.contains("RACE DONE"),
+                "a helper saw an error although nobody held the lock: {text}"
+            );
+            held += text
+                .split("held=")
+                .nth(1)
+                .and_then(|r| r.split_whitespace().next())
+                .and_then(|n| n.parse::<u32>().ok())
+                .unwrap_or(0);
+        }
+        assert!(held > 0, "nobody ever got the lock");
+    }
+
+    /// The child side of the test above (run only by it).
+    #[test]
+    #[ignore]
+    fn race_worker() {
+        let Ok(name) = std::env::var("BETTERCAM_LOCK_TEST_NAME") else {
+            return;
+        };
+        let me = me();
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(2500);
+        let (mut held, mut busy) = (0u32, 0u32);
+        while std::time::Instant::now() < until {
+            match acquire_in(&name, &me) {
+                Ok(Acquired::Held(l)) => {
+                    held += 1;
+                    drop(l);
+                }
+                Ok(Acquired::Busy) => busy += 1,
+                Err(e) => panic!("an unheld lock gave an error: {e}"),
+            }
+        }
+        println!("RACE DONE held={held} busy={busy}");
+    }
     #[test]
     fn the_message_names_the_situation() {
         assert!(BUSY_MESSAGE.contains("already running"));

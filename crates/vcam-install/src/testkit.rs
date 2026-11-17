@@ -67,6 +67,35 @@ pub fn security_of(path: &Path) -> Snapshot {
     acl::read(&h).unwrap()
 }
 
+/// How long an operation that must not wait for another program may take before the test calls it a hang.
+pub const BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run `job` on a thread of its own and fail the test, instead of hanging it, when it has not returned in `bound`:
+/// an operation that waits for another program's lock is a failure, not a slow test.
+pub fn within<T: Send + 'static>(
+    what: &str,
+    bound: std::time::Duration,
+    job: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(job());
+    });
+    rx.recv_timeout(bound)
+        .unwrap_or_else(|_| panic!("{what}: still waiting after {bound:?} (it waits for a lock)"))
+}
+
+/// An oplock on `p` the way a program of the user takes one on a file it may read (while it is held, a plain open,
+/// delete or rename of the file by anybody else waits, and so does a read of the file here: look at it with
+/// attribute-only calls such as `std::fs::metadata`). `None` (skip the test) when this file system grants none.
+pub fn lock_on(p: &Path) -> Option<vcam_protocol::secure::oplock::Oplock> {
+    let l = vcam_protocol::secure::oplock::Oplock::take(p).unwrap();
+    if l.is_none() {
+        eprintln!("this file system grants no oplock: skipped");
+    }
+    l
+}
+
 /// A fake DLL that passes `looks_like_dll`.
 pub fn fake_dll(dir: &Path, fill: u8) -> PathBuf {
     std::fs::create_dir_all(dir).unwrap();

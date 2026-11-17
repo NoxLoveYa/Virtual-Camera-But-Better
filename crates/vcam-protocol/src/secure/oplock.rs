@@ -23,7 +23,10 @@ use windows::Win32::System::Ioctl::{
 use windows::Win32::System::IO::{DeviceIoControl, OVERLAPPED};
 
 /// `OPLOCK_LEVEL_CACHE_READ | OPLOCK_LEVEL_CACHE_WRITE | OPLOCK_LEVEL_CACHE_HANDLE`.
-const READ_WRITE_HANDLE: u32 = 1 | 2 | 4;
+pub const READ_WRITE_HANDLE: u32 = 1 | 2 | 4;
+/// `OPLOCK_LEVEL_CACHE_READ | OPLOCK_LEVEL_CACHE_HANDLE`: what a program that has the file open for reading can get
+/// while others read it too. It is broken by a rename or a delete, not by an open that shares everything.
+pub const READ_HANDLE: u32 = 1 | 4;
 
 /// An oplock on a file, held until this value is dropped (the handle is closed, which gives the lock up).
 pub struct Oplock {
@@ -37,6 +40,11 @@ impl Oplock {
     /// Open `path` for reading and take a read-write-handle oplock on it. `Ok(None)` when the file system does
     /// not grant one (the caller skips its test); `Err` for anything unexpected.
     pub fn take(path: &Path) -> io::Result<Option<Oplock>> {
+        Self::take_level(path, READ_WRITE_HANDLE)
+    }
+
+    /// [`Oplock::take`] for another level ([`READ_HANDLE`]).
+    pub fn take_level(path: &Path, level: u32) -> io::Result<Option<Oplock>> {
         let w: Vec<u16> = path
             .as_os_str()
             .encode_wide()
@@ -57,7 +65,7 @@ impl Oplock {
         let input = REQUEST_OPLOCK_INPUT_BUFFER {
             StructureVersion: 1,
             StructureLength: std::mem::size_of::<REQUEST_OPLOCK_INPUT_BUFFER>() as u16,
-            RequestedOplockLevel: READ_WRITE_HANDLE,
+            RequestedOplockLevel: level,
             Flags: REQUEST_OPLOCK_INPUT_FLAG_REQUEST,
         };
         let mut output = Box::new(REQUEST_OPLOCK_OUTPUT_BUFFER {

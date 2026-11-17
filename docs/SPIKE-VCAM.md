@@ -730,7 +730,7 @@ Update.
 
 | # | Finding | Fix | Tests |
 |---|---|---|---|
-| M1 | An open waited for as long as a program held an opportunistic lock on the file (a standard user can take one on `frames.bin`, which they may read) | every open goes through `NtCreateFile` with `FILE_COMPLETE_IF_OPLOCKED` (`secure::open_with`, one choke point; also the installer's); a break in progress is a `refused` open ("show the slate" / "skip"). The log prune deletes through such a handle too (`secure::remove_plain_file`). The `LOG` mutex no longer covers an open or a prune: one thread claims the open (`begin_open`), the others drop their line meanwhile. The user has no access to `vcam-*.log` at all (see the table below), so only the service account could ever lock one | `secure::tests::an_open_does_not_wait_for_a_program_that_holds_an_oplock` (a real `FSCTL_REQUEST_OPLOCK`, no elevation; a plain open on a control thread is shown to block; the checked opens, read and write, pinned or not, and the delete return within 2 s, the old code hangs), `frames::tests::a_frame_file_with_somebody_elses_oplock_gives_the_slate_at_once` (activation read, mapping, pump polls), `log::tests::a_log_file_that_somebody_holds_an_oplock_on_is_not_waited_for`, `pruning_does_not_wait_for_a_locked_log_file`, `only_one_thread_opens_the_log_and_the_others_do_not_wait` |
+| M1 | An open waited for as long as a program held an opportunistic lock on the file (a standard user can take one on `frames.bin`, which they may read) | every open goes through `NtCreateFile` with `FILE_COMPLETE_IF_OPLOCKED` (`secure::open_with`, one choke point; also the installer's opens. **Opens only:** the installer's deletes and renames (`remove_dir_all`, `DeleteFileW`, `std::fs::rename`) still opened the file the plain way and waited; that is fixed in "P-hardening 4"); a break in progress is a `refused` open ("show the slate" / "skip"). The log prune deletes through such a handle too (`secure::remove_plain_file`). The `LOG` mutex no longer covers an open or a prune: one thread claims the open (`begin_open`), the others drop their line meanwhile. The user has no access to `vcam-*.log` at all (see the table below), so only the service account could ever lock one | `secure::tests::an_open_does_not_wait_for_a_program_that_holds_an_oplock` (a real `FSCTL_REQUEST_OPLOCK`, no elevation; a plain open on a control thread is shown to block; the checked opens, read and write, pinned or not, and the delete return within 2 s, the old code hangs), `frames::tests::a_frame_file_with_somebody_elses_oplock_gives_the_slate_at_once` (activation read, mapping, pump polls), `log::tests::a_log_file_that_somebody_holds_an_oplock_on_is_not_waited_for`, `pruning_does_not_wait_for_a_locked_log_file`, `only_one_thread_opens_the_log_and_the_others_do_not_wait` |
 | M2 | A `%ProgramData%` that is a junction or symbolic link made everything refuse (root opened as a link, files below it resolved to the real place, the comparison failed) | `canonical_dir` opens the root *following* links (an administrator's folder); everything below it is still never followed | `secure::tests::a_root_that_is_a_junction_is_followed_and_links_below_it_are_not`, `datadir::tests::a_program_data_that_is_a_junction_prepares_checks_and_logs` (prepare, kept on the second run, the app's writer, the helper's log and its tail; with the old open it fails with exactly the reviewer's "opened ...moved..., expected ...ProgramData..." message) |
 | M3 | A failed preparation of the data folder lost its `ERROR:` line (the log was let go of, the line waited for a file, the process ended); the app then showed an earlier line | `Log::flush`, called on every way out and on drop of `FileLog`; `install_with` makes the log ready again before it returns the error; the app shows a reason only from an `ERROR:` line | `install::tests::the_error_of_a_failed_preparation_reaches_install_log`, `lines_that_wait_for_a_file_are_written_when_the_log_is_dropped`, `vcam_admin::tests::a_log_without_an_error_line_gives_no_reason` |
 | L1 | Objects existed with inherited permissions for a moment; an old folder kept the user's inheritable modify right | a new object is created with its final protected DACL in the create call (`create_dir_with_sd`, `open_with_sd`, `acl::SecurityDescriptor`); the data folder is locked first, then `logs`, `frames.bin`, `install.log`; `logs` is swept of entries that are not owned by SYSTEM, Administrators or LOCAL SERVICE | `datadir::tests::a_new_object_has_its_final_permissions_from_the_create_call` (the DACL read back right after the create call, no `lock` call), `the_data_folder_is_locked_before_anything_below_it_is_made` (starts from an older folder with an inheritable user right), `entries_of_logs_that_are_not_owned_by_a_trusted_account_are_removed` |
@@ -741,7 +741,7 @@ Update.
 | L6 | The busy claim worked only inside one app process | the helper takes a machine-wide lock before anything else (`vcam_install::lock`): a mutex in a *private namespace* whose boundary is the Administrators group, so a standard user can neither hold nor squat it (a plain `Global\` name could be created beforehand by anybody); the existence of the object is the lock, so a helper that dies frees it; busy = exit 11, shown by the app as a sentence; `vcam-tool` takes the same lock | `lock::tests::a_second_helper_finds_the_lock_taken_and_the_next_one_gets_it_after_the_first_ends`, `the_end_of_the_holding_process_frees_the_lock` (a second process), `a_boundary_that_is_not_enabled_in_the_token_cannot_make_the_lock`, `vcam_admin::tests::a_helper_that_found_another_one_running_says_so`; live below |
 | L7 | The `vcam-tool` result file refused a link only in its last component | no result file at all: the elevated child reports through `install.log` (its own verified, admin-owned file, readable by the user) and the exit code; the parent prints the lines after the child's marker line. `--result` is refused | `vcam-tool util::tests::the_parent_prints_only_what_the_last_elevated_run_wrote`, `a_log_that_this_run_did_not_write_says_nothing`, `a_link_in_place_of_the_log_is_not_read`, `main::tests::the_elevated_copy_takes_no_result_path` |
 | L8 | Without `--user-sid` the helper used the elevated account | the helper (and the app's helper call) require it; the app refuses to start a helper when it cannot read its own SID, with a sentence and no prompt; `vcam-tool` passes it always and falls back to the current account only when run directly in an elevated shell or with `--current-user`. **Repair by a second Windows user:** the frame file belongs to one account at a time; the install replaces the user ACE, so the virtual camera works for the account that installed or repaired last and the earlier one repairs it again to get it back. The app says so (banner, button hint, the message after the install) | `vcam_admin::tests::an_install_without_the_users_sid_is_a_usage_error`, `without_the_users_sid_no_helper_is_started_and_the_message_says_why`, `the_app_gives_the_helper_the_users_sid`, `main::tests::the_elevated_step_must_be_told_whose_camera_it_is` |
-| L9 | `frames.bin` gave `FILE_WRITE_ATTRIBUTES` and `FILE_WRITE_EA` (hard link from a user's folder, read-only, sparse) | mask `0x12008f`; every open of the file asks for `FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES` and nothing more (`secure::ACCESS_READ_WRITE`, `Writer`, `MappedFile`); a frame file that is read-only, sparse, compressed or encrypted, or hard-linked, is replaced by the next Repair | `acl::tests::the_frame_file_acl_denies_hard_links_and_attributes_but_not_a_read_write_mapping` (real files; the control with the old mask `0x12019f` shows both attacks work), `datadir::tests::a_read_only_or_sparse_frame_file_is_replaced`, `a_frame_file_with_attributes_the_users_of_an_older_version_could_set_is_replaced`, `the_frame_file_acl_is_read_and_write_without_delete` |
+| L9 | `frames.bin` gave `FILE_WRITE_ATTRIBUTES` and `FILE_WRITE_EA` (hard link from a user's folder, read-only, sparse) | mask `0x12008f`; every open of the file asks for `FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES` and nothing more (`secure::ACCESS_READ_WRITE`, `Writer`, `MappedFile`); a frame file that is read-only or encrypted, or hard-linked, is replaced by the next Repair (**the mask does not prevent sparse, compressed or an extra data stream**: those need only rights the mask has; see "P-hardening 4", where Repair clears the first two in place and replaces a file that has a stream) | `acl::tests::the_frame_file_acl_denies_hard_links_and_attributes_but_not_a_read_write_mapping` (real files; the control with the old mask `0x12019f` shows both attacks work), `datadir::tests::a_read_only_or_sparse_frame_file_is_replaced`, `a_frame_file_with_attributes_the_users_of_an_older_version_could_set_is_replaced`, `the_frame_file_acl_is_read_and_write_without_delete` |
 | 8 | The test of "no second helper until the first exited" could not fail | `elevate::wait_for_exit` is the only wait and has no timeout: it asks for `WAIT_FOREVER`, and anything but "the process ended" is a `Failed` | `elevate::tests::the_wait_returns_only_when_the_process_has_exited` (a real child that runs 3 s; the wait ends with its exit code, not before), `the_wait_has_no_timeout` (the wait function is given a recording stand-in for `WaitForSingleObject`) |
 | - | Launch hygiene | `lpDirectory` is the System32 folder (`util::system_dir`, the shell's known folder) | `elevate::tests::the_elevated_process_starts_in_the_system_folder` |
 | - | Installer mode | `bundle.targets` is `["nsis"]`, `bundle.windows.nsis.installMode` is `perMachine` (both keys checked against `node_modules/@tauri-apps/cli/config.schema.json`); no installer was built | `npm run tauri build -- --no-bundle` passes |
@@ -760,7 +760,7 @@ are marked. Everything below is the machine after the live update (`icacls`, own
 
 As the standard user (medium integrity), live: creating a file or a folder in `BetterCam` or in `logs`, deleting or
 renaming `logs` or `frames.bin`, deleting or writing `install.log`, `mklink /H <own folder>\x.bin frames.bin`
-(`Access is denied`), `attrib +R frames.bin` (`Access denied`), `fsutil sparse setflag` (`Error 5`), opening
+(`Access is denied`), `attrib +R frames.bin` (`Access denied`), `fsutil sparse setflag` (`Error 5`; but that tool asks for more than data access: a handle with only `FILE_WRITE_DATA` can still set the flag, see "P-hardening 4"), opening
 `frames.bin` with `WriteAttributes`, `Delete` or `ChangePermissions`, and reading any `vcam-*.log` are all denied. Reading
 `install.log`, listing both folders, and opening `frames.bin` with exactly `ReadData | WriteData | ReadAttributes` work.
 Note that an open with `GENERIC_WRITE` (a plain .NET `FileAccess.ReadWrite`) is now denied too: it includes the right that
@@ -841,3 +841,115 @@ and the log shows them not interleaved.
   user who will run the app (it is checked to be a user account).
 * Not done on purpose (decided by the owner later): refusing a helper or DLL source in a folder a user can write to, and
   signature checks.
+
+# P-hardening 4: deletes, renames and the sweep (third review fixes)
+
+A third review judged the DLL and the protocol reader ready and found the faults in the installer's delete and rename
+paths. All fixed, each with a test; the ones that can have the old behaviour put back by hand were run that way (see
+"Check results"). No change to the frame-file layout, `PROTOCOL_VERSION`, the permission design of "P-hardening 3", the
+helper's command line or its exit codes (0, 1, 2, 5, 10, 11). **No source line of `crates/vcam-source` changed.** The
+DLL links `vcam-protocol`, whose `secure` module was refactored (a relative `nt_open_at`, one place that closes a
+handle on every status other than plain success), so the DLL was rebuilt and registered once (the content tag changes
+with any relink); the behaviour of every call the DLL makes is the one it had.
+
+## What changed
+
+| # | Finding | Fix | Tests |
+|---|---|---|---|
+| 1 | The sweep of `BetterCam.old-*` in `%ProgramData%` acted on entries any user can create, and waited for ever on a locked file in one | `datadir::sweep_data_asides(paths, trusted, log)`: each entry is looked at without following a link and without breaking any lock (`READ_CONTROL`, attributes only) and is **skipped unless its owner is SYSTEM or Administrators** (the helper's moved-aside folders have that owner; a standard user cannot make an entry with it); the owner is checked again on the handle that is deleted through (`secure::Top`); the delete is `secure::remove_tree_checked` (handles, `FILE_COMPLETE_IF_OPLOCKED`). A skipped entry is logged and never counts as a failure: install ignores the result, uninstall reports only entries of the helper's that stayed (as before), and says which file is locked | `datadir::tests::a_sweep_entry_of_somebody_else_is_left_alone_and_never_waited_for`, `an_old_data_folder_of_the_helpers_with_a_locked_file_is_left_without_waiting`, `moved_aside_data_folders_next_to_betercam_are_swept_without_following_links` (junction named like an entry), `install::tests::a_repair_does_not_wait_for_or_fail_on_an_old_data_folder_with_a_locked_file`, `an_uninstall_does_not_wait_for_a_locked_file_in_an_old_data_folder` (foreign entry: no failure, untouched; the helper's own: reported), `an_old_data_folder_that_cannot_be_deleted_is_reported_by_uninstall` |
+| 2 | The installer's other deletes and renames waited on such a lock too (`remove_dir_all`, `DeleteFileW`, `std::fs::rename`, `MoveFileExW`) | `secure::remove_tree`, `remove_tree_checked`, `remove_children` and `rename_no_wait` are the only delete and rename the installer uses: `NtCreateFile` with `DELETE` and `FILE_COMPLETE_IF_OPLOCKED`, then `FileDispositionInfoEx` (POSIX semantics, read-only ignored) or `FileRenameInfo` **on that handle**; folders are listed through the held handle and every entry is opened relative to it (`OBJECT_ATTRIBUTES.RootDirectory`), a link is deleted as a link and never entered (checked on the opened handle), depth is bounded. A file that is locked is left, the rest goes, and the error names the first file that stayed and how many more (`RemoveError`). `datadir::remove_no_follow`, `move_aside`, `empty_in_place`, `remove_all_reporting` (uninstall says what stayed behind), the sweeps and the deletes of DLLs in Program Files (`install::delete_file`) use them. A repair that has to replace a locked `frames.bin` fails at once with a sentence that names the file and does not stop the camera service (that does not help against a lock of the user). The log prune in the DLL already deleted through `secure::remove_plain_file` | `secure::tests::a_tree_is_deleted_without_following_links_and_a_locked_file_is_left_without_waiting`, `the_error_says_how_many_entries_stayed`, `a_check_on_the_top_entry_can_stop_the_delete_before_anything_is_changed`, `a_rename_does_not_wait_for_an_oplock_and_never_goes_through_a_link` (a junction is renamed or deleted itself, its target is left), `datadir::tests::removing_the_data_folder_does_not_wait_for_a_locked_file_and_says_which_one_stayed`, `a_logs_folder_that_is_emptied_in_place_does_not_wait_for_a_locked_log`, `moving_a_locked_file_aside_does_not_wait`, `replacing_a_locked_frame_file_is_an_error_that_names_it_and_does_not_wait`, `a_lock_that_is_given_up_within_a_moment_does_not_fail_the_repair_and_one_that_is_not_does`, `deleting_never_recurses_through_a_link`, `moving_a_junction_aside_renames_the_junction_and_not_the_target`, `install::tests::an_uninstall_does_not_wait_for_a_locked_install_log_and_says_what_stayed`, `an_old_dll_that_a_program_holds_a_lock_on_does_not_hold_up_an_update_or_a_removal`, `datadir::tests::an_object_that_gives_the_caller_no_delete_right_is_left_and_named` |
+| 3 | The frame file can still be made sparse or compressed or get extra data streams (the mask `0x12008f` has the data rights those need) | Docs and the test comment corrected (see below). Repair **clears the sparse and compressed state in place** through the held handle (`secure::clear_sparse_and_compression`: `FSCTL_SET_SPARSE` false, `FSCTL_SET_COMPRESSION` none; same file, same contents), and **replaces the file when it has any stream besides `::$DATA`** (`secure::extra_streams`, `FileStreamInfo`); read-only and encrypted files are replaced as before, and so is one whose flags cannot be cleared | `acl::tests::a_write_data_handle_can_still_make_the_frame_file_sparse_or_compressed_or_give_it_a_stream` (a `FILE_WRITE_DATA`-only handle on a file with the real mask), `datadir::tests::a_sparse_or_compressed_frame_file_is_cleared_in_place_and_stays_the_same_file` (file index unchanged, contents kept), `a_frame_file_with_an_extra_stream_is_replaced`, `a_read_only_frame_file_is_replaced`, `sparse_and_compressed_files_are_kept_and_a_file_with_a_stream_is_replaced`, `secure::tests::a_sparse_or_compressed_file_is_made_plain_in_place` (flag only, with a hole, compressed), `extra_data_streams_are_listed` |
+| 4 | The app could show an earlier run's `ERROR:` line (helper died after fewer than 8 lines) | The tail is cut at the last `---- install:` / `---- uninstall:` marker (`log::from_last_marker`, shared with `vcam-tool`'s `util::run_output`); the markers are constants used by the helper that writes them. When `install.log` itself is locked by another program neither the helper could write its reason nor the app can read it: the app says so instead of showing nothing (`log::install_log_locked`) | `log::tests::the_app_reads_only_the_last_run_and_never_the_error_of_an_earlier_one` (with the old reading as a control that finds the old error), `a_log_that_another_program_holds_a_lock_on_is_reported_as_locked`, `vcam-tool util::tests::*` |
+| 5 | The machine-wide lock could report an error when nobody holds it | `lock::open_namespace_with`: "create fails because it exists, then open" starts over (bounded: 20 tries, 10 ms apart) when the open finds nothing because the holder closed its last handle in between | `lock::tests::a_namespace_that_goes_away_between_the_create_and_the_open_is_created_again`, `a_namespace_that_cannot_be_opened_is_reported_after_a_bounded_number_of_tries`, `racing_helpers_never_see_an_error_when_nobody_holds_the_lock` (three processes, real calls) |
+| 6 | A handle could leak on an unexpected success status | `secure::finish_open_with` closes a non-null handle on every status but plain success | `secure::tests::a_handle_that_comes_with_an_unexpected_status_is_closed` (a recording close; success codes, informational, pending, warning and error statuses) |
+
+## The permission design: one correction
+
+The mask `0x12008f` of `frames.bin` is unchanged. What it does **not** prevent, because the right is one it has
+(reproduced on temp files with the same DACL by `acl::tests::a_write_data_handle_can_still_...`): `FSCTL_SET_SPARSE`
+through a handle with only `FILE_WRITE_DATA`; `FSCTL_SET_COMPRESSION` through read and write data; a named stream
+(`frames.bin:name`) through `FILE_WRITE_DATA`. The DLL and the app do not mind any of the three, but "a Repair replaces
+such a file" was not what the code did for streams (their data survived) and replaced the file for the other two for
+no need. `fsutil sparse setflag` fails for the user only because it asks for more than data access. The text of
+"P-hardening 3" (L9) and `acl.rs` now say this.
+
+## Things found only by running it
+
+* **Renaming a folder waits for a lock on a file below it, and no create flag can refuse that.** A read-write-handle
+  oplock (what any reader can take) on a file makes `SetFileInformationByHandle(FileRenameInfo)` of a folder above it
+  block until the holder lets go (a read-handle lock does not: the rename is refused at once). `FILE_COMPLETE_IF_OPLOCKED`
+  is a create option. `secure::rename_no_wait` therefore runs the call on a worker with a bound (1.5 s) and
+  `CancelSynchronousIo`s it; the rename is then not done (the folder is where it was) and the result is the same
+  refusal as an open. A moved-aside data folder or `logs` that holds such a file is therefore reported (`logs` is emptied
+  in place instead, as it already was for open files).
+* **A delete or rename of a *file* met the lock at the open** (it asks for `DELETE`), so those return at once
+  with the refusal; a lock that has been asked to break and never answers keeps every later open of the file refused
+  until it answers or the system gives up on it, so retrying at once does not help and `move_aside` does not retry.
+* Opens that meet a lock are asked again for about two seconds (`datadir::LOCK_PATIENCE`) before a Repair gives up:
+  a program that is asked to give a lock up does so within moments, and a failed Repair for an anti-virus scan would be
+  worse than a short wait. A lock that is not given up fails the Repair with a sentence that names the file.
+* Tests that look at a locked file must not read it (a plain read waits): they use attribute-only calls.
+* **A delete through a handle needs `DELETE` on the object itself.** `DeleteFileW` also deletes an object whose DACL gives the
+  caller nothing, through the delete-child right of the folder it is in; no open for `DELETE` that was tried (`CreateFileW`
+  with `DELETE`, with `DELETE_ON_CLOSE`, with and without backup intent, relative or absolute) is allowed in that case. Such an
+  object is left and named (it can only be one that somebody made with permissions that exclude the administrators: what the
+  helper makes grants Administrators full control), and the rest of its folder goes (`datadir::tests::an_object_that_gives_the_caller_no_delete_right_is_left_and_named`).
+  A test that made such a file in a sandbox as an unelevated user (a log made with the real accounts) used to leave its
+  folder in `%TEMP%`; those tests now use the sandbox's own accounts.
+* **`FSCTL_SET_SPARSE` false works on a file with holes** (they become zeros with storage); no filling pass is needed.
+* POSIX delete semantics (`FILE_DISPOSITION_FLAG_POSIX_SEMANTICS`) remove the name at once even while a program still has
+  the file open with delete sharing, which is what `remove_dir_all` did and what lets `logs` and the data folder go
+  while the camera service has a log open; a volume that does not know them gets the classic delete.
+* `tauri dev` watches `crates/vcam-install` and `crates/vcam-protocol` and restarts the app on every edit; with
+  `BETTER_CAM_TEST_WINDOW` set the restarted app stays in the background.
+* Seen once: a Repair started within a second of the app's launch left the engine "Opening the camera..." (STANDBY)
+  until Stop and Start; a Repair of a running app does not (checked). That is the engine's claim around a launch, not
+  the installer (not touched, not investigated further).
+
+## Not done
+
+* Reads and the rename of the DLL in `Program Files` (`install::copy_dll`: `std::fs::read(dest)`, `rename(tmp, dest)`;
+  `std::fs::read(dll_src)`) still use the plain open: a standard user can read that folder, so a lock on the installed
+  DLL could make a Repair wait. The deletes there go through handles now. The same bounded handle read would close it.
+* A Repair fails (quickly, with the file named) while a program of the user holds an unanswered lock on `install.log`;
+  Remove leaves `install.log`, `logs` and the data folder in that case, and says so. Neither waits.
+
+## Check results
+
+```
+cargo test -p vcam-protocol -p vcam-source -p vcam-install -p vcam-tool
+                            vcam-protocol 68 passed, vcam-source 57, vcam-install 110 (+2 ignored: the child processes of two
+                            lock tests), vcam-tool 17; 0 failed (before: 61, 57, 89, 17)
+cargo test -p better-cam vcam_admin          20 passed
+cargo clippy -p vcam-protocol -p vcam-source -p vcam-install -p vcam-tool --all-targets     0 warnings
+cargo fmt --check -p vcam-protocol -p vcam-source -p vcam-install -p vcam-tool              clean
+cargo check -p better-cam                    ok
+```
+
+With the old behaviour put back by hand (`remove_no_follow` as `remove_dir_all`, `move_aside` as `std::fs::rename`,
+the old sweep, in one go), the nine tests that name a lock in `datadir::tests` and `install::tests` fail after their 10 s
+bound with "still waiting ... it waits for a lock": the two sweep tests, `removing_the_data_folder_...`,
+`a_logs_folder_that_is_emptied_in_place_...`, `moving_a_locked_file_aside_...`, `replacing_a_locked_frame_file_...`,
+and the three install tests. `an_old_dll_...` fails the same way with `std::fs::remove_file`. The lock race test
+(`racing_helpers_...`) fails with the retry count at 1; the sparse test fails with the flag cleared by
+replacing (file index changes); the handle test fails with the close restricted to the oplock status ("status
+0x40000000: the handle leaked"); the log test carries its own control (the old reading finds the old error).
+
+Live, on this machine (Windows 11 build 26200, elevation without a prompt, debug build, app started with
+`BETTER_CAM_TEST_WINDOW`, driven through the DevTools protocol; the helper is started with `SW_HIDE`, see
+`elevate.rs`):
+
+```
+update (Repair, new DLL)     1.1 s, status ok, the registered DLL is byte-identical to target\release\better_cam_vcam.dll
+standard user's BetterCam.old-test with f.txt, an oplock held on f.txt by a hidden non-elevated process
+                             Repair 0.8 s, "done", status ok; install.log: "BetterCam.old-test left alone: its owner is S-1-5-21-...-1001, not SYSTEM
+                             or Administrators"; the entry and the locked file untouched; no helper left; a second Repair 0.2 s
+oplock on install.log (read-only open, nothing else had it open)
+                             Remove 3.7 s: "Could not remove the virtual camera (exit code 1) The details cannot be shown: another program has the
+                             install log ... open and locked ..."; camera, keys and DLL gone, logs\install.log left; Install while the lock is
+                             still held: 0.2 s, the same sentence; after the release: Install 0.3 s, status ok (the machine lock was free)
+frames.bin made sparse by a FILE_WRITE_DATA-only handle (app closed, standard user)
+                             attributes Archive, Temporary, SparseFile -> Archive, Temporary; file id 0x036d00000000e2ec before and after; Repair 1.2 s,
+                             install.log: "frames.bin: it is sparse or compressed; clearing that in place"; app LIVE, a consumer read 234 video frames in 8 s
+Remove, Install              5.8 s, 0.3 s; status missing, then ok; the user's old entry was skipped again, not an error
+```

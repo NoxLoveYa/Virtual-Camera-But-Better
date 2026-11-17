@@ -227,11 +227,61 @@ impl Drop for FileLog {
     }
 }
 
-/// The last `max` non-empty lines of `install.log` written after `since` (what the app shows when the helper
-/// failed). Empty when the file is older than `since`: that is another run's text. Read through the same checks as
-/// the file is written with.
+/// The line the helper writes first in an install, repair or update (after the time stamp): `---- install: elevated,
+/// user <SID>`. A run begins with its marker; what comes before the last one belongs to earlier runs.
+pub const INSTALL_MARKER: &str = "---- install:";
+/// The line the helper writes first in a removal.
+pub const UNINSTALL_MARKER: &str = "---- uninstall:";
+
+/// How many lines of `install.log` are looked through to find the run (a run writes a few dozen).
+pub const LOOKBACK: usize = 400;
+
+/// The lines of the last run: from the last line that `is_marker` accepts (that line included) to the end. Empty
+/// when there is no marker: nothing in `lines` is known to belong to the run that is asked about, and an earlier
+/// run's text must not be taken for it. One piece of code for the app and for `vcam-tool`.
+pub fn from_last_marker(lines: &[String], is_marker: impl Fn(&str) -> bool) -> &[String] {
+    match lines.iter().rposition(|l| is_marker(l)) {
+        Some(i) => &lines[i..],
+        None => &[],
+    }
+}
+
+/// What the app looks at when the helper failed: the last `max` lines of *this* run of the helper, that is, of
+/// `install.log` from its last install or uninstall marker on (see [`from_last_marker`]), and only when the file
+/// was written after `since`. A helper that dies after only a few lines (a crash, a kill) has not got an `ERROR:`
+/// line of its own, and the lines before its marker, which may have one from an earlier run, are not returned.
+/// Read through the same checks as the file is written with.
 pub fn log_tail_since(since: SystemTime, max: usize) -> Vec<String> {
-    tail_of(&Paths::system(), since, max)
+    helper_run_of(&Paths::system(), since, max)
+}
+
+/// [`log_tail_since`] for other folders (tests).
+pub fn helper_run_of(paths: &Paths, since: SystemTime, max: usize) -> Vec<String> {
+    let lines = tail_of(paths, since, LOOKBACK);
+    let run = from_last_marker(&lines, |l| {
+        l.contains(INSTALL_MARKER) || l.contains(UNINSTALL_MARKER)
+    });
+    run[run.len().saturating_sub(max)..].to_vec()
+}
+
+/// True when `install.log` cannot be read right now because another program holds an opportunistic lock on it (the
+/// user may read the file, and a lock on it makes every other open give up): the app then cannot show the reason of
+/// a failure that the helper could not write either, and says so.
+pub fn install_log_locked() -> bool {
+    install_log_locked_in(&Paths::system())
+}
+
+/// [`install_log_locked`] for other folders (tests).
+pub fn install_log_locked_in(paths: &Paths) -> bool {
+    secure::open_with(
+        &paths.install_log(),
+        GENERIC_READ,
+        secure::SHARE_ALL,
+        secure::DISP_OPEN_EXISTING,
+        false,
+        0,
+    )
+    .is_err_and(|e| secure::is_oplock_busy(&e))
 }
 
 /// [`log_tail_since`] for other folders (tests).
@@ -284,7 +334,7 @@ mod tests {
     #[test]
     fn lines_wait_for_the_folder_and_are_written_through_the_verified_file_afterwards() {
         let s = sandbox("filelog");
-        let mut log = FileLog::with_paths(s.paths.clone());
+        let mut log = FileLog::with_paths_and_principals(s.paths.clone(), s.p.clone());
         assert!(!log.attached(), "no folder yet: nothing is created");
         log.line("before the folder");
         assert!(!s.paths.data.exists(), "the log must not create the folder");
@@ -319,7 +369,7 @@ mod tests {
         std::fs::create_dir_all(&elsewhere).unwrap();
         remove_no_follow(&s.paths.logs()).unwrap();
         junction(&s.paths.logs(), &elsewhere);
-        let mut log = FileLog::with_paths(s.paths.clone());
+        let mut log = FileLog::with_paths_and_principals(s.paths.clone(), s.p.clone());
         assert!(!log.attached());
         log.line("secret");
         log.folder_ready();
@@ -341,13 +391,13 @@ mod tests {
         // `prepare` made install.log: put the hard link in its place
         std::fs::remove_file(s.paths.install_log()).unwrap();
         std::fs::hard_link(&victim, s.paths.install_log()).unwrap();
-        let mut log = FileLog::with_paths(s.paths.clone());
+        let mut log = FileLog::with_paths_and_principals(s.paths.clone(), s.p.clone());
         assert!(!log.attached());
         log.line("appended?");
         assert_eq!(text(&victim), "precious");
         std::fs::remove_file(s.paths.install_log()).unwrap();
         if std::os::windows::fs::symlink_file(&victim, s.paths.install_log()).is_ok() {
-            let mut log = FileLog::with_paths(s.paths.clone());
+            let mut log = FileLog::with_paths_and_principals(s.paths.clone(), s.p.clone());
             assert!(!log.attached());
             log.line("appended?");
             assert_eq!(text(&victim), "precious");
@@ -356,12 +406,97 @@ mod tests {
         }
     }
 
+    /// A helper that died (exit 101, a kill) after a few lines, with the last line of an earlier run's `ERROR:` still
+    /// within the last eight lines of the file: the app showed that old reason for the new failure.
+    #[test]
+    fn the_app_reads_only_the_last_run_and_never_the_error_of_an_earlier_one() {
+        let s = sandbox("filelog-run");
+        prepare(&s.paths, &s.p, &mut || false, &mut crate::log::NullLog).unwrap();
+        let before = SystemTime::now() - std::time::Duration::from_secs(5);
+        let write = |lines: &[&str]| {
+            let mut t = String::new();
+            for l in lines {
+                t.push_str(&format!("2026-11-17 01:02:03 {l}\n"));
+            }
+            std::fs::write(s.paths.install_log(), t).unwrap();
+        };
+        // control: the old reading (the last eight lines of the file) finds the old error
+        write(&[
+            "---- install: elevated, user S-1-5-21-1-2-3-1001",
+            "data folder ready",
+            "ERROR: the earlier run failed",
+            "---- install: elevated, user S-1-5-21-1-2-3-1001",
+            "dll source: C:\\x.dll",
+        ]);
+        let old = tail_of(&s.paths, before, 8);
+        assert!(
+            old.iter().any(|l| l.contains("the earlier run failed")),
+            "{old:?}"
+        );
+        // the run that died after two lines has no reason of its own, and the earlier one is not shown
+        let run = helper_run_of(&s.paths, before, 8);
+        assert_eq!(run.len(), 2, "{run:?}");
+        assert!(run[0].contains(INSTALL_MARKER) && run[1].contains("dll source"));
+        assert!(!run.iter().any(|l| l.contains("ERROR:")), "{run:?}");
+
+        // this run's own error is returned, with the lines of this run only
+        write(&[
+            "---- uninstall: elevated",
+            "ERROR: an old removal failed",
+            "---- install: elevated, user S-1-5-21-1-2-3-1001",
+            "data folder ready",
+            "ERROR: this run failed",
+        ]);
+        let run = helper_run_of(&s.paths, before, 8);
+        assert_eq!(run.len(), 3, "{run:?}");
+        assert!(run.last().unwrap().contains("this run failed"));
+        // a removal is a run too, and `max` cuts from the front
+        write(&[
+            "---- install: elevated",
+            "ERROR: old",
+            "---- uninstall: elevated",
+            "a",
+            "b",
+            "c",
+        ]);
+        let run = helper_run_of(&s.paths, before, 2);
+        assert_eq!(run.len(), 2);
+        assert!(run[0].ends_with(" b") && run[1].ends_with(" c"), "{run:?}");
+        // no marker at all: nothing in the file is known to be of this run
+        write(&["some line", "ERROR: whose?"]);
+        assert!(helper_run_of(&s.paths, before, 8).is_empty());
+        // a file that is older than the run says nothing, as before
+        write(&["---- install: elevated", "ERROR: x"]);
+        let later = SystemTime::now() + std::time::Duration::from_secs(60);
+        assert!(helper_run_of(&s.paths, later, 8).is_empty());
+    }
+
+    #[test]
+    fn a_log_that_another_program_holds_a_lock_on_is_reported_as_locked() {
+        let s = sandbox("filelog-locked");
+        prepare(&s.paths, &s.p, &mut || false, &mut crate::log::NullLog).unwrap();
+        assert!(!install_log_locked_in(&s.paths));
+        let Some(lock) = crate::testkit::lock_on(&s.paths.install_log()) else {
+            return;
+        };
+        let p = s.paths.clone();
+        assert!(crate::testkit::within(
+            "install_log_locked",
+            crate::testkit::BOUND,
+            move || install_log_locked_in(&p)
+        ));
+        // no file at all is not a lock
+        drop(lock);
+        std::fs::remove_file(s.paths.install_log()).unwrap();
+        assert!(!install_log_locked_in(&s.paths));
+    }
+
     #[test]
     fn the_tail_is_read_through_the_same_checks_and_only_when_it_is_new() {
         let s = sandbox("filelog-tail");
         prepare(&s.paths, &s.p, &mut || false, &mut crate::log::NullLog).unwrap();
         let before = SystemTime::now();
-        let mut log = FileLog::with_paths(s.paths.clone());
+        let mut log = FileLog::with_paths_and_principals(s.paths.clone(), s.p.clone());
         for i in 0..5 {
             log.line(&format!("line {i}"));
         }

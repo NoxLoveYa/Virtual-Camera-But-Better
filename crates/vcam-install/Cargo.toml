@@ -10,6 +10,10 @@ rust-version.workspace = true
 vcam-protocol.workspace = true
 windows-core.workspace = true
 
+[dev-dependencies]
+# `secure::oplock`: a test takes an opportunistic lock on a file the way a program of the user can
+vcam-protocol = { workspace = true, features = ["test-support"] }
+
 [dependencies.windows]
 workspace = true
 features = [

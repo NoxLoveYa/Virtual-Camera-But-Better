@@ -1,7 +1,7 @@
 use super::*;
 use crate::acl::Snapshot;
 use crate::log::VecLog;
-use crate::testkit::{junction, sandbox, security_of, Sandbox};
+use crate::testkit::{junction, lock_on, sandbox, security_of, within, Sandbox, BOUND};
 
 fn run(s: &Sandbox, log: &mut VecLog) -> Res<()> {
     prepare(&s.paths, &s.p, &mut || false, log)
@@ -57,6 +57,8 @@ fn good(is_directory: bool) -> Facts {
         owner_trusted: true,
         acl_as_expected: true,
         bad_attributes: false,
+        sparse_or_compressed: false,
+        extra_streams: false,
     }
 }
 
@@ -79,12 +81,37 @@ fn a_frame_file_with_attributes_the_users_of_an_older_version_could_set_is_repla
         ..good(dir)
     };
     let Plan::Replace(why) = decide(Object::FramesFile, Some(&odd(false))) else {
-        panic!("a read-only, sparse or compressed frame file must be replaced")
+        panic!("a read-only or encrypted frame file must be replaced")
     };
     assert!(why.contains("read-only"), "{why}");
     // the flags are meaningless for folders: they are not a reason
     assert_eq!(decide(Object::LogsDir, Some(&odd(true))), Plan::Keep);
     assert_eq!(decide(Object::DataDir, Some(&odd(true))), Plan::Keep);
+}
+
+/// The two states a `FILE_WRITE_DATA` handle can set are put right in place (the file is kept); an extra data
+/// stream is a reason to replace the file.
+#[test]
+fn sparse_and_compressed_files_are_kept_and_a_file_with_a_stream_is_replaced() {
+    let sparse = Facts {
+        sparse_or_compressed: true,
+        ..good(false)
+    };
+    assert_eq!(decide(Object::FramesFile, Some(&sparse)), Plan::Keep);
+    let streams = Facts {
+        extra_streams: true,
+        ..good(false)
+    };
+    let Plan::Replace(why) = decide(Object::FramesFile, Some(&streams)) else {
+        panic!("a file with a stream must be replaced")
+    };
+    assert!(why.contains("stream"), "{why}");
+    // folders are not looked at for streams
+    let dir = Facts {
+        extra_streams: true,
+        ..good(true)
+    };
+    assert_eq!(decide(Object::LogsDir, Some(&dir)), Plan::Keep);
 }
 
 #[test]
@@ -802,24 +829,42 @@ fn the_install_log_loses_the_modify_right_the_service_would_inherit_from_logs() 
 
 // ---- L9: a frame file the old permissions let the user damage is replaced
 
+/// A replaced file is a new one: the marker in the old one is gone (creation times cannot tell, NTFS tunnels them to
+/// a file made under the same name moments later).
+fn mark(s: &Sandbox) {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(s.paths.frames())
+        .unwrap();
+    f.seek(SeekFrom::Start(100)).unwrap();
+    f.write_all(b"OLD FILE").unwrap();
+}
+
+fn marked(s: &Sandbox) -> bool {
+    &std::fs::read(s.paths.frames()).unwrap()[100..108] == b"OLD FILE"
+}
+
+fn attributes_of(p: &Path) -> u32 {
+    std::fs::metadata(p).unwrap().file_attributes()
+}
+
+/// The identity of the file at `p` (volume and file index): the same value means the same file, not a copy.
+fn file_id(p: &Path) -> (u32, u32, u32) {
+    use windows::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let h = secure::open_with(p, 0x80, secure::SHARE_ALL, DISP_OPEN_EXISTING, false, 0).unwrap();
+    let mut i = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(secure::raw(&h), &mut i) }.unwrap();
+    (i.dwVolumeSerialNumber, i.nFileIndexHigh, i.nFileIndexLow)
+}
+
 #[test]
-fn a_read_only_or_sparse_frame_file_is_replaced() {
+fn a_read_only_frame_file_is_replaced() {
     let s = sandbox("bad-attrs");
     run(&s, &mut VecLog::default()).unwrap();
-    // a replaced file is a new one: the marker in the old one is gone (creation times cannot tell, NTFS tunnels
-    // them to a file made under the same name moments later)
-    let mark = |s: &Sandbox| {
-        use std::io::{Seek, SeekFrom, Write};
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(s.paths.frames())
-            .unwrap();
-        f.seek(SeekFrom::Start(100)).unwrap();
-        f.write_all(b"OLD FILE").unwrap();
-    };
-    let marked = |s: &Sandbox| &std::fs::read(s.paths.frames()).unwrap()[100..108] == b"OLD FILE";
     mark(&s);
-    // read-only
     let mut perm = std::fs::metadata(s.paths.frames()).unwrap().permissions();
     perm.set_readonly(true);
     std::fs::set_permissions(s.paths.frames(), perm).unwrap();
@@ -832,31 +877,105 @@ fn a_read_only_or_sparse_frame_file_is_replaced() {
     assert!(mentions(&log, "read-only"), "{:?}", log.0);
     assert!(!marked(&s), "the file was not replaced");
     assert!(secure::open_existing(&s.paths.frames(), true, None).is_ok());
-    // sparse (FSCTL_SET_SPARSE through fsutil, which a user with the old rights could do)
+}
+
+/// A handle with only `FILE_WRITE_DATA` can make the frame file sparse, one with read and write data can compress
+/// it (`acl::tests::a_write_data_handle_can_still_...`). Repair clears both in place, through the held handle: the
+/// same file, with its contents, not a copy.
+#[test]
+fn a_sparse_or_compressed_frame_file_is_cleared_in_place_and_stays_the_same_file() {
+    let s = sandbox("sparse-in-place");
+    run(&s, &mut VecLog::default()).unwrap();
     mark(&s);
-    let ok = std::process::Command::new("fsutil")
-        .args(["sparse", "setflag"])
-        .arg(s.paths.frames())
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !ok {
-        eprintln!("cannot mark the file sparse here: that part is skipped");
-        return;
+    let id = file_id(&s.paths.frames());
+    let frames = s.paths.frames();
+    // sparse, through a handle with only FILE_WRITE_DATA
+    {
+        let h = secure::open_with(
+            &frames,
+            0x2,
+            secure::SHARE_ALL,
+            DISP_OPEN_EXISTING,
+            false,
+            0,
+        )
+        .unwrap();
+        secure::set_sparse(secure::raw(&h), true).unwrap();
+    }
+    assert_ne!(attributes_of(&frames) & secure::ATTRIBUTE_SPARSE, 0);
+    let mut log = VecLog::default();
+    run(&s, &mut log).unwrap();
+    assert!(mentions(&log, "clearing that in place"), "{:?}", log.0);
+    assert_eq!(attributes_of(&frames) & secure::ATTRIBUTE_SPARSE, 0);
+    assert_eq!(file_id(&frames), id, "the file was replaced, not cleared");
+    assert!(marked(&s), "the contents are gone");
+    assert_eq!(
+        std::fs::metadata(&frames).unwrap().len(),
+        vcam_protocol::FILE_SIZE
+    );
+    assert!(
+        log.0.iter().any(|l| l.ends_with("frames.bin: kept")),
+        "{:?}",
+        log.0
+    );
+
+    // compressed (and sparse too), through a read-write handle
+    {
+        let h = secure::open_with(
+            &frames,
+            0x3,
+            secure::SHARE_ALL,
+            DISP_OPEN_EXISTING,
+            false,
+            0,
+        )
+        .unwrap();
+        secure::set_sparse(secure::raw(&h), true).unwrap();
+        if secure::set_compressed(secure::raw(&h), true).is_err() {
+            eprintln!("this volume cannot compress a file: that part is skipped");
+        }
     }
     let mut log = VecLog::default();
     run(&s, &mut log).unwrap();
-    assert!(mentions(&log, "sparse"), "{:?}", log.0);
-    assert!(!marked(&s), "the sparse file was not replaced");
     assert_eq!(
-        std::fs::metadata(s.paths.frames())
-            .unwrap()
-            .file_attributes()
-            & 0x200,
+        attributes_of(&frames) & (secure::ATTRIBUTE_SPARSE | secure::ATTRIBUTE_COMPRESSED),
         0
     );
+    assert_eq!(file_id(&frames), id);
+    assert!(marked(&s));
+    // and a file that is fine is not touched or mentioned
+    let mut log = VecLog::default();
+    run(&s, &mut log).unwrap();
+    assert!(!mentions(&log, "clearing that in place"), "{:?}", log.0);
+    assert_eq!(file_id(&frames), id);
 }
 
+/// A data stream on the frame file (made through `FILE_WRITE_DATA`) would survive a Repair that kept the file: the
+/// file is replaced, and what was in the stream goes with it.
+#[test]
+fn a_frame_file_with_an_extra_stream_is_replaced() {
+    let s = sandbox("stream");
+    run(&s, &mut VecLog::default()).unwrap();
+    mark(&s);
+    let stream = format!("{}:extra", s.paths.frames().display());
+    if std::fs::write(&stream, b"hidden").is_err() {
+        eprintln!("this volume has no named streams: skipped");
+        return;
+    }
+    assert_eq!(std::fs::read(&stream).unwrap(), b"hidden");
+    let mut log = VecLog::default();
+    run(&s, &mut log).unwrap();
+    assert!(mentions(&log, "extra data stream"), "{:?}", log.0);
+    assert!(!marked(&s), "the file was not replaced");
+    assert!(
+        std::fs::read(&stream).is_err(),
+        "the stream survived the repair"
+    );
+    // the new file is plain, and is kept the next time
+    let mut log = VecLog::default();
+    run(&s, &mut log).unwrap();
+    assert!(!mentions(&log, "extra data stream"), "{:?}", log.0);
+}
 // ---- L2: a moved-aside data folder is deleted later
 
 #[test]
@@ -872,7 +991,10 @@ fn moved_aside_data_folders_next_to_betercam_are_swept_without_following_links()
     std::fs::create_dir_all(pd.join("Other.old-1-0")).unwrap();
     std::fs::create_dir_all(pd.join("BetterCamera")).unwrap();
     let mut log = VecLog::default();
-    assert_eq!(sweep_data_asides(&s.paths, &mut log), 0);
+    assert_eq!(
+        sweep_data_asides(&s.paths, &s.p.trusted_owners, &mut log),
+        0
+    );
     assert!(!pd.join("BetterCam.old-1-0").exists());
     assert!(!pd.join("BetterCam.old-2-0").exists(), "the junction goes");
     untouched(&dir, &frames, &logs);
@@ -883,6 +1005,328 @@ fn moved_aside_data_folders_next_to_betercam_are_swept_without_following_links()
     assert!(mentions(&log, "BetterCam.old-1-0"), "{:?}", log.0);
 }
 
+/// An object whose own permissions give the caller no `DELETE` is not deleted through a handle (the plain
+/// `DeleteFileW` could, through the delete-child right of the folder it is in; the helper does not rely on that:
+/// what it makes grants Administrators full control). It is left, named, with everything else of the folder gone,
+/// and nothing waits or fails beyond it.
+#[test]
+fn an_object_that_gives_the_caller_no_delete_right_is_left_and_named() {
+    let s = sandbox("no-own-access");
+    let dir = s.root.join("folder");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("f.txt"), b"x").unwrap();
+    std::fs::write(dir.join("other.txt"), b"y").unwrap();
+    let h = secure::open_with(
+        &dir.join("f.txt"),
+        GENERIC_READ | acl::SECURITY_ACCESS,
+        secure::SHARE_ALL,
+        DISP_OPEN_EXISTING,
+        true,
+        0,
+    )
+    .unwrap();
+    // nobody but SYSTEM: the test user keeps only what an owner has (read and change the permissions)
+    let only_system = [acl::Ace {
+        sid: acl::SID_SYSTEM.into(),
+        mask: acl::FULL,
+        flags: 0,
+    }];
+    acl::apply_aces(&h, &only_system, &s.p.owner).unwrap();
+    // the owner can always give itself the right back: that is what the test does to clean up
+    let e = remove_no_follow(&dir).unwrap_err();
+    assert!(e.to_string().contains("f.txt"), "{e}");
+    assert!(
+        !dir.join("other.txt").exists(),
+        "the rest of the folder went"
+    );
+    let back = [acl::Ace {
+        sid: s.p.owner.clone(),
+        mask: acl::FULL,
+        flags: 0,
+    }];
+    acl::apply_aces(&h, &back, &s.p.owner).unwrap();
+    drop(h);
+    remove_no_follow(&dir).unwrap();
+    assert!(!dir.exists());
+}
+// ---- findings 1 and 2: nothing the helper deletes or moves waits for another program, and it acts only on its own
+
+/// What a standard user can leave in `%ProgramData%`: an entry named like the helper's, that the helper did not make,
+/// with a file in it that the user holds an oplock on. The sweep must leave it as it is (its owner is not SYSTEM or
+/// Administrators) and must not wait for the lock: this was a hang of every install, repair and removal, with the
+/// machine-wide lock held, for as long as the program held the lock.
+#[test]
+fn a_sweep_entry_of_somebody_else_is_left_alone_and_never_waited_for() {
+    let s = sandbox("sweep-foreign");
+    let pd = s.paths.program_data.clone();
+    let entry = pd.join("BetterCam.old-test");
+    std::fs::create_dir_all(entry.join("sub")).unwrap();
+    std::fs::write(entry.join("f.txt"), vec![1u8; 4096]).unwrap();
+    std::fs::write(entry.join("sub").join("g.txt"), b"g").unwrap();
+    let Some(lock) = lock_on(&entry.join("f.txt")) else {
+        return;
+    };
+    // only SYSTEM is trusted here: the test user (who made the entry) plays the standard user
+    let trusted = vec![acl::SID_SYSTEM.to_string()];
+    let paths = s.paths.clone();
+    let (left, lines) = within("sweep", BOUND, move || {
+        let mut log = VecLog::default();
+        (sweep_data_asides(&paths, &trusted, &mut log), log.0)
+    });
+    assert_eq!(
+        left, 0,
+        "somebody else's entry is not the helper's to report: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("BetterCam.old-test left alone")),
+        "{lines:?}"
+    );
+    // (a read of the locked file would itself wait: its size is looked at without opening it for data)
+    assert_eq!(std::fs::metadata(entry.join("f.txt")).unwrap().len(), 4096);
+    assert_eq!(
+        std::fs::read(entry.join("sub").join("g.txt")).unwrap(),
+        b"g"
+    );
+    drop(lock);
+    // ... and a junction with such a name that somebody else made is not removed either
+    let (dir, frames, logs) = elsewhere(&s);
+    junction(&pd.join("BetterCam.old-link"), &dir);
+    let mut log = VecLog::default();
+    assert_eq!(
+        sweep_data_asides(&s.paths, &[acl::SID_SYSTEM.to_string()], &mut log),
+        0
+    );
+    assert!(is_link(&pd.join("BetterCam.old-link")));
+    untouched(&dir, &frames, &logs);
+    // trusted: now it goes (as a junction), and so does the entry
+    let mut log = VecLog::default();
+    assert_eq!(
+        sweep_data_asides(&s.paths, &s.p.trusted_owners, &mut log),
+        0
+    );
+    assert!(!entry.exists() && !pd.join("BetterCam.old-link").exists());
+    untouched(&dir, &frames, &logs);
+}
+
+/// An entry the helper moved aside itself (owner Administrators) that still has a file somebody holds a lock on is
+/// left, without waiting, and said so; the rest of it is deleted, and the next sweep finishes it.
+#[test]
+fn an_old_data_folder_of_the_helpers_with_a_locked_file_is_left_without_waiting() {
+    let s = sandbox("sweep-locked");
+    let entry = s.paths.program_data.join("BetterCam.old-1-0");
+    std::fs::create_dir_all(entry.join("logs")).unwrap();
+    std::fs::write(entry.join("frames.bin"), vec![0u8; 8192]).unwrap();
+    std::fs::write(entry.join("logs").join("install.log"), b"x").unwrap();
+    let Some(lock) = lock_on(&entry.join("frames.bin")) else {
+        return;
+    };
+    let (paths, trusted) = (s.paths.clone(), s.p.trusted_owners.clone());
+    let (left, lines) = within("sweep", BOUND, move || {
+        let mut log = VecLog::default();
+        (sweep_data_asides(&paths, &trusted, &mut log), log.0)
+    });
+    assert_eq!(left, 1, "{lines:?}");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("frames.bin") && l.contains("locked by another program")),
+        "{lines:?}"
+    );
+    assert!(
+        !entry.join("logs").exists(),
+        "what is not locked was deleted"
+    );
+    drop(lock);
+    let mut log = VecLog::default();
+    assert_eq!(
+        sweep_data_asides(&s.paths, &s.p.trusted_owners, &mut log),
+        0
+    );
+    assert!(!entry.exists());
+}
+
+/// `remove_all` (uninstall) returns, does not wait, and says which file stayed.
+#[test]
+fn removing_the_data_folder_does_not_wait_for_a_locked_file_and_says_which_one_stayed() {
+    let s = sandbox("remove-all-locked");
+    run(&s, &mut VecLog::default()).unwrap();
+    std::fs::write(s.paths.logs().join("vcam-1.log"), b"x").unwrap();
+    let Some(lock) = lock_on(&s.paths.install_log()) else {
+        return;
+    };
+    let paths = s.paths.clone();
+    let r = within("remove_all", BOUND, move || remove_all_reporting(&paths));
+    let why = r.expect_err("a file that is locked cannot be deleted");
+    assert!(
+        why.contains("install.log") && why.contains("locked by another program"),
+        "{why}"
+    );
+    assert!(s.paths.install_log().exists());
+    assert!(!s.paths.frames().exists(), "what could go, went");
+    assert!(!s.paths.logs().join("vcam-1.log").exists());
+    let paths = s.paths.clone();
+    assert!(!within("remove_all", BOUND, move || remove_all(&paths)));
+    drop(lock);
+    assert!(remove_all(&s.paths));
+    assert!(!s.paths.data.exists());
+}
+
+/// `logs` that cannot be moved (a file in it is open) is emptied in place; a file in it that is locked by another
+/// program stays and does not hold the helper up.
+#[test]
+fn a_logs_folder_that_is_emptied_in_place_does_not_wait_for_a_locked_log() {
+    let s = sandbox("in-place-locked");
+    run(&s, &mut VecLog::default()).unwrap();
+    // what an older version left: a plain folder with other permissions, with logs in it
+    remove_no_follow(&s.paths.logs()).unwrap();
+    std::fs::create_dir(s.paths.logs()).unwrap();
+    std::fs::write(s.paths.logs().join("a.log"), vec![0u8; 4096]).unwrap();
+    std::fs::write(s.paths.logs().join("b.log"), b"b").unwrap();
+    // the holder has the file open, which alone keeps the folder from being moved
+    let Some(lock) = lock_on(&s.paths.logs().join("a.log")) else {
+        return;
+    };
+    let (paths, p) = (s.paths.clone(), s.p.clone());
+    let (r, lines) = within("prepare", BOUND, move || {
+        let mut log = VecLog::default();
+        (prepare(&paths, &p, &mut || false, &mut log), log.0)
+    });
+    r.unwrap();
+    assert!(mentions(&VecLog(lines.clone()), "in place"), "{lines:?}");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("a.log") && l.contains("locked by another program")),
+        "{lines:?}"
+    );
+    assert!(!s.paths.logs().join("b.log").exists());
+    assert!(
+        s.paths.logs().join("a.log").exists(),
+        "the locked log is the holder's to let go of"
+    );
+    let snap = security_of(&s.paths.logs());
+    acl::check(&snap, &acl::expected(Object::LogsDir, &s.p), &s.p.owner).unwrap();
+    drop(lock);
+}
+
+/// `install.log` is a file the user may read, so a program of theirs can hold a lock on it. A Repair that meets such
+/// a lock asks again for about two seconds (a program that is asked to give it up does so within moments), and then
+/// fails with a sentence that names the file: it does not wait, and does not carry on without having checked the
+/// file's permissions.
+#[test]
+fn a_lock_that_is_given_up_within_a_moment_does_not_fail_the_repair_and_one_that_is_not_does() {
+    let s = sandbox("lock-patience");
+    run(&s, &mut VecLog::default()).unwrap();
+    let Some(lock) = lock_on(&s.paths.install_log()) else {
+        return;
+    };
+    // given up after 400 ms
+    let (paths, p) = (s.paths.clone(), s.p.clone());
+    let repair = std::thread::spawn(move || {
+        let mut log = VecLog::default();
+        (prepare(&paths, &p, &mut || false, &mut log), log.0)
+    });
+    std::thread::sleep(Duration::from_millis(400));
+    drop(lock);
+    let (r, lines) = repair.join().unwrap();
+    r.unwrap_or_else(|e| panic!("{e}: {lines:?}"));
+    assert!(mentions(&VecLog(lines), "install.log: kept"));
+    // never given up
+    let lock = lock_on(&s.paths.install_log()).unwrap();
+    let (paths, p) = (s.paths.clone(), s.p.clone());
+    let t = std::time::Instant::now();
+    let r = within("prepare", BOUND, move || {
+        prepare(&paths, &p, &mut || false, &mut VecLog::default())
+    });
+    let e = r.expect_err("a lock that is never given up fails the repair");
+    assert!(
+        e.contains("install.log") && e.contains("locked by another program"),
+        "{e}"
+    );
+    assert!(t.elapsed() < Duration::from_secs(6), "{:?}", t.elapsed());
+    drop(lock);
+    run(&s, &mut VecLog::default()).unwrap();
+}
+
+/// A rename does not wait either: `move_aside` of a file that is locked returns an error that says so, and the
+/// file is where it was.
+#[test]
+fn moving_a_locked_file_aside_does_not_wait() {
+    let s = sandbox("aside-locked");
+    let f = s.root.join("frames.bin");
+    std::fs::write(&f, vec![0u8; 8192]).unwrap();
+    let Some(lock) = lock_on(&f) else {
+        return;
+    };
+    let p = f.clone();
+    let e = within("move_aside", BOUND, move || move_aside(&p)).unwrap_err();
+    assert!(secure::is_oplock_busy(&e), "{e}");
+    assert!(f.exists());
+    drop(lock);
+    let aside = move_aside(&f).unwrap();
+    assert!(!f.exists() && aside.exists());
+}
+
+/// A Repair that must replace `frames.bin` while a program of the user holds a lock on it ends with an error line
+/// that names the file and says why, within the bound (the old code waited in the rename); with the lock gone the
+/// same Repair replaces it.
+#[test]
+fn replacing_a_locked_frame_file_is_an_error_that_names_it_and_does_not_wait() {
+    let s = sandbox("replace-locked");
+    run(&s, &mut VecLog::default()).unwrap();
+    mark(&s);
+    // a reason to replace the file (and only it)
+    let stream = format!("{}:extra", s.paths.frames().display());
+    if std::fs::write(&stream, b"hidden").is_err() {
+        eprintln!("this volume has no named streams: skipped");
+        return;
+    }
+    let id = file_id(&s.paths.frames());
+    let Some(lock) = lock_on(&s.paths.frames()) else {
+        return;
+    };
+    let (paths, p) = (s.paths.clone(), s.p.clone());
+    let stops = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let counted = stops.clone();
+    let (r, lines) = within("prepare", BOUND, move || {
+        let mut log = VecLog::default();
+        let r = prepare(
+            &paths,
+            &p,
+            &mut || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                true
+            },
+            &mut log,
+        );
+        (r, log.0)
+    });
+    let err = r.expect_err("the file cannot be replaced while it is locked");
+    assert!(
+        err.contains("frames.bin") && err.contains("locked by another program"),
+        "{err}"
+    );
+    assert_eq!(
+        stops.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "stopping the camera service does not help against a lock of the user: {lines:?}"
+    );
+    // (reading the file would wait for the lock: it is looked at without opening it for data)
+    assert_eq!(file_id(&s.paths.frames()), id, "the file is as it was");
+    let names: Vec<String> = std::fs::read_dir(&s.paths.data)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(names.iter().all(|n| !is_aside_name(n)), "{names:?}");
+    drop(lock);
+    assert!(marked(&s), "the file is as it was");
+    let mut log = VecLog::default();
+    run(&s, &mut log).unwrap();
+    assert!(!marked(&s), "the file was replaced once the lock was gone");
+}
 // ---- M2: a %ProgramData% that is itself a junction (moved to another drive with a link) works
 
 /// Some people move `%ProgramData%` elsewhere and leave a junction behind. The root is an administrator's, so it is

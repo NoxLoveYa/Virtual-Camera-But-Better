@@ -10,9 +10,6 @@ use std::time::SystemTime;
 
 use vcam_install::util::Paths;
 
-/// How many lines of `install.log` the parent looks through to find this run (a run writes a few dozen).
-const LOOKBACK: usize = 400;
-
 /// The first line the elevated copy writes: the parent prints what follows the last one of these.
 pub fn marker(verb: &str) -> String {
     format!("---- vcam-tool {verb}: elevated run")
@@ -23,12 +20,10 @@ pub fn marker(verb: &str) -> String {
 /// in it belongs to another one) or cannot be read the way the helper writes it (no link, one hard link, the right
 /// place).
 pub fn run_output(paths: &Paths, verb: &str, started: SystemTime) -> Vec<String> {
-    let lines = vcam_install::log::tail_of(paths, started, LOOKBACK);
+    let lines = vcam_install::log::tail_of(paths, started, vcam_install::log::LOOKBACK);
     let mark = marker(verb);
-    match lines.iter().rposition(|l| l.contains(&mark)) {
-        Some(i) => lines[i..].to_vec(),
-        None => Vec::new(),
-    }
+    // the same cut as the app makes at its helper's marker
+    vcam_install::log::from_last_marker(&lines, |l| l.contains(&mark)).to_vec()
 }
 
 /// [`run_output`] on this machine's folders.

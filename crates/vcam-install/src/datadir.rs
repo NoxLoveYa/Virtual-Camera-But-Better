@@ -9,7 +9,13 @@
 //! * the folder handle is held without delete sharing while the helper works in it, so it cannot be swapped;
 //! * an object that is not what it must be (a link, the wrong kind, extra hard links, a frame file that is read-only,
 //!   sparse or compressed, an owner who is not SYSTEM or Administrators, for `logs` also any other permissions) is
-//!   moved aside and made again; what is moved aside is deleted without ever recursing through a link.
+//!   moved aside and made again; what is moved aside is deleted without ever recursing through a link;
+//! * nothing waits for another program: a standard user can read `install.log` and `frames.bin` and can create
+//!   entries in `%ProgramData%`, and a program of theirs that holds an opportunistic lock on a file makes the plain
+//!   delete, rename and open of it wait. Deletes and renames go through handles ([`secure::remove_tree`],
+//!   [`secure::rename_no_wait`]); a file that is locked is left, named, and tried again at the next install. The
+//!   helper acts only on entries it made: a `BetterCam.old-*` entry whose owner is not SYSTEM or Administrators is
+//!   left exactly as it is.
 //!
 //! Nothing is ever left with the permissions it would inherit: a new object is created with its final security
 //! descriptor in the create call, and the order is the data folder first (its permissions are replaced before
@@ -24,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use vcam_protocol::secure::{self, DISP_CREATE_NEW, DISP_OPEN_EXISTING};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TEMPORARY,
     FILE_SHARE_MODE,
@@ -49,13 +56,19 @@ pub struct Facts {
     pub owner_trusted: bool,
     /// Owner, protection and ACEs are exactly the expected ones.
     pub acl_as_expected: bool,
-    /// A file that is read-only, sparse, compressed or encrypted: the DLL and the app refuse such a frame file (an
-    /// older version gave the user the right to set these). Folders have no such flags that matter.
+    /// A file that is read-only or encrypted: the DLL and the app refuse such a frame file, and nothing but a new
+    /// file makes it right. Folders have no such flags that matter.
     pub bad_attributes: bool,
+    /// A file that is sparse or compressed (the DLL and the app refuse it too). A handle with only `FILE_WRITE_DATA`
+    /// can set both, so the mask of the frame file does not prevent it; the flags are cleared in place.
+    pub sparse_or_compressed: bool,
+    /// A file with a data stream besides its own contents (`frames.bin:name`). A handle with only `FILE_WRITE_DATA`
+    /// can create one, and what is in it would survive a Repair that kept the file.
+    pub extra_streams: bool,
 }
 
-/// `FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SPARSE_FILE | FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_ENCRYPTED`.
-const BAD_FILE_ATTRIBUTES: u32 = 0x1 | 0x200 | 0x800 | 0x4000;
+/// `FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ENCRYPTED`.
+const BAD_FILE_ATTRIBUTES: u32 = 0x1 | 0x4000;
 
 /// What to do with an object.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,8 +107,12 @@ pub fn decide(obj: Object, facts: Option<&Facts>) -> Plan {
         return Plan::Replace("its owner is not SYSTEM or Administrators".into());
     }
     if !wants_dir && f.bad_attributes {
-        return Plan::Replace("it is read-only, sparse, compressed or encrypted".into());
+        return Plan::Replace("it is read-only or encrypted".into());
     }
+    if !wants_dir && f.extra_streams {
+        return Plan::Replace("it has an extra data stream".into());
+    }
+    // `f.sparse_or_compressed` is not a reason to replace: the flags are cleared in place (see `ensure_exists`)
     // `logs` can hold files with permissions of their own, so other permissions on it mean the folder was
     // tampered with or made by an older version: start again. The data folder and frames.bin have no such
     // children: their permissions are replaced as a whole, nothing of the old ones survives.
@@ -137,6 +154,8 @@ fn inspect(paths: &Paths, obj: Object, p: &Principals) -> Res<Option<Facts>> {
                 owner_trusted: false,
                 acl_as_expected: false,
                 bad_attributes: false,
+                sparse_or_compressed: false,
+                extra_streams: false,
             }))
         }
     };
@@ -153,6 +172,9 @@ fn inspect(paths: &Paths, obj: Object, p: &Principals) -> Res<Option<Facts>> {
         ),
         Err(_) => (false, false),
     };
+    // a stream that cannot be listed is as bad as one that is there: the file is replaced
+    let extra_streams =
+        obj.is_file() && secure::extra_streams(secure::raw(&h)).map_or(true, |s| !s.is_empty());
     Ok(Some(Facts {
         reparse_point: kind.reparse_point,
         is_directory: kind.directory,
@@ -161,6 +183,10 @@ fn inspect(paths: &Paths, obj: Object, p: &Principals) -> Res<Option<Facts>> {
         owner_trusted,
         acl_as_expected,
         bad_attributes: kind.attributes & BAD_FILE_ATTRIBUTES != 0,
+        sparse_or_compressed: kind.attributes
+            & (secure::ATTRIBUTE_SPARSE | secure::ATTRIBUTE_COMPRESSED)
+            != 0,
+        extra_streams,
     }))
 }
 
@@ -176,53 +202,21 @@ pub fn is_link(p: &Path) -> bool {
     attributes(p).is_ok_and(|a| a & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0)
 }
 
-/// Delete `p`. A link (symbolic link, junction, any reparse point) is removed itself and what it points to is left
-/// alone; a folder is emptied without following links inside it (`remove_dir_all` opens every entry as a link
-/// first); a read-only file loses the flag first. A missing path is not an error.
+/// Delete `p`, through handles ([`secure::remove_tree`]): a link (symbolic link, junction, any reparse point) is
+/// removed itself and what it points to is left alone; a folder is emptied without following links in it; a
+/// read-only file goes too. A missing path is not an error.
+///
+/// Nothing here waits for another program: a file that a program holds an opportunistic lock on (a user may take one
+/// on any file they may read) is not deleted, the rest is, and the error names the file (see
+/// [`secure::is_oplock_busy`]).
 pub fn remove_no_follow(p: &Path) -> std::io::Result<()> {
-    let attrs = match attributes(p) {
-        Ok(a) => a,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    let dir = attrs & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
-    if attrs & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
-        // a junction or directory symlink is removed with RemoveDirectory, a file symlink with DeleteFile; neither
-        // touches the target
-        return if dir {
-            std::fs::remove_dir(p)
-        } else {
-            std::fs::remove_file(p)
-        };
-    }
-    if dir {
-        std::fs::remove_dir_all(p)
-    } else {
-        remove_plain_file(p)
-    }
-}
-
-fn remove_plain_file(p: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(p) {
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            if let Ok(md) = std::fs::symlink_metadata(p) {
-                let mut perm = md.permissions();
-                if perm.readonly() {
-                    // Windows only: this clears FILE_ATTRIBUTE_READONLY (the lint is about Unix mode bits)
-                    #[allow(clippy::permissions_set_readonly_false)]
-                    perm.set_readonly(false);
-                    let _ = std::fs::set_permissions(p, perm);
-                    return std::fs::remove_file(p);
-                }
-            }
-            Err(e)
-        }
-        other => other,
-    }
+    secure::remove_tree(p).map_err(std::io::Error::from)
 }
 
 /// Rename `p` to `<name>.old-<n>` next to it (a link is renamed itself, not what it points to). Retries a little:
-/// a handle that someone holds without delete sharing, such as the DLL listing the log folder, lasts a moment.
+/// a handle that someone holds without delete sharing, such as the DLL listing the log folder, lasts a moment. The
+/// rename goes through a handle opened like every other open here, so it never waits for a program that holds an
+/// opportunistic lock on the file ([`secure::rename_no_wait`]).
 pub fn move_aside(p: &Path) -> std::io::Result<PathBuf> {
     let name = p
         .file_name()
@@ -239,8 +233,13 @@ pub fn move_aside(p: &Path) -> std::io::Result<PathBuf> {
         if std::fs::symlink_metadata(&target).is_ok() {
             continue;
         }
-        match std::fs::rename(p, &target) {
+        match secure::rename_no_wait(p, &target) {
             Ok(()) => return Ok(target),
+            // gone: nothing to move, and waiting does not bring it back. Locked by another program: it was waited
+            // for already (up to the bound of the rename), and asking again does not make the holder answer
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound || secure::is_oplock_busy(&e) => {
+                return Err(e)
+            }
             Err(e) => {
                 last = Some(e);
                 std::thread::sleep(Duration::from_millis(150));
@@ -265,6 +264,8 @@ fn replace_aside(
     log.line(&format!("{}: {why}; moving it aside", path.display()));
     let aside = match move_aside(path) {
         Ok(a) => a,
+        // a program of the user holds a lock on it: stopping the camera service does not help against that
+        Err(first) if secure::is_oplock_busy(&first) => return Err(locked_message(path)),
         Err(first) => {
             log.line(&format!(
                 "{} is in use ({first}); stopping the camera service",
@@ -272,10 +273,14 @@ fn replace_aside(
             ));
             stop_service();
             move_aside(path).map_err(|e| {
-                format!(
-                    "cannot move {} out of the way: {e}. Close the apps that use the camera, or restart Windows, and try again",
-                    path.display()
-                )
+                if secure::is_oplock_busy(&e) {
+                    locked_message(path)
+                } else {
+                    format!(
+                        "cannot move {} out of the way: {e}. Close the apps that use the camera, or restart Windows, and try again",
+                        path.display()
+                    )
+                }
             })?
         }
     };
@@ -287,6 +292,14 @@ fn replace_aside(
         )),
     }
     Ok(())
+}
+
+/// The sentence for a file that another program holds an opportunistic lock on: said as it is, and not waited for.
+fn locked_message(path: &Path) -> String {
+    format!(
+        "{} (or a file in it) is locked by another program (it holds an opportunistic lock); not waiting for it. Close the program that has it open and run Repair again",
+        path.display()
+    )
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -328,18 +341,33 @@ fn verify_opened(paths: &Paths, obj: Object, h: &OwnedHandle) -> Res<()> {
     verdict.map_err(|e| werr(&format!("{} is not what it must be", path.display()), e))
 }
 
-/// Open the existing `obj` not following a link, and verify it.
+/// How long an open that met another program's lock is tried again (a program that holds such a lock and is asked to
+/// give it up, an anti-virus scan for one, answers within moments; one that never answers is reported after this).
+const LOCK_PATIENCE: [u64; 10] = [50, 100, 150, 150, 200, 200, 250, 250, 250, 250];
+
+/// Open the existing `obj` not following a link, and verify it. An open that meets another program's opportunistic
+/// lock does not wait for it: it is asked again a few times (about two seconds in all), then it fails with a
+/// sentence that says so.
 fn open_checked(paths: &Paths, obj: Object) -> Res<OwnedHandle> {
     let path = path_of(paths, obj);
-    let h = secure::open_with(
-        &path,
-        access_for(obj),
-        share_for(obj),
-        DISP_OPEN_EXISTING,
-        true,
-        attributes_for(obj),
-    )
-    .map_err(|e| werr(&format!("open {}", path.display()), e))?;
+    let mut patience = LOCK_PATIENCE.iter();
+    let h = loop {
+        match secure::open_with(
+            &path,
+            access_for(obj),
+            share_for(obj),
+            DISP_OPEN_EXISTING,
+            true,
+            attributes_for(obj),
+        ) {
+            Ok(h) => break h,
+            Err(e) if secure::is_oplock_busy(&e) => match patience.next() {
+                Some(ms) => std::thread::sleep(Duration::from_millis(*ms)),
+                None => return Err(locked_message(&path)),
+            },
+            Err(e) => return Err(werr(&format!("open {}", path.display()), e)),
+        }
+    };
     verify_opened(paths, obj, &h)?;
     Ok(h)
 }
@@ -384,31 +412,71 @@ fn ensure_exists(
     let plan = decide(obj, facts.as_ref());
     match plan {
         Plan::Keep => {
+            let h = open_checked(paths, obj)?;
+            // the one thing the frame file's mask lets a user do to it that is put right in place, not by a new file
+            if obj == Object::FramesFile {
+                if let Err(why) = plain_again(&h, &path, log) {
+                    drop(h);
+                    return replace(paths, obj, p, &why, stop_service, log);
+                }
+            }
             log.line(&format!("{}: kept", path.display()));
-            open_checked(paths, obj)
+            Ok(h)
         }
         Plan::Create => {
             log.line(&format!("{}: created", path.display()));
             create_new(paths, obj, p)
         }
-        Plan::Replace(why) => match replace_aside(&path, &why, stop_service, log) {
-            Ok(()) => {
-                log.line(&format!("{}: created", path.display()));
-                create_new(paths, obj, p)
-            }
-            // A folder cannot be renamed while any file in it is open, even one opened with delete sharing, and
-            // every camera app that loaded the DLL keeps its log open. `logs` only holds logs, so when it cannot
-            // be moved it is emptied and reset in place (through the held handle, links removed as links). A
-            // link or a file is never in that position: renaming those does not depend on what they contain.
-            Err(e) if obj == Object::LogsDir && is_real_dir(&path) => {
-                log.line(&format!("{e}; emptying and resetting it in place instead"));
-                let h = open_checked(paths, obj)?;
-                empty_in_place(&path, log);
-                Ok(h)
-            }
-            Err(e) => Err(e),
-        },
+        Plan::Replace(why) => replace(paths, obj, p, &why, stop_service, log),
     }
+}
+
+/// Move `obj` aside and make it again.
+fn replace(
+    paths: &Paths,
+    obj: Object,
+    p: &Principals,
+    why: &str,
+    stop_service: &mut dyn FnMut() -> bool,
+    log: &mut dyn Log,
+) -> Res<OwnedHandle> {
+    let path = path_of(paths, obj);
+    match replace_aside(&path, why, stop_service, log) {
+        Ok(()) => {
+            log.line(&format!("{}: created", path.display()));
+            create_new(paths, obj, p)
+        }
+        // A folder cannot be renamed while any file in it is open, even one opened with delete sharing, and
+        // every camera app that loaded the DLL keeps its log open. `logs` only holds logs, so when it cannot
+        // be moved it is emptied and reset in place (through the held handle, links removed as links). A
+        // link or a file is never in that position: renaming those does not depend on what they contain.
+        Err(e) if obj == Object::LogsDir && is_real_dir(&path) => {
+            log.line(&format!("{e}; emptying and resetting it in place instead"));
+            let h = open_checked(paths, obj)?;
+            empty_in_place(&h, &path, log);
+            Ok(h)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Clear the sparse and compressed state of the frame file through its handle (a handle with only `FILE_WRITE_DATA`
+/// can set both; the contents are not touched and the file stays the same file). `Err` says why that did not work
+/// and the file is to be replaced.
+fn plain_again(h: &OwnedHandle, path: &Path, log: &mut dyn Log) -> Result<(), String> {
+    let attrs = secure::kind(secure::raw(h))
+        .map_err(|e| format!("its attributes cannot be read ({e})"))?
+        .attributes;
+    if attrs & (secure::ATTRIBUTE_SPARSE | secure::ATTRIBUTE_COMPRESSED) == 0 {
+        return Ok(());
+    }
+    log.line(&format!(
+        "{}: it is sparse or compressed; clearing that in place",
+        path.display()
+    ));
+    secure::clear_sparse_and_compression(secure::raw(h))
+        .map(|_| ())
+        .map_err(|e| format!("it is sparse or compressed and that could not be cleared ({e})"))
 }
 
 /// A folder that is not a link of any kind.
@@ -418,17 +486,15 @@ fn is_real_dir(p: &Path) -> bool {
     })
 }
 
-/// Delete what is inside `dir` (never following a link); what a process still has open stays until it closes
-/// (delete pending: nobody can open it any more).
-fn empty_in_place(dir: &Path, log: &mut dyn Log) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in rd.flatten() {
-        match remove_no_follow(&e.path()) {
-            Ok(()) => {}
-            Err(err) => log.line(&format!("could not delete {}: {err}", e.path().display())),
-        }
+/// Delete what is inside the folder held as `dir` (never following a link, never waiting for a program that holds
+/// a lock on a file); what a process still has open stays until it closes (delete pending: nobody can open it any
+/// more), and what cannot go is logged.
+fn empty_in_place(dir: &OwnedHandle, shown: &Path, log: &mut dyn Log) {
+    if let Err(e) = secure::remove_children(dir, shown) {
+        log.line(&format!(
+            "could not delete everything in {}: {e}",
+            shown.display()
+        ));
     }
 }
 
@@ -477,8 +543,8 @@ fn sweep(paths: &Paths, log: &mut dyn Log) -> usize {
 }
 
 /// Delete the copies [`move_aside`] left next to `logs` and `frames.bin` that were still in use then, and the
-/// moved-aside data folders next to `BetterCam` itself ([`sweep_data_asides`]).
-pub fn sweep_asides(paths: &Paths, log: &mut dyn Log) {
+/// moved-aside data folders next to `BetterCam` itself ([`sweep_data_asides`]; only those owned by one of `trusted`).
+pub fn sweep_asides(paths: &Paths, trusted: &[String], log: &mut dyn Log) {
     if let Ok(rd) = std::fs::read_dir(&paths.data) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
@@ -490,15 +556,40 @@ pub fn sweep_asides(paths: &Paths, log: &mut dyn Log) {
             }
         }
     }
-    sweep_data_asides(paths, log);
+    sweep_data_asides(paths, trusted, log);
+}
+
+/// The owner of `path` (as SID text), read through a handle opened as the entry itself: no link is followed, and
+/// nothing is asked of it that would break another program's opportunistic lock (attributes and permissions only).
+/// `None` when the entry cannot be opened or its owner cannot be read (for example a folder that denies even that).
+fn owner_of(path: &Path) -> Option<String> {
+    secure::open_with(
+        path,
+        READ_CONTROL | 0x80, /* FILE_READ_ATTRIBUTES */
+        secure::SHARE_ALL,
+        DISP_OPEN_EXISTING,
+        true,
+        0,
+    )
+    .ok()
+    .and_then(|h| acl::read(&h).ok())
+    .map(|s| s.owner)
 }
 
 /// Delete the `BetterCam.old-*` folders in `%ProgramData%`: a data folder that [`move_aside`] moved out of the way
 /// (a link, a folder with the wrong owner, ...) lives *next to* `BetterCam`, not inside it, and its deletion can
-/// fail when the camera service still has a file of it open. Called by install and by uninstall. Each entry is
-/// removed without following links (a junction with such a name is removed as a junction); other names are never
-/// touched. Returns how many were left.
-pub fn sweep_data_asides(paths: &Paths, log: &mut dyn Log) -> usize {
+/// fail when the camera service still has a file of it open. Called by install and by uninstall.
+///
+/// Standard users may create entries in `%ProgramData%`, under any name, so a name is not enough to act on: an entry
+/// is deleted only when its owner is one of `trusted` (SYSTEM, Administrators: what the helper moved aside is owned
+/// by them, and a standard user cannot make an entry with such an owner). The owner is read through a handle that
+/// does not follow a link and does not touch any lock, then checked again on the handle the delete goes through.
+/// Anything else is left exactly as it is, and never counts as a failure: it is not the helper's.
+///
+/// The delete never waits for another program (see [`remove_no_follow`]): an entry of the helper's that a program
+/// still has open or locked stays until the next install or removal. Other names are never touched. Returns how many
+/// of the helper's entries were left.
+pub fn sweep_data_asides(paths: &Paths, trusted: &[String], log: &mut dyn Log) -> usize {
     let Ok(rd) = std::fs::read_dir(&paths.program_data) else {
         return 0;
     };
@@ -509,8 +600,45 @@ pub fn sweep_data_asides(paths: &Paths, log: &mut dyn Log) -> usize {
         if !name.to_lowercase().starts_with(&prefix) {
             continue;
         }
-        match remove_no_follow(&e.path()) {
-            Ok(()) => log.line(&format!("deleted old data folder {}", e.path().display())),
+        let path = e.path();
+        match owner_of(&path) {
+            Some(o) if acl::owner_trusted(&o, trusted) => {}
+            other => {
+                log.line(&format!(
+                    "{name} left alone: {}",
+                    match other {
+                        Some(o) => format!("its owner is {o}, not SYSTEM or Administrators"),
+                        None => "its owner cannot be read".to_string(),
+                    }
+                ));
+                continue;
+            }
+        }
+        // the check again, on the handle that is deleted through (the entry may have been swapped meanwhile)
+        let swapped = std::cell::Cell::new(false);
+        let check = |h: HANDLE| -> std::io::Result<()> {
+            let snap = acl::read_handle(h).map_err(secure::refused)?;
+            if acl::owner_trusted(&snap.owner, trusted) {
+                Ok(())
+            } else {
+                swapped.set(true);
+                Err(secure::refused(format!(
+                    "its owner is {}, not SYSTEM or Administrators",
+                    snap.owner
+                )))
+            }
+        };
+        let top = secure::Top {
+            access: secure::ACCESS_OWNER_CHECK,
+            check: &check,
+        };
+        match secure::remove_tree_checked(&path, &top) {
+            Ok(()) => log.line(&format!("deleted old data folder {}", path.display())),
+            Err(_) if swapped.get() => {
+                log.line(&format!(
+                    "{name} left alone: it was replaced by somebody else's"
+                ));
+            }
             Err(err) => {
                 left += 1;
                 log.line(&format!(
@@ -533,17 +661,7 @@ pub fn sweep_logs(paths: &Paths, trusted: &[String], log: &mut dyn Log) -> usize
     let mut removed = 0;
     for e in rd.flatten() {
         let path = e.path();
-        let owner = secure::open_with(
-            &path,
-            READ_CONTROL | 0x80,
-            secure::SHARE_ALL,
-            DISP_OPEN_EXISTING,
-            true,
-            0,
-        )
-        .ok()
-        .and_then(|h| acl::read(&h).ok())
-        .map(|s| s.owner);
+        let owner = owner_of(&path);
         let ok = owner
             .as_deref()
             .is_some_and(|o| acl::owner_trusted(o, trusted));
@@ -618,21 +736,27 @@ pub fn prepare(
     Ok(())
 }
 
-/// Delete the data folder: the folder is emptied and removed without following links; retried a few times because a
-/// stream that just ended may still hold `frames.bin`. Returns whether it is gone.
-pub fn remove_all(paths: &Paths) -> bool {
+/// Delete the data folder: the folder is emptied and removed without following links and without waiting for a
+/// program that holds a lock on a file in it; retried a few times (about 1.5 s in all) because a stream that just
+/// ended may still hold `frames.bin`. `Err` says what stayed behind: the first entry that could not go (told apart
+/// when another program holds a lock on it) and how many others.
+pub fn remove_all_reporting(paths: &Paths) -> Result<(), String> {
+    let mut last = String::new();
     for attempt in 0..6 {
-        if std::fs::symlink_metadata(&paths.data).is_err() {
-            return true;
-        }
-        if remove_no_follow(&paths.data).is_ok() {
-            return true;
+        match secure::remove_tree(&paths.data) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = e.to_string(),
         }
         if attempt < 5 {
             std::thread::sleep(Duration::from_millis(300));
         }
     }
-    std::fs::symlink_metadata(&paths.data).is_err()
+    Err(last)
+}
+
+/// [`remove_all_reporting`] as a yes or no: whether the data folder is gone.
+pub fn remove_all(paths: &Paths) -> bool {
+    remove_all_reporting(paths).is_ok()
 }
 
 #[cfg(test)]

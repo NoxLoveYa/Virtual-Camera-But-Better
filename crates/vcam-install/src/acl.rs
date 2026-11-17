@@ -10,12 +10,13 @@
 //! | `BetterCam` | Administrators | SYSTEM, Administrators: full, this folder only. LOCAL SERVICE, user: read and traverse, this folder only |
 //! | `logs` | Administrators | SYSTEM, Administrators: full, inherited. LOCAL SERVICE: read, traverse and create files here; modify on files created here (`vcam-<pid>.log`). User: read and traverse here, **no** access to the files in it |
 //! | `logs\install.log` | Administrators | SYSTEM, Administrators: full. User: read. Protected: nothing is inherited from `logs`, so LOCAL SERVICE cannot touch it |
-//! | `frames.bin` | Administrators | SYSTEM, Administrators: full. LOCAL SERVICE, user: read and write *data* (no delete, no change of permissions, no write of attributes or extended attributes) |
+//! | `frames.bin` | Administrators | SYSTEM, Administrators: full. LOCAL SERVICE, user: read and write *data* (no delete, no change of permissions, no write of attributes or extended attributes; sparse, compressed and extra streams are *not* prevented, see [`FRAMES_READ_WRITE`]) |
 //!
 //! The user has no access to `vcam-*.log` because a read right is all it takes to hold an opportunistic lock on a
 //! file that blocks every other open of it; and the frame file gives no `FILE_WRITE_ATTRIBUTES` because that right
-//! lets a user hard-link the file from a folder of their own or set it read-only or sparse, after which the DLL and
-//! the app refuse it until a Repair.
+//! lets a user hard-link the file from a folder of their own or set it read-only, after which the DLL and the app
+//! refuse it until a Repair. (Making it sparse or compressed, or giving it a data stream, only needs the data rights
+//! the user has; the installer puts those right again.)
 //!
 //! Everything here is applied and read back through a handle that [`vcam_protocol::secure`] verified, never by path.
 //! A new object is created with its final DACL in the create call ([`SecurityDescriptor`]), so it never exists with
@@ -53,8 +54,14 @@ pub const READ_TRAVERSE_ADD_FILE: u32 = 0x0012_00ab;
 pub const FILE_READ: u32 = 0x0012_0089;
 /// What the frame file gives its two users: `SYNCHRONIZE | READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_READ_EA |
 /// FILE_APPEND_DATA | FILE_WRITE_DATA | FILE_READ_DATA`. A read-write mapping works with it. Missing on purpose:
-/// `FILE_WRITE_ATTRIBUTES` (hard-link the file from another folder, set read-only or sparse), `FILE_WRITE_EA`,
-/// `DELETE`, `WRITE_DAC`, `WRITE_OWNER`.
+/// `FILE_WRITE_ATTRIBUTES` (hard-link the file from another folder, set it read-only), `FILE_WRITE_EA`, `DELETE`,
+/// `WRITE_DAC`, `WRITE_OWNER`.
+///
+/// What the mask does **not** prevent, because the right it is done with is one the mask has: `FSCTL_SET_SPARSE` (a
+/// handle with `FILE_WRITE_DATA` is enough), `FSCTL_SET_COMPRESSION` (read and write data), and a data stream
+/// (`frames.bin:name`, created through `FILE_WRITE_DATA`). None of the three bothers the DLL or the app; the
+/// installer undoes them: a Repair clears the sparse and compressed state in place and replaces a file that has a
+/// stream (see `datadir`).
 pub const FRAMES_READ_WRITE: u32 = 0x0012_008f;
 /// Read, write, execute and `DELETE` (a file the service made may be deleted by the service).
 pub const FILE_MODIFY: u32 = 0x0013_01bf;
@@ -468,12 +475,17 @@ struct AllowedAce {
 
 /// Read owner and DACL through `h` (opened with [`SECURITY_ACCESS`] or at least `READ_CONTROL`).
 pub fn read(h: &OwnedHandle) -> Res<Snapshot> {
+    read_handle(HANDLE(h.as_raw_handle()))
+}
+
+/// [`read`] for a raw handle that somebody else owns.
+pub fn read_handle(h: HANDLE) -> Res<Snapshot> {
     let mut owner = PSID::default();
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut psd = PSECURITY_DESCRIPTOR::default();
     let r = unsafe {
         GetSecurityInfo(
-            HANDLE(h.as_raw_handle()),
+            h,
             SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             Some(&mut owner),
@@ -579,6 +591,7 @@ pub fn owner_trusted(owner: &str, trusted: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::fs::MetadataExt;
 
     const USER: &str = "S-1-5-21-1004336348-1177238915-682003330-1001";
 
@@ -832,8 +845,8 @@ mod tests {
         perm.set_readonly(true);
         assert!(denied(std::fs::set_permissions(&new, perm)));
         assert!(!dir.join("new-link.bin").exists());
-        // sparse files are made with FSCTL_SET_SPARSE, which needs FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES
-        // read-write mapping and writes through it still work, and it is still one plain file
+        // read-write mapping and writes through it still work, and it is still one plain file (the mask does not
+        // stop sparse, compressed or extra streams: see the next test)
         let m = vcam_protocol::MappedFile::open(&new, vcam_protocol::Access::ReadWrite)
             .expect("a read-write mapping needs no more than the new mask gives");
         m.shared().set_consumer_active(true);
@@ -851,6 +864,100 @@ mod tests {
         #[allow(clippy::permissions_set_readonly_false)]
         perm.set_readonly(false);
         let _ = std::fs::set_permissions(&old, perm);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What the mask `0x12008f` does *not* prevent (the reviewer's reproduction, on temp files with the same DACL):
+    /// a handle with only `FILE_WRITE_DATA` makes the file sparse and can create a named stream; compression needs
+    /// read and write data, which the mask has. The installer therefore clears the first two states in place and
+    /// replaces a file that has a stream (`datadir` tests), and this test is the reason it has to.
+    #[test]
+    fn a_write_data_handle_can_still_make_the_frame_file_sparse_or_compressed_or_give_it_a_stream()
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use vcam_protocol::secure::{self, DISP_CREATE_NEW};
+        let me = crate::current_user_sid().unwrap();
+        let dir = std::env::temp_dir().join(format!("vcam-acl-writedata-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("frames.bin");
+        let sd = SecurityDescriptor::from_aces(&[ace(&me, FRAMES_READ_WRITE, 0)]).unwrap();
+        let h = unsafe {
+            secure::open_with_sd(
+                &path,
+                secure::ACCESS_READ_WRITE,
+                secure::SHARE_ALL,
+                DISP_CREATE_NEW,
+                false,
+                0,
+                Some(sd.as_ptr()),
+            )
+        }
+        .unwrap();
+        std::fs::File::from(h).set_len(1 << 20).unwrap();
+
+        // only FILE_WRITE_DATA (0x2): sparse works
+        let write_only = secure::open_with(
+            &path,
+            0x2,
+            secure::SHARE_ALL,
+            secure::DISP_OPEN_EXISTING,
+            false,
+            0,
+        )
+        .expect("the mask gives FILE_WRITE_DATA");
+        secure::set_sparse(secure::raw(&write_only), true)
+            .expect("FSCTL_SET_SPARSE needs only FILE_WRITE_DATA: the mask does not prevent it");
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().file_attributes() & secure::ATTRIBUTE_SPARSE,
+            0
+        );
+        // read and write data: compression works
+        let read_write = secure::open_existing(&path, true, None).unwrap();
+        if secure::set_compressed(secure::raw(&read_write), true).is_ok() {
+            assert_ne!(
+                std::fs::metadata(&path).unwrap().file_attributes() & secure::ATTRIBUTE_COMPRESSED,
+                0
+            );
+        } else {
+            eprintln!("this volume cannot compress a file: that part is skipped");
+        }
+        // a named stream through FILE_WRITE_DATA
+        let stream = format!("{}:extra", path.display());
+        let made = std::fs::OpenOptions::new()
+            .write(true)
+            .access_mode(0x2)
+            .create(true)
+            .truncate(true)
+            .open(&stream);
+        if made.is_ok() {
+            let extra = secure::extra_streams(secure::raw(&read_write)).unwrap();
+            assert_eq!(extra, [":extra:$DATA"], "the stream is there");
+        } else {
+            eprintln!("no named streams here: that part is skipped ({made:?})");
+        }
+        // and what the mask does prevent is still prevented
+        let mut perm = std::fs::metadata(&path).unwrap().permissions();
+        perm.set_readonly(true);
+        assert!(std::fs::set_permissions(&path, perm).is_err());
+
+        // the way back, through the installer's own handle (read and write data, not the user's mask)
+        drop((write_only, read_write));
+        // (the file has only `FRAMES_READ_WRITE`, so even the test asks for no more than that)
+        let mine = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .access_mode(0x3)
+            .open(&path)
+            .unwrap();
+        let changed = secure::clear_sparse_and_compression(HANDLE(mine.as_raw_handle())).unwrap();
+        assert!(changed);
+        let attrs = std::fs::metadata(&path).unwrap().file_attributes();
+        assert_eq!(
+            attrs & (secure::ATTRIBUTE_SPARSE | secure::ATTRIBUTE_COMPRESSED),
+            0
+        );
+        drop(mine);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

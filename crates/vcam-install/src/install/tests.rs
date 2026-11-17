@@ -1,6 +1,6 @@
 use super::*;
 use crate::log::VecLog;
-use crate::testkit::{fake_dll, sandbox, Sandbox};
+use crate::testkit::{fake_dll, lock_on, sandbox, within, Sandbox, BOUND};
 
 /// A machine that keeps its registry and camera in memory and fails at a named step.
 #[derive(Default)]
@@ -307,6 +307,48 @@ fn a_locked_old_dll_and_a_service_that_will_not_stop_is_a_pending_result_not_a_p
     // the new build is registered
     registration_is_sound(&m);
     assert_ne!(Path::new(&m.reg.as_ref().unwrap().dll), old_dll);
+}
+
+/// `Program Files` can be read by a standard user, who can hold an opportunistic lock on an old DLL there: deleting
+/// it must not wait (the update used to hang in `remove_file` with the machine-wide lock taken). The file counts as
+/// in use, like one Frame Server has loaded, and is deleted at the next restart.
+#[test]
+fn an_old_dll_that_a_program_holds_a_lock_on_does_not_hold_up_an_update_or_a_removal() {
+    let s = sandbox("install-dll-locked");
+    let mut m = Fake::default();
+    let old = fake_dll(&s.root.join("src-old"), 1);
+    do_install(&s, &old, &mut m, &mut VecLog::default()).unwrap();
+    let old_dll = Path::new(&m.reg.as_ref().unwrap().dll).to_path_buf();
+    let Some(lock) = lock_on(&old_dll) else {
+        return;
+    };
+    let new = fake_dll(&s.root.join("src-new"), 2);
+    let (paths, p) = (s.paths.clone(), s.p.clone());
+    let (r, m) = within("update", BOUND, move || {
+        let mut m = m;
+        let r = install_with(
+            &opts(),
+            &new,
+            &paths,
+            Some(p),
+            &mut m,
+            &mut VecLog::default(),
+        );
+        (r, m)
+    });
+    assert_eq!(r.unwrap(), InstallOutcome::PendingServiceRestart);
+    assert_eq!(m.delayed, vec![old_dll.clone()]);
+    assert!(old_dll.exists());
+    // and a removal
+    let paths = s.paths.clone();
+    let (r, m) = within("uninstall", BOUND, move || {
+        let mut m = m;
+        let r = uninstall_with(&paths, &mut m, &mut VecLog::default());
+        (r, m)
+    });
+    assert_eq!(r.unwrap(), UninstallOutcome::PendingReboot);
+    assert!(m.delayed.contains(&old_dll));
+    drop(lock);
 }
 
 #[test]
@@ -803,7 +845,7 @@ fn an_install_and_an_uninstall_delete_the_data_folders_that_were_moved_aside() {
 
     let b = mk("BetterCam.old-2-0");
     let mut log = VecLog::default();
-    uninstall_with(&s.paths, &mut m, &mut log).unwrap();
+    uninstall_trusting(&s.paths, &s.p.trusted_owners, &mut m, &mut log).unwrap();
     assert!(!b.exists(), "uninstall leaves the old copy: {:?}", log.0);
     assert!(!s.paths.data.exists());
 }
@@ -822,7 +864,133 @@ fn an_old_data_folder_that_cannot_be_deleted_is_reported_by_uninstall() {
         .share_mode(1)
         .open(&f)
         .unwrap();
-    let err = uninstall_with(&s.paths, &mut m, &mut VecLog::default()).unwrap_err();
+    let err = uninstall_trusting(
+        &s.paths,
+        &s.p.trusted_owners,
+        &mut m,
+        &mut VecLog::default(),
+    )
+    .unwrap_err();
     assert!(err.contains("old copy of the data folder"), "{err}");
     assert!(d.exists());
+}
+
+// ---- findings 1 and 2: what a user leaves in %ProgramData% never makes install or uninstall wait or fail
+
+/// An entry in `%ProgramData%` named like the helper's old data folders, with a file in it that a program holds an
+/// oplock on (the sandbox user made it).
+fn entry_with_a_locked_file(s: &Sandbox) -> (PathBuf, vcam_protocol::secure::oplock::Oplock) {
+    let d = s.paths.program_data.join("BetterCam.old-test");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("f.txt"), vec![1u8; 4096]).unwrap();
+    let lock = lock_on(&d.join("f.txt")).expect("an oplock");
+    (d, lock)
+}
+
+/// Repair with such an entry present: it returns within the bound and succeeds; the entry's file is still locked
+/// and still there. The old code waited in `remove_dir_all` for as long as the lock was held, with the machine-wide
+/// lock taken: every later helper exited 11.
+#[test]
+fn a_repair_does_not_wait_for_or_fail_on_an_old_data_folder_with_a_locked_file() {
+    let (s, mut m) = installed("repair-locked-aside");
+    let (d, lock) = entry_with_a_locked_file(&s);
+    let dll = fake_dll(&s.root.join("src2"), 2);
+    let (paths, p) = (s.paths.clone(), s.p.clone());
+    let (r, lines, m) = within("repair", BOUND, move || {
+        let mut log = VecLog::default();
+        let r = install_with(&opts(), &dll, &paths, Some(p), &mut m, &mut log);
+        (r, log.0, m)
+    });
+    assert_eq!(r.unwrap(), InstallOutcome::Done, "{lines:?}");
+    assert!(m.camera);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("BetterCam.old-test") && l.contains("locked by another program")),
+        "{lines:?}"
+    );
+    assert_eq!(std::fs::metadata(d.join("f.txt")).unwrap().len(), 4096);
+    drop(lock);
+}
+
+/// Remove: an entry that is not the helper's (its owner is not trusted) is left as it is and is no failure, and no
+/// wait; one that is the helper's with a lock in it is reported as left behind, truthfully, without a wait.
+#[test]
+fn an_uninstall_does_not_wait_for_a_locked_file_in_an_old_data_folder() {
+    let (s, m) = installed("uninstall-locked-aside");
+    let (d, lock) = entry_with_a_locked_file(&s);
+    // 1. not the helper's: only SYSTEM is trusted, the sandbox user made the entry
+    let (paths, only_system) = (s.paths.clone(), vec![crate::acl::SID_SYSTEM.to_string()]);
+    let (r, mut m) = within("uninstall (somebody else's entry)", BOUND, move || {
+        let mut m = m;
+        let r = uninstall_trusting(&paths, &only_system, &mut m, &mut VecLog::default());
+        (r, m)
+    });
+    assert_eq!(r.unwrap(), UninstallOutcome::Done);
+    assert!(
+        !s.paths.data.exists() && !m.camera,
+        "the removal itself succeeded"
+    );
+    assert_eq!(std::fs::metadata(d.join("f.txt")).unwrap().len(), 4096);
+
+    // 2. the helper's own (trusted owner), with a lock in it: reported, not waited for
+    let (paths, trusted) = (s.paths.clone(), s.p.trusted_owners.clone());
+    let (r, lines) = within("uninstall (the helper's entry)", BOUND, move || {
+        let mut log = VecLog::default();
+        (
+            uninstall_trusting(&paths, &trusted, &mut m, &mut log),
+            log.0,
+        )
+    });
+    let err = r.unwrap_err();
+    assert!(err.contains("old copy of the data folder"), "{err}");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("f.txt") && l.contains("locked by another program")),
+        "{lines:?}"
+    );
+    drop(lock);
+    uninstall_trusting(
+        &s.paths,
+        &s.p.trusted_owners,
+        &mut Fake::default(),
+        &mut VecLog::default(),
+    )
+    .unwrap();
+    assert!(!d.exists());
+}
+
+/// Remove with a program holding a lock on a file of the live data folder (the user may read `install.log`): the
+/// removal returns within the bound and says what stayed; the camera and the keys are gone all the same.
+#[test]
+fn an_uninstall_does_not_wait_for_a_locked_install_log_and_says_what_stayed() {
+    let (s, m) = installed("uninstall-locked-log");
+    let Some(lock) = lock_on(&s.paths.install_log()) else {
+        return;
+    };
+    let (paths, trusted) = (s.paths.clone(), s.p.trusted_owners.clone());
+    let (r, lines, m) = within("uninstall", BOUND, move || {
+        let mut m = m;
+        let mut log = VecLog::default();
+        let r = uninstall_trusting(&paths, &trusted, &mut m, &mut log);
+        (r, log.0, m)
+    });
+    let err = r.unwrap_err();
+    assert!(
+        err.contains("left behind")
+            && err.contains("install.log")
+            && err.contains("locked by another program"),
+        "{err}"
+    );
+    assert!(!m.camera && m.reg.is_none());
+    assert!(
+        lines.iter().any(|l| l.contains("could not remove")),
+        "{lines:?}"
+    );
+    assert!(s.paths.install_log().exists() && !s.paths.frames().exists());
+    drop(lock);
+    // the next removal finishes the job
+    uninstall_with(&s.paths, &mut Fake::default(), &mut VecLog::default()).unwrap();
+    assert!(!s.paths.data.exists());
 }

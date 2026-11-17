@@ -129,7 +129,7 @@ pub fn run_helper(cmd: HelperCommand) -> i32 {
     let mut log = vcam_install::FileLog::open_for(user_sid);
     let result: Result<i32, String> = match cmd {
         HelperCommand::Install { user_sid } => {
-            log.line(&format!("---- install: elevated, user {user_sid}"));
+            log.line(&format!("{} elevated, user {user_sid}", vcam_install::log::INSTALL_MARKER));
             locate_dll().and_then(|dll| {
                 log.line(&format!("dll source: {}", dll.display()));
                 vcam_install::install(
@@ -147,7 +147,7 @@ pub fn run_helper(cmd: HelperCommand) -> i32 {
             })
         }
         HelperCommand::Uninstall => {
-            log.line("---- uninstall: elevated");
+            log.line(&format!("{} elevated", vcam_install::log::UNINSTALL_MARKER));
             vcam_install::uninstall(&mut log).map(|o| match o {
                 UninstallOutcome::Done => EXIT_OK,
                 UninstallOutcome::PendingReboot => EXIT_PENDING,
@@ -323,13 +323,27 @@ pub fn run_action(launcher: &dyn Launcher, exe: &str, action: Action, user_sid: 
     let args = helper_args(action, user_sid)?;
     let started = SystemTime::now();
     let outcome = launcher.run_elevated(exe, &args);
-    let tail = match &outcome {
-        LaunchOutcome::Exited(c) if *c as i32 == EXIT_OK || *c as i32 == EXIT_PENDING || *c as i32 == EXIT_BUSY => Vec::new(),
-        // only what this run wrote: an older run's last lines say nothing about it
-        _ => vcam_install::log::log_tail_since(started, 8),
+    let failed = !matches!(&outcome, LaunchOutcome::Exited(c) if *c as i32 == EXIT_OK || *c as i32 == EXIT_PENDING || *c as i32 == EXIT_BUSY);
+    let tail = if failed {
+        // only what this run wrote (from its own marker on): an older run's lines say nothing about it
+        vcam_install::log::log_tail_since(started, 8)
+    } else {
+        Vec::new()
     };
-    outcome_to_result(action, &outcome, &tail)
+    let result = outcome_to_result(action, &outcome, &tail);
+    // a helper that failed leaves its reason in install.log; when a program of the user holds a lock on that file
+    // neither the helper could write it nor can this read it: say that instead of showing no reason
+    match result {
+        Err(msg) if failed && matches!(outcome, LaunchOutcome::Exited(_)) && vcam_install::log::install_log_locked() => {
+            Err(format!("{msg} {LOG_LOCKED}"))
+        }
+        other => other,
+    }
 }
+
+/// Added to a failure when `install.log` is locked by another program (see `run_action`).
+const LOG_LOCKED: &str =
+    "The details cannot be shown: another program has the install log (ProgramData\\BetterCam\\logs\\install.log) open and locked, so the helper could not write them either. Close that program and run the action again; what was done stays done.";
 
 /// [`run_action`] under the claim on the virtual camera: one change at a time, the engine (and its handle on
 /// `frames.bin`, which the helper may have to replace) released first. The claim is dropped when the helper has

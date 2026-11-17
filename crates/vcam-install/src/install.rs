@@ -61,6 +61,14 @@ pub fn file_looks_like_dll(path: &Path) -> bool {
     meta.len() as usize >= MIN_DLL_BYTES && f.read_exact(&mut head).is_ok() && &head == b"MZ"
 }
 
+/// Delete one file of the installation without waiting for another program. `Program Files` can be read by a standard
+/// user, and a program of theirs can hold an opportunistic lock on a DLL there, which makes `std::fs::remove_file`
+/// wait (with the machine-wide lock taken). A file that is locked, or loaded by the camera service, is "in use" as
+/// before, and the callers go on from there (stop the service, delete at the next restart).
+fn delete_file(p: &Path) -> std::io::Result<()> {
+    vcam_protocol::secure::remove_tree(p).map_err(std::io::Error::from)
+}
+
 fn is_ours(p: &Path) -> bool {
     p.file_name()
         .and_then(|n| n.to_str())
@@ -164,7 +172,7 @@ pub fn install_with(
 
     // 5. only now the older DLLs
     let pending = remove_old_dlls(&paths.install, &dest, m, log);
-    datadir::sweep_asides(paths, log);
+    datadir::sweep_asides(paths, &principals.trusted_owners, log);
     Ok(if pending {
         log.line(
             "installed; the camera service still has an older build loaded: the new one takes effect after that service restarts or Windows restarts",
@@ -190,7 +198,7 @@ fn copy_dll(bytes: &[u8], dest: &Path, log: &mut dyn Log) -> Res<bool> {
         .and_then(|()| std::fs::rename(&tmp, dest))
         .map_err(|e| werr(&format!("write {}", dest.display()), e));
     if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = delete_file(&tmp);
     }
     result?;
     log.line(&format!("dll copied: {}", dest.display()));
@@ -230,7 +238,7 @@ fn rollback(
     // the DLL we copied goes, unless the registration we kept names it
     let in_use = before.as_ref().is_some_and(|b| Path::new(&b.dll) == dest);
     if copied_new && !in_use && complete {
-        match std::fs::remove_file(dest) {
+        match delete_file(dest) {
             Ok(()) => log.line(&format!("rolled back: deleted {}", dest.display())),
             Err(e) => log.line(&format!("could not delete {}: {e}", dest.display())),
         }
@@ -257,7 +265,7 @@ fn remove_old_dlls(dir: &Path, keep: &Path, m: &mut dyn Machine, log: &mut dyn L
     for e in rd.flatten() {
         let p = e.path();
         if is_ours(&p) && p != keep {
-            if std::fs::remove_file(&p).is_ok() {
+            if delete_file(&p).is_ok() {
                 log.line(&format!("deleted {}", p.display()));
             } else {
                 locked.push(p);
@@ -291,7 +299,7 @@ enum Removal {
 
 /// Delete `p`; a file that is locked is scheduled for deletion at the next reboot.
 fn delete_or_delay(p: &Path, m: &mut dyn Machine, log: &mut dyn Log) -> Removal {
-    match std::fs::remove_file(p) {
+    match delete_file(p) {
         Ok(()) => {
             log.line(&format!("deleted {}", p.display()));
             Removal::Deleted
@@ -326,6 +334,17 @@ pub fn uninstall(log: &mut dyn Log) -> Res<UninstallOutcome> {
 /// process.
 pub fn uninstall_with(
     paths: &Paths,
+    m: &mut dyn Machine,
+    log: &mut dyn Log,
+) -> Res<UninstallOutcome> {
+    uninstall_trusting(paths, &Principals::machine(None).trusted_owners, m, log)
+}
+
+/// [`uninstall_with`] for another set of owners that the helper's own leftovers in `%ProgramData%` may have (the
+/// real ones are SYSTEM and Administrators; tests, which run as a standard user, name themselves).
+pub fn uninstall_trusting(
+    paths: &Paths,
+    trusted: &[String],
     m: &mut dyn Machine,
     log: &mut dyn Log,
 ) -> Res<UninstallOutcome> {
@@ -371,7 +390,7 @@ pub fn uninstall_with(
         .unwrap_or_default();
     let mut locked = Vec::new();
     for p in &dlls {
-        if std::fs::remove_file(p).is_ok() {
+        if delete_file(p).is_ok() {
             log.line(&format!("deleted {}", p.display()));
         } else {
             locked.push(p.clone());
@@ -396,20 +415,21 @@ pub fn uninstall_with(
 
     // the data folder, last: the log of this run lives in it
     log.release_folder();
-    let mut gone = datadir::remove_all(paths);
-    if !gone && !stopped {
+    let mut gone = datadir::remove_all_reporting(paths);
+    if gone.is_err() && !stopped {
         log.line("the data folder is in use; stopping Frame Server");
         m.stop_frame_server();
-        gone = datadir::remove_all(paths);
+        gone = datadir::remove_all_reporting(paths);
     }
-    if !gone {
+    if let Err(what) = gone {
         log.folder_ready();
-        let why = format!("{} (a file in it is in use)", paths.data.display());
+        // what stayed behind, as it is: a file another program holds a lock on is said so
+        let why = format!("{} ({what})", paths.data.display());
         log.line(&format!("could not remove {why}"));
         left.push(why);
     }
     // a data folder that an install moved out of the way lives next to `BetterCam`, not in it
-    if datadir::sweep_data_asides(paths, log) > 0 {
+    if datadir::sweep_data_asides(paths, trusted, log) > 0 {
         left.push(format!(
             "an old copy of the data folder in {} (in use)",
             paths.program_data.display()
