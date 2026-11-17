@@ -20,6 +20,11 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// What `start_engine` says while the virtual camera is not installed: the engine would write frames nobody reads.
+pub const VCAM_NOT_INSTALLED: &str =
+    "Better Cam's virtual camera is not installed. Use the “Install virtual camera” button above.";
+const VCAM_BEING_CHANGED: &str = "The virtual camera is being changed. Try again in a moment.";
+
 /// The engine and everything the commands need around it.
 #[derive(Default)]
 pub struct Service {
@@ -27,6 +32,22 @@ pub struct Service {
     sink: Mutex<Option<Arc<dyn EventSink>>>,
     window_visible: AtomicBool,
     preview: Preview,
+    /// An install, repair or removal of the virtual camera is running (one at a time).
+    vcam_busy: AtomicBool,
+    /// A removal is running: no engine may be created, or it would map `frames.bin` again.
+    engine_blocked: AtomicBool,
+}
+
+/// Held while the virtual camera is installed, repaired or removed; releases the claim on drop.
+pub struct VcamChange<'a> {
+    svc: &'a Service,
+}
+
+impl Drop for VcamChange<'_> {
+    fn drop(&mut self) {
+        self.svc.engine_blocked.store(false, Ordering::Release);
+        self.svc.vcam_busy.store(false, Ordering::Release);
+    }
 }
 
 /// The engine's settings for a pair of configs. Rejects what could never open.
@@ -73,12 +94,37 @@ impl Service {
         }
     }
 
-    /// The engine, created on first use. Blocks while another thread creates it.
+    /// Claim the right to change the virtual camera (install, repair, remove); one change at a time. With `remove`
+    /// the engine is shut down first (camera and `frames.bin` released) and cannot be created until the guard drops.
+    pub fn begin_vcam_change(&self, remove: bool) -> Result<VcamChange<'_>, String> {
+        if self
+            .vcam_busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err("Another change of the virtual camera is already running.".into());
+        }
+        let guard = VcamChange { svc: self };
+        if remove {
+            self.engine_blocked.store(true, Ordering::Release);
+            self.shutdown();
+        }
+        Ok(guard)
+    }
+
+    /// The engine, created on first use. Blocks while another thread creates it. Without the virtual camera there is
+    /// no engine: its frame file lives in the folder the installer makes, and nobody could read the frames.
     pub fn engine(&self) -> Result<Arc<Engine>, String> {
         let created = {
             let mut g = lock(&self.engine);
             if let Some(e) = g.as_ref() {
                 return Ok(e.clone());
+            }
+            if self.engine_blocked.load(Ordering::Acquire) {
+                return Err(VCAM_BEING_CHANGED.into());
+            }
+            if !vcam_install::registry::clsid_key_present() || !vcam_install::util::data_dir().is_dir() {
+                return Err(VCAM_NOT_INSTALLED.into());
             }
             let e = Arc::new(Engine::new()?);
             if let Some(s) = lock(&self.sink).clone() {
@@ -253,7 +299,8 @@ impl Service {
         }
     }
 
-    /// Stop the engine and release the camera and `frames.bin` (the app quits).
+    /// Stop the engine and release the camera and `frames.bin` (the app quits, or the virtual camera is removed). A
+    /// later call that needs the engine creates a new one.
     pub fn shutdown(&self) {
         self.preview.stop(None);
         let e = lock(&self.engine).take();

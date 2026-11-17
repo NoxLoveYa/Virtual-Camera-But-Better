@@ -10,6 +10,7 @@ import { SourcePanel } from "./components/SourcePanel";
 import { Stats } from "./components/Stats";
 import { TitleBar } from "./components/TitleBar";
 import { Toast } from "./components/Toast";
+import { VcamBanner } from "./components/VcamBanner";
 
 export default function App() {
   const chain = useStore((s) => s.chain);
@@ -17,6 +18,7 @@ export default function App() {
   const error = useStore((s) => s.error);
   const state = useStore((s) => s.engine.state);
   const reason = useStore((s) => s.engine.reason);
+  const vcamBanner = useStore((s) => s.vcam?.state === "missing" || s.vcam?.state === "outdated");
   const { setAllCollapsed, moveFilter, dismissError } = useStore.getState();
   const [dragFrom, setDragFrom] = useState<number | null>(null);
   const init = useRef(false);
@@ -51,8 +53,9 @@ export default function App() {
         </div>
 
         <div className="scroll app col col-right">
-          {(error || waiting) && (
+          {(error || waiting || vcamBanner) && (
             <div className="banners">
+              <VcamBanner />
               {error && (
                 <div className="banner error" onClick={dismissError}>
                   {error}

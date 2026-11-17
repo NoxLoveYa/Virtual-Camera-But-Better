@@ -44,7 +44,25 @@ fn forward_events(app: &AppHandle) -> Arc<dyn better_cam::engine::EventSink> {
     })
 }
 
+/// `--vcam-install` / `--vcam-uninstall`: the elevated helper of the virtual camera. Runs before the Tauri builder and
+/// the single-instance plugin, opens no window and exits with the helper's exit code.
+fn run_helper_if_asked() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let Some(parsed) = better_cam::vcam_admin::parse_helper_args(&args) else {
+        return;
+    };
+    let code = match parsed {
+        Ok(cmd) => better_cam::vcam_admin::run_helper(cmd),
+        Err(e) => {
+            eprintln!("{e}");
+            better_cam::vcam_admin::EXIT_USAGE
+        }
+    };
+    std::process::exit(code);
+}
+
 fn main() {
+    run_helper_if_asked();
     let builder = tauri::Builder::default();
     // A relaunch while the app sits in the tray should surface that window, not start a second instance.
     // Debug builds skip this so `tauri dev` still works while an installed copy is running.
@@ -129,6 +147,9 @@ fn main() {
             commands::save_preset,
             commands::load_preset,
             commands::delete_preset,
+            commands::vcam_status,
+            commands::vcam_install,
+            commands::vcam_uninstall,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Better Cam")

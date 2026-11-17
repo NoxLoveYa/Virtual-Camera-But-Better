@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useStore, type EngineInfo } from "../store";
+import type { VcamStatus } from "../api";
+import { useStore, type EngineInfo, type VcamAction } from "../store";
 import { Icon as Glyph } from "./Icon";
 import { Popover } from "./Popover";
 
@@ -20,6 +21,67 @@ function Setting({ title, hint, on, onToggle }: { title: string; hint: string; o
         <small>{hint}</small>
       </span>
       <button role="switch" aria-checked={on} aria-label={title} className="switch" />
+    </div>
+  );
+}
+
+/** What the "Virtual camera" row says about the camera and the action under way. */
+function vcamText(state: VcamStatus["state"] | undefined, busy: VcamAction | null) {
+  if (busy === "remove") return "Removing…";
+  if (busy === "install") return "Installing…";
+  if (busy === "update") return "Updating…";
+  if (busy === "repair") return "Repairing…";
+  if (state === "ok") return "Installed";
+  if (state === "outdated") return "Update available";
+  if (state === "missing") return "Not installed";
+  return "Checking…";
+}
+
+/** Installed state, Repair (install again) and Remove, with the confirmation inside the popover. */
+function VcamRow() {
+  const state = useStore((s) => s.vcam?.state);
+  const busy = useStore((s) => s.vcamBusy);
+  const { runVcam, removeVcam } = useStore.getState();
+  const [confirm, setConfirm] = useState(false);
+
+  if (confirm) {
+    return (
+      <div className="row static confirm-vcam">
+        <span>
+          <b>Remove the virtual camera?</b>
+          <small>Other apps lose “Better Cam”. Asks for administrator rights.</small>
+        </span>
+        <span className="row-actions">
+          <button
+            className="danger"
+            onClick={() => {
+              setConfirm(false);
+              void removeVcam();
+            }}
+          >
+            Remove
+          </button>
+          <button className="ghost" onClick={() => setConfirm(false)}>
+            Cancel
+          </button>
+        </span>
+      </div>
+    );
+  }
+  return (
+    <div className="row static">
+      <span>
+        <b>Virtual camera</b>
+        <small>{vcamText(state, busy)}</small>
+      </span>
+      <span className="row-actions">
+        <button disabled={busy !== null || state === undefined} onClick={() => void runVcam(state === "outdated" ? "update" : "repair")}>
+          {state === "outdated" ? "Update" : "Repair"}
+        </button>
+        <button className="danger" disabled={busy !== null || state === undefined || state === "missing"} onClick={() => setConfirm(true)}>
+          Remove
+        </button>
+      </span>
     </div>
   );
 }
@@ -52,6 +114,7 @@ function Settings() {
         on={closeToTray}
         onToggle={() => setCloseToTray(!closeToTray)}
       />
+      <VcamRow />
     </Popover>
   );
 }

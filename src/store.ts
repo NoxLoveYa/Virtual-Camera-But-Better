@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { api, type EngineState, type Stats } from "./api";
+import { api, type EngineState, type Stats, type VcamStatus } from "./api";
 import { FILTERS, defaultChain, makeFilter, type FilterCfg, type FilterKind, type ParamValue } from "./filters/schema";
 import { normalizeChain, signature } from "./filters/chain";
 import {
@@ -53,6 +53,9 @@ interface Snapshot {
   activePreset: string | null;
   presetBaseline: string | null;
 }
+
+/** What the virtual camera is being asked to do (the button that was pressed). */
+export type VcamAction = "install" | "update" | "repair" | "remove";
 
 /** The engine's state as the last `engine-state` event said it. Pause is not part of it (see `paused`). */
 export interface EngineInfo {
@@ -127,8 +130,20 @@ interface State extends Saved {
   controlsError: string | null;
   /** Reset all is running. */
   controlsResetting: boolean;
+  /** The virtual camera as `vcam_status` last said; `null` until the first answer. */
+  vcam: VcamStatus | null;
+  /** The action whose administrator prompt or work is running; the buttons are disabled meanwhile. */
+  vcamBusy: VcamAction | null;
+  /** Bumped when the virtual camera was installed, removed or changed state: the engine behind the preview is new. */
+  vcamEpoch: number;
 
   init: () => Promise<void>;
+  /** Reads `vcam_status` (skipped while an action runs: its end reads it again). */
+  refreshVcam: () => Promise<void>;
+  /** Install, update or repair: one UAC prompt. A refusal or failure shows a toast; the banner stays. */
+  runVcam: (action: Exclude<VcamAction, "remove">) => Promise<void>;
+  /** Stops the engine and removes the virtual camera: one UAC prompt. */
+  removeVcam: () => Promise<void>;
   refreshCameras: () => Promise<void>;
   /** Reads the selected camera's controls (from the open camera, else by opening the device for a moment). */
   refreshControls: () => Promise<void>;
@@ -391,6 +406,54 @@ export const useStore = create<State>((set, get) => {
     controlsFor: null,
     controlsError: null,
     controlsResetting: false,
+    vcam: null,
+    vcamBusy: null,
+    vcamEpoch: 0,
+
+    refreshVcam: async () => {
+      if (get().vcamBusy) return;
+      try {
+        const vcam = await api.vcamStatus();
+        if (get().vcamBusy) return;
+        const changed = get().vcam?.state !== vcam.state;
+        set((s) => ({ vcam, ...(changed && { vcamEpoch: s.vcamEpoch + 1 }) }));
+      } catch {
+        /* the banner keeps what it showed; the next focus asks again */
+      }
+    },
+
+    runVcam: async (action) => {
+      if (get().vcamBusy) return;
+      set({ vcamBusy: action });
+      try {
+        await api.vcamInstall();
+        // A Start that was refused for want of the camera left its error up; it is no longer true.
+        if (get().error?.includes("virtual camera is not installed")) set({ error: null });
+        say(action === "repair" ? "Virtual camera repaired" : action === "update" ? "Virtual camera updated" : "Virtual camera installed");
+      } catch (e) {
+        say(String(e));
+      } finally {
+        set((s) => ({ vcamBusy: null, vcamEpoch: s.vcamEpoch + 1 }));
+        await get().refreshVcam();
+      }
+    },
+
+    removeVcam: async () => {
+      if (get().vcamBusy) return;
+      // The backend shuts the engine down before it asks for administrator rights; the window follows at once.
+      set({ vcamBusy: "remove", engine: STOPPED, paused: false, wasRunning: false });
+      useStats.setState({ stats: null });
+      persist();
+      try {
+        await api.vcamUninstall();
+        say("Virtual camera removed");
+      } catch (e) {
+        say(String(e));
+      } finally {
+        set((s) => ({ vcamBusy: null, vcamEpoch: s.vcamEpoch + 1 }));
+        await get().refreshVcam();
+      }
+    },
 
     init: async () => {
       await api.onEngineState((e) => {
@@ -415,6 +478,10 @@ export const useStore = create<State>((set, get) => {
         const next = sortControls(infos).map((i) => (queued(i.key) ? (cur?.find((c) => c.key === i.key) ?? i) : i));
         if (JSON.stringify(next) !== JSON.stringify(cur)) set({ controlInfos: next, controlsFor: selectedCam()?.id ?? get().controlsFor });
       });
+      // The virtual camera is read at startup, after each action (above) and whenever the window gets focus back
+      // (a repair by hand, or `vcam-tool`, shows up without a restart).
+      const vcamRead = get().refreshVcam();
+      window.addEventListener("focus", () => void get().refreshVcam());
       await Promise.all([get().refreshCameras(), get().refreshPresets()]).catch(fail);
 
       // Work out which saved preset (if any) the restored chain still matches, so the toolbar shows the right name.
@@ -448,7 +515,9 @@ export const useStore = create<State>((set, get) => {
 
       // Both a login launch and a manual one start again when the engine was running at the last exit. Right after
       // login the engine may not be ready yet, so a login launch keeps trying for a while.
-      if (get().wasRunning) {
+      // Without the virtual camera the start would only be refused; the banner already says what to do.
+      await vcamRead;
+      if (get().wasRunning && get().vcam?.state !== "missing") {
         const login = await api.launchedAtStartup().catch(() => false);
         for (let i = 0; i < (login ? 10 : 1) && !running(); i++) {
           if (!(await begin()) && login) await new Promise((r) => setTimeout(r, 3000));

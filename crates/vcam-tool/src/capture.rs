@@ -20,8 +20,7 @@ use windows::Win32::Media::MediaFoundation::{
 };
 use windows_core::{Interface, GUID};
 
-use crate::status::enum_mf_devices;
-use crate::util::init_com_and_mf;
+use vcam_install::{enum_mf_devices, init_com_and_mf};
 
 pub const USAGE: &str =
     "usage: vcam-tool capture-test [--frames N] [--format nv12|rgb32] [--size WxH] [--fps N]

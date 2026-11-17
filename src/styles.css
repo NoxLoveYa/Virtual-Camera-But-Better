@@ -97,6 +97,14 @@ body {
 .pop-menu .row span { display: flex; flex-direction: column; gap: 2px; }
 .pop-menu .row b { font-weight: 500; }
 .pop-menu .row small { color: var(--faint); font-size: 11px; }
+/* a row that holds its own buttons instead of being one big switch */
+.pop-menu .row.static { cursor: default; }
+.pop-menu .row.static:hover { background: none; }
+.pop-menu .row .row-actions { flex-direction: row; gap: 6px; }
+.pop-menu .row .row-actions button { height: 28px; }
+.pop-menu .row.confirm-vcam { flex-wrap: wrap; row-gap: 8px; }
+.pop-menu .row.confirm-vcam > span:first-child { flex: 1 1 100%; }
+.pop-menu .row.confirm-vcam .row-actions { margin-left: auto; }
 
 /* rows inside menus: flat, full width, no button chrome */
 .pm-item {

@@ -9,3 +9,4 @@ pub mod fx;
 pub mod gpu;
 pub mod output_writer;
 pub mod preview;
+pub mod vcam_admin;

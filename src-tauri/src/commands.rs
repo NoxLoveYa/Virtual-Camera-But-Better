@@ -2,6 +2,7 @@ use better_cam::api::Service;
 use better_cam::camera_controls::ControlInfoDto;
 use better_cam::config::{CameraDto, OutputCfg, SourceCfg};
 use better_cam::preview::Sink;
+use better_cam::vcam_admin::{self, VcamStatus};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -142,6 +143,31 @@ pub async fn set_preview(
 #[tauri::command]
 pub fn preview_ack(state: State<AppState>, frame: u32) {
     state.service.preview_ack(frame);
+}
+
+/// What the virtual camera needs (plan 5.5): `{state: "missing" | "outdated" | "ok", listed, consumers}`. No elevation.
+#[tauri::command]
+pub async fn vcam_status() -> Result<VcamStatus, String> {
+    blocking(|| Ok(vcam_admin::status())).await
+}
+
+/// Install, update or repair the virtual camera: one UAC prompt. Rejects with a readable sentence when the prompt is
+/// declined or the helper fails.
+#[tauri::command]
+pub async fn vcam_install(state: State<'_, AppState>) -> Result<(), String> {
+    let svc = state.service.clone();
+    blocking(move || {
+        let _change = svc.begin_vcam_change(false)?;
+        vcam_admin::install(&vcam_install::ShellLauncher)
+    })
+    .await
+}
+
+/// Remove the virtual camera: the engine stops and `frames.bin` closes first, then one UAC prompt.
+#[tauri::command]
+pub async fn vcam_uninstall(state: State<'_, AppState>) -> Result<(), String> {
+    let svc = state.service.clone();
+    blocking(move || vcam_admin::uninstall(&svc, &vcam_install::ShellLauncher)).await
 }
 
 #[tauri::command]

@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 vcam-protocol.workspace = true
+vcam-install.workspace = true
 windows-core.workspace = true
 
 [dependencies.windows]

@@ -5,10 +5,8 @@
 //! return its exit code. The child is the same binary started with `--elevated`.
 
 mod capture;
-mod elevate;
 mod feed;
 mod gen_slates;
-mod install;
 mod stats;
 mod status;
 mod util;
@@ -17,6 +15,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use util::Out;
+use vcam_install::{LaunchOutcome, Launcher, ShellLauncher};
+
+/// Exit code when the UAC prompt was declined.
+const EXIT_DECLINED: i32 = 3;
+/// Exit code when the UAC prompt was not answered in time.
+const EXIT_TIMEOUT: i32 = 4;
 
 const USAGE: &str = "usage: vcam-tool <command>
   register [--dshow-class]   install DLL + registry + virtual camera (asks for elevation)
@@ -71,7 +75,7 @@ fn elevate_self(verb: &str, args: &ElevatedArgs) -> i32 {
     };
     let result = std::env::temp_dir().join(format!("better-cam-{verb}-{}.log", std::process::id()));
     let _ = std::fs::remove_file(&result);
-    let sid = elevate::current_user_sid().unwrap_or_default();
+    let sid = vcam_install::current_user_sid().unwrap_or_default();
     let mut child_args = vec![
         verb.to_string(),
         "--elevated".into(),
@@ -86,14 +90,41 @@ fn elevate_self(verb: &str, args: &ElevatedArgs) -> i32 {
         child_args.push("--dshow-class".into());
     }
     println!("requesting elevation for '{verb}' (UAC prompt)...");
-    let code = elevate::run_elevated(&exe, &child_args, ELEVATION_WAIT);
+    let outcome = ShellLauncher.run_elevated(&exe, &child_args, ELEVATION_WAIT);
     if let Ok(text) = std::fs::read_to_string(&result) {
         print!("{text}");
     }
     let _ = std::fs::remove_file(&result);
-    match code {
-        Ok(c) => c,
-        Err(c) => c,
+    match outcome {
+        LaunchOutcome::Exited(c) => c as i32,
+        LaunchOutcome::Cancelled => {
+            eprintln!("elevation declined (UAC prompt cancelled)");
+            EXIT_DECLINED
+        }
+        LaunchOutcome::TimedOut => {
+            eprintln!(
+                "elevated process did not finish within {ELEVATION_WAIT:?} (UAC prompt unanswered?)"
+            );
+            EXIT_TIMEOUT
+        }
+        LaunchOutcome::Failed(why) => {
+            eprintln!("{why}");
+            1
+        }
+    }
+}
+
+/// The DLL the tool registers: `better_cam_vcam.dll` next to this exe.
+fn dll_next_to_exe() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let p = exe
+        .parent()
+        .ok_or("exe has no parent")?
+        .join(format!("{}.dll", vcam_protocol::DLL_BASE_NAME));
+    if p.is_file() {
+        Ok(p)
+    } else {
+        Err(format!("DLL not found next to the tool: {}", p.display()))
     }
 }
 
@@ -102,21 +133,24 @@ fn do_elevated(verb: &str, args: &ElevatedArgs) -> i32 {
     let mut out = Out::new(args.result.as_deref());
     out.line(&format!(
         "{verb}: running elevated: {}",
-        elevate::is_elevated()
+        vcam_install::is_elevated()
     ));
     let r = if verb == "register" {
-        install::register(
-            &install::RegisterOptions {
-                user_sid: args
-                    .user_sid
-                    .clone()
-                    .or_else(|| elevate::current_user_sid().ok()),
-                dshow_class: args.dshow_class,
-            },
-            &mut out,
-        )
+        dll_next_to_exe().and_then(|dll| {
+            vcam_install::install(
+                &vcam_install::InstallOptions {
+                    user_sid: args
+                        .user_sid
+                        .clone()
+                        .or_else(|| vcam_install::current_user_sid().ok()),
+                    dshow_class: args.dshow_class,
+                },
+                &dll,
+                &mut out,
+            )
+        })
     } else {
-        install::unregister(&mut out)
+        vcam_install::uninstall(&mut out)
     };
     match r {
         Ok(()) => 0,
@@ -140,7 +174,7 @@ fn main() {
                 eprintln!("{e}\n{USAGE}");
                 2
             }
-            Ok(a) if a.elevated || elevate::is_elevated() => do_elevated(&cmd, &a),
+            Ok(a) if a.elevated || vcam_install::is_elevated() => do_elevated(&cmd, &a),
             Ok(a) => elevate_self(&cmd, &a),
         },
         "status" => status::run(),

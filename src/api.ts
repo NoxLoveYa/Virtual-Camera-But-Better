@@ -25,6 +25,17 @@ export interface Stats {
   consumers: number;
 }
 
+/** `missing`: not installed or not listed by Windows; `outdated`: another build than the DLL shipped with the app. */
+export type VcamState = "missing" | "outdated" | "ok";
+
+export interface VcamStatus {
+  state: VcamState;
+  /** Windows lists the camera. */
+  listed: boolean;
+  /** 0 or 1: an app has the camera open right now. */
+  consumers: number;
+}
+
 export const api = {
   listCameras: () => invoke<CameraInfo[]>("list_cameras"),
   startEngine: (source: SourceCfg, output: OutputCfg, chain: FilterCfg[], controls: ControlsRecord = null) =>
@@ -46,6 +57,12 @@ export const api = {
     return invoke<void>("set_preview", { on, width, height, channel });
   },
   previewAck: (frame: number) => invoke<void>("preview_ack", { frame }),
+  /** No elevation; takes a moment (Media Foundation enumeration). */
+  vcamStatus: () => invoke<VcamStatus>("vcam_status"),
+  /** Installs, updates or repairs the virtual camera: one UAC prompt. Rejects with a sentence when declined or failed. */
+  vcamInstall: () => invoke<void>("vcam_install"),
+  /** Stops the engine, then removes the virtual camera: one UAC prompt. Rejects like `vcamInstall`. */
+  vcamUninstall: () => invoke<void>("vcam_uninstall"),
   getAutostart: () => invoke<boolean>("get_autostart"),
   setAutostart: (on: boolean) => invoke<void>("set_autostart", { on }),
   launchedAtStartup: () => invoke<boolean>("launched_at_startup"),

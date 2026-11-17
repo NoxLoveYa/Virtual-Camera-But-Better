@@ -208,6 +208,17 @@ export function Preview() {
     [sync],
   );
 
+  // The virtual camera was installed or removed: the backend engine (and its preview tap) is a new one, or none was
+  // there when the preview was asked for. Ask again.
+  const vcamEpoch = useStore((s) => s.vcamEpoch);
+  const seenEpoch = useRef(vcamEpoch);
+  useEffect(() => {
+    if (seenEpoch.current === vcamEpoch) return;
+    seenEpoch.current = vcamEpoch;
+    applied.current = "";
+    void sync();
+  }, [vcamEpoch, sync]);
+
   // A lost WebGL context (GPU reset) is rebuilt on the next frame.
   useEffect(() => {
     const canvas = canvasRef.current!;

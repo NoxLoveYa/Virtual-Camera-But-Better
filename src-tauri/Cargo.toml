@@ -26,6 +26,7 @@ tauri-plugin-single-instance = "2.5.2"
 # The `implement` macro expands to paths in `windows_core`, so the crate must be a direct dependency.
 windows-core.workspace = true
 vcam-protocol = { workspace = true }
+vcam-install = { workspace = true }
 
 [dependencies.windows]
 workspace = true
