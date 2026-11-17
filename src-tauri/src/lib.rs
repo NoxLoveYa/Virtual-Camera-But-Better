@@ -10,4 +10,5 @@ pub mod fx;
 pub mod gpu;
 pub mod output_writer;
 pub mod preview;
+pub mod test_window;
 pub mod vcam_admin;

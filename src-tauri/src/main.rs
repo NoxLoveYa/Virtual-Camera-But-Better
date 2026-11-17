@@ -9,6 +9,7 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
 use tauri_plugin_autostart::MacosLauncher;
+use windows::Win32::Foundation::HWND;
 
 /// Tell the engine whether somebody can see the window: shown and not minimized. Hidden to the tray and minimized
 /// both count as hidden (`deactivate_when_not_showing`).
@@ -20,11 +21,20 @@ fn report_visibility(app: &AppHandle) {
     app.state::<commands::AppState>().service.set_window_visible(visible);
 }
 
+/// Every path that surfaces the main window (start-up, tray, second launch) goes through here. With the debug-only
+/// `BETTER_CAM_TEST_WINDOW` the window is placed and shown without activation and nothing takes the focus.
 fn show_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
-        let _ = w.show();
-        let _ = w.unminimize();
-        let _ = w.set_focus();
+        if let Some(placement) = better_cam::test_window::requested() {
+            match w.hwnd() {
+                Ok(hwnd) => better_cam::test_window::show_without_focus(HWND(hwnd.0 as _), &placement),
+                Err(e) => eprintln!("[test window] no window handle: {e}"),
+            }
+        } else {
+            let _ = w.show();
+            let _ = w.unminimize();
+            let _ = w.set_focus();
+        }
     }
     report_visibility(app);
 }
