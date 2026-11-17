@@ -249,6 +249,8 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-autostart",
  "tauri-plugin-single-instance",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]
@@ -4311,6 +4313,9 @@ dependencies = [
 [[package]]
 name = "vcam-protocol"
 version = "0.1.0"
+dependencies = [
+ "windows",
+]
 
 [[package]]
 name = "vcam-source"
