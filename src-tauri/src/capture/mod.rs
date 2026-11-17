@@ -3,10 +3,12 @@
 //! * [`list_cameras`] walks `MFEnumDeviceSources` and every device's native media types.
 //! * [`reader`] opens one camera with a Source Reader in async mode and delivers [`reader::Frame`]s.
 //! * [`hotplug`] reports camera arrival and removal (`CM_Register_Notification`).
+//! * [`controls`] reads and writes the device controls (brightness, exposure, focus, ...) of an open camera.
 //!
 //! Threading: call these functions from any thread. Each entry point makes sure the calling thread has COM
 //! initialised ([`ensure_com`]) and holds a Media Foundation startup reference ([`MfSession`]) while it works.
 
+pub mod controls;
 pub mod hotplug;
 pub mod reader;
 

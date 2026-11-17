@@ -5,15 +5,25 @@
 //! capture_probe open  [--device N|NAME] [--format mjpeg|nv12|yuy2|...] [--size WxH] [--fps N]
 //!                     [--seconds N] [--hw-decode on|off] [--gpu hw|warp]
 //! capture_probe watch [--seconds N]
+//! capture_probe controls [--device N|NAME] [--path auto|ks|iam|compare] [--save FILE]
+//! capture_probe set      [--device N|NAME] --control KEY [--value N|min|max|mid|default] [--auto true|false]
+//!                        [--measure] [--settle-ms N] [--reapply-test] [--path auto|ks|iam]
+//! capture_probe restore  [--device N|NAME] --file FILE
 //! ```
 //!
-//! Exit codes: 0 success (also when the device is lost during `open`), 1 stream error, 2 usage or setup error,
-//! 3 camera in use.
+//! `controls`, `set` and `restore` (plan phase P4) also take `--format`, `--size` and `--fps` like `open`.
+//! `controls --save FILE` writes the full device state as a snapshot; `restore --file FILE` applies it again.
+//!
+//! Exit codes: 0 success (also when the device is lost during `open`), 1 stream error or a control the camera
+//! lacks, 2 usage or setup error, 3 camera in use.
 
 use std::process::ExitCode;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
+use better_cam::capture::controls::{
+    AccessPath, ControlError, ControlInfo, ControlKey, ControlSnapshot, DeviceControls,
+};
 use better_cam::capture::hotplug::{HotplugEvent, HotplugWatcher};
 use better_cam::capture::reader::{
     CaptureReader, DecodeKind, FrameData, OpenOptions, RecvError, StopReason,
@@ -32,7 +42,10 @@ use windows::Win32::Graphics::Direct3D11::{
 const USAGE: &str = "usage:
   capture_probe list
   capture_probe open  [--device N|NAME] [--format F] [--size WxH] [--fps N] [--seconds N] [--hw-decode on|off] [--gpu hw|warp]
-  capture_probe watch [--seconds N]";
+  capture_probe watch [--seconds N]
+  capture_probe controls [--device N|NAME] [--path auto|ks|iam|compare] [--save FILE]
+  capture_probe set      [--device N|NAME] --control KEY [--value N|min|max|mid|default] [--auto true|false] [--measure] [--settle-ms N] [--reapply-test] [--path auto|ks|iam]
+  capture_probe restore  [--device N|NAME] --file FILE";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -40,6 +53,9 @@ fn main() -> ExitCode {
         Some("list") => list(),
         Some("open") => open(&args[1..]),
         Some("watch") => watch(&args[1..]),
+        Some("controls") => finish(controls_cmd(&args[1..])),
+        Some("set") => finish(set_cmd(&args[1..])),
+        Some("restore") => finish(restore_cmd(&args[1..])),
         _ => {
             eprintln!("{USAGE}");
             2
@@ -155,7 +171,12 @@ fn parse_size(s: &str) -> Result<(u32, u32), String> {
 }
 
 fn open(args: &[String]) -> u8 {
-    match open_inner(args) {
+    finish(open_inner(args))
+}
+
+/// Print a failure and turn the result into an exit code.
+fn finish(r: Result<u8, Failure>) -> u8 {
+    match r {
         Ok(code) => code,
         Err(Failure::Usage(m)) => {
             eprintln!("error: {m}");
@@ -168,12 +189,35 @@ fn open(args: &[String]) -> u8 {
                 _ => 2,
             }
         }
+        Err(Failure::Control(e)) => {
+            eprintln!("error: {e}");
+            match e {
+                ControlError::NotSupported(_)
+                | ControlError::AutoNotSupported(_)
+                | ControlError::ManualNotSupported(_) => 1,
+                ControlError::Capture(CaptureError::InUse(_)) => 3,
+                ControlError::Capture(_) => 2,
+            }
+        }
     }
 }
 
 enum Failure {
     Usage(String),
     Capture(CaptureError),
+    Control(ControlError),
+}
+
+impl From<&str> for Failure {
+    fn from(s: &str) -> Self {
+        Failure::Usage(s.to_string())
+    }
+}
+
+impl From<ControlError> for Failure {
+    fn from(e: ControlError) -> Self {
+        Failure::Control(e)
+    }
 }
 
 impl From<String> for Failure {
@@ -608,4 +652,559 @@ fn watch(args: &[String]) -> u8 {
     drop(watcher);
     show("cameras at end");
     0
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Device controls (plan phase P4)
+
+/// An open camera with its controls. `controls` is declared first so it drops before the reader.
+struct Session {
+    controls: DeviceControls,
+    reader: CaptureReader,
+}
+
+/// The camera `--device` names, and the format the probe opens it with.
+struct Target {
+    key: better_cam::capture::DeviceKey,
+    request: FormatRequest,
+}
+
+fn target(opts: &[(String, String)]) -> Result<Target, Failure> {
+    let cameras = list_cameras()?;
+    let dev_arg = get(opts, "--device").unwrap_or("0");
+    let cam = match dev_arg.parse::<usize>() {
+        Ok(i) => cameras.get(i),
+        Err(_) => {
+            let needle = dev_arg.to_ascii_lowercase();
+            cameras.iter().find(|c| {
+                c.key.name.to_ascii_lowercase().contains(&needle)
+                    || c.key.symbolic_link.to_ascii_lowercase().contains(&needle)
+            })
+        }
+    }
+    .ok_or_else(|| CaptureError::NoSuchDevice(dev_arg.to_string()))?;
+    // The default must stream fast: some cameras deliver their largest raw sizes at 2 fps, which can miss the
+    // first-frame timeout. Prefer MJPEG, and 1280x720 when the camera lists it.
+    let format = match get(opts, "--format") {
+        Some(f) => PixelFormat::from_name(f).ok_or_else(|| format!("unknown --format '{f}'"))?,
+        None => cam
+            .formats
+            .iter()
+            .find(|f| f.format == Some(PixelFormat::Mjpeg))
+            .or_else(|| cam.formats.iter().find(|f| f.format.is_some()))
+            .and_then(|f| f.format)
+            .ok_or_else(|| "camera lists no usable format".to_string())?,
+    };
+    let size = match get(opts, "--size") {
+        Some(s) => Some(parse_size(s)?),
+        None => cam
+            .formats
+            .iter()
+            .any(|f| f.format == Some(format) && (f.width, f.height) == (1280, 720))
+            .then_some((1280, 720)),
+    };
+    Ok(Target {
+        key: cam.key.clone(),
+        request: FormatRequest {
+            format,
+            size,
+            fps: get(opts, "--fps").map(parse_ratio).transpose()?,
+        },
+    })
+}
+
+/// Open the camera (software decode, CPU frames) and attach its controls. Another process holding the camera is
+/// retried for about 40 s.
+fn open_session(t: &Target) -> Result<Session, Failure> {
+    let mut attempt = 0;
+    let reader = loop {
+        let mut o = OpenOptions::new(&t.key.symbolic_link, t.request);
+        o.hw_decode = false;
+        match CaptureReader::open(o) {
+            Err(CaptureError::InUse(e)) if attempt < 20 => {
+                attempt += 1;
+                eprintln!(
+                    "camera in use ({}); retry {attempt}/20 in 2 s",
+                    hr_text(e.code())
+                );
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            other => break other?,
+        }
+    };
+    let controls = DeviceControls::from_reader(&reader)?;
+    Ok(Session { controls, reader })
+}
+
+const COLUMNS: &str =
+    "key                      min     max  step  default   value  can_auto  manual  auto   path";
+
+fn row(i: &ControlInfo) -> String {
+    format!(
+        "{:<22} {:>6}  {:>6}  {:>4}  {:>7}  {:>6}  {:<8}  {:<6}  {:<5}  {}",
+        i.key.key(),
+        i.min,
+        i.max,
+        i.step,
+        i.default,
+        i.value,
+        i.can_auto,
+        i.can_manual,
+        i.auto,
+        i.path
+    )
+}
+
+fn print_table(infos: &[ControlInfo]) {
+    println!("{COLUMNS}");
+    for i in infos {
+        println!("{}", row(i));
+    }
+    let missing: Vec<&str> = ControlKey::ALL
+        .iter()
+        .filter(|k| !infos.iter().any(|i| i.key == **k))
+        .map(|k| k.key())
+        .collect();
+    println!("not supported: {}", missing.join(", "));
+}
+
+fn parse_bool(s: &str, flag: &str) -> Result<bool, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "true" | "on" | "1" | "yes" => Ok(true),
+        "false" | "off" | "0" | "no" => Ok(false),
+        _ => Err(format!("{flag} expects true|false, got '{s}'")),
+    }
+}
+
+fn controls_cmd(args: &[String]) -> Result<u8, Failure> {
+    let opts = parse_opts(
+        args,
+        &[
+            "--device", "--format", "--size", "--fps", "--path", "--save",
+        ],
+    )?;
+    let t = target(&opts)?;
+    let session = open_session(&t)?;
+    println!("device: {}", t.key.name);
+    println!("link: {}", t.key.symbolic_link);
+    let path = get(&opts, "--path").unwrap_or("auto");
+    let infos = match path {
+        "auto" => session.controls.read_all()?,
+        "ks" => session.controls.read_all_via(Some(AccessPath::Ks))?,
+        "iam" => session.controls.read_all_via(Some(AccessPath::Iam))?,
+        "compare" => {
+            let ks = session.controls.read_all_via(Some(AccessPath::Ks))?;
+            let iam = session.controls.read_all_via(Some(AccessPath::Iam))?;
+            println!("-- KS --");
+            print_table(&ks);
+            println!("-- IAM --");
+            print_table(&iam);
+            let mut same = true;
+            for k in ControlKey::ALL {
+                if k.iam_property().is_none() {
+                    continue; // KS only: IAM cannot serve it
+                }
+                let a = ks.iter().find(|i| i.key == k);
+                let b = iam.iter().find(|i| i.key == k);
+                let eq = match (a, b) {
+                    (Some(a), Some(b)) => {
+                        ControlInfo {
+                            path: AccessPath::Ks,
+                            ..b.clone()
+                        } == *a
+                    }
+                    (None, None) => true,
+                    _ => false,
+                };
+                if !eq {
+                    same = false;
+                    println!(
+                        "differs: {k}: KS {:?} | IAM {:?}",
+                        a.map(|i| (
+                            i.min,
+                            i.max,
+                            i.step,
+                            i.default,
+                            i.value,
+                            i.can_auto,
+                            i.can_manual,
+                            i.auto
+                        )),
+                        b.map(|i| (
+                            i.min,
+                            i.max,
+                            i.step,
+                            i.default,
+                            i.value,
+                            i.can_auto,
+                            i.can_manual,
+                            i.auto
+                        ))
+                    );
+                }
+            }
+            println!(
+                "KS and IAM agree on every control IAM can serve: {}",
+                if same { "yes" } else { "NO" }
+            );
+            ks
+        }
+        o => return Err(format!("--path expects auto|ks|iam|compare, got '{o}'").into()),
+    };
+    if path != "compare" {
+        print_table(&infos);
+    }
+    if let Some(file) = get(&opts, "--save") {
+        // Full device state: the library's snapshot plus the value an Auto control reports, so `restore` can put
+        // that back too (devices keep the last manual value while Auto is on).
+        let mut snap = ControlSnapshot::from_infos(t.key.clone(), &infos);
+        for c in &mut snap.controls {
+            if c.value.is_none() {
+                c.value = infos.iter().find(|i| i.key == c.key).map(|i| i.value);
+            }
+        }
+        std::fs::write(
+            file,
+            serde_json::to_string_pretty(&snap).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("cannot write {file}: {e}"))?;
+        println!(
+            "saved snapshot ({} controls) to {file}",
+            snap.controls.len()
+        );
+    }
+    Ok(0)
+}
+
+fn restore_cmd(args: &[String]) -> Result<u8, Failure> {
+    let opts = parse_opts(args, &["--device", "--format", "--size", "--fps", "--file"])?;
+    let file = get(&opts, "--file").ok_or("restore needs --file")?;
+    let snap: ControlSnapshot = serde_json::from_str(
+        &std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?,
+    )
+    .map_err(|e| format!("bad snapshot {file}: {e}"))?;
+    let t = target(&opts)?;
+    let session = open_session(&t)?;
+    println!("device: {}", t.key.name);
+    let report = session.controls.apply_snapshot(&snap)?;
+    print_report(&report);
+    // A control stored as Auto keeps its Auto mode under `apply_snapshot`; the value the device reports while
+    // Auto is on is the last manual one. Put it back the way it was: write it, then turn Auto on again.
+    for c in &snap.controls {
+        if let (Some(true), Some(v)) = (c.auto, c.value) {
+            session.controls.set_value(c.key, v)?;
+            session.controls.set_auto(c.key, true)?;
+            println!("restored: {:<22} value={v} then auto=true", c.key.key());
+        }
+    }
+    println!("restored table:");
+    print_table(&session.controls.read_all()?);
+    Ok(0)
+}
+
+fn print_report(r: &better_cam::capture::controls::ApplyReport) {
+    for a in &r.applied {
+        println!(
+            "applied: {:<22} auto={} value={}{}",
+            a.key.key(),
+            a.auto.map_or("-".to_string(), |v| v.to_string()),
+            a.value.map_or("-".to_string(), |v| v.to_string()),
+            a.clamped_from
+                .map(|v| format!(" (clamped from {v})"))
+                .unwrap_or_default()
+        );
+    }
+    for (k, why) in &r.skipped {
+        println!("skipped: {:<22} {why}", k.key());
+    }
+}
+
+/// `min|max|mid|default|<int>` against what the device reports.
+fn resolve_value(spec: &str, i: &ControlInfo) -> Result<i32, String> {
+    Ok(match spec.to_ascii_lowercase().as_str() {
+        "min" => i.min,
+        "max" => i.max,
+        "default" => i.default,
+        "mid" => i.min + (i.max - i.min) / 2 / i.step.max(1) * i.step.max(1),
+        n => n
+            .parse()
+            .map_err(|_| format!("--value expects min|max|mid|default|<number>, got '{spec}'"))?,
+    })
+}
+
+/// Mean luma of the next `n` frames (stale queued frames are dropped first).
+fn collect_luma(reader: &CaptureReader, n: usize) -> Result<f64, Failure> {
+    while reader.try_recv().is_ok() {}
+    let mut sum = 0.0;
+    let mut got = 0;
+    while got < n {
+        match reader.recv_timeout(Duration::from_secs(2)) {
+            Ok(f) => {
+                let l = luma_of(&f, None).ok_or_else(|| {
+                    "luma needs a CPU frame in nv12, yuy2, i420 or similar".to_string()
+                })?;
+                sum += l;
+                got += 1;
+            }
+            Err(RecvError::Timeout) => return Err("no frame for 2 s".to_string().into()),
+            Err(RecvError::Stopped(r)) => return Err(format!("stream stopped: {r}").into()),
+        }
+    }
+    Ok(sum / n as f64)
+}
+
+/// `(ms since t0, luma)` of every frame that arrives until `t0 + window`.
+fn watch_luma(reader: &CaptureReader, t0: Instant, window: Duration) -> Vec<(f64, f64)> {
+    let mut out = Vec::new();
+    while let Some(left) = (t0 + window).checked_duration_since(Instant::now()) {
+        if let Ok(f) = reader.recv_timeout(left.min(Duration::from_millis(100))) {
+            if let Some(l) = luma_of(&f, None) {
+                out.push((t0.elapsed().as_secs_f64() * 1000.0, l));
+            }
+        }
+    }
+    out
+}
+
+/// First time the picture moved at least halfway from `before` to `after`.
+fn first_visible(series: &[(f64, f64)], before: f64, after: f64) -> Option<f64> {
+    let half = before + (after - before) / 2.0;
+    series
+        .iter()
+        .find(|(_, l)| {
+            if after > before {
+                *l >= half
+            } else {
+                *l <= half
+            }
+        })
+        .map(|(t, _)| *t)
+}
+
+fn set_cmd(args: &[String]) -> Result<u8, Failure> {
+    // `--measure` and `--reapply-test` are bare flags; the rest are `--key value` pairs.
+    let measure = args.iter().any(|a| a == "--measure");
+    let reapply = args.iter().any(|a| a == "--reapply-test");
+    let pairs: Vec<String> = args
+        .iter()
+        .filter(|a| *a != "--measure" && *a != "--reapply-test")
+        .cloned()
+        .collect();
+    let opts = parse_opts(
+        &pairs,
+        &[
+            "--device",
+            "--format",
+            "--size",
+            "--fps",
+            "--control",
+            "--value",
+            "--auto",
+            "--settle-ms",
+            "--path",
+        ],
+    )?;
+    let forced = match get(&opts, "--path").unwrap_or("auto") {
+        "auto" => None,
+        "ks" => Some(AccessPath::Ks),
+        "iam" => Some(AccessPath::Iam),
+        o => return Err(format!("--path expects auto|ks|iam, got '{o}'").into()),
+    };
+
+    let name = get(&opts, "--control").ok_or("set needs --control KEY")?;
+    let key = ControlKey::from_key(name).ok_or_else(|| {
+        format!(
+            "unknown control '{name}'; keys: {}",
+            ControlKey::ALL.map(|k| k.key()).join(", ")
+        )
+    })?;
+    let value_spec = get(&opts, "--value");
+    let auto = get(&opts, "--auto")
+        .map(|s| parse_bool(s, "--auto"))
+        .transpose()?;
+    if value_spec.is_none() && auto.is_none() {
+        return Err("set needs --value and/or --auto".to_string().into());
+    }
+    if auto == Some(true) && value_spec.is_some() {
+        return Err(
+            "--auto true cannot be combined with --value (a value makes a control manual)"
+                .to_string()
+                .into(),
+        );
+    }
+    let settle = Duration::from_millis(
+        get(&opts, "--settle-ms")
+            .map_or(Ok(2500), str::parse)
+            .map_err(|_| "bad --settle-ms".to_string())?,
+    );
+
+    let t = target(&opts)?;
+    let session = open_session(&t)?;
+    session.controls.force_path(forced);
+    println!("device: {}", t.key.name);
+    let Some(before) = session.controls.read(key)? else {
+        return Err(ControlError::NotSupported(key).into());
+    };
+    println!("{COLUMNS}");
+    println!("{}   <- before", row(&before));
+    let wanted = value_spec.map(|s| resolve_value(s, &before)).transpose()?;
+
+    let luma_before = if measure {
+        let l = collect_luma(&session.reader, 30)?;
+        println!("luma before: {l:.2} (mean of 30 frames)");
+        Some(l)
+    } else {
+        None
+    };
+
+    let mut snapshot = ControlSnapshot::new(t.key.clone());
+    let write_start = Instant::now();
+    if let Some(a) = auto {
+        let s = Instant::now();
+        session.controls.set_auto(key, a)?;
+        println!(
+            "write: auto={a} took {:.1} ms",
+            s.elapsed().as_secs_f64() * 1000.0
+        );
+        snapshot.record_auto(key, a);
+    }
+    if let Some(v) = wanted {
+        let s = Instant::now();
+        session.controls.set_value(key, v)?;
+        println!(
+            "write: value={v}{} took {:.1} ms",
+            if v != before.clamp(v) {
+                format!(" (clamped to {})", before.clamp(v))
+            } else {
+                String::new()
+            },
+            s.elapsed().as_secs_f64() * 1000.0
+        );
+        snapshot.record_value(key, before.clamp(v));
+    }
+    let after = session
+        .controls
+        .read(key)?
+        .ok_or(ControlError::NotSupported(key))?;
+    println!("{}   <- after", row(&after));
+
+    if let Some(lb) = luma_before {
+        let series = watch_luma(&session.reader, write_start, settle);
+        let la = collect_luma(&session.reader, 30)?;
+        println!(
+            "luma after:  {la:.2} (mean of 30 frames, {} ms after the write)",
+            settle.as_millis()
+        );
+        println!(
+            "luma change: {:+.2}  after > before: {}",
+            la - lb,
+            if la > lb { "yes" } else { "no" }
+        );
+        let shown: Vec<String> = series
+            .iter()
+            .take(14)
+            .map(|(t, l)| format!("{t:.0}ms:{l:.1}"))
+            .collect();
+        println!("luma series after write: {}", shown.join(" "));
+        if (la - lb).abs() >= 0.5 {
+            match first_visible(&series, lb, la) {
+                Some(t) => println!("picture moved halfway after {t:.0} ms"),
+                None => println!(
+                    "picture moved halfway: not inside the {} ms window",
+                    settle.as_millis()
+                ),
+            }
+        } else {
+            println!(
+                "no visible change in luma (before {lb:.2}, after {la:.2}): the scene may be too dark or too flat to show this control"
+            );
+        }
+    }
+
+    if reapply {
+        reapply_test(&t, session, key, &snapshot)?;
+    }
+    Ok(0)
+}
+
+/// Close and reopen the camera, show what the device reports right after reopen, apply the snapshot, and check
+/// the re-applied state equals the stored one. A second round first disturbs the control, so the check also
+/// passes meaningfully on a device that keeps its values.
+fn reapply_test(
+    t: &Target,
+    session: Session,
+    key: ControlKey,
+    snapshot: &ControlSnapshot,
+) -> Result<(), Failure> {
+    let stored = session
+        .controls
+        .read(key)?
+        .ok_or(ControlError::NotSupported(key))?;
+    println!(
+        "-- reapply test: stored state of {key}: value={} auto={}",
+        stored.value, stored.auto
+    );
+    let json = serde_json::to_string(snapshot).map_err(|e| e.to_string())?;
+    println!("snapshot: {json}");
+    let snapshot: ControlSnapshot = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+
+    // Close: the controls drop first, then the reader releases the camera.
+    let closing = Instant::now();
+    drop(session);
+    println!("closed in {} ms; reopening", closing.elapsed().as_millis());
+    std::thread::sleep(Duration::from_millis(800));
+    let session = open_session(t)?;
+
+    let fresh = session
+        .controls
+        .read(key)?
+        .ok_or(ControlError::NotSupported(key))?;
+    let same =
+        |a: &ControlInfo, b: &ControlInfo| a.auto == b.auto && (a.auto || a.value == b.value);
+    println!("{COLUMNS}");
+    println!("{}   <- straight after reopen", row(&fresh));
+    println!(
+        "device after reopen: {}",
+        if same(&fresh, &stored) {
+            "KEPT the stored state"
+        } else {
+            "LOST the stored state"
+        }
+    );
+    let report = session.controls.apply_snapshot(&snapshot)?;
+    print_report(&report);
+    let applied = session
+        .controls
+        .read(key)?
+        .ok_or(ControlError::NotSupported(key))?;
+    println!("{}   <- after re-apply", row(&applied));
+    println!(
+        "re-applied == stored: {}",
+        if same(&applied, &stored) { "yes" } else { "NO" }
+    );
+
+    // Disturb the control, apply again.
+    let disturbed = if stored.auto {
+        session.controls.set_auto(key, false)
+    } else {
+        let other = if stored.value == stored.min {
+            stored.max
+        } else {
+            stored.min
+        };
+        session.controls.set_value(key, other)
+    }?;
+    println!("{}   <- disturbed", row(&disturbed));
+    let report = session.controls.apply_snapshot(&snapshot)?;
+    print_report(&report);
+    let again = session
+        .controls
+        .read(key)?
+        .ok_or(ControlError::NotSupported(key))?;
+    println!("{}   <- after second re-apply", row(&again));
+    println!(
+        "re-applied after disturbance == stored: {}",
+        if same(&again, &stored) { "yes" } else { "NO" }
+    );
+    Ok(())
 }
