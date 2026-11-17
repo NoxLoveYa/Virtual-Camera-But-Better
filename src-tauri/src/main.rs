@@ -2,11 +2,23 @@
 
 mod commands;
 
+use better_cam::engine::EngineEvent;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
 use tauri_plugin_autostart::MacosLauncher;
+
+/// Tell the engine whether somebody can see the window: shown and not minimized. Hidden to the tray and minimized
+/// both count as hidden (`deactivate_when_not_showing`).
+fn report_visibility(app: &AppHandle) {
+    let Some(w) = app.get_webview_window("main") else {
+        return;
+    };
+    let visible = w.is_visible().unwrap_or(false) && !w.is_minimized().unwrap_or(false);
+    app.state::<commands::AppState>().service.set_window_visible(visible);
+}
 
 fn show_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
@@ -14,6 +26,20 @@ fn show_main(app: &AppHandle) {
         let _ = w.unminimize();
         let _ = w.set_focus();
     }
+    report_visibility(app);
+}
+
+/// Engine events to the webview (plan 5.6).
+fn forward_events(app: &AppHandle) -> Arc<dyn better_cam::engine::EventSink> {
+    let app = app.clone();
+    Arc::new(move |event: EngineEvent| {
+        let _ = match event {
+            EngineEvent::State(s) => app.emit("engine-state", s),
+            EngineEvent::Error(message) => app.emit("engine-error", message),
+            EngineEvent::Stats(s) => app.emit("stats", s),
+            EngineEvent::DevicesChanged => app.emit("devices-changed", ()),
+        };
+    })
 }
 
 fn main() {
@@ -35,6 +61,7 @@ fn main() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, e| match e.id.as_ref() {
                     "show" => show_main(app),
+                    // The engine is shut down in `RunEvent::Exit` below: camera released, frames.bin closed.
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -48,21 +75,44 @@ fn main() {
             }
             tray.build(app)?;
 
+            // The engine reports to the webview; creating it (D3D11 device, shaders) happens off this thread.
+            let service = app.state::<commands::AppState>().service.clone();
+            service.set_sink(forward_events(app.handle()));
+            std::thread::spawn(move || {
+                if let Err(e) = service.init() {
+                    eprintln!("[engine] cannot start the engine: {e}");
+                }
+            });
+
             // The window starts hidden; a login launch stays in the tray, a manual one shows it.
-            if !commands::launched_at_startup() {
+            if commands::launched_at_startup() {
+                report_visibility(app.handle());
+            } else {
                 show_main(app.handle());
             }
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            WindowEvent::CloseRequested { api, .. } => {
                 if window.state::<commands::AppState>().close_to_tray.load(Ordering::Relaxed) {
                     api.prevent_close();
                     let _ = window.hide();
+                    report_visibility(window.app_handle());
                 }
             }
+            // Minimizing and restoring change the size and the focus; hiding and showing go through the code above.
+            WindowEvent::Resized(_) | WindowEvent::Focused(_) | WindowEvent::Moved(_) => {
+                report_visibility(window.app_handle());
+            }
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
+            commands::list_cameras,
+            commands::start_engine,
+            commands::stop_engine,
+            commands::set_source,
+            commands::set_output,
+            commands::set_pause,
             commands::get_autostart,
             commands::set_autostart,
             commands::launched_at_startup,
@@ -72,6 +122,11 @@ fn main() {
             commands::load_preset,
             commands::delete_preset,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Better Cam");
+        .build(tauri::generate_context!())
+        .expect("error while building Better Cam")
+        .run(|app, event| {
+            if let RunEvent::Exit = event {
+                app.state::<commands::AppState>().service.shutdown();
+            }
+        });
 }

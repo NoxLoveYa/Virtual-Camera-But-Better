@@ -1,5 +1,8 @@
+use better_cam::api::Service;
+use better_cam::config::{CameraDto, OutputCfg, SourceCfg};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_autostart::ManagerExt;
 
@@ -9,6 +12,60 @@ pub const AUTOSTART_ARG: &str = "--autostarted";
 #[derive(Default)]
 pub struct AppState {
     pub close_to_tray: AtomicBool,
+    /// The engine and the logic behind the engine commands (`better_cam::api`).
+    pub service: Arc<Service>,
+}
+
+/// Run a blocking job off the UI thread. Media Foundation calls (enumerating formats, opening a camera, creating
+/// the D3D11 device) take hundreds of milliseconds.
+async fn blocking<T: Send + 'static>(
+    job: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(job)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Cameras with their formats and frame intervals; Better Cam's own camera is not listed.
+#[tauri::command]
+pub async fn list_cameras(state: State<'_, AppState>) -> Result<Vec<CameraDto>, String> {
+    let svc = state.service.clone();
+    blocking(move || svc.list_cameras()).await
+}
+
+/// Start the engine: Standby, then Live (at once, or when an app or the window watches with
+/// `deactivate_when_not_showing`). `controls` and `chain` are accepted and ignored for now.
+#[tauri::command]
+pub async fn start_engine(
+    state: State<'_, AppState>,
+    source: SourceCfg,
+    output: OutputCfg,
+    controls: Option<serde_json::Value>,
+    chain: Option<serde_json::Value>,
+) -> Result<(), String> {
+    let svc = state.service.clone();
+    blocking(move || svc.start_engine(source, output, controls, chain)).await
+}
+
+#[tauri::command]
+pub async fn stop_engine(state: State<'_, AppState>) -> Result<(), String> {
+    state.service.stop_engine()
+}
+
+/// Reopens the camera only when a capture setting changed (device, size, rate, format, hw decode, buffering).
+#[tauri::command]
+pub async fn set_source(state: State<'_, AppState>, source: SourceCfg) -> Result<(), String> {
+    state.service.set_source(source)
+}
+
+#[tauri::command]
+pub async fn set_output(state: State<'_, AppState>, output: OutputCfg) -> Result<(), String> {
+    state.service.set_output(output)
+}
+
+#[tauri::command]
+pub async fn set_pause(state: State<'_, AppState>, on: bool) -> Result<(), String> {
+    state.service.set_pause(on)
 }
 
 #[tauri::command]

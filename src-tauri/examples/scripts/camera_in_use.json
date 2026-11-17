@@ -1,0 +1,21 @@
+{
+  "steps": [
+    { "do": "print", "text": "== check 6: another process holds the camera (capture_probe, 10 s), then the engine starts" },
+    { "do": "run", "cmd": "target\\release\\examples\\capture_probe.exe", "args": ["open", "--device", "0", "--seconds", "10"], "label": "probe", "wait": false },
+    { "do": "sleep", "seconds": 2 },
+    { "do": "start",
+      "source": {
+        "video_device_id": null, "res_type": "custom", "resolution": "1280x720", "frame_interval": 333333,
+        "video_format": "mjpeg", "color_space": "default", "color_range": "default", "buffering": "auto",
+        "flip_vertically": false, "autorotation": true, "hw_decode": true, "deactivate_when_not_showing": false
+      },
+      "output": { "resolution": "1280x720", "fps": "source", "fit": "fit", "background_color": 4278190080, "extra_sizes": true },
+      "controls": {}, "chain": [] },
+    { "do": "wait_state", "state": "reconnecting", "reason_contains": "in use", "timeout": 10, "max": 3.0, "label": "start while the camera is held -> reconnecting (in use)" },
+    { "do": "header" },
+    { "do": "wait_process", "label": "probe" },
+    { "do": "wait_state", "state": "live", "timeout": 10, "max": 4.0, "label": "probe exited -> live (retry every 3 s)" },
+    { "do": "sleep", "seconds": 2 },
+    { "do": "header" }
+  ]
+}

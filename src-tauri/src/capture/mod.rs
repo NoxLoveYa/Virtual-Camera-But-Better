@@ -887,6 +887,12 @@ pub fn list_cameras() -> Result<Vec<CameraInfo>, CaptureError> {
     Ok(out)
 }
 
+/// Native formats of one camera, read by opening it briefly (cheaper than [`list_cameras`], which opens them all).
+pub fn camera_formats(link: &str) -> Result<Vec<NativeFormat>, CaptureError> {
+    let _mf = MfSession::start()?;
+    read_native_formats(link)
+}
+
 /// Create the media source of the camera with this symbolic link (`MFCreateDeviceSource`).
 pub(crate) fn create_source(link: &str) -> Result<IMFMediaSource, CaptureError> {
     if is_own_virtual_camera("", link) {

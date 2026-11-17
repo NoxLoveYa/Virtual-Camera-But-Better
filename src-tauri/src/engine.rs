@@ -1,17 +1,29 @@
-//! The headless engine (plan 2.3, 2.4): camera (or a synthetic source) -> convert -> filter chain -> output stage ->
-//! encode -> readback -> `frames.bin`.
+//! The engine (plan 2.3, 2.4): camera (or a synthetic source) -> convert -> filter chain -> output stage -> encode ->
+//! readback -> `frames.bin`, with the state machine around it.
 //!
 //! # Threads
-//! * The caller owns an [`Engine`] handle and talks to it with [`Msg`]s over an `mpsc` channel (a later phase wires
-//!   Tauri commands to [`Engine::send`]).
-//! * The **control thread** owns the shader cache and starts and stops render threads.
-//! * The **render thread** (one per `Start`) opens the source, owns the D3D11 immediate context while it runs, and
-//!   loops: take the newest frame (older ones are dropped by the capture queue and by `drain`), convert, run the
-//!   filter chain, fit to the output size, encode, read back, publish.
+//! * The caller owns an [`Engine`] handle and talks to it with [`Msg`]s over an `mpsc` channel (the Tauri commands
+//!   go through [`crate::api::Service`], which calls the handle's methods).
+//! * The **control thread** owns the state machine: states, timers, the hot-plug watcher, the event sink, the
+//!   writer's slate states and the heartbeat. It starts and ends sessions.
+//! * A **session thread** (one per open camera; the render thread) opens the source, owns the D3D11 immediate context
+//!   while it runs, and loops: take the newest frame (older ones are dropped by the capture queue and by `drain`),
+//!   convert, run the filter chain, fit to the output size, encode, read back, publish. It reports to the control
+//!   thread once when the camera is open and once when it ends, with the reason.
 //!
-//! # States
-//! This phase has `Stopped` and `Live` only. While the camera opens the file's writer state is `Starting` (the DLL
-//! shows its "starting" slate); the first published frame makes it `Live`; stopping leaves it `Closed`.
+//! # States (plan 2.4)
+//! * `Stopped`: no camera. The file's writer state is `Paused` (the DLL shows "Camera paused"); the heartbeat goes on.
+//! * `Standby`: engine ready, camera closed or being opened. Writer `Starting` ("Starting camera...") unless paused.
+//!   Reasons: `opening` (a camera is being opened), `reopening` (a capture setting changed while live; the last frame
+//!   stays on the file), `idle` (`deactivate_when_not_showing`: nobody watches).
+//! * `Live`: the camera is open and frames flow. The first published frame sets the writer to `Live`.
+//! * `Reconnecting`: the camera is lost or in use. A retry every `retry_interval`, and at once when the same device
+//!   arrives. Any other failure is fatal: `Stopped` with `engine-error`.
+//!
+//! Pause is not a state: the camera stays open, the writer shows `Paused`, frames are read and dropped.
+//!
+//! With `deactivate_when_not_showing` the camera is open only while a consumer is attached or the window is visible;
+//! after `standby_delay` (5 s) with neither a `Live` or `Reconnecting` engine goes to `Standby` and closes the camera.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,11 +32,20 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use vcam_protocol::{advertised_for_output, qpc_to_hns, Writer, WriterState};
+use serde::Serialize;
+use vcam_protocol::{qpc_to_hns, Writer, WriterState};
+use windows::core::HRESULT;
 use windows::Win32::Media::MediaFoundation::{MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX};
 
-use crate::capture::reader::{CaptureReader, Frame, FrameData, OpenOptions, RecvError};
-use crate::capture::{ensure_com, qpc_now_100ns, FormatRequest, PixelFormat, FIRST_VIDEO_STREAM};
+use crate::capture::hotplug::{HotplugEvent, HotplugWatcher};
+use crate::capture::reader::{
+    CaptureReader, DecodeKind, Frame, FrameData, OpenOptions, RecvError, StopReason,
+};
+use crate::capture::{
+    ensure_com, hr_text, links_match, qpc_now_100ns, CaptureError, FormatRequest, PixelFormat,
+    FIRST_VIDEO_STREAM,
+};
+use crate::config::{advertised_list, arrival_matches, resolve_camera, CaptureCfg};
 use crate::gpu::convert::{
     is_supported, ColorRange, ColorSettings, ColorSpace, Converter, SourceData, SourceFrame,
 };
@@ -36,16 +57,105 @@ use crate::output_writer::{FrameTag, OutputWriter, Published};
 // ---------------------------------------------------------------------------------------------------------------
 // Public types
 
-/// Engine state (plan 2.4). Standby, Reconnecting and Pause come with later phases.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Engine state (plan 2.4, 5.6).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum EngineState {
     #[default]
     Stopped,
+    Standby,
     Live,
+    Reconnecting,
 }
 
-/// A physical camera.
-#[derive(Clone, Debug)]
+impl EngineState {
+    pub fn name(self) -> &'static str {
+        match self {
+            EngineState::Stopped => "stopped",
+            EngineState::Standby => "standby",
+            EngineState::Live => "live",
+            EngineState::Reconnecting => "reconnecting",
+        }
+    }
+}
+
+/// Why a session ended or a camera could not be opened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryKind {
+    /// Another process holds the camera.
+    InUse,
+    /// The camera was unplugged or invalidated.
+    Disconnected,
+    /// The camera is not among the connected ones.
+    NotFound,
+}
+
+/// A failure of the camera side. Retryable ones lead to `Reconnecting`, the others are fatal.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Failure {
+    /// `reason` is what the `engine-state` event carries.
+    Retry(RetryKind, String),
+    /// The message of the `engine-error` event.
+    Fatal(String),
+}
+
+impl Failure {
+    pub fn from_capture(e: &CaptureError) -> Failure {
+        match e {
+            CaptureError::InUse(err) => Failure::in_use(Some(err.code())),
+            CaptureError::DeviceLost(err) => Failure::disconnected(Some(err.code())),
+            CaptureError::NoSuchDevice(_) => {
+                Failure::Retry(RetryKind::NotFound, "camera not found".into())
+            }
+            other => Failure::Fatal(other.to_string()),
+        }
+    }
+
+    pub fn from_stop(r: StopReason) -> Failure {
+        match r {
+            StopReason::DeviceLost(hr) => Failure::disconnected(hr),
+            StopReason::InUse(hr) => Failure::in_use(Some(hr)),
+            other => Failure::Fatal(format!("the camera stopped: {other}")),
+        }
+    }
+
+    pub fn in_use(hr: Option<HRESULT>) -> Failure {
+        Failure::Retry(
+            RetryKind::InUse,
+            match hr {
+                Some(h) => format!("camera in use by another app ({})", hr_text(h)),
+                None => "camera in use by another app".into(),
+            },
+        )
+    }
+
+    pub fn disconnected(hr: Option<HRESULT>) -> Failure {
+        Failure::Retry(
+            RetryKind::Disconnected,
+            match hr {
+                Some(h) => format!("camera disconnected ({})", hr_text(h)),
+                None => "camera disconnected".into(),
+            },
+        )
+    }
+}
+
+impl From<String> for Failure {
+    fn from(s: String) -> Failure {
+        Failure::Fatal(s)
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failure::Retry(_, r) | Failure::Fatal(r) => f.write_str(r),
+        }
+    }
+}
+
+/// A physical camera, fully resolved.
+#[derive(Clone, Debug, PartialEq)]
 pub struct CameraSpec {
     /// Symbolic link (`DeviceKey::symbolic_link`).
     pub link: String,
@@ -55,7 +165,7 @@ pub struct CameraSpec {
 }
 
 /// Generated SMPTE colour bars in a camera format, delivered at a fixed rate through the normal pipeline.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SyntheticSpec {
     pub width: u32,
     pub height: u32,
@@ -65,10 +175,13 @@ pub struct SyntheticSpec {
     pub color: ColorSettings,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SourceSpec {
     Camera(CameraSpec),
     Synthetic(SyntheticSpec),
+    /// The frontend's capture settings, resolved against the connected cameras every time the camera is opened (so a
+    /// camera that comes back on another port, or a new output rate, is picked up).
+    Configured(CaptureCfg),
 }
 
 /// Plan 6.3 output settings. `None` size or rate means "same as the camera".
@@ -79,6 +192,8 @@ pub struct OutputSettings {
     pub fps: Option<u32>,
     pub fit: FitMode,
     pub background: [u8; 3],
+    /// Advertise 720p and 360p besides the output size.
+    pub extra_sizes: bool,
 }
 
 impl Default for OutputSettings {
@@ -89,6 +204,7 @@ impl Default for OutputSettings {
             fps: None,
             fit: FitMode::Fit,
             background: [0, 0, 0],
+            extra_sizes: true,
         }
     }
 }
@@ -114,6 +230,18 @@ pub struct Settings {
     /// Overrides for the colour space and range the camera states.
     pub color: ColorSettings,
     pub readback: ReadbackPolicy,
+    /// Plan 6.1 `deactivate_when_not_showing`.
+    pub deactivate_when_not_showing: bool,
+}
+
+/// The source side of [`Settings`], for [`Msg::SetSource`]: the camera is reopened only when `source` differs from the
+/// running one; the other fields apply to the next frame.
+#[derive(Clone, Debug)]
+pub struct SourceUpdate {
+    pub source: SourceSpec,
+    pub flip_vertical: bool,
+    pub color: ColorSettings,
+    pub deactivate_when_not_showing: bool,
 }
 
 /// Called on the render thread with the finished output frame (RGBA, output size) after the output stage. The
@@ -124,13 +252,20 @@ pub trait FrameTap: Send {
 
 /// Messages to the engine.
 pub enum Msg {
-    /// Open the source and start rendering. A running session is stopped first.
+    /// Open the source (now or, with `deactivate_when_not_showing`, when somebody watches) and start rendering. A
+    /// running session is stopped first.
     Start(Box<Settings>),
-    /// Stop rendering, release the camera, leave the file `Closed`.
+    /// Stop rendering, release the camera, show the paused slate.
     Stop,
+    /// Apply new source settings; reopens the camera only when the capture settings changed.
+    SetSource(Box<SourceUpdate>),
     /// Change the output settings; takes effect on the next frame (a new size or rate is advertised again).
     SetOutput(OutputSettings),
     SetFlip(bool),
+    /// Keep the camera open but show the paused slate.
+    SetPause(bool),
+    /// The app window is visible (shown and not minimized). Counts as "somebody watches".
+    SetWindowVisible(bool),
     SetTap(Option<Box<dyn FrameTap>>),
     /// Stop and end the control thread.
     Shutdown,
@@ -140,8 +275,15 @@ pub enum Msg {
 #[derive(Clone, Debug, Default)]
 pub struct EngineStats {
     pub state: EngineState,
+    pub paused: bool,
     /// What is open, e.g. `W4GS mjpeg 1920x1080@60 hw decode, texture frames`.
     pub source: String,
+    /// The camera's picture size and native format (what `stats.capture` reports).
+    pub capture_width: u32,
+    pub capture_height: u32,
+    pub capture_format: String,
+    /// `"hw"`, `"sw"` or `"none"`.
+    pub decode: &'static str,
     pub capture_fps: f64,
     pub render_fps: f64,
     pub publish_fps: f64,
@@ -175,21 +317,124 @@ pub struct EngineStats {
     pub consumer: bool,
 }
 
+/// The `engine-state` event payload (plan 5.6).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct StateEvent {
+    pub state: EngineState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// `stats.capture` of the `stats` event.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct CaptureStatsEvent {
+    pub width: u32,
+    pub height: u32,
+    pub format: String,
+    pub fps: f64,
+    /// `"hw"`, `"sw"` or `"none"`.
+    pub decode: String,
+}
+
+/// `stats.output` of the `stats` event.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct OutputStatsEvent {
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+}
+
+/// The `stats` event payload (plan 5.6), 4 Hz.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct StatsEvent {
+    pub capture: CaptureStatsEvent,
+    pub output: OutputStatsEvent,
+    pub gpu_ms: f64,
+    /// Frames lost before the file (capture mailbox replaced + output ring full or refused).
+    pub dropped: u64,
+    /// Frames the virtual camera repeated because no new one was there (the DLL's counter, cumulative).
+    pub repeated: u64,
+    pub latency_p95_ms: f64,
+    /// Apps reading the virtual camera: 0 or 1 (the header has one consumer flag).
+    pub consumers: u32,
+}
+
+/// What the engine reports to its owner.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EngineEvent {
+    State(StateEvent),
+    /// Fatal; the engine is `Stopped`.
+    Error(String),
+    Stats(StatsEvent),
+    /// A camera arrived or left.
+    DevicesChanged,
+}
+
+/// Receives [`EngineEvent`]s on the control thread: return quickly.
+pub trait EventSink: Send + Sync {
+    fn emit(&self, event: EngineEvent);
+}
+
+impl<F: Fn(EngineEvent) + Send + Sync> EventSink for F {
+    fn emit(&self, event: EngineEvent) {
+        self(event)
+    }
+}
+
+/// Timers of the state machine. The defaults are the product's; tests shorten them.
+#[derive(Clone, Copy, Debug)]
+pub struct Timings {
+    /// No consumer and window hidden for this long: close the camera (`deactivate_when_not_showing`).
+    pub standby_delay: Duration,
+    /// Between camera open attempts while `Reconnecting`.
+    pub retry_interval: Duration,
+    /// How often the control thread looks at consumers, timers and messages.
+    pub tick: Duration,
+    /// Between `stats` events.
+    pub stats_interval: Duration,
+}
+
+impl Default for Timings {
+    fn default() -> Self {
+        Timings {
+            standby_delay: Duration::from_secs(5),
+            retry_interval: Duration::from_secs(3),
+            tick: Duration::from_millis(50),
+            stats_interval: Duration::from_millis(250),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Handle
 
 struct Shared {
     state: Mutex<EngineState>,
+    reason: Mutex<Option<String>>,
     cv: Condvar,
     stats: Mutex<EngineStats>,
     error: Mutex<Option<String>>,
     output: Mutex<OutputSettings>,
     flip: AtomicBool,
+    color: Mutex<ColorSettings>,
+    paused: AtomicBool,
     tap: Mutex<Option<Box<dyn FrameTap>>>,
+    sink: Mutex<Option<Arc<dyn EventSink>>>,
+    /// Symbolic link of the open camera (for hot-plug removal), empty while none is open.
+    camera_link: Mutex<Option<String>>,
+    /// Last advertised `(width, height, fps)`, for a consumer that attaches while the camera is closed.
+    advertised: Mutex<Option<(u32, u32, u32)>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn emit(shared: &Shared, event: EngineEvent) {
+    let sink = lock(&shared.sink).clone();
+    if let Some(s) = sink {
+        s.emit(event);
+    }
 }
 
 /// Handle to the engine threads. Dropping it stops everything.
@@ -197,7 +442,7 @@ pub struct Engine {
     tx: Sender<Msg>,
     shared: Arc<Shared>,
     writer: Arc<Writer>,
-    control: Option<JoinHandle<()>>,
+    control: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Engine {
@@ -211,31 +456,86 @@ impl Engine {
 
     /// Engine on a given device and writer (tests use WARP and a temporary file).
     pub fn with_parts(gpu: Arc<GpuDevice>, writer: Arc<Writer>) -> Result<Engine, String> {
+        Engine::with_timings(gpu, writer, Timings::default())
+    }
+
+    /// [`Engine::with_parts`] with other timers.
+    pub fn with_timings(
+        gpu: Arc<GpuDevice>,
+        writer: Arc<Writer>,
+        timings: Timings,
+    ) -> Result<Engine, String> {
+        Engine::build(gpu, writer, timings, Arc::new(DefaultFactory))
+    }
+
+    fn build(
+        gpu: Arc<GpuDevice>,
+        writer: Arc<Writer>,
+        timings: Timings,
+        factory: Arc<dyn SourceFactory>,
+    ) -> Result<Engine, String> {
         let renderer = Arc::new(Renderer::new(gpu).map_err(|e| e.to_string())?);
         renderer.shaders.warm_up().map_err(|e| e.to_string())?;
         let shared = Arc::new(Shared {
             state: Mutex::new(EngineState::Stopped),
+            reason: Mutex::new(None),
             cv: Condvar::new(),
-            stats: Mutex::new(EngineStats::default()),
+            stats: Mutex::new(EngineStats {
+                decode: "none",
+                ..EngineStats::default()
+            }),
             error: Mutex::new(None),
             output: Mutex::new(OutputSettings::default()),
             flip: AtomicBool::new(false),
+            color: Mutex::new(ColorSettings::default()),
+            paused: AtomicBool::new(false),
             tap: Mutex::new(None),
+            sink: Mutex::new(None),
+            camera_link: Mutex::new(None),
+            advertised: Mutex::new(None),
         });
         let (tx, rx) = mpsc::channel();
+        let (events_tx, events_rx) = mpsc::channel();
         let control = {
-            let (shared, writer) = (shared.clone(), writer.clone());
+            let c = Control {
+                rx,
+                events_rx,
+                events_tx,
+                shared: shared.clone(),
+                renderer,
+                writer: writer.clone(),
+                factory,
+                timings,
+                cfg: None,
+                phase: EngineState::Stopped,
+                session: None,
+                gen: 0,
+                window_visible: false,
+                idle_since: None,
+                next_retry: None,
+                attempt_started: Instant::now(),
+                retrying: false,
+                emitted: None,
+                last_heartbeat: Instant::now(),
+                last_stats: Instant::now(),
+                hotplug: None,
+            };
             std::thread::Builder::new()
                 .name("engine control".into())
-                .spawn(move || control_loop(rx, shared, renderer, writer))
+                .spawn(move || c.run())
                 .map_err(|e| e.to_string())?
         };
         Ok(Engine {
             tx,
             shared,
             writer,
-            control: Some(control),
+            control: Mutex::new(Some(control)),
         })
+    }
+
+    /// Where the engine reports to (replaces the previous sink). Events come from the control thread.
+    pub fn set_event_sink(&self, sink: Arc<dyn EventSink>) {
+        *lock(&self.shared.sink) = Some(sink);
     }
 
     /// Queue a message.
@@ -253,8 +553,39 @@ impl Engine {
         self.send(Msg::Stop);
     }
 
+    /// `Msg::SetSource`.
+    pub fn set_source(&self, update: SourceUpdate) {
+        self.send(Msg::SetSource(Box::new(update)));
+    }
+
+    /// `Msg::SetOutput`.
+    pub fn set_output(&self, output: OutputSettings) {
+        self.send(Msg::SetOutput(output));
+    }
+
+    /// `Msg::SetPause`; the flag is set at once so the render thread follows within a frame.
+    pub fn set_pause(&self, on: bool) {
+        self.shared.paused.store(on, Ordering::Release);
+        self.send(Msg::SetPause(on));
+    }
+
+    /// `Msg::SetWindowVisible`.
+    pub fn set_window_visible(&self, visible: bool) {
+        self.send(Msg::SetWindowVisible(visible));
+    }
+
+    pub fn paused(&self) -> bool {
+        self.shared.paused.load(Ordering::Acquire)
+    }
+
     pub fn state(&self) -> EngineState {
         *lock(&self.shared.state)
+    }
+
+    /// The reason of the last state change (`reconnecting`: what is wrong; `standby`: `opening`, `reopening`,
+    /// `idle`).
+    pub fn reason(&self) -> Option<String> {
+        lock(&self.shared.reason).clone()
     }
 
     pub fn stats(&self) -> EngineStats {
@@ -270,8 +601,7 @@ impl Engine {
         &self.writer
     }
 
-    /// Block until the state is `Live` (`Ok`), a start fails or the session ends (`Err` with the reason), or the
-    /// timeout passes.
+    /// Block until the state is `Live` (`Ok`), a start fails fatally (`Err` with the reason), or the timeout passes.
     pub fn wait_live(&self, timeout: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         let mut st = lock(&self.shared.state);
@@ -295,11 +625,11 @@ impl Engine {
         }
     }
 
-    /// Block until the state is `Stopped` or the timeout passes.
-    pub fn wait_stopped(&self, timeout: Duration) -> bool {
+    /// Block until the state is `state` or the timeout passes.
+    pub fn wait_state(&self, state: EngineState, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut st = lock(&self.shared.state);
-        while *st != EngineState::Stopped {
+        while *st != state {
             let now = Instant::now();
             if now >= deadline {
                 return false;
@@ -307,20 +637,27 @@ impl Engine {
             st = self
                 .shared
                 .cv
-                .wait_timeout(st, deadline - now)
+                .wait_timeout(st, (deadline - now).min(Duration::from_millis(50)))
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
         true
     }
 
-    /// Stop the session and end the control thread; the file ends up `Closed`.
-    pub fn shutdown(mut self) {
-        self.finish();
+    /// Block until the state is `Stopped` or the timeout passes.
+    pub fn wait_stopped(&self, timeout: Duration) -> bool {
+        self.wait_state(EngineState::Stopped, timeout)
     }
 
-    fn finish(&mut self) {
-        if let Some(h) = self.control.take() {
+    /// Stop the session and end the control thread; the file ends up `Closed`. Safe to call twice.
+    pub fn shutdown(self) {
+        self.close();
+    }
+
+    /// [`Engine::shutdown`] for a shared handle.
+    pub fn close(&self) {
+        let handle = lock(&self.control).take();
+        if let Some(h) = handle {
             let _ = self.tx.send(Msg::Shutdown);
             let _ = h.join();
         }
@@ -329,80 +666,534 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        self.finish();
+        self.close();
     }
-}
-
-fn set_state(shared: &Shared, state: EngineState) {
-    *lock(&shared.state) = state;
-    lock(&shared.stats).state = state;
-    shared.cv.notify_all();
 }
 
 // ---------------------------------------------------------------------------------------------------------------
 // Control thread
 
+/// One open camera and its render thread.
 struct Session {
+    gen: u64,
     stop: Arc<AtomicBool>,
+    /// Set by the control thread when the hot-plug watcher reports this camera removed.
+    removed: Arc<AtomicBool>,
     join: JoinHandle<()>,
 }
 
-fn control_loop(
+struct SessionEvent {
+    gen: u64,
+    msg: SessionMsg,
+}
+
+enum SessionMsg {
+    /// The camera is open and the first frame arrived.
+    Opened,
+    /// The session thread is done (the camera is closed). `Ok` only after the stop flag.
+    Ended(Result<(), Failure>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenMode {
+    /// From `Standby`: the writer shows "starting", the state says `opening`.
+    Fresh,
+    /// A capture setting changed while live: the last frame stays on the file, the state says `reopening`.
+    Reopen,
+    /// A retry while `Reconnecting`: the state does not change until it works.
+    Retry,
+}
+
+struct Control {
     rx: Receiver<Msg>,
+    events_rx: Receiver<SessionEvent>,
+    events_tx: Sender<SessionEvent>,
     shared: Arc<Shared>,
     renderer: Arc<Renderer>,
     writer: Arc<Writer>,
-) {
-    let mut session: Option<Session> = None;
-    let end = |session: &mut Option<Session>| {
-        if let Some(s) = session.take() {
+    factory: Arc<dyn SourceFactory>,
+    timings: Timings,
+    /// What the engine is running; `None` while `Stopped`.
+    cfg: Option<Settings>,
+    phase: EngineState,
+    session: Option<Session>,
+    gen: u64,
+    window_visible: bool,
+    /// Since when nobody watches (`deactivate_when_not_showing`).
+    idle_since: Option<Instant>,
+    next_retry: Option<Instant>,
+    attempt_started: Instant,
+    /// The session that is being opened is a retry.
+    retrying: bool,
+    emitted: Option<(EngineState, Option<String>)>,
+    last_heartbeat: Instant,
+    last_stats: Instant,
+    hotplug: Option<(HotplugWatcher, Receiver<HotplugEvent>)>,
+}
+
+impl Control {
+    fn run(mut self) {
+        ensure_com();
+        match HotplugWatcher::start() {
+            Ok(h) => self.hotplug = Some(h),
+            Err(e) => eprintln!("[engine] hot-plug watcher unavailable: {e}"),
+        }
+        self.writer.set_state(WriterState::Paused);
+        loop {
+            let mut next = match self.rx.recv_timeout(self.timings.tick) {
+                Ok(m) => Some(m),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.shutdown();
+                    return;
+                }
+            };
+            while let Some(m) = next.take() {
+                if matches!(m, Msg::Shutdown) {
+                    self.shutdown();
+                    return;
+                }
+                self.handle(m);
+                next = self.rx.try_recv().ok();
+            }
+            self.poll_session();
+            self.poll_hotplug();
+            self.tick();
+        }
+    }
+
+    fn shutdown(&mut self) {
+        self.end_session();
+        self.cfg = None;
+        self.writer.set_state(WriterState::Closed);
+        *lock(&self.shared.state) = EngineState::Stopped;
+        lock(&self.shared.stats).state = EngineState::Stopped;
+        self.shared.cv.notify_all();
+    }
+
+    fn handle(&mut self, msg: Msg) {
+        match msg {
+            Msg::Start(s) => self.start(*s),
+            Msg::Stop => self.stop(),
+            Msg::SetSource(u) => self.set_source(*u),
+            Msg::SetOutput(o) => {
+                *lock(&self.shared.output) = o;
+                if self.cfg.is_some() && self.session.is_none() {
+                    self.advertise_idle();
+                }
+            }
+            Msg::SetFlip(f) => self.shared.flip.store(f, Ordering::Relaxed),
+            Msg::SetPause(on) => self.set_pause(on),
+            Msg::SetWindowVisible(v) => self.window_visible = v,
+            Msg::SetTap(t) => *lock(&self.shared.tap) = t,
+            Msg::Shutdown => {}
+        }
+    }
+
+    // ---- state
+
+    fn set_phase(&mut self, phase: EngineState, reason: Option<String>) {
+        self.phase = phase;
+        // The event goes out before `Engine::state` changes: whoever sees the state has had the event.
+        let now = Some((phase, reason.clone()));
+        if self.emitted != now {
+            self.emitted = now;
+            emit(
+                &self.shared,
+                EngineEvent::State(StateEvent {
+                    state: phase,
+                    reason: reason.clone(),
+                }),
+            );
+        }
+        *lock(&self.shared.reason) = reason;
+        *lock(&self.shared.state) = phase;
+        lock(&self.shared.stats).state = phase;
+        self.shared.cv.notify_all();
+    }
+
+    /// The writer state while no frames flow: `Paused` when stopped or paused, else `Starting`.
+    fn set_slate(&self) {
+        let paused = self.shared.paused.load(Ordering::Acquire);
+        self.writer.set_state(if self.cfg.is_none() || paused {
+            WriterState::Paused
+        } else {
+            WriterState::Starting
+        });
+    }
+
+    fn wants_camera(&self) -> bool {
+        match &self.cfg {
+            None => false,
+            Some(c) => {
+                !c.deactivate_when_not_showing
+                    || self.window_visible
+                    || self.writer.consumer_active()
+            }
+        }
+    }
+
+    fn target_link(&self) -> Option<String> {
+        match &self.cfg.as_ref()?.source {
+            SourceSpec::Camera(c) => Some(c.link.clone()),
+            SourceSpec::Configured(c) => c.device.clone(),
+            SourceSpec::Synthetic(_) => None,
+        }
+    }
+
+    // ---- commands
+
+    fn start(&mut self, s: Settings) {
+        self.end_session();
+        *lock(&self.shared.error) = None;
+        *lock(&self.shared.output) = s.output;
+        self.shared.flip.store(s.flip_vertical, Ordering::Relaxed);
+        *lock(&self.shared.color) = s.color;
+        self.shared.paused.store(false, Ordering::Release);
+        self.idle_since = None;
+        self.next_retry = None;
+        self.retrying = false;
+        self.cfg = Some(s);
+        if self.wants_camera() {
+            self.open_session(OpenMode::Fresh);
+        } else {
+            self.go_idle();
+        }
+    }
+
+    fn stop(&mut self) {
+        self.end_session();
+        self.cfg = None;
+        self.shared.paused.store(false, Ordering::Release);
+        self.idle_since = None;
+        self.next_retry = None;
+        self.retrying = false;
+        self.set_phase(EngineState::Stopped, None);
+        self.set_slate();
+        self.emit_stats();
+    }
+
+    /// A fatal failure: `Stopped`, with the message for the owner.
+    fn fail(&mut self, message: String) {
+        self.end_session();
+        eprintln!("[engine] {message}");
+        *lock(&self.shared.error) = Some(message.clone());
+        self.cfg = None;
+        self.shared.paused.store(false, Ordering::Release);
+        self.idle_since = None;
+        self.next_retry = None;
+        self.retrying = false;
+        emit(&self.shared, EngineEvent::Error(message));
+        self.set_phase(EngineState::Stopped, Some("error".into()));
+        self.set_slate();
+        self.emit_stats();
+    }
+
+    fn set_source(&mut self, u: SourceUpdate) {
+        let Some(cfg) = self.cfg.as_mut() else {
+            return;
+        };
+        let reopen = cfg.source != u.source;
+        cfg.source = u.source;
+        cfg.flip_vertical = u.flip_vertical;
+        cfg.color = u.color;
+        cfg.deactivate_when_not_showing = u.deactivate_when_not_showing;
+        self.shared.flip.store(u.flip_vertical, Ordering::Relaxed);
+        *lock(&self.shared.color) = u.color;
+        if !reopen {
+            return;
+        }
+        match self.phase {
+            EngineState::Live => self.open_session(OpenMode::Reopen),
+            EngineState::Reconnecting => self.open_session(OpenMode::Retry),
+            EngineState::Standby if self.session.is_some() => self.open_session(OpenMode::Fresh),
+            // Idle standby: the next wake-up opens the camera with the new settings.
+            EngineState::Standby | EngineState::Stopped => {}
+        }
+    }
+
+    fn set_pause(&mut self, on: bool) {
+        if self.cfg.is_none() {
+            self.shared.paused.store(false, Ordering::Release);
+            return;
+        }
+        self.shared.paused.store(on, Ordering::Release);
+        if on {
+            self.writer.set_state(WriterState::Paused);
+        } else if self.phase != EngineState::Live || self.session.is_none() {
+            self.set_slate();
+        }
+        // Live and resumed: the render thread leaves `Paused` with the first frame it publishes.
+    }
+
+    // ---- sessions
+
+    fn open_session(&mut self, mode: OpenMode) {
+        let Some(cfg) = &self.cfg else {
+            return;
+        };
+        let (source, readback) = (cfg.source.clone(), cfg.readback);
+        self.end_session();
+        self.gen += 1;
+        let (stop, removed) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let ctx = SessionCtx {
+            source,
+            readback,
+            gen: self.gen,
+            shared: self.shared.clone(),
+            renderer: self.renderer.clone(),
+            writer: self.writer.clone(),
+            factory: self.factory.clone(),
+            stop: stop.clone(),
+            removed: removed.clone(),
+            events: self.events_tx.clone(),
+        };
+        self.attempt_started = Instant::now();
+        self.retrying = mode == OpenMode::Retry;
+        self.next_retry = None;
+        match std::thread::Builder::new()
+            .name("render".into())
+            .spawn(move || session_thread(ctx))
+        {
+            Ok(join) => {
+                self.session = Some(Session {
+                    gen: self.gen,
+                    stop,
+                    removed,
+                    join,
+                })
+            }
+            Err(e) => {
+                self.fail(format!("cannot start the render thread: {e}"));
+                return;
+            }
+        }
+        match mode {
+            OpenMode::Fresh => {
+                self.set_phase(EngineState::Standby, Some("opening".into()));
+                self.set_slate();
+            }
+            OpenMode::Reopen => self.set_phase(EngineState::Standby, Some("reopening".into())),
+            OpenMode::Retry => {}
+        }
+    }
+
+    /// Stop the session thread and wait for it: the camera is closed when this returns.
+    fn end_session(&mut self) {
+        if let Some(s) = self.session.take() {
             s.stop.store(true, Ordering::Release);
             let _ = s.join.join();
         }
-    };
-    loop {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(Msg::Start(settings)) => {
-                end(&mut session);
-                *lock(&shared.error) = None;
-                *lock(&shared.output) = settings.output;
-                shared.flip.store(settings.flip_vertical, Ordering::Relaxed);
-                let stop = Arc::new(AtomicBool::new(false));
-                let ctx = RenderCtx {
-                    settings: *settings,
-                    shared: shared.clone(),
-                    renderer: renderer.clone(),
-                    writer: writer.clone(),
-                    stop: stop.clone(),
-                };
-                match std::thread::Builder::new()
-                    .name("render".into())
-                    .spawn(move || render_thread(ctx))
-                {
-                    Ok(join) => session = Some(Session { stop, join }),
-                    Err(e) => {
-                        *lock(&shared.error) = Some(format!("cannot start the render thread: {e}"));
-                        shared.cv.notify_all();
-                    }
+        *lock(&self.shared.camera_link) = None;
+    }
+
+    /// `Standby` with the camera closed: nobody watches.
+    fn go_idle(&mut self) {
+        self.end_session();
+        self.idle_since = None;
+        self.next_retry = None;
+        self.retrying = false;
+        self.set_phase(EngineState::Standby, Some("idle".into()));
+        self.set_slate();
+        self.advertise_idle();
+    }
+
+    fn go_reconnecting(&mut self, reason: String) {
+        // A failed retry waits one interval from its own start; a camera lost while live waits from now.
+        let base = if self.retrying {
+            self.attempt_started
+        } else {
+            Instant::now()
+        };
+        self.retrying = false;
+        self.next_retry = Some((base + self.timings.retry_interval).max(Instant::now()));
+        self.set_phase(EngineState::Reconnecting, Some(reason));
+        self.set_slate();
+        self.advertise_idle();
+    }
+
+    /// Keep the advertised media types current while no camera is open, so a consumer that attaches then (and wakes
+    /// the engine) sees the configured size: an explicit output size, else what the last session advertised.
+    fn advertise_idle(&self) {
+        let o = *lock(&self.shared.output);
+        let last = *lock(&self.shared.advertised);
+        let (w, h, fps) = match (o.width, o.height, last) {
+            (Some(w), Some(h), l) => (w, h, o.fps.or(l.map(|l| l.2)).unwrap_or(30)),
+            (_, _, Some((w, h, f))) => (w, h, o.fps.unwrap_or(f)),
+            _ => return,
+        };
+        self.writer
+            .set_advertised(&advertised_list(w, h, fps, o.extra_sizes));
+    }
+
+    fn poll_session(&mut self) {
+        while let Ok(ev) = self.events_rx.try_recv() {
+            if self.session.as_ref().map(|s| s.gen) != Some(ev.gen) {
+                continue; // an older session that was replaced
+            }
+            match ev.msg {
+                SessionMsg::Opened => {
+                    self.idle_since = None;
+                    self.retrying = false;
+                    self.next_retry = None;
+                    self.set_phase(EngineState::Live, None);
                 }
-            }
-            Ok(Msg::Stop) => end(&mut session),
-            Ok(Msg::SetOutput(o)) => *lock(&shared.output) = o,
-            Ok(Msg::SetFlip(f)) => shared.flip.store(f, Ordering::Relaxed),
-            Ok(Msg::SetTap(t)) => *lock(&shared.tap) = t,
-            Ok(Msg::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
-                end(&mut session);
-                writer.set_state(WriterState::Closed);
-                return;
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                // Reap a session that ended on its own (camera error).
-                if session.as_ref().is_some_and(|s| s.join.is_finished()) {
-                    end(&mut session);
+                SessionMsg::Ended(result) => {
+                    self.end_session();
+                    match result {
+                        Ok(()) => self.go_idle(),
+                        Err(Failure::Retry(_, reason)) => self.go_reconnecting(reason),
+                        Err(Failure::Fatal(message)) => self.fail(message),
+                    }
                 }
             }
         }
     }
+
+    fn poll_hotplug(&mut self) {
+        let events: Vec<HotplugEvent> = match &self.hotplug {
+            Some((_, rx)) => rx.try_iter().collect(),
+            None => return,
+        };
+        if events.is_empty() {
+            return;
+        }
+        emit(&self.shared, EngineEvent::DevicesChanged);
+        for ev in events {
+            match ev {
+                HotplugEvent::Arrival { link } => {
+                    if self.phase == EngineState::Reconnecting
+                        && self.session.is_none()
+                        && arrival_matches(self.target_link().as_deref(), &link)
+                    {
+                        self.next_retry = Some(Instant::now());
+                    }
+                }
+                HotplugEvent::Removal { link } => {
+                    let open = lock(&self.shared.camera_link).clone();
+                    if let (Some(s), Some(open)) = (&self.session, open) {
+                        if links_match(&open, &link) {
+                            s.removed.store(true, Ordering::Release);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn tick(&mut self) {
+        let now = Instant::now();
+        // The DLL shows "not running" after a second without a heartbeat; the render thread beats while it works,
+        // this covers everything else (opening, standby, stopped).
+        if now.duration_since(self.last_heartbeat) >= Duration::from_millis(100) {
+            self.writer.heartbeat();
+            self.last_heartbeat = now;
+        }
+
+        if let Some(deactivate) = self.cfg.as_ref().map(|c| c.deactivate_when_not_showing) {
+            let wants = self.wants_camera();
+            match self.phase {
+                EngineState::Standby if self.session.is_none() && wants => {
+                    self.open_session(OpenMode::Fresh);
+                }
+                EngineState::Live | EngineState::Reconnecting if deactivate && !wants => {
+                    let since = *self.idle_since.get_or_insert(now);
+                    if now.duration_since(since) >= self.timings.standby_delay {
+                        self.go_idle();
+                    }
+                }
+                _ => self.idle_since = None,
+            }
+            if self.phase == EngineState::Reconnecting
+                && self.session.is_none()
+                && self.next_retry.is_some_and(|t| now >= t)
+            {
+                self.open_session(OpenMode::Retry);
+            }
+        }
+
+        if self.phase != EngineState::Stopped
+            && now.duration_since(self.last_stats) >= self.timings.stats_interval
+        {
+            // A fixed cadence (4 Hz), not "interval after the last one": the tick would stretch every period.
+            self.last_stats += self.timings.stats_interval;
+            if now.duration_since(self.last_stats) >= self.timings.stats_interval {
+                self.last_stats = now;
+            }
+            self.emit_stats();
+        }
+    }
+
+    fn emit_stats(&self) {
+        let s = lock(&self.shared.stats).clone();
+        let live = self.phase == EngineState::Live;
+        let header = self.writer.shared().header();
+        let event = StatsEvent {
+            capture: CaptureStatsEvent {
+                width: if live { s.capture_width } else { 0 },
+                height: if live { s.capture_height } else { 0 },
+                format: if live {
+                    s.capture_format.clone()
+                } else {
+                    String::new()
+                },
+                fps: if live { s.capture_fps } else { 0.0 },
+                decode: if live {
+                    s.decode.to_string()
+                } else {
+                    "none".to_string()
+                },
+            },
+            output: OutputStatsEvent {
+                width: if live { s.output_width } else { 0 },
+                height: if live { s.output_height } else { 0 },
+                fps: if live { s.publish_fps } else { 0.0 },
+            },
+            gpu_ms: if live { s.gpu_ms } else { 0.0 },
+            dropped: if live {
+                s.dropped_mailbox + s.dropped_output
+            } else {
+                0
+            },
+            repeated: header.repeated,
+            latency_p95_ms: if live { s.latency_p95_ms } else { 0.0 },
+            consumers: self.writer.consumer_active() as u32,
+        };
+        emit(&self.shared, EngineEvent::Stats(event));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Session thread
+
+struct SessionCtx {
+    source: SourceSpec,
+    readback: ReadbackPolicy,
+    gen: u64,
+    shared: Arc<Shared>,
+    renderer: Arc<Renderer>,
+    writer: Arc<Writer>,
+    factory: Arc<dyn SourceFactory>,
+    stop: Arc<AtomicBool>,
+    removed: Arc<AtomicBool>,
+    events: Sender<SessionEvent>,
+}
+
+fn session_thread(ctx: SessionCtx) {
+    ensure_com();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render_session(&ctx)));
+    let outcome = match result {
+        Ok(r) => r,
+        Err(_) => Err(Failure::Fatal("the render thread panicked".into())),
+    };
+    // The camera (inside `render_session`) is closed by now.
+    let _ = ctx.events.send(SessionEvent {
+        gen: ctx.gen,
+        msg: SessionMsg::Ended(outcome),
+    });
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -498,7 +1289,7 @@ impl InFrame {
 enum SourceEvent {
     Frame(InFrame),
     Timeout,
-    Stopped(String),
+    Stopped(Failure),
 }
 
 struct SourceInfo {
@@ -508,6 +1299,43 @@ struct SourceInfo {
     fps: f64,
     /// What the camera's media type states about matrix and range.
     color: ColorSettings,
+    /// The camera's native format name (`mjpeg`, `nv12`, ...).
+    format: String,
+    /// `"hw"`, `"sw"` or `"none"`.
+    decode: &'static str,
+    /// Symbolic link of the camera, for hot-plug removal.
+    link: Option<String>,
+}
+
+/// Opens sources. The engine uses [`DefaultFactory`]; tests plug in sources that fail and recover on command.
+trait SourceFactory: Send + Sync {
+    /// `output_fps` is the output rate in effect (for `frame_interval` -1).
+    fn open(
+        &self,
+        spec: &SourceSpec,
+        output_fps: Option<u32>,
+        gpu: &Arc<GpuDevice>,
+    ) -> Result<Box<dyn Source>, Failure>;
+}
+
+struct DefaultFactory;
+
+impl SourceFactory for DefaultFactory {
+    fn open(
+        &self,
+        spec: &SourceSpec,
+        output_fps: Option<u32>,
+        gpu: &Arc<GpuDevice>,
+    ) -> Result<Box<dyn Source>, Failure> {
+        Ok(match spec {
+            SourceSpec::Camera(c) => Box::new(open_camera(c, gpu)?),
+            SourceSpec::Configured(cap) => {
+                let c = resolve_camera(cap, output_fps)?;
+                Box::new(open_camera(&c, gpu)?)
+            }
+            SourceSpec::Synthetic(s) => Box::new(SyntheticInput::new(*s)?),
+        })
+    }
 }
 
 trait Source {
@@ -544,7 +1372,7 @@ impl Source for CameraInput {
                 SourceEvent::Frame(InFrame::Camera(f, (self.info.width, self.info.height)))
             }
             Err(RecvError::Timeout) => SourceEvent::Timeout,
-            Err(RecvError::Stopped(r)) => SourceEvent::Stopped(r.to_string()),
+            Err(RecvError::Stopped(r)) => SourceEvent::Stopped(Failure::from_stop(r)),
         }
     }
 
@@ -554,13 +1382,13 @@ impl Source for CameraInput {
     }
 }
 
-fn open_camera(spec: &CameraSpec, gpu: &Arc<GpuDevice>) -> Result<CameraInput, String> {
+fn open_camera(spec: &CameraSpec, gpu: &Arc<GpuDevice>) -> Result<CameraInput, Failure> {
     let mut opts = OpenOptions::new(&spec.link, spec.request);
     opts.hw_decode = spec.hw_decode;
     opts.gpu = Some(gpu.clone());
     // A queue of one is the latest-frame mailbox: a newer frame replaces the one the render thread has not taken.
     opts.queue_len = 1;
-    let reader = CaptureReader::open(opts).map_err(|e| e.to_string())?;
+    let reader = CaptureReader::open(opts).map_err(|e| Failure::from_capture(&e))?;
     let i = reader.info().clone();
     let color = read_color(&reader);
     let (vw, vh) = visible_size(&i);
@@ -591,6 +1419,17 @@ fn open_camera(spec: &CameraSpec, gpu: &Arc<GpuDevice>) -> Result<CameraInput, S
             height: vh,
             fps: i.fps.as_f64(),
             color,
+            format: i
+                .native
+                .format
+                .map(|f| f.name().to_string())
+                .unwrap_or_else(|| crate::capture::subtype_label(&i.native.subtype)),
+            decode: match i.decode {
+                DecodeKind::None => "none",
+                DecodeKind::Hardware => "hw",
+                DecodeKind::Software => "sw",
+            },
+            link: Some(spec.link.clone()),
         },
         reader,
         drained: 0,
@@ -689,6 +1528,9 @@ impl SyntheticInput {
                 height: h,
                 fps: spec.fps as f64,
                 color: ColorSettings::default(),
+                format: spec.format.name().to_string(),
+                decode: "none",
+                link: None,
             },
             spec,
             data: Arc::new(data),
@@ -812,31 +1654,14 @@ impl Window {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Render thread
+// Render loop
 
-struct RenderCtx {
-    settings: Settings,
-    shared: Arc<Shared>,
-    renderer: Arc<Renderer>,
-    writer: Arc<Writer>,
-    stop: Arc<AtomicBool>,
-}
-
-fn render_thread(ctx: RenderCtx) {
-    ensure_com();
-    let shared = ctx.shared.clone();
-    let writer = ctx.writer.clone();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render_session(&ctx)));
-    let outcome = match result {
-        Ok(r) => r,
-        Err(_) => Err("the render thread panicked".to_string()),
-    };
-    // Released here: the camera (inside render_session) is already closed.
-    writer.set_state(WriterState::Closed);
-    if let Err(e) = outcome {
-        *lock(&shared.error) = Some(e);
-    }
-    set_state(&shared, EngineState::Stopped);
+/// Replace the published statistics but keep the state the control thread owns.
+fn store_stats(shared: &Shared, stats: &EngineStats) {
+    let mut s = lock(&shared.stats);
+    let state = s.state;
+    *s = stats.clone();
+    s.state = state;
 }
 
 /// The output size and rate in effect: the settings, else the source's, forced even and inside the protocol limits.
@@ -854,31 +1679,43 @@ fn resolve_output(o: &OutputSettings, info: &SourceInfo) -> (u32, u32, u32) {
     (w, h, fps)
 }
 
-fn render_session(ctx: &RenderCtx) -> Result<(), String> {
-    let RenderCtx {
-        settings,
+fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
+    let SessionCtx {
         shared,
         renderer,
         writer,
         stop,
+        removed,
+        ..
     } = ctx;
-    writer.set_state(WriterState::Starting);
-
-    let mut source: Box<dyn Source> = match &settings.source {
-        SourceSpec::Camera(c) => Box::new(open_camera(c, &renderer.gpu)?),
-        SourceSpec::Synthetic(s) => Box::new(SyntheticInput::new(*s)?),
-    };
+    let output_fps = lock(&shared.output).fps;
+    let mut source: Box<dyn Source> = ctx.factory.open(&ctx.source, output_fps, &renderer.gpu)?;
     if stop.load(Ordering::Acquire) {
         return Ok(());
     }
-    let (description, src_h, camera_color) = {
+    let (description, src_h, camera_color, capture_info) = {
         let i = source.info();
-        (i.description.clone(), i.height, i.color)
+        (
+            i.description.clone(),
+            i.height,
+            i.color,
+            (
+                i.width,
+                i.height,
+                i.format.clone(),
+                i.decode,
+                i.link.clone(),
+            ),
+        )
     };
-    let color = ColorSettings {
-        space: settings.color.space.or(camera_color.space),
-        range: settings.color.range.or(camera_color.range),
+    *lock(&shared.camera_link) = capture_info.4.clone();
+    // The colour space and range the user chose win over what the camera states; read again every frame, so a
+    // change applies live.
+    let effective_color = |user: ColorSettings| ColorSettings {
+        space: user.space.or(camera_color.space),
+        range: user.range.or(camera_color.range),
     };
+    let mut color = effective_color(*lock(&shared.color));
 
     let mut converter = Converter::new(renderer.clone()).map_err(|e| e.to_string())?;
     let stage = OutputStage::new(renderer.clone()).map_err(|e| e.to_string())?;
@@ -887,14 +1724,18 @@ fn render_session(ctx: &RenderCtx) -> Result<(), String> {
         OutputWriter::new(renderer.clone(), writer.clone()).map_err(|e| e.to_string())?;
     let mut timer = GpuTimer::new(&renderer.gpu.device).ok();
 
-    let mut advertised = (0u32, 0u32, 0u32);
+    let mut advertised = (0u32, 0u32, 0u32, true);
     let mut published_any = false;
+    let mut was_paused = false;
     let mut window = Window::new(0);
     let mut latency = LatencyTrack::default();
     let mut pipeline = LatencyTrack::default();
     let mut stats = EngineStats {
-        state: EngineState::Live,
         source: format!("{description}; color {}", describe_color(&color, src_h)),
+        capture_width: capture_info.0,
+        capture_height: capture_info.1,
+        capture_format: capture_info.2,
+        decode: capture_info.3,
         ..EngineStats::default()
     };
     let (mut rendered, mut published) = (0u64, 0u64);
@@ -902,23 +1743,64 @@ fn render_session(ctx: &RenderCtx) -> Result<(), String> {
     let mut last_heartbeat = Instant::now();
     let mut first_error: Option<String> = None;
 
-    set_state(shared, EngineState::Live);
-    *lock(&shared.stats) = stats.clone();
+    store_stats(shared, &stats);
+    // The camera is open and (for a real camera) the first frame is in: the control thread may call us `Live`.
+    let _ = ctx.events.send(SessionEvent {
+        gen: ctx.gen,
+        msg: SessionMsg::Opened,
+    });
 
     let outcome = loop {
         if stop.load(Ordering::Acquire) {
             break Ok(());
         }
+        if removed.load(Ordering::Acquire) {
+            break Err(Failure::disconnected(None));
+        }
         // Keep the DLL's picture of what we advertise current.
         let out_settings = *lock(&shared.output);
         let (ow, oh, ofps) = resolve_output(&out_settings, source.info());
-        if advertised != (ow, oh, ofps) {
-            writer.set_advertised(&advertised_for_output(ow, oh, ofps));
-            advertised = (ow, oh, ofps);
+        if advertised != (ow, oh, ofps, out_settings.extra_sizes) {
+            writer.set_advertised(&advertised_list(ow, oh, ofps, out_settings.extra_sizes));
+            advertised = (ow, oh, ofps, out_settings.extra_sizes);
+            *lock(&shared.advertised) = Some((ow, oh, ofps));
+        }
+        color = effective_color(*lock(&shared.color));
+
+        // Pause: keep the camera open, read and drop its frames, show the paused slate.
+        let paused = shared.paused.load(Ordering::Acquire);
+        if paused != was_paused {
+            was_paused = paused;
+            stats.paused = paused;
+            if !paused {
+                // Resumed: the writer leaves `Paused` with the first frame published from here on.
+                published_any = false;
+            }
+        }
+        if paused {
+            writer.set_state(WriterState::Paused);
+            match source.next(Duration::from_millis(40)) {
+                SourceEvent::Frame(_) | SourceEvent::Timeout => {}
+                SourceEvent::Stopped(f) => break Err(f),
+            }
+            maybe_publish_stats(
+                shared,
+                &mut stats,
+                &mut window,
+                source.as_ref(),
+                &latency,
+                &pipeline,
+                &output,
+                rendered,
+                published,
+                &mut timer,
+                renderer,
+            );
+            continue;
         }
 
         // Frames that finished on the GPU while we waited.
-        if settings.readback == ReadbackPolicy::NextFrame {
+        if ctx.readback == ReadbackPolicy::NextFrame {
             while let Some(p) = output
                 .poll(output.pending() >= 2)
                 .map_err(|e| e.to_string())?
@@ -957,7 +1839,7 @@ fn render_session(ctx: &RenderCtx) -> Result<(), String> {
                 );
                 continue;
             }
-            SourceEvent::Stopped(reason) => break Err(format!("the camera stopped: {reason}")),
+            SourceEvent::Stopped(failure) => break Err(failure),
         };
         let (capture_100ns, arrival_100ns) = frame.times();
         let cpu_started = Instant::now();
@@ -1025,13 +1907,15 @@ fn render_session(ctx: &RenderCtx) -> Result<(), String> {
                     first_error = Some(e.to_string());
                 }
                 if consecutive_errors >= 30 {
-                    break Err(format!("rendering failed 30 times in a row: {e}"));
+                    break Err(Failure::Fatal(format!(
+                        "rendering failed 30 times in a row: {e}"
+                    )));
                 }
                 continue;
             }
         }
 
-        match settings.readback {
+        match ctx.readback {
             ReadbackPolicy::Immediate => match output.poll(true) {
                 Ok(Some(p)) => {
                     window.readback_sum += p.copy_ms;
@@ -1068,6 +1952,10 @@ fn render_session(ctx: &RenderCtx) -> Result<(), String> {
             }
         }
         last_heartbeat = Instant::now();
+        // A pause that arrived while this frame was in flight must not be undone by its first publish.
+        if shared.paused.load(Ordering::Acquire) {
+            writer.set_state(WriterState::Paused);
+        }
         stats.dropped_output = output.dropped + output.rejected;
         maybe_publish_stats(
             shared,
@@ -1191,7 +2079,7 @@ fn maybe_publish_stats(
     stats.total_latency_p95_ms = latency.total_p95();
     stats.total_pipeline_p95_ms = pipeline.total_p95();
     stats.consumer = output.writer().consumer_active();
-    *lock(&shared.stats) = stats.clone();
+    store_stats(shared, stats);
     *window = Window::new(captured);
 }
 
@@ -1265,6 +2153,7 @@ mod tests {
             flip_vertical: false,
             color: ColorSettings::default(),
             readback: ReadbackPolicy::Immediate,
+            deactivate_when_not_showing: false,
         });
         engine.wait_live(Duration::from_secs(20)).unwrap();
         wait_for(&engine, 5);
@@ -1332,13 +2221,18 @@ mod tests {
 
         engine.send(Msg::Stop);
         assert!(engine.wait_stopped(Duration::from_secs(10)));
+        // Stopped shows the "paused" slate; only a shutdown closes the file.
         assert_eq!(
             reader.shared().header().writer_state,
-            WriterState::Closed as u32
+            WriterState::Paused as u32
         );
         let s = engine.stats();
         assert!(s.published >= 5 && s.rendered >= s.published);
         engine.shutdown();
+        assert_eq!(
+            reader.shared().header().writer_state,
+            WriterState::Closed as u32
+        );
     }
 
     #[test]
@@ -1359,10 +2253,894 @@ mod tests {
             flip_vertical: false,
             color: ColorSettings::default(),
             readback: ReadbackPolicy::Immediate,
+            deactivate_when_not_showing: false,
         });
         let err = engine.wait_live(Duration::from_secs(10)).unwrap_err();
         assert!(err.contains("not valid"), "{err}");
         assert!(engine.wait_stopped(Duration::from_secs(5)));
         let _ = Read::NoFrame;
+    }
+
+    // ---- state machine: a fake camera that can fail, vanish and come back --------------------------------------
+
+    /// Short timers: the product's are 5 s and 3 s.
+    fn fast() -> Timings {
+        Timings {
+            standby_delay: Duration::from_millis(400),
+            retry_interval: Duration::from_millis(300),
+            tick: Duration::from_millis(20),
+            stats_interval: Duration::from_millis(250),
+        }
+    }
+
+    /// Opens synthetic bars; stands in for the camera.
+    struct Fake {
+        opens: std::sync::atomic::AtomicU32,
+        /// Sources that are open right now (the camera is "busy" while this is above 0).
+        alive: Arc<std::sync::atomic::AtomicU32>,
+        /// Failures the next opens return, in order.
+        failures: Mutex<VecDeque<Failure>>,
+        /// The camera is unplugged: open fails and open sources stop.
+        gone: Arc<AtomicBool>,
+        specs: Mutex<Vec<SourceSpec>>,
+    }
+
+    struct FakeSource {
+        inner: SyntheticInput,
+        gone: Arc<AtomicBool>,
+        alive: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl Drop for FakeSource {
+        fn drop(&mut self) {
+            self.alive.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Source for FakeSource {
+        fn info(&self) -> &SourceInfo {
+            self.inner.info()
+        }
+        fn next(&mut self, timeout: Duration) -> SourceEvent {
+            if self.gone.load(Ordering::SeqCst) {
+                return SourceEvent::Stopped(Failure::disconnected(None));
+            }
+            self.inner.next(timeout)
+        }
+        fn counters(&self) -> (u64, u64) {
+            self.inner.counters()
+        }
+    }
+
+    impl SourceFactory for Fake {
+        fn open(
+            &self,
+            spec: &SourceSpec,
+            _output_fps: Option<u32>,
+            _gpu: &Arc<GpuDevice>,
+        ) -> Result<Box<dyn Source>, Failure> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            self.specs.lock().unwrap().push(spec.clone());
+            if let Some(f) = self.failures.lock().unwrap().pop_front() {
+                return Err(f);
+            }
+            if self.gone.load(Ordering::SeqCst) {
+                return Err(Failure::Retry(
+                    RetryKind::NotFound,
+                    "camera not found".into(),
+                ));
+            }
+            let SourceSpec::Synthetic(s) = spec else {
+                return Err(Failure::Fatal("the fake opens synthetic sources".into()));
+            };
+            self.alive.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(FakeSource {
+                inner: SyntheticInput::new(*s)?,
+                gone: self.gone.clone(),
+                alive: self.alive.clone(),
+            }))
+        }
+    }
+
+    struct Rig {
+        engine: Engine,
+        fake: Arc<Fake>,
+        file: MappedFile,
+        events: Arc<Mutex<Vec<(Instant, EngineEvent)>>>,
+        started: Instant,
+    }
+
+    impl Rig {
+        fn new(name: &str, timings: Timings) -> Rig {
+            let gpu = Arc::new(GpuDevice::new(AdapterKind::Warp).expect("WARP"));
+            let path = temp_file(name);
+            let _ = std::fs::remove_file(&path);
+            let writer = Arc::new(Writer::create(&path).unwrap());
+            let fake = Arc::new(Fake {
+                opens: Default::default(),
+                alive: Default::default(),
+                failures: Mutex::new(VecDeque::new()),
+                gone: Arc::new(AtomicBool::new(false)),
+                specs: Mutex::new(Vec::new()),
+            });
+            let engine = Engine::build(gpu, writer, timings, fake.clone()).unwrap();
+            let events: Arc<Mutex<Vec<(Instant, EngineEvent)>>> = Arc::default();
+            let sink = events.clone();
+            engine.set_event_sink(Arc::new(move |e: EngineEvent| {
+                sink.lock().unwrap().push((Instant::now(), e));
+            }));
+            Rig {
+                engine,
+                fake,
+                file: MappedFile::open(&path, Access::ReadWrite).unwrap(),
+                events,
+                started: Instant::now(),
+            }
+        }
+
+        fn writer_state(&self) -> u32 {
+            self.file.shared().header().writer_state
+        }
+
+        fn opens(&self) -> u32 {
+            self.fake.opens.load(Ordering::SeqCst)
+        }
+
+        fn alive(&self) -> u32 {
+            self.fake.alive.load(Ordering::SeqCst)
+        }
+
+        /// `(state, reason)` of every state event so far.
+        fn states(&self) -> Vec<(EngineState, Option<String>)> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(_, e)| match e {
+                    EngineEvent::State(s) => Some((s.state, s.reason.clone())),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn wait(&self, what: &str, timeout: Duration, cond: impl Fn(&Rig) -> bool) -> Duration {
+            let t = Instant::now();
+            while !cond(self) {
+                assert!(
+                    t.elapsed() < timeout,
+                    "timed out after {timeout:?} waiting for {what}: state {:?} reason {:?}, writer {}, states {:?}",
+                    self.engine.state(),
+                    self.engine.reason(),
+                    self.writer_state(),
+                    self.states()
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            t.elapsed()
+        }
+
+        fn wait_state(&self, state: EngineState, timeout: Duration) -> Duration {
+            self.wait(&format!("{state:?}"), timeout, |r| {
+                r.engine.state() == state
+            })
+        }
+
+        /// A consumer attached to the file (what the DLL does while a stream runs), until dropped.
+        fn consumer(&self, path_name: &str) -> Consumer {
+            Consumer::start(&temp_file(path_name))
+        }
+    }
+
+    struct Consumer {
+        stop: Arc<AtomicBool>,
+        join: Option<std::thread::JoinHandle<()>>,
+        file: Arc<MappedFile>,
+    }
+
+    impl Consumer {
+        fn start(path: &std::path::Path) -> Consumer {
+            let file = Arc::new(MappedFile::open(path, Access::ReadWrite).unwrap());
+            let stop = Arc::new(AtomicBool::new(false));
+            file.shared()
+                .set_negotiated(&Format::new(320, 180, 30, SUBTYPE_NV12));
+            file.shared().set_consumer_active(true);
+            let (f, s) = (file.clone(), stop.clone());
+            let join = std::thread::spawn(move || {
+                while !s.load(Ordering::SeqCst) {
+                    f.shared().set_consumer_heartbeat(vcam_protocol::qpc_now());
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            });
+            Consumer {
+                stop,
+                join: Some(join),
+                file,
+            }
+        }
+
+        fn detach(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(j) = self.join.take() {
+                let _ = j.join();
+            }
+            self.file.shared().set_consumer_active(false);
+        }
+    }
+
+    impl Drop for Consumer {
+        fn drop(&mut self) {
+            self.detach();
+        }
+    }
+
+    fn bars(fps: u32) -> SourceSpec {
+        SourceSpec::Synthetic(SyntheticSpec {
+            width: 320,
+            height: 180,
+            fps,
+            format: PixelFormat::Nv12,
+            color: ColorSettings::default(),
+        })
+    }
+
+    fn settings(source: SourceSpec, deactivate: bool) -> Settings {
+        Settings {
+            source,
+            output: OutputSettings::default(),
+            flip_vertical: false,
+            color: ColorSettings::default(),
+            readback: ReadbackPolicy::Immediate,
+            deactivate_when_not_showing: deactivate,
+        }
+    }
+
+    const PAUSED: u32 = WriterState::Paused as u32;
+    const STARTING: u32 = WriterState::Starting as u32;
+    const LIVE: u32 = WriterState::Live as u32;
+    const CLOSED: u32 = WriterState::Closed as u32;
+
+    #[test]
+    fn start_pause_resume_and_stop() {
+        let rig = Rig::new("sm-pause.bin", fast());
+        assert_eq!(rig.engine.state(), EngineState::Stopped);
+        // an engine that exists but runs nothing shows the paused slate and keeps its heartbeat
+        rig.wait("the paused slate", Duration::from_secs(5), |r| {
+            r.writer_state() == PAUSED
+        });
+
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("frames", Duration::from_secs(10), |r| {
+            r.writer_state() == LIVE
+        });
+        assert_eq!(
+            rig.opens(),
+            1,
+            "no standby wait without deactivate_when_not_showing"
+        );
+
+        rig.engine.set_pause(true);
+        rig.wait("the paused slate", Duration::from_secs(5), |r| {
+            r.writer_state() == PAUSED
+        });
+        assert_eq!(
+            rig.engine.state(),
+            EngineState::Live,
+            "pause is not a state"
+        );
+        assert_eq!(rig.alive(), 1, "the camera stays open while paused");
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            rig.writer_state(),
+            PAUSED,
+            "frames must not revive a paused writer"
+        );
+
+        rig.engine.set_pause(false);
+        rig.wait("video again", Duration::from_secs(10), |r| {
+            r.writer_state() == LIVE
+        });
+        assert_eq!(rig.opens(), 1, "resume does not reopen the camera");
+
+        rig.engine.stop();
+        assert!(rig.engine.wait_stopped(Duration::from_secs(10)));
+        assert_eq!(rig.alive(), 0, "stop releases the camera");
+        rig.wait("the paused slate", Duration::from_secs(5), |r| {
+            r.writer_state() == PAUSED
+        });
+        // Stop clears a pause
+        assert!(!rig.engine.paused());
+
+        // start again: video again
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("video", Duration::from_secs(10), |r| {
+            r.writer_state() == LIVE
+        });
+
+        assert_eq!(
+            rig.states(),
+            vec![
+                (EngineState::Standby, Some("opening".into())),
+                (EngineState::Live, None),
+                (EngineState::Stopped, None),
+                (EngineState::Standby, Some("opening".into())),
+                (EngineState::Live, None),
+            ]
+        );
+        let writer_state = rig.file.shared().header().writer_state;
+        assert_eq!(writer_state, LIVE);
+        rig.engine.close();
+        assert_eq!(rig.writer_state(), CLOSED);
+    }
+
+    #[test]
+    fn pause_before_the_camera_is_open_shows_the_paused_slate() {
+        let rig = Rig::new("sm-pause-early.bin", fast());
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.set_pause(true);
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(rig.writer_state(), PAUSED);
+        rig.engine.set_pause(false);
+        rig.wait("video", Duration::from_secs(10), |r| {
+            r.writer_state() == LIVE
+        });
+    }
+
+    #[test]
+    fn deactivate_follows_the_consumer_and_the_window() {
+        let rig = Rig::new("sm-idle.bin", fast());
+        let path = "sm-idle.bin";
+        // hidden window, no consumer: nothing opens, the slate says "starting" for whoever comes
+        rig.engine.start(settings(bars(30), true));
+        rig.wait_state(EngineState::Standby, Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(rig.engine.reason().as_deref(), Some("idle"));
+        assert_eq!(
+            (rig.opens(), rig.alive()),
+            (0, 0),
+            "the camera was never opened"
+        );
+        assert_eq!(rig.writer_state(), STARTING);
+
+        // a consumer attaches: Live
+        let mut consumer = rig.consumer(path);
+        let woke = rig.wait_state(EngineState::Live, Duration::from_secs(5));
+        eprintln!("consumer attached -> live in {woke:?}");
+        assert_eq!(rig.alive(), 1);
+
+        // it leaves: standby after the delay, camera released
+        let left = Instant::now();
+        consumer.detach();
+        rig.wait_state(EngineState::Standby, Duration::from_secs(5));
+        let idle_after = left.elapsed();
+        assert!(
+            idle_after >= Duration::from_millis(350) && idle_after < Duration::from_secs(3),
+            "standby after {idle_after:?}"
+        );
+        assert_eq!(rig.alive(), 0, "the camera is free in standby");
+        assert_eq!(rig.engine.reason().as_deref(), Some("idle"));
+
+        // the window shows: Live
+        rig.engine.set_window_visible(true);
+        rig.wait_state(EngineState::Live, Duration::from_secs(5));
+        // still visible: no standby, however long
+        std::thread::sleep(Duration::from_millis(900));
+        assert_eq!(rig.engine.state(), EngineState::Live);
+        // hidden (or minimized) with a consumer attached: stays live
+        let mut again = rig.consumer(path);
+        rig.engine.set_window_visible(false);
+        std::thread::sleep(Duration::from_millis(900));
+        assert_eq!(
+            rig.engine.state(),
+            EngineState::Live,
+            "a consumer keeps it live"
+        );
+        again.detach();
+        rig.wait_state(EngineState::Standby, Duration::from_secs(5));
+        assert_eq!(rig.alive(), 0);
+        assert_eq!(
+            rig.opens(),
+            2,
+            "one open per wake-up: consumer, then window"
+        );
+
+        // a visible window that hides and shows again within the delay never closes the camera
+        rig.engine.set_window_visible(true);
+        rig.wait_state(EngineState::Live, Duration::from_secs(5));
+        rig.engine.set_window_visible(false);
+        std::thread::sleep(Duration::from_millis(150));
+        rig.engine.set_window_visible(true);
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(rig.engine.state(), EngineState::Live);
+        assert_eq!(rig.opens(), 3);
+    }
+
+    #[test]
+    fn without_deactivate_a_hidden_window_changes_nothing() {
+        let rig = Rig::new("sm-keep.bin", fast());
+        rig.engine.set_window_visible(false);
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        std::thread::sleep(Duration::from_millis(1000));
+        assert_eq!(rig.engine.state(), EngineState::Live);
+        assert_eq!(rig.opens(), 1);
+    }
+
+    #[test]
+    fn a_lost_camera_goes_reconnecting_and_comes_back() {
+        let rig = Rig::new("sm-lost.bin", fast());
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("video", Duration::from_secs(10), |r| {
+            r.writer_state() == LIVE
+        });
+
+        rig.fake.gone.store(true, Ordering::SeqCst);
+        rig.wait_state(EngineState::Reconnecting, Duration::from_secs(5));
+        let reason = rig.engine.reason().unwrap();
+        assert!(reason.contains("disconnected"), "{reason}");
+        assert_eq!(rig.alive(), 0, "the lost camera is released");
+        assert_eq!(
+            rig.writer_state(),
+            STARTING,
+            "the slate says the camera is starting"
+        );
+        // it keeps trying (the open fails: "not found"), and says so
+        let opens_before = rig.opens();
+        rig.wait("a retry", Duration::from_secs(5), |r| {
+            r.opens() > opens_before
+        });
+        rig.wait("the new reason", Duration::from_secs(5), |r| {
+            r.engine.reason().is_some_and(|x| x.contains("not found"))
+        });
+        assert_eq!(rig.engine.state(), EngineState::Reconnecting);
+
+        // plugged in again: Live within one retry interval (plus the open)
+        rig.fake.gone.store(false, Ordering::SeqCst);
+        let back = rig.wait_state(EngineState::Live, Duration::from_secs(5));
+        eprintln!("camera back -> live in {back:?}");
+        assert!(back < Duration::from_millis(1200), "{back:?}");
+        rig.wait("video", Duration::from_secs(10), |r| {
+            r.writer_state() == LIVE
+        });
+
+        let states = rig.states();
+        assert_eq!(
+            states[..2],
+            [
+                (EngineState::Standby, Some("opening".into())),
+                (EngineState::Live, None),
+            ]
+        );
+        assert_eq!(states[2].0, EngineState::Reconnecting);
+        assert!(states[2].1.as_deref().unwrap().contains("disconnected"));
+        assert_eq!(
+            states[3],
+            (EngineState::Reconnecting, Some("camera not found".into()))
+        );
+        assert_eq!(states.last(), Some(&(EngineState::Live, None)));
+    }
+
+    #[test]
+    fn a_camera_in_use_is_retried_until_it_is_free() {
+        let rig = Rig::new("sm-inuse.bin", fast());
+        for _ in 0..2 {
+            rig.fake
+                .failures
+                .lock()
+                .unwrap()
+                .push_back(Failure::in_use(Some(HRESULT(0xC00D_3704_u32 as i32))));
+        }
+        let t = Instant::now();
+        rig.engine.start(settings(bars(30), false));
+        rig.wait_state(EngineState::Reconnecting, Duration::from_secs(5));
+        let reason = rig.engine.reason().unwrap();
+        assert!(
+            reason.contains("in use") && reason.contains("0xC00D3704"),
+            "{reason}"
+        );
+        rig.engine.wait_live(Duration::from_secs(10)).unwrap();
+        // two failed opens, retried every 300 ms
+        assert_eq!(rig.opens(), 3);
+        assert!(
+            t.elapsed() >= Duration::from_millis(550),
+            "{:?}",
+            t.elapsed()
+        );
+        assert_eq!(
+            rig.states(),
+            vec![
+                (EngineState::Standby, Some("opening".into())),
+                (EngineState::Reconnecting, Some(reason)),
+                (EngineState::Live, None),
+            ],
+            "the repeated failure is not announced twice"
+        );
+    }
+
+    #[test]
+    fn a_new_source_while_reconnecting_retries_at_once() {
+        let mut t = fast();
+        t.retry_interval = Duration::from_secs(30);
+        let rig = Rig::new("sm-retry-now.bin", t);
+        rig.fake
+            .failures
+            .lock()
+            .unwrap()
+            .push_back(Failure::in_use(None));
+        rig.engine.start(settings(bars(30), false));
+        rig.wait_state(EngineState::Reconnecting, Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(rig.opens(), 1, "the retry is 30 s away");
+        rig.engine.set_source(SourceUpdate {
+            source: bars(25),
+            flip_vertical: false,
+            color: ColorSettings::default(),
+            deactivate_when_not_showing: false,
+        });
+        rig.wait_state(EngineState::Live, Duration::from_secs(5));
+        assert_eq!(rig.opens(), 2);
+    }
+
+    #[test]
+    fn stop_ends_a_reconnect_and_start_goes_on() {
+        let rig = Rig::new("sm-stop-reconnect.bin", fast());
+        rig.fake.gone.store(true, Ordering::SeqCst);
+        rig.engine.start(settings(bars(30), false));
+        rig.wait_state(EngineState::Reconnecting, Duration::from_secs(5));
+        rig.engine.stop();
+        assert!(rig.engine.wait_stopped(Duration::from_secs(5)));
+        let opens = rig.opens();
+        std::thread::sleep(Duration::from_millis(800));
+        assert_eq!(rig.opens(), opens, "no retries after Stop");
+        assert_eq!(rig.writer_state(), PAUSED);
+    }
+
+    #[test]
+    fn reconnecting_without_anyone_watching_gives_up_the_camera() {
+        let rig = Rig::new("sm-reconnect-idle.bin", fast());
+        rig.fake.gone.store(true, Ordering::SeqCst);
+        rig.engine.set_window_visible(true);
+        rig.engine.start(settings(bars(30), true));
+        rig.wait_state(EngineState::Reconnecting, Duration::from_secs(5));
+        rig.engine.set_window_visible(false);
+        rig.wait_state(EngineState::Standby, Duration::from_secs(5));
+        let opens = rig.opens();
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(rig.opens(), opens, "standby does not retry");
+    }
+
+    #[test]
+    fn another_failure_is_fatal() {
+        let rig = Rig::new("sm-fatal.bin", fast());
+        rig.fake.failures.lock().unwrap().push_back(Failure::Fatal(
+            "camera does not list mjpeg 1280x720; it lists: yuy2".into(),
+        ));
+        rig.engine.start(settings(bars(30), false));
+        let err = rig.engine.wait_live(Duration::from_secs(5)).unwrap_err();
+        assert!(err.contains("does not list"), "{err}");
+        assert!(rig.engine.wait_stopped(Duration::from_secs(5)));
+        assert_eq!(rig.engine.last_error().as_deref(), Some(err.as_str()));
+        assert_eq!(rig.writer_state(), PAUSED);
+        let events: Vec<EngineEvent> = rig
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.1.clone())
+            .collect();
+        let error_at = events
+            .iter()
+            .position(|e| *e == EngineEvent::Error(err.clone()))
+            .expect("engine-error");
+        let stopped_at = events
+            .iter()
+            .position(|e| matches!(e, EngineEvent::State(s) if s.state == EngineState::Stopped && s.reason.as_deref() == Some("error")))
+            .expect("stopped with reason error");
+        assert!(error_at < stopped_at, "the error comes first");
+        // a new start works again and clears the error
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(10)).unwrap();
+        assert_eq!(rig.engine.last_error(), None);
+    }
+
+    #[test]
+    fn set_source_reopens_only_for_capture_changes() {
+        let rig = Rig::new("sm-source.bin", fast());
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("video", Duration::from_secs(10), |r| {
+            r.writer_state() == LIVE
+        });
+        let update = |source: SourceSpec, flip: bool, space: Option<ColorSpace>| SourceUpdate {
+            source,
+            flip_vertical: flip,
+            color: ColorSettings { space, range: None },
+            deactivate_when_not_showing: false,
+        };
+
+        // colour and flip apply live
+        rig.engine
+            .set_source(update(bars(30), true, Some(ColorSpace::Bt601)));
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!((rig.opens(), rig.engine.state()), (1, EngineState::Live));
+        assert!(rig.engine.shared.flip.load(Ordering::Relaxed));
+        assert_eq!(
+            lock(&rig.engine.shared.color).space,
+            Some(ColorSpace::Bt601)
+        );
+
+        // a capture change reopens, and the last frame stays on the file meanwhile
+        let t = Instant::now();
+        rig.engine
+            .set_source(update(bars(25), true, Some(ColorSpace::Bt601)));
+        rig.wait("the reopen", Duration::from_secs(5), |r| r.opens() == 2);
+        rig.wait("live again", Duration::from_secs(5), |r| {
+            r.engine.state() == EngineState::Live && r.alive() == 1
+        });
+        eprintln!("reopen took {:?}", t.elapsed());
+        assert_eq!(rig.writer_state(), LIVE);
+        assert_eq!(
+            rig.alive(),
+            1,
+            "the old camera was released before the new one opened"
+        );
+        let states = rig.states();
+        assert_eq!(states[2], (EngineState::Standby, Some("reopening".into())));
+        assert_eq!(states[3], (EngineState::Live, None));
+        assert_eq!(rig.fake.specs.lock().unwrap()[1], bars(25));
+
+        // while idle in standby a new source waits for the next wake-up
+        let idle = Rig::new("sm-source-idle.bin", fast());
+        idle.engine.start(settings(bars(30), true));
+        idle.wait_state(EngineState::Standby, Duration::from_secs(5));
+        idle.engine.set_source(SourceUpdate {
+            source: bars(15),
+            flip_vertical: false,
+            color: ColorSettings::default(),
+            deactivate_when_not_showing: true,
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(idle.opens(), 0);
+        idle.engine.set_window_visible(true);
+        idle.wait_state(EngineState::Live, Duration::from_secs(5));
+        assert_eq!(idle.fake.specs.lock().unwrap()[0], bars(15));
+    }
+
+    #[test]
+    fn set_output_changes_the_advertised_types_live() {
+        let rig = Rig::new("sm-output.bin", fast());
+        rig.engine.start(Settings {
+            output: OutputSettings {
+                width: Some(1920),
+                height: Some(1080),
+                fps: Some(30),
+                ..OutputSettings::default()
+            },
+            ..settings(bars(30), false)
+        });
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        let advertised = |r: &Rig| {
+            let h = r.file.shared().header();
+            h.advertised[..h.advertised_count as usize]
+                .iter()
+                .map(|f| (f.width, f.height))
+                .collect::<Vec<_>>()
+        };
+        rig.wait("1080p advertised", Duration::from_secs(5), |r| {
+            advertised(r).first() == Some(&(1920, 1080))
+        });
+        assert!(advertised(&rig).contains(&(1280, 720)) && advertised(&rig).contains(&(640, 360)));
+
+        rig.engine.set_output(OutputSettings {
+            width: Some(640),
+            height: Some(360),
+            fps: Some(30),
+            fit: FitMode::Fill,
+            extra_sizes: false,
+            ..OutputSettings::default()
+        });
+        rig.wait("640x360 advertised", Duration::from_secs(5), |r| {
+            advertised(r).iter().all(|s| *s == (640, 360)) && !advertised(r).is_empty()
+        });
+
+        rig.engine.set_output(OutputSettings {
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(30),
+            extra_sizes: false,
+            ..OutputSettings::default()
+        });
+        rig.wait("1080p only", Duration::from_secs(5), |r| {
+            advertised(r).iter().all(|s| *s == (1920, 1080)) && !advertised(r).is_empty()
+        });
+        assert_eq!(rig.engine.state(), EngineState::Live);
+        assert_eq!(rig.opens(), 1, "an output change never reopens the camera");
+    }
+
+    #[test]
+    fn the_idle_engine_advertises_the_configured_output() {
+        let rig = Rig::new("sm-output-idle.bin", fast());
+        rig.engine.start(Settings {
+            output: OutputSettings {
+                width: Some(1280),
+                height: Some(720),
+                fps: Some(30),
+                extra_sizes: false,
+                ..OutputSettings::default()
+            },
+            ..settings(bars(30), true)
+        });
+        rig.wait_state(EngineState::Standby, Duration::from_secs(5));
+        rig.wait("the advertised list", Duration::from_secs(5), |r| {
+            let h = r.file.shared().header();
+            h.advertised_count > 0 && h.advertised[0].width == 1280
+        });
+        assert_eq!(rig.opens(), 0);
+    }
+
+    #[test]
+    fn stats_events_come_four_times_a_second_with_every_field() {
+        let rig = Rig::new("sm-stats.bin", fast());
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        // let a one-second statistics window complete
+        rig.wait("a full window", Duration::from_secs(10), |r| {
+            r.engine.stats().publish_fps > 0.0
+        });
+        let mark = Instant::now();
+        let stats_since = |t: Instant, rig: &Rig| -> Vec<StatsEvent> {
+            rig.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(at, _)| *at >= t)
+                .filter_map(|(_, e)| match e {
+                    EngineEvent::Stats(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        std::thread::sleep(Duration::from_millis(2000));
+        let none = stats_since(mark, &rig);
+        // 4 per second: 8 in two seconds, give or take the timer
+        assert!(
+            (7..=9).contains(&none.len()),
+            "{} stats events in 2 s",
+            none.len()
+        );
+        let s = none.last().unwrap();
+        assert_eq!((s.capture.width, s.capture.height), (320, 180));
+        assert_eq!(s.capture.format, "nv12");
+        assert_eq!(s.capture.decode, "none");
+        assert!(s.capture.fps > 20.0, "{s:?}");
+        assert_eq!((s.output.width, s.output.height), (320, 180));
+        assert!(s.output.fps > 20.0, "{s:?}");
+        assert!(s.latency_p95_ms > 0.0, "{s:?}");
+        assert_eq!(s.consumers, 0);
+        // every key of plan 5.6 is in the JSON
+        let json = serde_json::to_value(s).unwrap();
+        for key in [
+            "capture",
+            "output",
+            "gpu_ms",
+            "dropped",
+            "repeated",
+            "latency_p95_ms",
+            "consumers",
+        ] {
+            assert!(json.get(key).is_some(), "missing {key}");
+        }
+        for key in ["width", "height", "format", "fps", "decode"] {
+            assert!(json["capture"].get(key).is_some(), "missing capture.{key}");
+        }
+        for key in ["width", "height", "fps"] {
+            assert!(json["output"].get(key).is_some(), "missing output.{key}");
+        }
+
+        // a consumer shows as 1, and as 0 again once it is gone
+        let mut consumer = rig.consumer("sm-stats.bin");
+        let t = Instant::now();
+        rig.wait("consumers = 1", Duration::from_secs(5), |r| {
+            stats_since(t, r).last().is_some_and(|s| s.consumers == 1)
+        });
+        consumer.detach();
+        let t = Instant::now();
+        rig.wait("consumers = 0", Duration::from_secs(5), |r| {
+            stats_since(t, r).last().is_some_and(|s| s.consumers == 0)
+        });
+        rig.engine.stop();
+        assert!(rig.engine.wait_stopped(Duration::from_secs(5)));
+        // after Stop one zeroed event, then silence
+        std::thread::sleep(Duration::from_millis(100));
+        let t = Instant::now();
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(
+            stats_since(t, &rig).is_empty(),
+            "stats keep coming while stopped"
+        );
+        let zero = rig
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|(_, e)| match e {
+                EngineEvent::Stats(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            (zero.capture.width, zero.output.width, zero.consumers),
+            (0, 0, 0)
+        );
+        let _ = rig.started;
+    }
+
+    #[test]
+    fn failures_carry_the_reasons_the_ui_shows() {
+        use windows::core::Error;
+        let hr = HRESULT(0xC00D_3704_u32 as i32);
+        assert_eq!(
+            Failure::from_capture(&CaptureError::InUse(Error::from(hr))),
+            Failure::Retry(
+                RetryKind::InUse,
+                "camera in use by another app (0xC00D3704)".into()
+            )
+        );
+        assert!(matches!(
+            Failure::from_capture(&CaptureError::DeviceLost(Error::from(hr))),
+            Failure::Retry(RetryKind::Disconnected, r) if r.starts_with("camera disconnected (0x")
+        ));
+        assert_eq!(
+            Failure::from_capture(&CaptureError::NoSuchDevice("x".into())),
+            Failure::Retry(RetryKind::NotFound, "camera not found".into())
+        );
+        assert!(matches!(
+            Failure::from_capture(&CaptureError::Timeout("the first frame")),
+            Failure::Fatal(m) if m.contains("first frame")
+        ));
+        assert!(matches!(
+            Failure::from_stop(StopReason::DeviceLost(None)),
+            Failure::Retry(RetryKind::Disconnected, _)
+        ));
+        assert!(matches!(
+            Failure::from_stop(StopReason::InUse(hr)),
+            Failure::Retry(RetryKind::InUse, _)
+        ));
+        assert!(matches!(
+            Failure::from_stop(StopReason::EndOfStream),
+            Failure::Fatal(_)
+        ));
+    }
+
+    #[test]
+    fn state_events_serialize_as_plan_5_6() {
+        let live = serde_json::to_value(StateEvent {
+            state: EngineState::Live,
+            reason: None,
+        })
+        .unwrap();
+        assert_eq!(live, serde_json::json!({"state": "live"}));
+        let r = serde_json::to_value(StateEvent {
+            state: EngineState::Reconnecting,
+            reason: Some("camera in use by another app (0xC00D3704)".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            r,
+            serde_json::json!({"state": "reconnecting", "reason": "camera in use by another app (0xC00D3704)"})
+        );
+        for (s, n) in [
+            (EngineState::Stopped, "stopped"),
+            (EngineState::Standby, "standby"),
+            (EngineState::Live, "live"),
+            (EngineState::Reconnecting, "reconnecting"),
+        ] {
+            assert_eq!(serde_json::to_value(s).unwrap(), serde_json::json!(n));
+            assert_eq!(s.name(), n);
+        }
     }
 }

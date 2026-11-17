@@ -1,0 +1,52 @@
+{
+  "steps": [
+    { "do": "print", "text": "== check 3: YUY2 640x480 source, set_output 640x360 fill -> a new consumer asking 640x360 gets a cropped 640x360 picture" },
+    { "do": "start",
+      "source": {
+        "video_device_id": null, "res_type": "custom", "resolution": "640x480", "frame_interval": 333333,
+        "video_format": "yuy2", "color_space": "default", "color_range": "default", "buffering": "auto",
+        "flip_vertically": false, "autorotation": true, "hw_decode": true, "deactivate_when_not_showing": false
+      },
+      "output": { "resolution": "source", "fps": "source", "fit": "fit", "background_color": 4278190080, "extra_sizes": true },
+      "controls": {}, "chain": [] },
+    { "do": "wait_state", "state": "live", "timeout": 15, "label": "start -> live" },
+    { "do": "header" },
+    { "do": "set_output", "output": { "resolution": "640x360", "fps": "source", "fit": "fill", "background_color": 4278190080, "extra_sizes": true } },
+    { "do": "sleep", "seconds": 1 },
+    { "do": "header" },
+    { "do": "consume", "seconds": 4, "size": "640x360", "format": "nv12", "label": "640x360 fill", "dump": "fill_640x360.png", "gain": 10 },
+    { "do": "set_output", "output": { "resolution": "640x360", "fps": "source", "fit": "fit", "background_color": 4278190080, "extra_sizes": true } },
+    { "do": "sleep", "seconds": 1 },
+    { "do": "consume", "seconds": 4, "size": "640x360", "format": "nv12", "label": "640x360 fit", "dump": "fit_640x360.png", "gain": 10 },
+    { "do": "stop" },
+    { "do": "wait_state", "state": "stopped", "timeout": 5, "label": "stop -> stopped" },
+
+    { "do": "print", "text": "== check 5: deactivate_when_not_showing, window hidden" },
+    { "do": "window", "visible": true },
+    { "do": "start",
+      "source": {
+        "video_device_id": null, "res_type": "custom", "resolution": "1280x720", "frame_interval": 333333,
+        "video_format": "mjpeg", "color_space": "default", "color_range": "default", "buffering": "auto",
+        "flip_vertically": false, "autorotation": true, "hw_decode": true, "deactivate_when_not_showing": true
+      },
+      "output": { "resolution": "1280x720", "fps": "source", "fit": "fit", "background_color": 4278190080, "extra_sizes": true },
+      "controls": {}, "chain": [] },
+    { "do": "wait_state", "state": "live", "timeout": 15, "label": "start with the window visible -> live" },
+    { "do": "sleep", "seconds": 2 },
+    { "do": "window", "visible": false },
+    { "do": "wait_state", "state": "standby", "reason_contains": "idle", "timeout": 10, "max": 6.0, "label": "window hidden, no consumer -> standby (5 s rule)" },
+    { "do": "run", "cmd": "target\\release\\examples\\capture_probe.exe", "args": ["open", "--device", "0", "--seconds", "3"], "label": "capture_probe open in standby", "wait": true },
+    { "do": "consume", "seconds": 9, "size": "1280x720", "format": "nv12", "label": "consumer wakes the engine", "background": true },
+    { "do": "wait_state", "state": "live", "timeout": 10, "max": 3.0, "label": "consumer attaches -> live" },
+    { "do": "sleep", "seconds": 2 },
+    { "do": "stats_report", "label": "stats with a consumer attached" },
+    { "do": "join" },
+    { "do": "sleep", "seconds": 2 },
+    { "do": "stats_report", "label": "stats after the consumer left" },
+    { "do": "wait_state", "state": "standby", "reason_contains": "idle", "timeout": 10, "label": "consumer left -> standby again" },
+    { "do": "run", "cmd": "target\\release\\examples\\capture_probe.exe", "args": ["open", "--device", "0", "--seconds", "3"], "label": "capture_probe open in standby again", "wait": true },
+    { "do": "window", "visible": true },
+    { "do": "wait_state", "state": "live", "timeout": 10, "max": 3.0, "label": "window shown -> live" },
+    { "do": "sleep", "seconds": 1 }
+  ]
+}

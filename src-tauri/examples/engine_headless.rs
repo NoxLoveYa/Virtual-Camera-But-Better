@@ -796,6 +796,7 @@ fn run() -> Result<(), String> {
             fps: a.out_fps,
             fit: a.fit,
             background: [0, 0, 0],
+            extra_sizes: true,
         },
         flip_vertical: a.flip,
         color: if a.synthetic {
@@ -804,6 +805,7 @@ fn run() -> Result<(), String> {
             a.color
         },
         readback: a.readback,
+        deactivate_when_not_showing: false,
     };
 
     // ---- start (the camera may be held by another process for a moment)

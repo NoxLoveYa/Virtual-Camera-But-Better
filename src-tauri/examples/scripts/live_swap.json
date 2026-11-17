@@ -1,0 +1,53 @@
+{
+  "steps": [
+    { "do": "print", "text": "== check 1: Custom 1280x720, 30 fps, MJPEG -> live, a consumer reads moving frames" },
+    { "do": "start",
+      "source": {
+        "video_device_id": null, "res_type": "custom", "resolution": "1280x720", "frame_interval": 333333,
+        "video_format": "mjpeg", "color_space": "default", "color_range": "default", "buffering": "auto",
+        "flip_vertically": false, "autorotation": true, "hw_decode": true, "deactivate_when_not_showing": false
+      },
+      "output": { "resolution": "1280x720", "fps": "source", "fit": "fit", "background_color": 4278190080, "extra_sizes": true },
+      "controls": {}, "chain": [] },
+    { "do": "wait_state", "state": "live", "timeout": 15, "label": "start -> live" },
+    { "do": "consume", "seconds": 19, "size": "1280x720", "label": "consumer across the whole script", "dump": "live_before.png", "background": true },
+    { "do": "sleep", "seconds": 3 },
+    { "do": "stats_report", "label": "stats while live (3 s)" },
+    { "do": "header" },
+
+    { "do": "print", "text": "== check 2: set_source to YUY2 640x480 -> reopens within 2 s, the consumer keeps receiving frames" },
+    { "do": "set_source",
+      "source": {
+        "video_device_id": null, "res_type": "custom", "resolution": "640x480", "frame_interval": 333333,
+        "video_format": "yuy2", "color_space": "default", "color_range": "default", "buffering": "auto",
+        "flip_vertically": false, "autorotation": true, "hw_decode": true, "deactivate_when_not_showing": false
+      } },
+    { "do": "wait_state", "state": "live", "timeout": 10, "max": 2.0, "label": "set_source reopen" },
+    { "do": "sleep", "seconds": 3 },
+
+    { "do": "print", "text": "== check 4: pause -> 'Camera paused' slate, resume -> video" },
+    { "do": "pause", "on": true },
+    { "do": "sleep", "seconds": 2 },
+    { "do": "header" },
+    { "do": "pause", "on": false },
+    { "do": "sleep", "seconds": 2 },
+    { "do": "header" },
+
+    { "do": "print", "text": "== check 4b: stop -> slate, start -> video" },
+    { "do": "stop" },
+    { "do": "wait_state", "state": "stopped", "timeout": 5, "label": "stop -> stopped" },
+    { "do": "sleep", "seconds": 2 },
+    { "do": "header" },
+    { "do": "start",
+      "source": {
+        "video_device_id": null, "res_type": "custom", "resolution": "1280x720", "frame_interval": 333333,
+        "video_format": "mjpeg", "color_space": "default", "color_range": "default", "buffering": "auto",
+        "flip_vertically": false, "autorotation": true, "hw_decode": true, "deactivate_when_not_showing": false
+      },
+      "output": { "resolution": "1280x720", "fps": "source", "fit": "fit", "background_color": 4278190080, "extra_sizes": true },
+      "controls": {}, "chain": [] },
+    { "do": "wait_state", "state": "live", "timeout": 15, "label": "restart -> live" },
+    { "do": "sleep", "seconds": 2 },
+    { "do": "join" }
+  ]
+}
