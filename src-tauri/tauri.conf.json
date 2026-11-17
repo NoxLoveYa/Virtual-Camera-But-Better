@@ -32,8 +32,9 @@
     "targets": ["nsis"],
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.ico"],
     "resources": { "../target/vcam-stage/better_cam_vcam.dll": "vcam/better_cam_vcam.dll" },
+    "licenseFile": "../LICENSE",
     "windows": {
-      "nsis": { "installMode": "perMachine" }
+      "nsis": { "installMode": "perMachine", "installerHooks": "./windows/hooks.nsh" }
     }
   }
 }
