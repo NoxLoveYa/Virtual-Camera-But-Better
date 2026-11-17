@@ -1,8 +1,7 @@
-import type { CSSProperties } from "react";
 import { useStore } from "../store";
-import { FILTERS, isSelect, type FilterCfg } from "../filters/schema";
+import { FILTERS, type FilterCfg } from "../filters/schema";
 import { Icon } from "./Icon";
-import { Select } from "./Select";
+import { ParamField } from "./ParamField";
 
 interface Props {
   filter: FilterCfg;
@@ -16,6 +15,7 @@ export function FilterCard({ filter, index, count, onDragStart, onDrop }: Props)
   const { toggleFilter, removeFilter, moveFilter, setParam, collapsed, toggleCollapsed } = useStore();
   const def = FILTERS[filter.kind];
   const folded = !!collapsed[filter.id];
+  const error = useStore((s) => s.filterErrors[filter.id]);
 
   return (
     <li className={`step${filter.enabled ? " on" : ""}`} onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
@@ -53,41 +53,16 @@ export function FilterCard({ filter, index, count, onDragStart, onDrop }: Props)
             <Icon name="close" />
           </button>
         </div>
+        {error && (
+          <p className="filter-error" role="alert">
+            {error}
+          </p>
+        )}
         {def.params.length > 0 && !folded && (
-          <div className="params">
-            {def.params.map((p) => {
-              const value = filter.params[p.key] ?? p.def;
-              if (isSelect(p)) {
-                return (
-                  <label key={p.key}>
-                    {p.label}
-                    <Select value={String(value)} options={p.options} onChange={(v) => setParam(filter.id, p.key, v)} />
-                  </label>
-                );
-              }
-              const fill = ((Number(value) - p.min) / (p.max - p.min)) * 100;
-              return (
-                <label key={p.key}>
-                  <span>
-                    {p.label}
-                    <b>
-                      {Number(value).toFixed(p.step < 1 ? (p.step < 0.1 ? 2 : 1) : 0)}
-                      {p.unit ? ` ${p.unit}` : ""}
-                    </b>
-                  </span>
-                  <input
-                    type="range"
-                    style={{ "--p": `${fill}%` } as CSSProperties}
-                    min={p.min}
-                    max={p.max}
-                    step={p.step}
-                    value={Number(value)}
-                    onChange={(e) => setParam(filter.id, p.key, Number(e.target.value))}
-                    onDoubleClick={() => setParam(filter.id, p.key, p.def)}
-                  />
-                </label>
-              );
-            })}
+          <div className={`params${def.layout ? ` layout-${def.layout}` : ""}`}>
+            {def.params.map((p) => (
+              <ParamField key={p.key} def={p} params={filter.params} onChange={(key, value) => setParam(filter.id, key, value)} />
+            ))}
           </div>
         )}
       </div>

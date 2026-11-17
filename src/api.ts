@@ -1,6 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { FilterCfg } from "./filters/schema";
+import { presetChain, presetFile } from "./filters/chain";
 import type { CameraInfo, ControlInfo, OutputCfg, SourceCfg } from "./camera/schema";
 
 /** The changed controls of the selected camera, as `start_engine` and `set_source` take them (see `controlsRecord`). */
@@ -49,12 +50,19 @@ export const api = {
   setAutostart: (on: boolean) => invoke<void>("set_autostart", { on }),
   launchedAtStartup: () => invoke<boolean>("launched_at_startup"),
   setCloseToTray: (on: boolean) => invoke<void>("set_close_to_tray", { on }),
+  /** The whole chain, cheap enough for every slider step; applies before the next frame, also while the engine is stopped. */
+  setChain: (chain: FilterCfg[]) => invoke<void>("set_chain", { chain }),
   listPresets: () => invoke<string[]>("list_presets"),
-  savePreset: (name: string, chain: FilterCfg[]) => invoke<void>("save_preset", { name, chain }),
-  loadPreset: (name: string) => invoke<FilterCfg[]>("load_preset", { name }),
+  /** Writes the preset file of plan 5.4 (no ids). */
+  savePreset: (name: string, chain: FilterCfg[]) => invoke<void>("save_preset", { name, preset: presetFile(chain) }),
+  /** The chain of the preset file (the object, or the old bare array), normalized, with fresh ids. */
+  loadPreset: (name: string) => invoke<unknown>("load_preset", { name }).then(presetChain),
   deletePreset: (name: string) => invoke<void>("delete_preset", { name }),
   onEngineState: (cb: (s: EngineState) => void) => listen<EngineState>("engine-state", (e) => cb(e.payload)),
   onEngineError: (cb: (msg: string) => void) => listen<string>("engine-error", (e) => cb(e.payload)),
+  /** A filter failed and is bypassed until it recovers (not fatal). `id` is the card's id. */
+  onFilterError: (cb: (e: { id: string; message: string }) => void) =>
+    listen<{ id: string; message: string }>("filter-error", (e) => cb(e.payload)),
   onStats: (cb: (s: Stats) => void) => listen<Stats>("stats", (e) => cb(e.payload)),
   onDevicesChanged: (cb: () => void) => listen("devices-changed", () => cb()),
   /** About once a second while the camera is open and a control is on Auto, and after the stored values were re-applied. */

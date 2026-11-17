@@ -10,7 +10,7 @@ interface Props {
   align?: "left" | "right";
   /** Make the panel at least as wide as the anchor (for dropdowns). */
   matchWidth?: boolean;
-  role?: "menu" | "listbox";
+  role?: "menu" | "listbox" | "dialog";
   className?: string;
 }
 

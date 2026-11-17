@@ -33,6 +33,8 @@ interface Saved {
   /** Only the camera controls the user changed, per camera. Re-applied by the engine on every open. */
   controls: StoredControls;
   chain: FilterCfg[];
+  /** Filter cards folded in the chain, by filter id (ids are saved with the chain, so this survives a restart). */
+  collapsed: Record<string, boolean>;
   closeToTray: boolean;
   /** Whether the "launch on startup" default has been applied once; after that the OS entry is the truth. */
   autostartDefaulted: boolean;
@@ -67,6 +69,7 @@ const loadSaved = (): Saved => {
     output: DEFAULT_OUTPUT,
     controls: {},
     chain: defaultChain(),
+    collapsed: {},
     closeToTray: false,
     autostartDefaulted: false,
     activePreset: null,
@@ -77,11 +80,14 @@ const loadSaved = (): Saved => {
   try {
     const s = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "");
     if (s && typeof s === "object") {
+      const chain = Array.isArray(s.chain) ? normalizeChain(s.chain) : fresh.chain;
+      const folded = s.collapsed && typeof s.collapsed === "object" ? (s.collapsed as Record<string, unknown>) : {};
       return {
         source: normalizeSource(s.source),
         output: normalizeOutput(s.output),
         controls: normalizeControls(s.controls),
-        chain: Array.isArray(s.chain) ? normalizeChain(s.chain) : fresh.chain,
+        chain,
+        collapsed: Object.fromEntries(chain.filter((f) => folded[f.id] === true).map((f) => [f.id, true])),
         closeToTray: s.closeToTray === true,
         autostartDefaulted: s.autostartDefaulted === true,
         activePreset: typeof s.activePreset === "string" ? s.activePreset : null,
@@ -111,7 +117,8 @@ interface State extends Saved {
   /** Bumped on every toast so repeating the same message restarts its timer. */
   noticeSeq: number;
   undo: Snapshot | null;
-  collapsed: Record<string, boolean>;
+  /** What the engine said when a filter failed, by filter id; gone when that filter's entry changes. */
+  filterErrors: Record<string, string>;
   presets: string[];
   /** What the selected camera's controls say now; `null` until they were read. */
   controlInfos: ControlInfo[] | null;
@@ -164,18 +171,63 @@ interface State extends Saved {
 export const useStore = create<State>((set, get) => {
   const persist = () => {
     const { source, output, controls, chain, closeToTray, autostartDefaulted, activePreset, presetBaseline, wasRunning, previewOn } = get();
+    // Only the folded cards that still exist; entries of removed filters and "expanded" flags are not worth keeping.
+    const folded = get().collapsed;
+    const collapsed = Object.fromEntries(chain.filter((f) => folded[f.id]).map((f) => [f.id, true]));
     localStorage.setItem(
       STORAGE_KEY,
-      JSON.stringify({ source, output, controls, chain, closeToTray, autostartDefaulted, activePreset, presetBaseline, wasRunning, previewOn }),
+      JSON.stringify({ source, output, controls, chain, collapsed, closeToTray, autostartDefaulted, activePreset, presetBaseline, wasRunning, previewOn }),
     );
   };
 
-  const setChain = (chain: FilterCfg[]) => {
-    set({ chain });
-    persist();
+  const fail = (e: unknown) => set({ error: String(e) });
+
+  // ---- live chain: every change goes to the backend (`set_chain` is cheap, also while the engine is stopped). A drag
+  // makes many changes a frame; they are folded into one call per animation frame, one call in flight at a time, and the
+  // last call always carries the newest chain.
+  let chainDirty = false;
+  let chainQueued = false;
+  let chainInflight = false;
+  const sendChain = () => {
+    if (chainInflight || !chainDirty) return;
+    chainDirty = false;
+    chainInflight = true;
+    api
+      .setChain(get().chain)
+      .catch(fail)
+      .finally(() => {
+        chainInflight = false;
+        if (chainDirty) pushChain();
+      });
+  };
+  const pushChain = () => {
+    chainDirty = true;
+    if (chainQueued) return;
+    chainQueued = true;
+    // A hidden window does not run animation frames; the timer makes sure the call still goes out.
+    const go = () => {
+      if (!chainQueued) return;
+      chainQueued = false;
+      sendChain();
+    };
+    requestAnimationFrame(go);
+    setTimeout(go, 50);
   };
 
-  const fail = (e: unknown) => set({ error: String(e) });
+  const setChain = (chain: FilterCfg[]) => {
+    const before = get().chain;
+    const errors = get().filterErrors;
+    // A failure message is about one version of one entry: it goes when the entry changes or is gone.
+    const kept = Object.fromEntries(
+      Object.entries(errors).filter(([id]) => {
+        const was = before.find((f) => f.id === id);
+        return was !== undefined && chain.find((f) => f.id === id) === was;
+      }),
+    );
+    set({ chain, ...(Object.keys(kept).length !== Object.keys(errors).length && { filterErrors: kept }) });
+    persist();
+    pushChain();
+  };
 
   /** Shows a toast, optionally with an Undo that restores `undo`. */
   const say = (notice: string, undo: Snapshot | null = null) => set((s) => ({ notice, undo, noticeSeq: s.noticeSeq + 1 }));
@@ -230,7 +282,7 @@ export const useStore = create<State>((set, get) => {
       await api.startEngine(source, output, chain, record());
       // The events may already have said more than "standby"; only fill in when they have not.
       if (!running()) set({ engine: { state: "standby", reason: "opening" } });
-      set({ error: null, paused: false, wasRunning: true });
+      set({ error: null, paused: false, wasRunning: true, filterErrors: {} });
       persist();
       return true;
     } catch (e) {
@@ -333,7 +385,7 @@ export const useStore = create<State>((set, get) => {
     notice: null,
     noticeSeq: 0,
     undo: null,
-    collapsed: {},
+    filterErrors: {},
     presets: [],
     controlInfos: null,
     controlsFor: null,
@@ -351,6 +403,10 @@ export const useStore = create<State>((set, get) => {
         useStats.setState({ stats: null });
         persist();
       });
+      await api.onFilterError(({ id, message }) => {
+        // Only for a card that exists; the card shows it until its entry changes.
+        if (get().chain.some((f) => f.id === id)) set((s) => ({ filterErrors: { ...s.filterErrors, [id]: message } }));
+      });
       await api.onStats((stats) => useStats.setState({ stats }));
       await api.onDevicesChanged(() => void get().refreshCameras());
       await api.onControlsChanged((infos) => {
@@ -367,7 +423,7 @@ export const useStore = create<State>((set, get) => {
       if (!get().activePreset) {
         const sig = signature(get().chain);
         for (const name of presets) {
-          const saved = await api.loadPreset(name).then(normalizeChain).catch(() => null);
+          const saved = await api.loadPreset(name).catch(() => null);
           if (saved && signature(saved) === sig) {
             set({ activePreset: name, presetBaseline: sig });
             break;
@@ -567,8 +623,14 @@ export const useStore = create<State>((set, get) => {
     setParam: (id, key, value) =>
       setChain(get().chain.map((f) => (f.id === id ? { ...f, params: { ...f.params, [key]: value } } : f))),
 
-    toggleCollapsed: (id) => set((s) => ({ collapsed: { ...s.collapsed, [id]: !s.collapsed[id] } })),
-    setAllCollapsed: (on) => set((s) => ({ collapsed: Object.fromEntries(s.chain.map((f) => [f.id, on])) })),
+    toggleCollapsed: (id) => {
+      set((s) => ({ collapsed: { ...s.collapsed, [id]: !s.collapsed[id] } }));
+      persist();
+    },
+    setAllCollapsed: (on) => {
+      set((s) => ({ collapsed: Object.fromEntries(s.chain.map((f) => [f.id, on])) }));
+      persist();
+    },
 
     refreshPresets: async () => set({ presets: await api.listPresets() }),
     savePreset: async (name) => {
@@ -589,7 +651,7 @@ export const useStore = create<State>((set, get) => {
     },
     loadPreset: async (name) => {
       try {
-        const chain = normalizeChain(await api.loadPreset(name));
+        const chain = await api.loadPreset(name);
         const prev = snapshot();
         replaceChain(chain, name, signature(chain));
         say(`Loaded “${name}”`, signature(prev.chain) === signature(chain) ? null : prev);

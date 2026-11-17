@@ -229,12 +229,28 @@ button.ghost:hover:not(:disabled) { color: var(--text); box-shadow: none; border
 .toggle { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 30px; color: var(--dim); cursor: pointer; }
 .toggle:hover { color: var(--text); }
 
-/* Background colour: a field-looking box whose native colour input covers it, so a click or the keyboard opens the picker. */
-.swatch { position: relative; display: flex; align-items: center; gap: 10px; height: 32px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: var(--r); transition: border-color 0.15s, box-shadow 0.15s; }
-.swatch:hover, .swatch:focus-within { border-color: rgba(46, 230, 214, 0.55); box-shadow: var(--glow-soft); }
-.swatch input[type="color"] { position: absolute; inset: 0; width: 100%; height: 100%; padding: 0; border: 0; opacity: 0; cursor: pointer; }
-.swatch .chip { flex: none; width: 18px; height: 18px; border-radius: 2px; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.2); }
+/* Colour field (components/ColorField.tsx): the swatch button looks like a field; the panel is the shared floating menu. */
+.swatch { display: flex; align-items: center; gap: 10px; width: 100%; padding: 0 10px; font-weight: 400; text-align: left; }
+.swatch[aria-expanded="true"] { border-color: rgba(46, 230, 214, 0.55); box-shadow: var(--glow-soft); }
+.swatch .chip, .swatch .chip::after { border-radius: 2px; }
+/* The chip shows the colour (--c) over a checkerboard, so an alpha below 100% reads as see-through. */
+.swatch .chip { position: relative; flex: none; box-sizing: border-box; width: 18px; height: 18px; border: 1px solid rgba(255, 255, 255, 0.2); background: conic-gradient(#4a4f57 25%, #7b818b 0 50%, #4a4f57 0 75%, #7b818b 0) 0 0 / 8px 8px; }
+.swatch .chip::after { content: ""; position: absolute; inset: 0; background: var(--c); }
 .swatch .hex { color: var(--dim); font-variant-numeric: tabular-nums; }
+.color-pop { width: 248px; min-width: 0; padding: 10px; }
+.cf { display: flex; flex-direction: column; gap: 10px; }
+.cf-top { display: grid; grid-template-columns: minmax(0, 1fr) 44px; gap: 8px; }
+.cf-hex { min-width: 0; font-variant-numeric: tabular-nums; }
+.cf-hex.bad, .combo input.bad { border-color: var(--danger); }
+input[type="color"] { padding: 3px; cursor: pointer; }
+input[type="color"]::-webkit-color-swatch-wrapper { padding: 0; }
+input[type="color"]::-webkit-color-swatch { border: 0; border-radius: 2px; }
+.cf-presets { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 6px; }
+.cf-preset { height: 26px; padding: 0; border-radius: 3px; }
+.cf-preset[aria-pressed="true"] { outline: 2px solid var(--accent); outline-offset: 1px; }
+.cf-alpha { display: flex; flex-direction: column; gap: 6px; color: var(--dim); font-size: 12px; }
+.cf-alpha > span { display: flex; justify-content: space-between; }
+.cf-alpha b { color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; }
 
 /* ---------- stats (footer line) ---------- */
 .stats { overflow: hidden; color: var(--dim); font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
@@ -348,10 +364,26 @@ button.ghost:hover:not(:disabled) { color: var(--text); box-shadow: none; border
 
 .params { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px 28px; margin-top: 12px; transition: opacity 0.2s; }
 .step:not(.on) .params { opacity: 0.4; }
-.params label { display: flex; flex-direction: column; gap: 6px; color: var(--dim); font-size: 12px; }
-.params label > span { display: flex; justify-content: space-between; }
+.params label, .params .pf { display: flex; flex-direction: column; gap: 6px; min-width: 0; color: var(--dim); font-size: 12px; }
+.params label > span, .params .pf > span { display: flex; justify-content: space-between; }
 .params label b { color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; }
 .params small { color: var(--faint); }
+/* A switch row: caption left, switch right, an optional hint on its own line. */
+.params label.pf-row { flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; min-height: 28px; cursor: pointer; }
+.params label.pf-row > .pf-hint { flex-basis: 100%; }
+/* A path param before the file picker exists (components/ParamField.tsx). */
+.pf-path { display: flex; align-items: center; min-height: 32px; padding: 6px 10px; color: var(--faint); border: 1px dashed var(--line-strong); border-radius: var(--r); opacity: 0.7; }
+/* Card layout hook: `.params.layout-<name>` (FilterDef.layout); every field carries data-key="<param key>". */
+/* Integer box (components/NumberField.tsx) */
+.num-field { display: flex; align-items: center; gap: 4px; }
+.num-field input { flex: 1; min-width: 0; text-align: center; font-variant-numeric: tabular-nums; }
+.num-step { flex: none; width: 32px; padding: 0; }
+.num-unit { flex: none; color: var(--faint); }
+/* Select with a "Custom…" text box (components/ComboField.tsx) */
+.combo { display: flex; flex-direction: column; gap: 8px; }
+.combo input { width: 100%; min-width: 0; }
+/* A filter that failed, inside its card */
+.filter-error { margin: 10px 0 0; padding: 8px 12px; color: var(--text); font-size: 12px; border-left: 2px solid var(--danger); background: rgba(255, 92, 108, 0.08); overflow-wrap: anywhere; }
 
 input[type="range"] { appearance: none; width: 100%; height: 16px; margin: 0; background: transparent; cursor: pointer; }
 input[type="range"]::-webkit-slider-runnable-track {

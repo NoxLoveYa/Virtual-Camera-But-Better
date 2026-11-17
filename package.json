@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "tauri": "tauri",
+    "schema:export": "node scripts/export-schema.mjs",
     "vcam:build": "cargo build -p vcam-source --release"
   },
   "dependencies": {

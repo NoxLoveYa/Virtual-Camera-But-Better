@@ -194,19 +194,87 @@ pub fn list_presets(app: AppHandle) -> Result<Vec<String>, String> {
     Ok(v)
 }
 
+/// The preset object of plan 5.4 around a chain list: `{ "app", "version", "chain" }`.
+fn preset_object(chain: Vec<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({ "app": "better-cam", "version": 1, "chain": chain })
+}
+
+/// What `save_preset` writes: the chain of the given preset object without ids (presets hold the filters only, never
+/// device controls and never a camera section).
+fn preset_to_write(preset: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let list = preset.get("chain").and_then(|c| c.as_array()).ok_or("a preset needs a \"chain\" list")?;
+    let chain = list
+        .iter()
+        .map(|f| {
+            let mut f = f.as_object().cloned().ok_or("every filter in a preset must be an object")?;
+            f.remove("id");
+            Ok(serde_json::Value::Object(f))
+        })
+        .collect::<Result<Vec<_>, &str>>()?;
+    Ok(preset_object(chain))
+}
+
+/// What `load_preset` returns for the file's content: the object format, or the older bare array wrapped in it. Other
+/// sections (a future `camera`) are ignored.
+fn preset_from_file(content: serde_json::Value) -> Result<serde_json::Value, String> {
+    match content {
+        serde_json::Value::Array(chain) => Ok(preset_object(chain)),
+        serde_json::Value::Object(mut o) => match o.remove("chain") {
+            Some(serde_json::Value::Array(chain)) => Ok(preset_object(chain)),
+            _ => Err("this preset file has no \"chain\" list".into()),
+        },
+        _ => Err("this file is not a Better Cam preset".into()),
+    }
+}
+
 #[tauri::command]
-pub fn save_preset(app: AppHandle, name: String, chain: Vec<serde_json::Value>) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(&chain).map_err(|e| e.to_string())?;
+pub fn save_preset(app: AppHandle, name: String, preset: serde_json::Value) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(&preset_to_write(&preset)?).map_err(|e| e.to_string())?;
     std::fs::write(preset_path(&app, &name)?, json).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn load_preset(app: AppHandle, name: String) -> Result<Vec<serde_json::Value>, String> {
+pub fn load_preset(app: AppHandle, name: String) -> Result<serde_json::Value, String> {
     let s = std::fs::read_to_string(preset_path(&app, &name)?).map_err(|e| e.to_string())?;
-    serde_json::from_str(&s).map_err(|e| e.to_string())
+    preset_from_file(serde_json::from_str(&s).map_err(|e| e.to_string())?)
 }
 
 #[tauri::command]
 pub fn delete_preset(app: AppHandle, name: String) -> Result<(), String> {
     std::fs::remove_file(preset_path(&app, &name)?).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_saved_preset_is_the_object_without_ids_or_other_sections() {
+        let given = json!({
+            "app": "other", "version": 9, "camera": { "gain": 3 },
+            "chain": [{ "id": "a1", "kind": "color_filter", "enabled": true, "params": { "saturation": -1 } }]
+        });
+        let want = json!({
+            "app": "better-cam", "version": 1,
+            "chain": [{ "kind": "color_filter", "enabled": true, "params": { "saturation": -1 } }]
+        });
+        assert_eq!(preset_to_write(&given).unwrap(), want);
+        assert!(preset_to_write(&json!({ "chain": "no" })).is_err());
+        assert!(preset_to_write(&json!([1, 2])).is_err());
+        assert!(preset_to_write(&json!({ "chain": [5] })).is_err());
+    }
+
+    #[test]
+    fn loading_accepts_the_object_and_the_old_bare_array() {
+        let entry = json!({ "kind": "color_filter", "enabled": true, "params": {} });
+        let want = json!({ "app": "better-cam", "version": 1, "chain": [entry.clone()] });
+        assert_eq!(preset_from_file(json!([entry.clone()])).unwrap(), want);
+        assert_eq!(preset_from_file(want.clone()).unwrap(), want);
+        // A camera section is ignored.
+        let with_camera = json!({ "app": "better-cam", "version": 1, "chain": [entry], "camera": { "gain": 3 } });
+        assert_eq!(preset_from_file(with_camera).unwrap(), want);
+        assert!(preset_from_file(json!({ "app": "better-cam" })).is_err());
+        assert!(preset_from_file(json!("text")).is_err());
+    }
 }

@@ -3,11 +3,10 @@ import {
   FIT_OPTIONS,
   OUTPUT_FPS_OPTIONS,
   OUTPUT_RESOLUTION_OPTIONS,
-  abgrToHex,
-  hexToAbgr,
   type FitMode,
   type Option,
 } from "../camera/schema";
+import { ColorField } from "./ColorField";
 import { Field } from "./Field";
 import { Select } from "./Select";
 import { ToggleRow } from "./ToggleRow";
@@ -19,7 +18,6 @@ const withCurrent = (options: Option[], value: string): Option[] =>
 export function OutputPanel() {
   const output = useStore((s) => s.output);
   const { patchOutput, setBackground } = useStore.getState();
-  const hex = abgrToHex(output.background_color);
 
   return (
     <section className="panel output" aria-label="Output">
@@ -43,12 +41,8 @@ export function OutputPanel() {
           <Select value={output.fit} options={FIT_OPTIONS} onChange={(v) => patchOutput({ fit: v as FitMode })} />
         </Field>
         <Field label="Background">
-          {/* A later phase swaps this for the full ColorField popover. */}
-          <span className="swatch">
-            <input type="color" value={hex} aria-label="Background color" onChange={(e) => setBackground(hexToAbgr(e.target.value))} />
-            <span className="chip" style={{ background: hex }} />
-            <span className="hex">{hex}</span>
-          </span>
+          {/* No alpha: the background stays opaque, ColorField keeps the alpha byte (0xFF) as it is. */}
+          <ColorField value={output.background_color} onChange={setBackground} label="Background color" />
         </Field>
       </div>
       <div className="toggles">
