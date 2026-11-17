@@ -2058,6 +2058,8 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                 let cfg = lock(&shared.chain).clone();
                 chain.apply(renderer, &cfg);
             }
+            // The filters that scale to the "base (canvas) resolution" use the output size.
+            chain.set_canvas((target.width, target.height));
             let rgba = chain.run(renderer, rgba)?;
             let fitted = stage.run(
                 &rgba,

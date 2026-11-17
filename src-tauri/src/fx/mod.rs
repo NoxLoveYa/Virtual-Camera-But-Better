@@ -18,7 +18,12 @@
 
 pub mod assets;
 pub mod color;
+pub mod geometry;
+pub mod keys;
+pub mod lut;
+pub mod mask;
 pub mod shader_filter;
+pub mod sharpen;
 #[cfg(test)]
 mod tests;
 
@@ -135,6 +140,11 @@ pub trait GpuFilter: Send {
         input
     }
 
+    /// The engine's output resolution (OBS's "base (canvas) resolution"), for a filter that needs it (Scaling/Aspect
+    /// Ratio). The chain calls it before the first frame that follows each change of that size, and on every
+    /// instance made after it was set; a filter that does not care leaves the default. Called on the render thread.
+    fn set_canvas(&mut self, _size: (u32, u32)) {}
+
     /// Prepare what the first `render` would otherwise build while a frame waits (compile shaders into the
     /// renderer's cache). Called for a fresh instance of every registered kind at engine start; see [`warm_up`].
     fn warm_up(&mut self, _r: &Renderer) -> GpuResult<()> {
@@ -149,7 +159,21 @@ pub trait GpuFilter: Send {
 type Maker = fn() -> Box<dyn GpuFilter>;
 
 /// Every filter kind the engine knows: one line per filter.
-const REGISTRY: &[(&str, Maker)] = &[(color::KIND, color::make)];
+const REGISTRY: &[(&str, Maker)] = &[
+    (color::KIND, color::make),
+    // Geometry (P10)
+    (geometry::crop::KIND, geometry::crop::make),
+    (geometry::scale::KIND, geometry::scale::make),
+    (geometry::transform::KIND, geometry::transform::make),
+    // Sharpen and Apply LUT (P11)
+    (sharpen::KIND, sharpen::make),
+    (lut::KIND, lut::make),
+    // Keys and Image Mask/Blend (P12)
+    (keys::CHROMA_KIND, keys::make_chroma),
+    (keys::COLOR_KIND, keys::make_color),
+    (keys::LUMA_KIND, keys::make_luma),
+    (mask::KIND, mask::make),
+];
 
 /// A new filter of this kind, with default settings. `None` for a kind that is not registered.
 pub fn make(kind: &str) -> Option<Box<dyn GpuFilter>> {
@@ -194,6 +218,8 @@ pub struct Chain {
     made: u64,
     errors: Vec<FilterError>,
     assets: Option<AssetClient>,
+    /// The output resolution, once the engine has told ([`Chain::set_canvas`]).
+    canvas: Option<(u32, u32)>,
 }
 
 impl Default for Chain {
@@ -215,6 +241,18 @@ impl Chain {
             made: 0,
             errors: Vec::new(),
             assets: None,
+            canvas: None,
+        }
+    }
+
+    /// Tell the filters the engine's output resolution ([`GpuFilter::set_canvas`]). Call it before [`Chain::run`]
+    /// with the size the output stage will produce; it only reaches the filters when the size changed.
+    pub fn set_canvas(&mut self, size: (u32, u32)) {
+        if self.canvas != Some(size) {
+            self.canvas = Some(size);
+            for slot in &mut self.slots {
+                slot.filter.set_canvas(size);
+            }
         }
     }
 
@@ -239,6 +277,9 @@ impl Chain {
                     Some(mut filter) => {
                         if let Some(a) = &self.assets {
                             filter.attach_assets(a.handle(&c.id));
+                        }
+                        if let Some(size) = self.canvas {
+                            filter.set_canvas(size);
                         }
                         self.made += 1;
                         Slot {

@@ -395,6 +395,28 @@ input[type="color"]::-webkit-color-swatch { border: 0; border-radius: 2px; }
 .pf-clear { flex: none; width: 32px; height: 32px; }
 .params .pf-failure { color: var(--danger); overflow-wrap: anywhere; }
 /* Card layout hook: `.params.layout-<name>` (FilterDef.layout); every field carries data-key="<param key>". */
+/* Crop layout: the four edges around a small frame (top above, left and right at the sides, bottom below). With
+   Relative off, Width takes the place of Right and Height the place of Bottom. */
+.params.layout-crop {
+  grid-template-columns: minmax(124px, 1fr) minmax(112px, 160px) minmax(124px, 1fr);
+  grid-template-areas:
+    "rel rel rel"
+    ". top ."
+    "left frame right"
+    ". bottom .";
+  align-items: center;
+  gap: 12px 20px;
+}
+.layout-crop > [data-key="relative"] { grid-area: rel; }
+.layout-crop > [data-key="top"] { grid-area: top; }
+.layout-crop > [data-key="left"] { grid-area: left; }
+.layout-crop > [data-key="right"], .layout-crop > [data-key="cx"] { grid-area: right; }
+.layout-crop > [data-key="bottom"], .layout-crop > [data-key="cy"] { grid-area: bottom; }
+.layout-crop::before, .layout-crop::after { content: ""; grid-area: frame; align-self: stretch; pointer-events: none; }
+.layout-crop::before { min-height: 56px; border: 1px dashed var(--line-strong); border-radius: var(--r); background: rgba(255, 255, 255, 0.02); }
+.layout-crop::after { margin: 12px 18px; border: 1px solid rgba(46, 230, 214, 0.55); border-radius: 2px; background: var(--accent-soft); }
+/* The long switch caption of Scaling/Aspect Ratio wraps beside its switch instead of pushing the switch to a second line. */
+.params label.pf-row[data-key="undistort"] > span { flex: 1 1 0; min-width: 0; }
 /* Integer box (components/NumberField.tsx) */
 .num-field { display: flex; align-items: center; gap: 4px; }
 .num-field input { flex: 1; min-width: 0; text-align: center; font-variant-numeric: tabular-nums; }

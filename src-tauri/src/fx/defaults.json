@@ -8,5 +8,66 @@
     "opacity": 1,
     "color_multiply": 16777215,
     "color_add": 0
+  },
+  "crop_filter": {
+    "relative": true,
+    "left": 0,
+    "top": 0,
+    "right": 0,
+    "bottom": 0,
+    "cx": 0,
+    "cy": 0
+  },
+  "scale_filter": {
+    "sampling": "bicubic",
+    "resolution": "None",
+    "undistort": false
+  },
+  "transform": {
+    "flip_h": false,
+    "flip_v": false,
+    "rotation": 0
+  },
+  "sharpness_filter": {
+    "sharpness": 0.08
+  },
+  "clut_filter": {
+    "image_path": "",
+    "clut_amount": 1,
+    "passthrough_alpha": false
+  },
+  "chroma_key_filter": {
+    "key_color_type": "green",
+    "key_color": 65280,
+    "similarity": 400,
+    "smoothness": 80,
+    "spill": 100,
+    "opacity": 1,
+    "contrast": 0,
+    "brightness": 0,
+    "gamma": 0
+  },
+  "color_key_filter": {
+    "key_color_type": "green",
+    "key_color": 65280,
+    "similarity": 80,
+    "smoothness": 50,
+    "opacity": 1,
+    "contrast": 0,
+    "brightness": 0,
+    "gamma": 0
+  },
+  "luma_key_filter": {
+    "luma_max": 1,
+    "luma_max_smooth": 0,
+    "luma_min": 0,
+    "luma_min_smooth": 0
+  },
+  "mask_filter": {
+    "type": "mask_color_filter.effect",
+    "image_path": "",
+    "color": 16777215,
+    "opacity": 1,
+    "stretch": false
   }
 }

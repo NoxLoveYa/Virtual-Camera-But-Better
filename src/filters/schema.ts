@@ -98,6 +98,166 @@ const CATALOGUE = {
       { type: "color", key: "color_add", label: "Color Add", def: 0x00000000 },
     ],
   },
+  // Geometry (P10)
+  crop_filter: {
+    label: "Crop/Pad",
+    hint: "Trim edges; negative values add padding",
+    layout: "crop",
+    params: [
+      { type: "bool", key: "relative", label: "Relative", def: true, hint: "Off: a window at Left and Top; a Width or Height of 0 runs to the edge" },
+      { type: "int", key: "left", label: "Left", min: -8192, max: 8192, def: 0 },
+      { type: "int", key: "top", label: "Top", min: -8192, max: 8192, def: 0 },
+      { type: "int", key: "right", label: "Right", min: -8192, max: 8192, def: 0, showIf: { key: "relative", in: [true] } },
+      { type: "int", key: "bottom", label: "Bottom", min: -8192, max: 8192, def: 0, showIf: { key: "relative", in: [true] } },
+      { type: "int", key: "cx", label: "Width", min: 0, max: 8192, def: 0, showIf: { key: "relative", in: [false] } },
+      { type: "int", key: "cy", label: "Height", min: 0, max: 8192, def: 0, showIf: { key: "relative", in: [false] } },
+    ],
+  },
+  scale_filter: {
+    label: "Scaling/Aspect Ratio",
+    hint: "Resize the image or force an aspect ratio",
+    params: [
+      {
+        type: "select",
+        key: "sampling",
+        label: "Scale Filtering",
+        def: "bicubic",
+        options: [
+          { value: "point", label: "Point" },
+          { value: "bilinear", label: "Bilinear" },
+          { value: "bicubic", label: "Bicubic (16 samples)" },
+          { value: "lanczos", label: "Lanczos (32 samples)" },
+          { value: "area", label: "Area (4/6/9 samples)" },
+        ],
+      },
+      {
+        type: "combo",
+        key: "resolution",
+        label: "Resolution",
+        def: "None",
+        options: ["None", "Base (Canvas) Resolution", "16:9", "16:10", "4:3", "1:1"],
+        pattern: /^([1-9]\d{0,4}x[1-9]\d{0,4}|[1-9]\d{0,2}:[1-9]\d{0,2})$/,
+        placeholder: "1280x720 or 4:3",
+        hint: "An aspect ratio keeps the height and sets the width",
+      },
+      {
+        type: "bool",
+        key: "undistort",
+        label: "Undistort center of image when scaling from ultrawide",
+        def: false,
+        showIf: { key: "sampling", in: ["bicubic", "lanczos"] },
+      },
+    ],
+  },
+  transform: {
+    label: "Transform",
+    hint: "Mirror or rotate the image",
+    params: [
+      { type: "bool", key: "flip_h", label: "Flip horizontal (mirror)", def: false },
+      { type: "bool", key: "flip_v", label: "Flip vertical", def: false },
+      { type: "slider", key: "rotation", label: "Rotation", min: -180, max: 180, step: 0.1, def: 0, unit: "°" },
+    ],
+  },
+  sharpness_filter: {
+    label: "Sharpen",
+    hint: "Crisper edges (unsharp mask)",
+    params: [{ type: "slider", key: "sharpness", label: "Sharpness", min: 0, max: 1, step: 0.01, def: 0.08 }],
+  },
+  clut_filter: {
+    label: "Apply LUT",
+    hint: "Color grade with a .cube or .png LUT",
+    params: [
+      { type: "path", key: "image_path", label: "Path", def: "", filter: "lut" },
+      { type: "slider", key: "clut_amount", label: "Amount", min: 0, max: 1, step: 0.0001, def: 1 },
+      { type: "bool", key: "passthrough_alpha", label: "Passthrough Alpha", def: false },
+    ],
+  },
+  // Keys and Image Mask/Blend (P12)
+  chroma_key_filter: {
+    label: "Chroma Key",
+    hint: "Remove a green or blue screen",
+    params: [
+      {
+        type: "select",
+        key: "key_color_type",
+        label: "Key Color Type",
+        def: "green",
+        options: [
+          { value: "green", label: "Green" },
+          { value: "blue", label: "Blue" },
+          { value: "magenta", label: "Magenta" },
+          { value: "custom", label: "Custom Color" },
+        ],
+      },
+      { type: "color", key: "key_color", label: "Key Color", def: 0x0000ff00, showIf: { key: "key_color_type", in: ["custom"] } },
+      { type: "slider", key: "similarity", label: "Similarity (1-1000)", min: 1, max: 1000, step: 1, def: 400, int: true },
+      { type: "slider", key: "smoothness", label: "Smoothness (1-1000)", min: 1, max: 1000, step: 1, def: 80, int: true },
+      { type: "slider", key: "spill", label: "Key Color Spill Reduction (1-1000)", min: 1, max: 1000, step: 1, def: 100, int: true },
+      { type: "slider", key: "opacity", label: "Opacity", min: 0, max: 1, step: 0.0001, def: 1 },
+      { type: "slider", key: "contrast", label: "Contrast", min: -4, max: 4, step: 0.01, def: 0 },
+      { type: "slider", key: "brightness", label: "Brightness", min: -1, max: 1, step: 0.0001, def: 0 },
+      { type: "slider", key: "gamma", label: "Gamma", min: -1, max: 1, step: 0.01, def: 0 },
+    ],
+  },
+  color_key_filter: {
+    label: "Color Key",
+    hint: "Make one color transparent",
+    params: [
+      {
+        type: "select",
+        key: "key_color_type",
+        label: "Key Color Type",
+        def: "green",
+        options: [
+          { value: "green", label: "Green" },
+          { value: "blue", label: "Blue" },
+          { value: "red", label: "Red" },
+          { value: "magenta", label: "Magenta" },
+          { value: "custom", label: "Custom Color" },
+        ],
+      },
+      { type: "color", key: "key_color", label: "Key Color", def: 0x0000ff00, showIf: { key: "key_color_type", in: ["custom"] } },
+      { type: "slider", key: "similarity", label: "Similarity (1-1000)", min: 1, max: 1000, step: 1, def: 80, int: true },
+      { type: "slider", key: "smoothness", label: "Smoothness (1-1000)", min: 1, max: 1000, step: 1, def: 50, int: true },
+      { type: "slider", key: "opacity", label: "Opacity", min: 0, max: 1, step: 0.0001, def: 1 },
+      { type: "slider", key: "contrast", label: "Contrast", min: -4, max: 4, step: 0.01, def: 0 },
+      { type: "slider", key: "brightness", label: "Brightness", min: -1, max: 1, step: 0.0001, def: 0 },
+      { type: "slider", key: "gamma", label: "Gamma", min: -1, max: 1, step: 0.01, def: 0 },
+    ],
+  },
+  luma_key_filter: {
+    label: "Luma Key",
+    hint: "Make dark or bright areas transparent",
+    params: [
+      { type: "slider", key: "luma_max", label: "Luma Max", min: 0, max: 1, step: 0.0001, def: 1 },
+      { type: "slider", key: "luma_max_smooth", label: "Luma Max Smooth", min: 0, max: 1, step: 0.0001, def: 0 },
+      { type: "slider", key: "luma_min", label: "Luma Min", min: 0, max: 1, step: 0.0001, def: 0 },
+      { type: "slider", key: "luma_min_smooth", label: "Luma Min Smooth", min: 0, max: 1, step: 0.0001, def: 0 },
+    ],
+  },
+  mask_filter: {
+    label: "Image Mask/Blend",
+    hint: "Shape or blend the image with a picture",
+    params: [
+      {
+        type: "select",
+        key: "type",
+        label: "Type",
+        def: "mask_color_filter.effect",
+        options: [
+          { value: "mask_color_filter.effect", label: "Alpha Mask (Color Channel)" },
+          { value: "mask_alpha_filter.effect", label: "Alpha Mask (Alpha Channel)" },
+          { value: "blend_mul_filter.effect", label: "Blend (Multiply)" },
+          { value: "blend_add_filter.effect", label: "Blend (Addition)" },
+          { value: "blend_sub_filter.effect", label: "Blend (Subtraction)" },
+        ],
+      },
+      { type: "path", key: "image_path", label: "Path", def: "", filter: "image" },
+      { type: "color", key: "color", label: "Color", def: 0x00ffffff },
+      { type: "slider", key: "opacity", label: "Opacity", min: 0, max: 1, step: 0.0001, def: 1 },
+      { type: "bool", key: "stretch", label: "Stretch Image (discard image aspect ratio)", def: false },
+    ],
+  },
 } satisfies Record<string, FilterDef>;
 
 export type FilterKind = keyof typeof CATALOGUE;

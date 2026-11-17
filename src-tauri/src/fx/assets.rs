@@ -67,6 +67,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //! * [`AssetKind::Lut`]: a file ending in `.cube` becomes [`Asset::Cube`] (parsed table plus its GPU texture);
 //!   any other file is decoded as an image and becomes [`Asset::LutImage`] (pixels only, no texture): the `.png`
 //!   LUT layouts are for the filter to build, with [`create_texture3d_rgba8`] and friends.
+//! * [`AssetKind::ColorLut`]: what the Apply LUT filter reads. A `.cube` file becomes [`Asset::Cube`] as above; a
+//!   picture is cut into a 64 cubed table the way OBS does it ([`png_lut_to_cube`]) and becomes an [`Asset::Cube`]
+//!   too, so a picture that is not a table fails to load with a message instead of reaching the render thread.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -117,6 +120,9 @@ pub enum AssetKind {
     Image,
     /// A colour lookup table: a `.cube` file, or a picture (`.png`) holding one.
     Lut,
+    /// A colour lookup table ready to use: a `.cube` file or a picture holding a 64 cubed table (see
+    /// [`png_lut_to_cube`]), always loaded as [`Asset::Cube`]. A picture of any other layout fails to load.
+    ColorLut,
 }
 
 /// A loaded asset. Cheap to share: hold the `Arc` the handle gives you.
@@ -737,6 +743,63 @@ pub fn create_texture3d_rgba16f(
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// Picture tables
+
+/// Entries per axis of a table held in a picture (`LUT_WIDTH` in OBS's color-grade-filter.c).
+pub const PNG_LUT_SIZE: u32 = 64;
+
+/// Cut a picture into the 64 cubed table it holds, the way OBS's `make_clut_texture_png` does.
+///
+/// OBS accepts a picture whose width and height are both multiples of 64 and whose pixel count is 64 cubed
+/// (262144): 512 x 512 in practice. The picture is a grid of 64 x 64 tiles, `width / 64` tiles across and
+/// `height / 64` down; tile `z` (the blue index) sits at column `z % (width / 64)` and row `z / (height / 64)`, and
+/// within a tile the pixel at column `x`, row `y` is the entry for red `x`, green `y`. For 512 x 512 that is the usual
+/// 8 x 8 grid, left to right, top to bottom. For the other shapes that pass OBS's size test (for example 1024 x 256)
+/// OBS's own placement formula reads outside the picture, or repeats tiles: the same formula is used here, and a
+/// picture it would read outside of is refused.
+///
+/// The table values are the pixels' code values divided by 255 (the picture is sRGB, as OBS samples it through an
+/// sRGB view); alpha is ignored. The domain is 0 to 1, so the lookup constants are OBS's PNG ones
+/// (`scale = 1 - 1/64`, `offset = 0.5/64`).
+pub fn png_lut_to_cube(img: &DecodedImage) -> Result<CubeLut, String> {
+    let n = PNG_LUT_SIZE;
+    let (w, h) = (img.width, img.height);
+    let refused = || {
+        format!("the picture is {w}x{h}; a LUT picture is 512x512 pixels holding a {n}x{n}x{n} table")
+    };
+    if w % n != 0 || h % n != 0 || w as u64 * h as u64 != (n as u64).pow(3) {
+        return Err(refused());
+    }
+    if img.rgba.len() != w as usize * h as usize * 4 {
+        return Err("the picture is damaged".into());
+    }
+    let (macro_w, macro_h) = (w / n, h / n);
+    let mut data = Vec::with_capacity((n as usize).pow(3));
+    for z in 0..n {
+        let z_x = (z % macro_w) * n;
+        let z_y = (z / macro_h) * n;
+        if z_x + n > w || z_y + n > h {
+            return Err(refused());
+        }
+        for y in 0..n {
+            let row = w as usize * (z_y + y) as usize;
+            for x in 0..n {
+                let i = 4 * (row + (z_x + x) as usize);
+                let px = &img.rgba[i..i + 3];
+                data.push([px[0], px[1], px[2]].map(|v| v as f32 / 255.0));
+            }
+        }
+    }
+    Ok(CubeLut {
+        dim: LutDim::ThreeD,
+        size: n,
+        domain_min: [0.0; 3],
+        domain_max: [1.0; 3],
+        data,
+    })
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // Loading one file
 
 fn is_cube(path: &Path) -> bool {
@@ -757,7 +820,7 @@ pub fn load_asset(gpu: &GpuDevice, kind: AssetKind, path: &Path) -> Result<Asset
                 srv,
             }))
         }
-        AssetKind::Lut if is_cube(path) => {
+        AssetKind::Lut | AssetKind::ColorLut if is_cube(path) => {
             let len = check_file(path)?;
             if len > MAX_CUBE_FILE_BYTES {
                 return Err(format!(
@@ -773,6 +836,11 @@ pub fn load_asset(gpu: &GpuDevice, kind: AssetKind, path: &Path) -> Result<Asset
             Ok(Asset::Cube(CubeAsset { lut, srv }))
         }
         AssetKind::Lut => Ok(Asset::LutImage(decode_image(path)?)),
+        AssetKind::ColorLut => {
+            let lut = png_lut_to_cube(&decode_image(path)?)?;
+            let srv = lut.create_texture(gpu, true).map_err(|e| e.to_string())?;
+            Ok(Asset::Cube(CubeAsset { lut, srv }))
+        }
     }
 }
 
