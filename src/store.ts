@@ -126,6 +126,8 @@ interface State extends Saved {
   undo: Snapshot | null;
   /** What the engine said when a filter failed, by filter id; gone when that filter's entry changes. */
   filterErrors: Record<string, string>;
+  /** Lines the engine shows on a card that are not errors ("Loading model…"), by filter id; gone when the engine stops or the card is. */
+  filterStatus: Record<string, string>;
   presets: string[];
   /** What the selected camera's controls say now; `null` until they were read. */
   controlInfos: ControlInfo[] | null;
@@ -144,6 +146,8 @@ interface State extends Saved {
   nvidia: NvidiaStatus | null;
   /** The installed RTX GPU; `null` when there is none (or until it was read). Filter cards offer the install only with one. */
   gpu: NvidiaGpu | null;
+  /** `gpu` and `nvidia` have been read once, so a `null` GPU means "none" and not "not asked yet". */
+  gpuRead: boolean;
   /** The install dialog is open. */
   nvidiaPrompt: boolean;
   /** The install is running; `stage` is `download`, `verify` or `install`. */
@@ -252,9 +256,10 @@ export const useStore = create<State>((set, get) => {
   const setChain = (chain: FilterCfg[]) => {
     const before = get().chain;
     const errors = get().filterErrors;
-    // A failure message is about one version of one entry: it goes when the entry changes or is gone. One exception:
+    // A failure message is about one version of one entry: it goes when the entry changes or is gone. Two exceptions:
     // "could not load <file>" stays while the file's path is the same (a slider moved; the engine tells again only
-    // when the path or the file changes, or when the load works).
+    // when the path or the file changes, or when the load works), and the message of an NVIDIA filter stays until the
+    // engine clears it (it re-checks when the mode or picture size changes, and says so).
     const kept = Object.fromEntries(
       Object.entries(errors).filter(([id, message]) => {
         const was = before.find((f) => f.id === id);
@@ -262,13 +267,21 @@ export const useStore = create<State>((set, get) => {
         if (was === undefined || now === undefined) return false;
         if (was === now) return true;
         return (
-          message.startsWith("could not load ") &&
           was.kind === now.kind &&
-          FILTERS[now.kind].params.every((p) => p.type !== "path" || was.params[p.key] === now.params[p.key])
+          (FILTERS[now.kind].rtx === true ||
+            (message.startsWith("could not load ") &&
+              FILTERS[now.kind].params.every((p) => p.type !== "path" || was.params[p.key] === now.params[p.key])))
         );
       }),
     );
-    set({ chain, ...(Object.keys(kept).length !== Object.keys(errors).length && { filterErrors: kept }) });
+    // A status line belongs to the card: it goes with it.
+    const statuses = get().filterStatus;
+    const keptStatus = Object.fromEntries(Object.entries(statuses).filter(([id]) => chain.some((f) => f.id === id)));
+    set({
+      chain,
+      ...(Object.keys(kept).length !== Object.keys(errors).length && { filterErrors: kept }),
+      ...(Object.keys(keptStatus).length !== Object.keys(statuses).length && { filterStatus: keptStatus }),
+    });
     persist();
     pushChain();
   };
@@ -430,6 +443,7 @@ export const useStore = create<State>((set, get) => {
     noticeSeq: 0,
     undo: null,
     filterErrors: {},
+    filterStatus: {},
     presets: [],
     controlInfos: null,
     controlsFor: null,
@@ -440,6 +454,7 @@ export const useStore = create<State>((set, get) => {
     vcamEpoch: 0,
     nvidia: null,
     gpu: null,
+    gpuRead: false,
     nvidiaPrompt: false,
     nvidiaInstall: null,
     nvidiaError: null,
@@ -447,8 +462,9 @@ export const useStore = create<State>((set, get) => {
     refreshNvidia: async () => {
       try {
         const nvidia = await api.nvidiaStatus();
-        set({ nvidia });
-        if (!get().gpu) set({ gpu: await api.nvidiaGpu() });
+        // Both at once, so a card never sees "no GPU" for the moment between the two answers.
+        const gpu = get().gpu ?? (await api.nvidiaGpu());
+        set({ nvidia, gpu, gpuRead: true });
       } catch {
         /* the dialog and the cards keep what they showed; the next focus asks again */
       }
@@ -545,7 +561,7 @@ export const useStore = create<State>((set, get) => {
 
     init: async () => {
       await api.onEngineState((e) => {
-        set({ engine: { state: e.state, reason: e.reason ?? null }, ...(e.state === "stopped" && { paused: false }) });
+        set({ engine: { state: e.state, reason: e.reason ?? null }, ...(e.state === "stopped" && { paused: false, filterStatus: {} }) });
         if (e.state === "stopped") useStats.setState({ stats: null });
       });
       await api.onEngineError((error) => {
@@ -567,6 +583,19 @@ export const useStore = create<State>((set, get) => {
         }
         // Only for a card that exists; the card shows it until its entry changes.
         if (get().chain.some((f) => f.id === id)) set((s) => ({ filterErrors: { ...s.filterErrors, [id]: message } }));
+      });
+      await api.onFilterStatus(({ id, message }) => {
+        // An empty message clears the line. Only a card that exists shows one.
+        if (message === "") {
+          if (id in get().filterStatus) {
+            set((s) => {
+              const { [id]: _gone, ...rest } = s.filterStatus;
+              return { filterStatus: rest };
+            });
+          }
+          return;
+        }
+        if (get().chain.some((f) => f.id === id)) set((s) => ({ filterStatus: { ...s.filterStatus, [id]: message } }));
       });
       await api.onStats((stats) => useStats.setState({ stats }));
       await api.onNvidiaInstall((p) => get().nvidiaInstall && set({ nvidiaInstall: p }));

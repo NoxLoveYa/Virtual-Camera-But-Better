@@ -62,6 +62,23 @@ pub struct FilterError {
     pub message: String,
 }
 
+/// What a filter's card says besides a failed frame (`filter-status` event): a line that is not an error, like
+/// "Loading model…". An empty `message` clears the line.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FilterStatus {
+    pub id: String,
+    pub message: String,
+}
+
+/// A message a filter hands to its card ([`GpuFilter::take_notes`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Note {
+    /// Progress, not a problem: becomes a [`FilterStatus`]. Empty clears it.
+    Status(String),
+    /// A problem the filter works around by passing the picture through: becomes a [`FilterError`]. Empty clears it.
+    Error(String),
+}
+
 /// Parse the `chain` argument of `start_engine` and `set_chain`: a JSON array of [`FilterCfg`]. `null` is an empty
 /// chain. A malformed entry rejects the whole chain with a message that names it.
 pub fn parse_chain(value: &Value) -> Result<Vec<FilterCfg>, String> {
@@ -156,6 +173,11 @@ pub trait GpuFilter: Send {
     /// Render `input` into `output` (a pooled texture of the size [`GpuFilter::output_size`] returned). An error
     /// bypasses the filter for this frame.
     fn render(&mut self, r: &Renderer, input: &RgbaTexture, output: &RgbaTexture) -> GpuResult<()>;
+
+    /// Messages for the filter's card that arose since the last call (append them to `out`). The chain asks after
+    /// every frame the filter rendered. A filter that works around a problem by passing the picture through (so its
+    /// `render` succeeds) reports it here instead of failing.
+    fn take_notes(&mut self, _out: &mut Vec<Note>) {}
 }
 
 type Maker = fn() -> Box<dyn GpuFilter>;
@@ -177,6 +199,10 @@ const REGISTRY: &[(&str, Maker)] = &[
     (mask::KIND, mask::make),
     // Auto Adjust (P16, Better Cam's own)
     (auto_adjust::KIND, auto_adjust::make),
+    // NVIDIA Video Effects (P13b)
+    (nvidia::filter::REMOVAL_KIND, nvidia::filter::make_removal),
+    (nvidia::filter::BLUR_KIND, nvidia::filter::make_blur),
+    (nvidia::filter::BACKGROUND_BLUR_KIND, nvidia::filter::make_background_blur),
 ];
 
 /// A new filter of this kind, with default settings. `None` for a kind that is not registered.
@@ -221,6 +247,7 @@ pub struct Chain {
     factory: fn(&str) -> Option<Box<dyn GpuFilter>>,
     made: u64,
     errors: Vec<FilterError>,
+    statuses: Vec<FilterStatus>,
     assets: Option<AssetClient>,
     /// The output resolution, once the engine has told ([`Chain::set_canvas`]).
     canvas: Option<(u32, u32)>,
@@ -244,6 +271,7 @@ impl Chain {
             factory,
             made: 0,
             errors: Vec::new(),
+            statuses: Vec::new(),
             assets: None,
             canvas: None,
         }
@@ -308,6 +336,7 @@ impl Chain {
     /// one, and the failure is queued for [`Chain::take_errors`] unless the filter was already failing. An empty
     /// chain hands the input back untouched.
     pub fn run(&mut self, r: &Renderer, mut image: Pooled) -> GpuResult<Pooled> {
+        let mut notes = Vec::new();
         for slot in self.slots.iter_mut().filter(|s| s.enabled) {
             let (w, h) = slot.filter.output_size((image.width, image.height));
             let out = r.texture(w, h)?;
@@ -327,6 +356,14 @@ impl Chain {
                     }
                 }
             }
+            notes.clear();
+            slot.filter.take_notes(&mut notes);
+            for note in notes.drain(..) {
+                match note {
+                    Note::Status(message) => self.statuses.push(FilterStatus { id: slot.id.clone(), message }),
+                    Note::Error(message) => self.errors.push(FilterError { id: slot.id.clone(), message }),
+                }
+            }
         }
         Ok(image)
     }
@@ -334,6 +371,11 @@ impl Chain {
     /// The failures to report since the last call.
     pub fn take_errors(&mut self) -> Vec<FilterError> {
         std::mem::take(&mut self.errors)
+    }
+
+    /// The status lines of the cards to report since the last call (`filter-status`).
+    pub fn take_status(&mut self) -> Vec<FilterStatus> {
+        std::mem::take(&mut self.statuses)
     }
 
     /// Filters in the chain (enabled or not).

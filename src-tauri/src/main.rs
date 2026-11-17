@@ -50,6 +50,7 @@ fn forward_events(app: &AppHandle) -> Arc<dyn better_cam::engine::EventSink> {
             EngineEvent::DevicesChanged => app.emit("devices-changed", ()),
             EngineEvent::Controls(c) => app.emit("controls-changed", c),
             EngineEvent::FilterError(e) => app.emit("filter-error", e),
+            EngineEvent::FilterStatus(s) => app.emit("filter-status", s),
         };
     })
 }

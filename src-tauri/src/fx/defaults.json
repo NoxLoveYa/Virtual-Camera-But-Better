@@ -76,5 +76,16 @@
     "target": 0.45,
     "strength": 1,
     "speed": 0.3
+  },
+  "nv_greenscreen_filter": {
+    "mode": 0,
+    "threshold": 1,
+    "processing_interval": 1
+  },
+  "nv_blur_filter": {
+    "intensity": 0.5
+  },
+  "nv_background_blur_filter": {
+    "intensity": 0.5
   }
 }

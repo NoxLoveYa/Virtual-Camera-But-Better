@@ -126,6 +126,12 @@ export const api = {
    */
   onFilterError: (cb: (e: { id: string; message: string }) => void) =>
     listen<{ id: string; message: string }>("filter-error", (e) => cb(e.payload)),
+  /**
+   * A line for a filter's card that is not an error: "Loading model…" while NVIDIA's model loads (`filter-status`).
+   * `id` is the card's id. An **empty `message`** clears the line.
+   */
+  onFilterStatus: (cb: (e: { id: string; message: string }) => void) =>
+    listen<{ id: string; message: string }>("filter-status", (e) => cb(e.payload)),
   onStats: (cb: (s: Stats) => void) => listen<Stats>("stats", (e) => cb(e.payload)),
   onDevicesChanged: (cb: () => void) => listen("devices-changed", () => cb()),
   /** About once a second while the camera is open and a control is on Auto, and after the stored values were re-applied. */

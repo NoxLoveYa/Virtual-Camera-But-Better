@@ -61,7 +61,7 @@ use crate::gpu::convert::{
 use crate::gpu::output::{FitMode, OutputParams, OutputStage};
 use crate::gpu::pattern;
 use crate::fx::assets::{AssetClient, Assets};
-use crate::fx::{Chain, FilterCfg, FilterError};
+use crate::fx::{Chain, FilterCfg, FilterError, FilterStatus};
 use crate::gpu::{AdapterKind, GpuDevice, GpuError, GpuTimer, Renderer, RgbaTexture};
 use crate::output_writer::{FrameTag, OutputWriter, Published};
 
@@ -388,6 +388,9 @@ pub enum EngineEvent {
     /// (`could not load <file>: <reason>`), and with an **empty `message`** to clear the card's line after a good
     /// load or when the path was cleared.
     FilterError(FilterError),
+    /// A line for a filter's card that is not an error (`filter-status`): "Loading model…" while NVIDIA's model loads.
+    /// An empty `message` clears the line.
+    FilterStatus(FilterStatus),
 }
 
 /// Receives [`EngineEvent`]s on the control thread: return quickly.
@@ -2113,6 +2116,9 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
         // Filters that failed this frame were bypassed; each failure is reported once (the chain keeps count).
         for e in chain.take_errors() {
             emit(shared, EngineEvent::FilterError(e));
+        }
+        for s in chain.take_status() {
+            emit(shared, EngineEvent::FilterStatus(s));
         }
         match rendered_frame {
             Ok(()) => {

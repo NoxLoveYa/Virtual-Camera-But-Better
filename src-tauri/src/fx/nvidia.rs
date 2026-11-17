@@ -9,6 +9,16 @@
 //!   the `Arc` they came from is alive: keep both together.
 //! * [`run_install`] downloads NVIDIA's redistributable, accepts it by a valid NVIDIA signature or by its pinned
 //!   SHA-256 ([`pins`]) and runs it (`install_nvidia.ps1`).
+//!
+//! The three filters (`nv_greenscreen_filter`, `nv_blur_filter`, `nv_background_blur_filter`, plan 4.6) are in the
+//! submodules: [`ffi`] (the raw interface and its layout checks), [`effect`] (owning wrappers and the per-size
+//! [`effect::Pipeline`]) and [`filter`] (the [`crate::fx::GpuFilter`], its loader thread and the card messages).
+
+pub mod effect;
+pub mod ffi;
+pub mod filter;
+#[cfg(test)]
+mod hw_tests;
 
 use libloading::os::windows::{Library, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR};
 use serde::Serialize;
@@ -99,6 +109,11 @@ pub fn parse_smi(output: &str) -> Option<Gpu> {
 /// Asks `nvidia-smi`, which can take a second: call it off the UI thread. A GPU found once is remembered.
 pub fn detect_gpu() -> Option<Gpu> {
     use std::os::windows::process::CommandExt;
+    // Debug builds only: `BETTER_CAM_TEST_NO_RTX` pretends there is no RTX GPU, to look at the cards of a PC without one.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("BETTER_CAM_TEST_NO_RTX").is_some_and(|v| !v.is_empty()) {
+        return None;
+    }
     static FOUND: OnceLock<Gpu> = OnceLock::new();
     if let Some(g) = FOUND.get() {
         return Some(g.clone());
@@ -253,6 +268,8 @@ type GetVersionFn = unsafe extern "C" fn(*mut u32) -> i32;
 pub struct Runtime {
     dir: PathBuf,
     version: u32,
+    /// The functions the filters call, looked up on first use ([`Runtime::api`]).
+    api: OnceLock<Result<ffi::Api, String>>,
     // `videofx` depends on `cvimage`: fields drop in this order.
     videofx: Library,
     cvimage: Library,
@@ -281,7 +298,13 @@ impl Runtime {
         if rc != NVCV_SUCCESS {
             return Err(format!("NvVFX_GetVersion failed (status {rc})"));
         }
-        Ok(Self { dir: dir.to_path_buf(), version, videofx, cvimage })
+        Ok(Self { dir: dir.to_path_buf(), version, api: OnceLock::new(), videofx, cvimage })
+    }
+
+    /// The functions of NVIDIA's DLLs that the filters call. They live as long as this runtime does: hold the `Arc`
+    /// for as long as anything made with them exists.
+    pub fn api(&self) -> Result<&ffi::Api, String> {
+        self.api.get_or_init(|| ffi::Api::load(self)).as_ref().map_err(Clone::clone)
     }
 
     /// The runtime of `dir`, shared: the copy that is loaded now when somebody holds one, else a new load.
@@ -929,6 +952,35 @@ mod tests {
         let rt = Runtime::shared(&layout.dir).expect("load the runtime");
         eprintln!("runtime {} (raw {:#010x}) loaded in {:?} from {}", format_version(rt.version()), rt.version(), t.elapsed(), rt.dir().display());
         assert!(version_ok(rt.version()));
+        // The model files the table asks for for this GPU are the ones the installer put there, by name.
+        let arch = detect_gpu().map(|g| g.arch).expect("complete() needs a GPU");
+        let installed: Vec<String> = std::fs::read_dir(rt.models_dir())
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.starts_with("AIGS_"))
+            .collect();
+        eprintln!("GPU {arch}: required {:?}; installed AIGS files {installed:?}", required_models(arch));
+        for name in required_models(arch) {
+            assert!(installed.contains(&name), "{name} is not installed");
+        }
+        // Every function the filters call is exported (this loads them all).
+        assert!(rt.api().is_ok(), "{:?}", rt.api().err());
+        // Which DLLs of the runtime (and CUDA and TensorRT behind it) the process has loaded now.
+        let modules = std::process::Command::new("tasklist")
+            .args(["/m", "/fi", &format!("PID eq {}", std::process::id())])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let ours: Vec<&str> = modules
+            .split([',', '\n', ' '])
+            .map(str::trim)
+            .filter(|m| {
+                let l = m.to_ascii_lowercase();
+                l.ends_with(".dll") && ["nvcv", "nvvideo", "cuda", "cublas", "npp", "nvinfer", "nvrtc", "libcrypto"].iter().any(|p| l.starts_with(p))
+            })
+            .collect();
+        eprintln!("runtime DLLs loaded after the version call: {ours:?}");
+        assert!(ours.iter().any(|m| m.eq_ignore_ascii_case("NVCVImage.dll")) && ours.iter().any(|m| m.eq_ignore_ascii_case("NVVideoEffects.dll")));
         // `open` is what the filters call: same folder, same shared copy.
         let opened = Runtime::open().expect("Runtime::open");
         assert!(Arc::ptr_eq(&rt, &opened));

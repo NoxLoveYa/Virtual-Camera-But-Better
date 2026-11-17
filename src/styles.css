@@ -427,6 +427,12 @@ input[type="color"]::-webkit-color-swatch { border: 0; border-radius: 2px; }
 .combo input { width: 100%; min-width: 0; }
 /* A filter that failed, inside its card */
 .filter-error { margin: 10px 0 0; padding: 8px 12px; color: var(--text); font-size: 12px; border-left: 2px solid var(--danger); background: rgba(255, 92, 108, 0.08); overflow-wrap: anywhere; }
+/* NVIDIA filters (P13b): a line that is not an error ("Loading model…"), the install link on an error line, the menu badge */
+.filter-status { display: flex; align-items: center; gap: 8px; margin: 10px 0 0; padding: 8px 12px; color: var(--dim); font-size: 12px; border-left: 2px solid var(--accent); background: var(--accent-soft); }
+.filter-status .spinner { flex: none; width: 10px; height: 10px; border: 1.5px solid rgba(46, 230, 214, 0.3); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.filter-error button.link { display: inline; margin: 0 0 0 8px; font-size: 12px; }
+.rtx-badge { margin-left: 8px; color: var(--warn); font-size: 10px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; }
 
 input[type="range"] { appearance: none; width: 100%; height: 16px; margin: 0; background: transparent; cursor: pointer; }
 input[type="range"]::-webkit-slider-runnable-track {

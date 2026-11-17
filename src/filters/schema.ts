@@ -77,6 +77,8 @@ export interface FilterDef {
   params: ParamDef[];
   /** Names a special arrangement of the params in the card (`layout-<name>` on `.params`, `data-key` on every field). */
   layout?: "crop";
+  /** Runs on NVIDIA's Video Effects runtime and needs an RTX GPU: the card explains what is missing, the menu says "RTX only". */
+  rtx?: boolean;
 }
 
 /**
@@ -269,6 +271,50 @@ const CATALOGUE = {
       { type: "slider", key: "strength", label: "Strength", min: 0, max: 1, step: 0.01, def: 1 },
       { type: "slider", key: "speed", label: "Adaptation speed", min: 0.05, max: 1, step: 0.01, def: 0.3 },
     ],
+  },
+  // NVIDIA Video Effects (P13b): keys, ranges and defaults are OBS's nv-filters.
+  nv_greenscreen_filter: {
+    label: "NVIDIA Background Removal",
+    hint: "AI background removal (RTX only)",
+    rtx: true,
+    params: [
+      {
+        type: "select",
+        key: "mode",
+        label: "Mode",
+        def: 0,
+        options: [
+          { value: 0, label: "Quality" },
+          { value: 1, label: "Performance" },
+          { value: 2, label: "Quality + chair removal" },
+          { value: 3, label: "Performance + chair removal" },
+        ],
+      },
+      { type: "slider", key: "threshold", label: "Threshold", min: 0, max: 1, step: 0.05, def: 1 },
+      {
+        type: "slider",
+        key: "processing_interval",
+        label: "Mask refresh frequency in frames",
+        min: 1,
+        max: 4,
+        step: 1,
+        def: 1,
+        int: true,
+        hint: "The mask is made every this many frames and reused in between. Higher is lighter on the GPU",
+      },
+    ],
+  },
+  nv_blur_filter: {
+    label: "NVIDIA Blur",
+    hint: "Blur the whole image (RTX only)",
+    rtx: true,
+    params: [{ type: "slider", key: "intensity", label: "Blur Intensity", min: 0, max: 1, step: 0.05, def: 0.5 }],
+  },
+  nv_background_blur_filter: {
+    label: "NVIDIA Background Blur",
+    hint: "Blur only the background (RTX only)",
+    rtx: true,
+    params: [{ type: "slider", key: "intensity", label: "Blur Intensity", min: 0, max: 1, step: 0.05, def: 0.5 }],
   },
 } satisfies Record<string, FilterDef>;
 

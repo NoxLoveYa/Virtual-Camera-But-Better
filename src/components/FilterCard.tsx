@@ -16,6 +16,22 @@ export function FilterCard({ filter, index, count, onDragStart, onDrop }: Props)
   const def = FILTERS[filter.kind];
   const folded = !!collapsed[filter.id];
   const error = useStore((s) => s.filterErrors[filter.id]);
+  const status = useStore((s) => s.filterStatus[filter.id]);
+  const gpu = useStore((s) => s.gpu);
+  const gpuRead = useStore((s) => s.gpuRead);
+  const nvidia = useStore((s) => s.nvidia);
+  const openNvidiaPrompt = useStore((s) => s.openNvidiaPrompt);
+  // What an NVIDIA filter needs before it can run, in the order of precedence: an RTX GPU, then the runtime. The app knows
+  // both without the engine, so a card in a loaded preset says it before the first frame (the engine says the same
+  // thing, and the picture is passed through meanwhile).
+  const needs =
+    !def.rtx || !gpuRead
+      ? null
+      : !gpu
+        ? { text: "Needs an NVIDIA RTX GPU (GeForce RTX 20 series or newer).", install: false }
+        : nvidia && !nvidia.available
+          ? { text: nvidia.detail, install: true }
+          : null;
 
   return (
     <li className={`step${filter.enabled ? " on" : ""}`} onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
@@ -53,10 +69,29 @@ export function FilterCard({ filter, index, count, onDragStart, onDrop }: Props)
             <Icon name="close" />
           </button>
         </div>
-        {error && (
+        {needs ? (
           <p className="filter-error" role="alert">
-            {error}
+            {needs.text}
+            {needs.install && (
+              <button className="link" onClick={openNvidiaPrompt}>
+                Install it now
+              </button>
+            )}
           </p>
+        ) : (
+          <>
+            {error && (
+              <p className="filter-error" role="alert">
+                {error}
+              </p>
+            )}
+            {status && !error && (
+              <p className="filter-status" role="status">
+                <span className="spinner" aria-hidden />
+                {status}
+              </p>
+            )}
+          </>
         )}
         {def.params.length > 0 && !folded && (
           <div className={`params${def.layout ? ` layout-${def.layout}` : ""}`}>
