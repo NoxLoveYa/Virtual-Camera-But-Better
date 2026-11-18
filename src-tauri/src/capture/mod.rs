@@ -162,6 +162,33 @@ pub fn classify_hresult(hr: HRESULT) -> ErrorClass {
     }
 }
 
+/// A failure of the video decoder the reader put between the camera and us: any `MF_E_TRANSFORM_*` code
+/// (`0xC00D6D60..=0xC00D6D7F`, which includes `MF_E_UNSUPPORTED_D3D_TYPE`), or no codec for the stream
+/// (`MF_E_TOPO_CODEC_NOT_FOUND`). A hardware decoder that fails to start is retried once with hardware decoding off
+/// (plan 4.9).
+pub fn is_decoder_failure(hr: HRESULT) -> bool {
+    const MF_E_TOPO_CODEC_NOT_FOUND: u32 = 0xC00D_5212;
+    let code = hr.0 as u32;
+    (0xC00D_6D60..=0xC00D_6D7F).contains(&code) || code == MF_E_TOPO_CODEC_NOT_FOUND
+}
+
+/// An error that a second try cannot change: an invalid argument, an operation or interface the object does not
+/// have, a format Media Foundation does not support. The engine stops at once with the named error instead of
+/// retrying it for 30 seconds.
+pub fn is_deterministic_failure(hr: HRESULT) -> bool {
+    const E_INVALIDARG: u32 = 0x8007_0057;
+    const E_NOTIMPL: u32 = 0x8000_4001;
+    const E_NOINTERFACE: u32 = 0x8000_4002;
+    /// `HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)`.
+    const HR_NOT_SUPPORTED: u32 = 0x8007_0032;
+    const MF_E_UNSUPPORTED_FORMAT: u32 = 0xC00D_3E98;
+    const MF_E_INVALIDMEDIATYPE: u32 = 0xC00D_36B4;
+    matches!(
+        hr.0 as u32,
+        E_INVALIDARG | E_NOTIMPL | E_NOINTERFACE | HR_NOT_SUPPORTED | MF_E_UNSUPPORTED_FORMAT | MF_E_INVALIDMEDIATYPE
+    )
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // COM and Media Foundation lifetime
 
@@ -1270,6 +1297,25 @@ mod tests {
             CaptureError::from_call("x", Error::from(MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED)),
             CaptureError::DeviceLost(_)
         ));
+    }
+
+    #[test]
+    fn decoder_and_deterministic_failures_are_told_apart() {
+        // Any transform error, the first and the last of the range, and "no codec".
+        for code in [0xC00D_6D60_u32, 0xC00D_6D61, 0xC00D_6D76, 0xC00D_6D7F, 0xC00D_5212] {
+            assert!(is_decoder_failure(HRESULT(code as i32)), "{code:#X}");
+        }
+        // The camera's own errors and the neighbours of the range are not the decoder's.
+        for code in [0xC00D_3704_u32, 0xC00D_6D5F, 0xC00D_6D80, 0x8007_0057] {
+            assert!(!is_decoder_failure(HRESULT(code as i32)), "{code:#X}");
+        }
+        for code in [0x8007_0057_u32, 0x8000_4001, 0x8000_4002, 0x8007_0032, 0xC00D_3E98, 0xC00D_36B4] {
+            assert!(is_deterministic_failure(HRESULT(code as i32)), "{code:#X}");
+        }
+        // A hiccup of the driver or the service may pass: it is retried.
+        for code in [0x8000_4005_u32, 0xC00D_3E8C, 0x8007_001F, 0xC00D_3704] {
+            assert!(!is_deterministic_failure(HRESULT(code as i32)), "{code:#X}");
+        }
     }
 
     #[test]

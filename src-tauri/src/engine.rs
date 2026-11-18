@@ -20,7 +20,12 @@
 //! * `Reconnecting`: the camera is lost or in use. A retry every `retry_interval`, and at once when the same device
 //!   arrives. Any other failure is fatal: `Stopped` with `engine-error`.
 //!
-//! Pause is not a state: the camera stays open, the writer shows `Paused`, frames are read and dropped.
+//! Pause is not a state: the camera stays open, the writer shows `Paused`, frames are read and dropped. Every change
+//! of the flag is reported (`EngineEvent::Paused`), also the one a Start or a Stop makes.
+//!
+//! The GPU device is looked at before every camera open: one that was lost while nothing used it (a driver update
+//! while the app sat in the tray, the camera off in standby, the engine stopped) is rebuilt first, so the camera is
+//! never handed a dead device and its failure never taken for a format or camera problem.
 //!
 //! Order: the control thread sets the writer's slate (`Paused`, `Starting`) before it changes `Engine::state` and
 //! before the event for the new state goes out (`Control::enter_slate`), so an observer of the state or the event
@@ -103,8 +108,15 @@ pub enum RetryKind {
     NotFound,
     /// Windows privacy settings keep desktop apps from the camera.
     Privacy,
+    /// The open failed with `E_ACCESSDENIED`: a camera that is in use, or Windows' privacy settings. Only this
+    /// failure is ever turned into [`RetryKind::Privacy`] (and only when a switch is off); the banner says "in use"
+    /// until then.
+    AccessDenied,
     /// The camera opened but delivered no picture in time.
     NoFrames,
+    /// The video decoder failed at open or at the first frame. [`DefaultFactory`] retries once with hardware
+    /// decoding off; one that gets out is retried like any other generic failure.
+    Decoder,
     /// Any other error from the camera or its stream. Retried, but only for [`Timings::error_cap`].
     Error,
 }
@@ -113,18 +125,18 @@ impl RetryKind {
     /// The `kind` of the `engine-state` event: what the banner keys its text and its button on.
     pub fn name(self) -> &'static str {
         match self {
-            RetryKind::InUse => "in_use",
+            RetryKind::InUse | RetryKind::AccessDenied => "in_use",
             RetryKind::Disconnected => "disconnected",
             RetryKind::NotFound => "not_found",
             RetryKind::Privacy => "privacy",
-            RetryKind::NoFrames | RetryKind::Error => "error",
+            RetryKind::NoFrames | RetryKind::Decoder | RetryKind::Error => "error",
         }
     }
 
     /// Failures that may be permanent: they are retried for a while only (`Timings::error_cap`). A camera that is in
     /// use, unplugged or blocked by Windows may stay so for as long as the user likes.
     fn is_generic(self) -> bool {
-        matches!(self, RetryKind::NoFrames | RetryKind::Error)
+        matches!(self, RetryKind::NoFrames | RetryKind::Decoder | RetryKind::Error)
     }
 }
 
@@ -144,6 +156,12 @@ pub enum Failure {
 
 impl Failure {
     pub fn from_capture(e: &CaptureError) -> Failure {
+        // A lost GPU device first: the decoder and the media type share it, so with it gone any call can fail with
+        // any code, and a failure to set the media type is not a format problem (it would trigger the device-default
+        // fallback and the user's saved format would be replaced).
+        if let Some(hr) = e.hresult().filter(|hr| crate::gpu::is_device_lost_hr(*hr)) {
+            return Failure::GpuLost(format!("DXGI device removed ({})", hr_text(hr)));
+        }
         match e {
             CaptureError::InUse(err) => Failure::in_use(Some(err.code())),
             CaptureError::DeviceLost(err) => Failure::disconnected(Some(err.code())),
@@ -155,12 +173,21 @@ impl Failure {
                 RetryKind::NoFrames,
                 "the camera did not deliver a picture in time".into(),
             ),
-            // The camera refused the type that was picked from its own list.
-            CaptureError::Api { what, .. } if what.starts_with("SetCurrentMediaType") => {
-                Failure::Format(e.to_string())
+            CaptureError::Api { what, error } => {
+                let hr = error.code();
+                if crate::capture::is_decoder_failure(hr) {
+                    Failure::Retry(RetryKind::Decoder, e.to_string())
+                } else if what.starts_with("SetCurrentMediaType") {
+                    // The camera refused the type that was picked from its own list.
+                    Failure::Format(e.to_string())
+                } else if crate::capture::is_deterministic_failure(hr) {
+                    // A second try cannot change it: stop at once and name the error.
+                    Failure::Fatal(e.to_string())
+                } else {
+                    Failure::Retry(RetryKind::Error, e.to_string())
+                }
             }
             CaptureError::OwnVirtualCamera => Failure::Fatal(e.to_string()),
-            other => Failure::Retry(RetryKind::Error, other.to_string()),
         }
     }
 
@@ -170,6 +197,9 @@ impl Failure {
         match r {
             StopReason::DeviceLost(hr) => Failure::disconnected(hr),
             StopReason::InUse(hr) => Failure::in_use(Some(hr)),
+            StopReason::Error(hr) if crate::gpu::is_device_lost_hr(hr) => {
+                Failure::GpuLost(format!("DXGI device removed ({})", hr_text(hr)))
+            }
             StopReason::Error(hr) => Failure::Retry(
                 RetryKind::Error,
                 format!("the camera stream failed ({})", hr_text(hr)),
@@ -186,8 +216,9 @@ impl Failure {
     }
 
     pub fn in_use(hr: Option<HRESULT>) -> Failure {
+        let denied = hr == Some(windows::Win32::Foundation::E_ACCESSDENIED);
         Failure::Retry(
-            RetryKind::InUse,
+            if denied { RetryKind::AccessDenied } else { RetryKind::InUse },
             match hr {
                 Some(h) => format!("camera in use by another app ({})", hr_text(h)),
                 None => "camera in use by another app".into(),
@@ -347,6 +378,9 @@ pub enum Msg {
     /// A camera arrived or left, as the configuration manager's watcher would report it. The engine hears of real
     /// ones from its own watcher; tests and the example scripts use this to stand in for it.
     Hotplug(HotplugEvent),
+    /// What the engine is doing, answered by the control thread after every message that was queued before this one
+    /// ([`Engine::resume_state`]).
+    Snapshot(Sender<Option<ResumeState>>),
     /// Stop and end the control thread.
     Shutdown,
 }
@@ -359,6 +393,16 @@ pub struct ResumeState {
     pub chain: Vec<FilterCfg>,
     /// The stored device controls that are re-applied after every open.
     pub record: Option<crate::capture::controls::ControlSnapshot>,
+}
+
+/// The pending answer to [`Engine::ask_state`].
+pub struct StateAnswer(Option<Receiver<Option<ResumeState>>>);
+
+impl StateAnswer {
+    /// The engine's state, `Some(None)` for a stopped one; `None` when the control thread is gone and cannot say.
+    pub fn wait(self) -> Option<Option<ResumeState>> {
+        self.0?.recv().ok()
+    }
 }
 
 /// Numbers for the UI footer and the headless example. Times in milliseconds.
@@ -431,6 +475,17 @@ pub struct FormatFallbackEvent {
     pub width: u32,
     pub height: u32,
     pub interval: i64,
+    /// The camera's native format that is used (`mjpeg`, `nv12`, ...), for the field that names it. The window keeps
+    /// its saved settings: this is what runs until the next Start.
+    pub format: String,
+}
+
+/// `engine-paused`: pause is not a state, so it has its own report. Sent whenever the pause flag changes, also while
+/// the engine is stopped or stopping (a Start or a Stop clears it), but never when the engine is released for a
+/// virtual camera change: the pause then travels with [`ResumeState`] and the new engine reports it again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct PausedEvent {
+    pub paused: bool,
 }
 
 /// `stats.capture` of the `stats` event.
@@ -488,6 +543,8 @@ pub enum EngineEvent {
     FilterStatus(FilterStatus),
     /// The camera does not offer the saved format; the device default is in use (`format-fallback`).
     FormatFallback(FormatFallbackEvent),
+    /// The pause flag changed (`engine-paused`).
+    Paused(PausedEvent),
 }
 
 /// Receives [`EngineEvent`]s on the control thread: return quickly.
@@ -520,6 +577,9 @@ pub struct Timings {
     pub stable_after: Duration,
     /// Device losses closer together than this belong to one run; three in one run stop the engine.
     pub gpu_failure_window: Duration,
+    /// After a device loss the last frame stays on the file for this long; a recovery that takes longer shows the
+    /// "starting" slate (plan 4.9: 1 s).
+    pub gpu_slate_delay: Duration,
 }
 
 impl Default for Timings {
@@ -532,6 +592,7 @@ impl Default for Timings {
             error_cap: Duration::from_secs(30),
             stable_after: Duration::from_secs(10),
             gpu_failure_window: Duration::from_secs(30),
+            gpu_slate_delay: Duration::from_secs(1),
         }
     }
 }
@@ -565,8 +626,15 @@ struct Shared {
     sink: Mutex<Option<Arc<dyn EventSink>>>,
     /// Symbolic link of the open camera (for hot-plug removal), empty while none is open.
     camera_link: Mutex<Option<String>>,
-    /// Last advertised `(width, height, fps)`, for a consumer that attaches while the camera is closed.
-    advertised: Mutex<Option<(u32, u32, u32)>>,
+    /// What the file advertises, `(width, height, fps, extra_sizes)`, and the lock that orders the writers of the list:
+    /// the render thread (the real picture size) and the control thread (the configured output while no camera
+    /// delivers). The list is written with this held, so the file and this record never disagree, and whoever comes
+    /// later sees what the earlier one wrote. Also what a consumer that attaches while the camera is closed gets.
+    advertised: Mutex<Option<(u32, u32, u32, bool)>>,
+    /// The session (its `gen`) whose first frame has been published. The render thread sets it with the `Live`
+    /// writer state; the control thread's slate after a device loss looks at it, so a slate can never replace the
+    /// picture of a session that is already live.
+    live_gen: Mutex<u64>,
     /// Device controls: the open camera's, the stored record, the lease for calls while no camera is open.
     hub: Arc<ControlsHub>,
     /// What the engine is running (a copy of the control thread's settings; `None` while stopped), so the owner can
@@ -574,9 +642,20 @@ struct Shared {
     running: Mutex<Option<Settings>>,
     /// Counts the GPU devices the engine has built: 1 for the first, one more after every device loss.
     gpu_generation: AtomicU64,
-    /// Test hook: frames that fail with `DXGI_ERROR_DEVICE_REMOVED` before they render.
+    /// Test hook: frames that fail with `DXGI_ERROR_DEVICE_REMOVED` before they render. The first one also marks the
+    /// current device removed, as a real loss would.
     #[cfg(test)]
     gpu_faults: std::sync::atomic::AtomicU32,
+    /// Test hook: how long building a new GPU device takes on top of the real work.
+    #[cfg(test)]
+    rebuild_delay: Mutex<Duration>,
+    /// Test hook: the control thread takes this at the top of every pass, so a test that holds it keeps messages
+    /// queued and unprocessed.
+    #[cfg(test)]
+    control_gate: Mutex<()>,
+    /// Test hook: how many [`Msg::Snapshot`]s were sent.
+    #[cfg(test)]
+    snapshots: std::sync::atomic::AtomicU32,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -587,6 +666,38 @@ fn emit(shared: &Shared, event: EngineEvent) {
     let sink = lock(&shared.sink).clone();
     if let Some(s) = sink {
         s.emit(event);
+    }
+}
+
+/// Keep the advertised media types current while no camera delivers, so a consumer that attaches then (and wakes the
+/// engine) sees the configured size: an explicit output size, else what the last session advertised. Called on the
+/// control thread; the render thread writes the list of the real picture with [`advertise_session`].
+fn advertise_configured(shared: &Shared, writer: &Writer) {
+    let o = *lock(&shared.output);
+    let mut last = lock(&shared.advertised);
+    let (w, h, fps) = match (o.width, o.height, *last) {
+        (Some(w), Some(h), l) => (w, h, o.fps.or(l.map(|l| l.2)).unwrap_or(30)),
+        (_, _, Some((w, h, f, _))) => (w, h, o.fps.unwrap_or(f)),
+        _ => return,
+    };
+    write_advertised(writer, &mut last, (w, h, fps, o.extra_sizes));
+}
+
+/// The render thread's list: the output size and rate in effect and whether the extra sizes go along. Rewrites the
+/// file when it holds anything else, whoever wrote that.
+fn advertise_session(shared: &Shared, writer: &Writer, want: (u32, u32, u32, bool)) {
+    write_advertised(writer, &mut lock(&shared.advertised), want);
+}
+
+/// Write the list unless the file already holds it. The caller holds the `advertised` lock, which orders the writers.
+fn write_advertised(
+    writer: &Writer,
+    record: &mut Option<(u32, u32, u32, bool)>,
+    want: (u32, u32, u32, bool),
+) {
+    if *record != Some(want) {
+        writer.set_advertised(&advertised_list(want.0, want.1, want.2, want.3));
+        *record = Some(want);
     }
 }
 
@@ -658,11 +769,18 @@ impl Engine {
             sink: Mutex::new(None),
             camera_link: Mutex::new(None),
             advertised: Mutex::new(None),
+            live_gen: Mutex::new(0),
             hub: Arc::new(ControlsHub::new(opener)),
             running: Mutex::new(None),
             gpu_generation: AtomicU64::new(1),
             #[cfg(test)]
             gpu_faults: Default::default(),
+            #[cfg(test)]
+            rebuild_delay: Mutex::new(Duration::ZERO),
+            #[cfg(test)]
+            control_gate: Mutex::new(()),
+            #[cfg(test)]
+            snapshots: Default::default(),
         });
         let poller = spawn_poller(shared.clone()).map_err(|e| e.to_string())?;
         // The asset loader reports failed loads (and the clears) straight to the sink, from its own thread.
@@ -706,6 +824,8 @@ impl Engine {
                 gpu_last_loss: None,
                 gpu_recovering_since: None,
                 arrival_burst: 0,
+                first_open: true,
+                paused_reported: false,
             };
             std::thread::Builder::new()
                 .name("engine control".into())
@@ -784,17 +904,25 @@ impl Engine {
     }
 
     /// Whether a start is in effect: the engine runs, or waits for somebody to watch, or reconnects. `false` after
-    /// a Stop or a fatal error.
+    /// a Stop or a fatal error. Ordered after every command queued before the call, like [`Engine::resume_state`]
+    /// (a Start that the control thread has not read yet counts).
     pub fn is_started(&self) -> bool {
-        lock(&self.shared.running).is_some()
+        self.resume_state().is_some()
     }
 
     /// Everything needed to bring a new engine to the state this one is in, or `None` while it is stopped. The
     /// owner takes it before it releases the engine (the virtual camera is being changed) and hands it to
     /// [`Engine::resume`] on the new one.
+    ///
+    /// The control thread answers, after every message that was queued before this call: a Start, a Stop, a source,
+    /// output or chain change that the caller issued just before is part of the answer. The fields the control
+    /// thread updates only when it reads a message are not read from here.
     pub fn resume_state(&self) -> Option<ResumeState> {
+        if let Some(state) = self.ask_state().wait() {
+            return state;
+        }
+        // The control thread is gone (the engine was closed): what it last published.
         let mut settings = lock(&self.shared.running).clone()?;
-        // The output settings change without a message to the source settings.
         settings.output = *lock(&self.shared.output);
         Some(ResumeState {
             settings,
@@ -802,6 +930,15 @@ impl Engine {
             chain: lock(&self.shared.chain).as_ref().clone(),
             record: self.shared.hub.record(),
         })
+    }
+
+    /// Ask the control thread what the engine is doing, without waiting for the answer: the question is queued
+    /// behind every message sent before it. [`StateAnswer::wait`] waits.
+    pub fn ask_state(&self) -> StateAnswer {
+        let (tx, rx) = mpsc::channel();
+        #[cfg(test)]
+        self.shared.snapshots.fetch_add(1, Ordering::SeqCst);
+        StateAnswer(self.tx.send(Msg::Snapshot(tx)).ok().map(|()| rx))
     }
 
     /// Start with what [`Engine::resume_state`] returned.
@@ -812,6 +949,33 @@ impl Engine {
         if state.paused {
             self.set_pause(true);
         }
+    }
+
+    /// Test hook: the next `frames` frames fail as if the GPU device was removed (and the device then reports it).
+    #[cfg(test)]
+    pub(crate) fn inject_device_loss(&self, frames: u32) {
+        self.shared.gpu_faults.store(frames, Ordering::SeqCst);
+    }
+
+    /// Test hook: what the engine is doing once it has handled everything queued before this call (the same message
+    /// [`Engine::resume_state`] sends, whatever the handle's own way of reading is).
+    #[cfg(test)]
+    pub(crate) fn settled(&self) -> Option<ResumeState> {
+        let (tx, rx) = mpsc::channel();
+        self.tx.send(Msg::Snapshot(tx)).ok()?;
+        rx.recv().ok()?
+    }
+
+    /// Test hook: while held, the control thread reads no message.
+    #[cfg(test)]
+    pub(crate) fn control_gate(&self) -> &Mutex<()> {
+        &self.shared.control_gate
+    }
+
+    /// Test hook: how many times the engine's state was asked for.
+    #[cfg(test)]
+    pub(crate) fn snapshot_requests(&self) -> u32 {
+        self.shared.snapshots.load(Ordering::SeqCst)
     }
 
     pub fn paused(&self) -> bool {
@@ -992,6 +1156,12 @@ struct Control {
     gpu_recovering_since: Option<Instant>,
     /// Retries left that follow the arrival of the camera being waited for at the short interval.
     arrival_burst: u32,
+    /// No session has opened the current source yet: a camera that opens but sends no picture in a saved format
+    /// counts as lacking that format, and the device default is tried. Set by a Start and by a changed source,
+    /// cleared by the first session that opens; a reconnect retry that times out is retried in the same format.
+    first_open: bool,
+    /// The pause flag as the last `engine-paused` event said it.
+    paused_reported: bool,
 }
 
 impl Control {
@@ -1002,6 +1172,8 @@ impl Control {
             Err(e) => eprintln!("[engine] hot-plug watcher unavailable: {e}"),
         }
         self.writer.set_state(WriterState::Paused);
+        #[cfg(test)]
+        let gate_owner = self.shared.clone();
         loop {
             let mut next = match self.rx.recv_timeout(self.timings.tick) {
                 Ok(m) => Some(m),
@@ -1011,6 +1183,8 @@ impl Control {
                     return;
                 }
             };
+            #[cfg(test)]
+            let _gate = lock(&gate_owner.control_gate);
             while let Some(m) = next.take() {
                 if matches!(m, Msg::Shutdown) {
                     self.shutdown();
@@ -1044,10 +1218,15 @@ impl Control {
                 *lock(&self.shared.output) = o;
                 // The render thread advertises the new list at the top of its loop, within a frame, but only once the
                 // camera delivers. Until then (opening, reopening, reconnecting, idle) it is this thread's job: a
-                // consumer that attaches in that time must not see the list of the old output.
+                // consumer that attaches in that time must not see the list of the old output. Both write under the
+                // `advertised` lock, and the render thread compares with what the file holds (not with what it wrote
+                // last), so neither can leave the other's stale list behind.
                 if self.cfg.is_some() && self.phase != EngineState::Live {
                     self.advertise_idle();
                 }
+            }
+            Msg::Snapshot(reply) => {
+                let _ = reply.send(self.snapshot());
             }
             Msg::SetFlip(f) => self.shared.flip.store(f, Ordering::Relaxed),
             Msg::SetPause(on) => self.set_pause(on),
@@ -1106,9 +1285,41 @@ impl Control {
         self.set_phase(phase, reason);
     }
 
-    /// Copy the settings into [`Shared::running`] (what [`Engine::resume_state`] reads).
+    /// Copy the settings into [`Shared::running`] (what [`Engine::resume_state`] falls back to once this thread is
+    /// gone).
     fn sync_cfg(&self) {
         *lock(&self.shared.running) = self.cfg.clone();
+    }
+
+    /// What this engine is doing: the answer to [`Msg::Snapshot`]. Every message queued before it has been handled.
+    fn snapshot(&self) -> Option<ResumeState> {
+        let mut settings = self.cfg.clone()?;
+        // The output settings change without a message to the source settings.
+        settings.output = *lock(&self.shared.output);
+        Some(ResumeState {
+            settings,
+            paused: self.shared.paused.load(Ordering::Acquire),
+            chain: lock(&self.shared.chain).as_ref().clone(),
+            record: self.shared.hub.record(),
+        })
+    }
+
+    /// Report the pause flag when it differs from what was reported last.
+    fn report_paused(&mut self) {
+        let paused = self.shared.paused.load(Ordering::Acquire);
+        if paused != self.paused_reported {
+            self.paused_reported = paused;
+            emit(&self.shared, EngineEvent::Paused(PausedEvent { paused }));
+        }
+    }
+
+    /// One beat of the file's heartbeat, at most every 100 ms.
+    fn beat(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.last_heartbeat) >= Duration::from_millis(100) {
+            self.writer.heartbeat();
+            self.last_heartbeat = now;
+        }
     }
 
     /// The writer state while no frames flow: `Paused` when stopped or paused, else `Starting`. Depends on `cfg` and
@@ -1154,10 +1365,13 @@ impl Control {
         self.next_retry = None;
         self.retrying = false;
         self.error_streak = None;
+        self.gpu_recovering_since = None;
         self.gpu_losses = 0;
         self.gpu_last_loss = None;
+        self.first_open = true;
         self.cfg = Some(s);
         self.sync_cfg();
+        self.report_paused();
         if self.wants_camera() {
             self.open_session(OpenMode::Fresh);
         } else {
@@ -1174,6 +1388,8 @@ impl Control {
         self.next_retry = None;
         self.retrying = false;
         self.error_streak = None;
+        self.gpu_recovering_since = None;
+        self.report_paused();
         self.enter_slate(EngineState::Stopped, None);
         self.emit_stats();
     }
@@ -1194,6 +1410,8 @@ impl Control {
         self.next_retry = None;
         self.retrying = false;
         self.error_streak = None;
+        self.gpu_recovering_since = None;
+        self.report_paused();
         // The slate first: neither the error nor the `Stopped` event may be seen with the writer still `Starting`.
         self.set_slate();
         emit(&self.shared, EngineEvent::Error(message));
@@ -1211,6 +1429,10 @@ impl Control {
         cfg.flip_vertical = u.flip_vertical;
         cfg.color = u.color;
         cfg.deactivate_when_not_showing = u.deactivate_when_not_showing;
+        if reopen {
+            // A new source is a first open: the fallback to the device default applies to it again.
+            self.first_open = true;
+        }
         self.sync_cfg();
         self.shared.flip.store(u.flip_vertical, Ordering::Relaxed);
         *lock(&self.shared.color) = u.color;
@@ -1229,9 +1451,11 @@ impl Control {
     fn set_pause(&mut self, on: bool) {
         if self.cfg.is_none() {
             self.shared.paused.store(false, Ordering::Release);
+            self.report_paused();
             return;
         }
         self.shared.paused.store(on, Ordering::Release);
+        self.report_paused();
         if on {
             self.writer.set_state(WriterState::Paused);
         } else if self.phase != EngineState::Live || self.session.is_none() {
@@ -1247,6 +1471,16 @@ impl Control {
             return;
         }
         self.end_session();
+        // The device may have been lost while nothing used it (a driver update while the app sat in the tray, the
+        // camera off in standby, the engine stopped): look before every open, so the camera is never handed a dead
+        // device, and its failure never mistaken for a format or camera problem.
+        if !self.gpu_dirty {
+            if let Some(hr) = self.renderer.gpu.removed_reason() {
+                if !self.note_gpu_loss(&format!("DXGI device removed ({})", hr_text(hr))) {
+                    return;
+                }
+            }
+        }
         // The GPU device was lost: a new one first (a failure counts as another loss and is handled there).
         if self.gpu_dirty && !self.rebuild_gpu() {
             return;
@@ -1274,6 +1508,7 @@ impl Control {
             stop: stop.clone(),
             removed: removed.clone(),
             events: self.events_tx.clone(),
+            first_open: self.first_open,
         };
         self.attempt_started = Instant::now();
         self.retrying = mode == OpenMode::Retry;
@@ -1325,6 +1560,10 @@ impl Control {
         self.idle_since = None;
         self.next_retry = None;
         self.retrying = false;
+        // The camera is closed for good measure: failures counted before the idle time say nothing about the next
+        // wake-up, which must not stop the engine on its first failure.
+        self.error_streak = None;
+        self.opened_at = None;
         self.enter_slate(EngineState::Standby, Some("idle".into()));
         self.advertise_idle();
     }
@@ -1354,17 +1593,27 @@ impl Control {
     /// last frame stays on the file meanwhile. Three losses in a row stop the engine.
     fn gpu_lost(&mut self, why: String) {
         eprintln!("[engine] GPU device lost: {why}");
-        if !self.count_gpu_loss() {
-            self.fail(format!(
-                "The graphics device was lost {GPU_LOSSES_MAX} times in a row ({why}). Update the graphics driver or restart Windows, then press Start."
-            ));
+        if !self.note_gpu_loss(&why) {
             return;
         }
-        self.gpu_dirty = true;
         self.gpu_recovering_since = Some(Instant::now());
         // The window and the log say what is going on while the device is rebuilt (the last frame stays on the file).
         self.set_phase(EngineState::Standby, Some("reopening".into()));
         self.open_session(OpenMode::Reopen);
+    }
+
+    /// The current GPU device is lost: count it and mark it for a rebuild. `false` when it is the third of one run:
+    /// the engine stopped with an error (and keeps the dead device marked, so the next Start builds a new one before
+    /// it opens the camera).
+    fn note_gpu_loss(&mut self, why: &str) -> bool {
+        self.gpu_dirty = true;
+        if self.count_gpu_loss() {
+            return true;
+        }
+        self.fail(format!(
+            "The graphics device was lost {GPU_LOSSES_MAX} times in a row ({why}). Update the graphics driver or restart Windows, then press Start."
+        ));
+        false
     }
 
     /// Count a device loss; `false` once it is the third of one run.
@@ -1384,22 +1633,52 @@ impl Control {
     /// A new device, renderer and asset loader on the adapter kind of the old one. `false` when it failed: that
     /// counts as another loss (the driver may still be coming back), and the engine either tries again after the
     /// retry interval or stops.
+    ///
+    /// The device is built on a helper thread (it takes 0.6-0.8 s on WARP and may take longer after a driver reset)
+    /// while this thread keeps the file's heartbeat going: the virtual camera shows "Better Cam is not running"
+    /// after a second without one. Messages that arrive meanwhile wait in the queue.
     fn rebuild_gpu(&mut self) -> bool {
         let started = Instant::now();
-        let built = (|| -> Result<(Arc<Renderer>, Assets), String> {
-            let gpu = Arc::new(
-                GpuDevice::new(self.renderer.gpu.kind).map_err(|e| format!("D3D11 device: {e}"))?,
-            );
-            let renderer = Arc::new(Renderer::new(gpu).map_err(|e| e.to_string())?);
-            renderer.shaders.warm_up().map_err(|e| e.to_string())?;
-            crate::fx::warm_up(&renderer).map_err(|e| e.to_string())?;
-            let shared = self.shared.clone();
-            let assets = Assets::new(
-                renderer.gpu.clone(),
-                Arc::new(move |e| emit(&shared, EngineEvent::FilterError(e))),
-            );
-            Ok((renderer, assets))
-        })();
+        let kind = self.renderer.gpu.kind;
+        let shared = self.shared.clone();
+        let (done, result) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("gpu rebuild".into())
+            .spawn(move || {
+                ensure_com();
+                #[cfg(test)]
+                {
+                    let delay = *lock(&shared.rebuild_delay);
+                    if !delay.is_zero() {
+                        std::thread::sleep(delay);
+                    }
+                }
+                let built = (|| -> Result<(Arc<Renderer>, Assets), String> {
+                    let gpu = Arc::new(GpuDevice::new(kind).map_err(|e| format!("D3D11 device: {e}"))?);
+                    let renderer = Arc::new(Renderer::new(gpu).map_err(|e| e.to_string())?);
+                    renderer.shaders.warm_up().map_err(|e| e.to_string())?;
+                    crate::fx::warm_up(&renderer).map_err(|e| e.to_string())?;
+                    let events = shared.clone();
+                    let assets = Assets::new(
+                        renderer.gpu.clone(),
+                        Arc::new(move |e| emit(&events, EngineEvent::FilterError(e))),
+                    );
+                    Ok((renderer, assets))
+                })();
+                let _ = done.send(built);
+            });
+        let built = match spawned {
+            Ok(_) => loop {
+                match result.recv_timeout(self.timings.tick) {
+                    Ok(built) => break built,
+                    Err(RecvTimeoutError::Timeout) => self.beat(),
+                    Err(RecvTimeoutError::Disconnected) => {
+                        break Err("the rebuild thread ended without a result".to_string())
+                    }
+                }
+            },
+            Err(e) => Err(format!("cannot start the rebuild thread: {e}")),
+        };
         match built {
             Ok((renderer, assets)) => {
                 // The old loader thread ends with the old `Assets`; the old device goes when its last user does.
@@ -1438,15 +1717,7 @@ impl Control {
     /// Keep the advertised media types current while no camera is open, so a consumer that attaches then (and wakes
     /// the engine) sees the configured size: an explicit output size, else what the last session advertised.
     fn advertise_idle(&self) {
-        let o = *lock(&self.shared.output);
-        let last = *lock(&self.shared.advertised);
-        let (w, h, fps) = match (o.width, o.height, last) {
-            (Some(w), Some(h), l) => (w, h, o.fps.or(l.map(|l| l.2)).unwrap_or(30)),
-            (_, _, Some((w, h, f))) => (w, h, o.fps.unwrap_or(f)),
-            _ => return,
-        };
-        self.writer
-            .set_advertised(&advertised_list(w, h, fps, o.extra_sizes));
+        advertise_configured(&self.shared, &self.writer);
     }
 
     fn poll_session(&mut self) {
@@ -1462,6 +1733,8 @@ impl Control {
                     self.opened_at = Some(Instant::now());
                     self.gpu_recovering_since = None;
                     self.arrival_burst = 0;
+                    // This source has opened: from now on a camera that sends no picture is retried in its format.
+                    self.first_open = false;
                     if let Some(fb) = fallback {
                         // From now on the engine runs with what it opened, so a later reopen (the camera comes
                         // back) does not ask for the missing format again and the owner's `set_source` with the same
@@ -1479,6 +1752,7 @@ impl Control {
                                 width: fb.width,
                                 height: fb.height,
                                 interval,
+                                format: fb.format,
                             }),
                         );
                     }
@@ -1512,18 +1786,7 @@ impl Control {
     /// `Timings::error_cap` (counted from the first failure of the run; a camera that stayed up for
     /// `Timings::stable_after` starts a new run). Other kinds end the run.
     fn generic_failure_exhausted(&mut self, kind: RetryKind, lived: Option<Duration>) -> bool {
-        if !kind.is_generic() {
-            self.error_streak = None;
-            return false;
-        }
-        let now = Instant::now();
-        let stable = lived.is_some_and(|l| l >= self.timings.stable_after);
-        let first = match self.error_streak {
-            Some(first) if !stable => first,
-            _ => now,
-        };
-        self.error_streak = Some(first);
-        now.duration_since(first) >= self.timings.error_cap
+        streak_exhausted(&mut self.error_streak, kind, lived, Instant::now(), &self.timings)
     }
 
     fn poll_hotplug(&mut self) {
@@ -1569,18 +1832,21 @@ impl Control {
         let now = Instant::now();
         // The DLL shows "not running" after a second without a heartbeat; the render thread beats while it works,
         // this covers everything else (opening, standby, stopped).
-        if now.duration_since(self.last_heartbeat) >= Duration::from_millis(100) {
-            self.writer.heartbeat();
-            self.last_heartbeat = now;
-        }
-        // A device loss that takes longer than a second to get over: the frame that was repeated gives way to the
-        // "starting" slate (the first frame of the new session sets `Live` again).
+        self.beat();
+        // A device loss that takes longer than `Timings::gpu_slate_delay` to get over: the frame that was repeated
+        // gives way to the "starting" slate (the first frame of the new session sets `Live` again, and is the only
+        // thing that does: see `live_gen`).
         if self
             .gpu_recovering_since
-            .is_some_and(|t| now.duration_since(t) >= Duration::from_secs(1))
+            .is_some_and(|t| now.duration_since(t) >= self.timings.gpu_slate_delay)
         {
             self.gpu_recovering_since = None;
-            self.set_slate();
+            // Under the lock the render thread takes to go live: the slate cannot replace the picture of a session
+            // that has published its first frame already.
+            let live = lock(&self.shared.live_gen);
+            if *live != self.gen {
+                self.set_slate();
+            }
         }
 
         if let Some(deactivate) = self.cfg.as_ref().map(|c| c.deactivate_when_not_showing) {
@@ -1656,6 +1922,29 @@ impl Control {
     }
 }
 
+/// The count behind [`Control::generic_failure_exhausted`], with the clock passed in: `first` is when the run of
+/// failures began; `true` when this failure (at `now`) is at least `Timings::error_cap` after it. A failure that is not
+/// generic, or one of a camera that was up for `Timings::stable_after`, starts a new run.
+fn streak_exhausted(
+    first: &mut Option<Instant>,
+    kind: RetryKind,
+    lived: Option<Duration>,
+    now: Instant,
+    timings: &Timings,
+) -> bool {
+    if !kind.is_generic() {
+        *first = None;
+        return false;
+    }
+    let stable = lived.is_some_and(|l| l >= timings.stable_after);
+    let start = match *first {
+        Some(first) if !stable => first,
+        _ => now,
+    };
+    *first = Some(start);
+    now.duration_since(start) >= timings.error_cap
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Session thread
 
@@ -1671,6 +1960,8 @@ struct SessionCtx {
     stop: Arc<AtomicBool>,
     removed: Arc<AtomicBool>,
     events: Sender<SessionEvent>,
+    /// No session has opened this source yet (see [`Control::first_open`]).
+    first_open: bool,
 }
 
 fn session_thread(ctx: SessionCtx) {
@@ -1680,25 +1971,29 @@ fn session_thread(ctx: SessionCtx) {
         Ok(r) => r,
         Err(_) => Err(Failure::Fatal("the render thread panicked".into())),
     };
-    // Windows' privacy settings show up as "in use" (access denied), as a stream error, as no picture at all or as a
-    // camera that lists no formats: when a switch is off, that is the reason, and the banner says so.
-    let outcome = match outcome {
-        Err(
-            Failure::Retry(RetryKind::InUse | RetryKind::NoFrames | RetryKind::Error, _)
-            | Failure::Format(_),
-        ) => {
-            match ctx.factory.privacy_blocked() {
-                Some(blocked) => Err(Failure::privacy(blocked)),
-                None => outcome,
-            }
-        }
-        other => other,
-    };
+    let outcome = outcome_with_privacy(outcome, &*ctx.factory);
     // The camera (inside `render_session`) is closed by now.
     let _ = ctx.events.send(SessionEvent {
         gen: ctx.gen,
         msg: SessionMsg::Ended(outcome),
     });
+}
+
+/// An open that failed with "access denied" is Windows' privacy setting when a switch is off. That is the only
+/// failure that becomes a privacy wait: a registry value that says `Deny` does not stop every desktop program on
+/// every Windows build (it did not on the machine this was measured on), so it never turns an unrelated failure into
+/// one. The switches only decide the banner's wording.
+fn outcome_with_privacy(
+    outcome: Result<(), Failure>,
+    factory: &dyn SourceFactory,
+) -> Result<(), Failure> {
+    match outcome {
+        Err(Failure::Retry(RetryKind::AccessDenied, _)) => match factory.privacy_blocked() {
+            Some(blocked) => Err(Failure::privacy(blocked)),
+            None => outcome,
+        },
+        other => other,
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1824,17 +2119,22 @@ struct FormatFallback {
     /// The picture size that is used.
     width: u32,
     height: u32,
+    /// The camera's native format that is used.
+    format: String,
     cfg: CaptureCfg,
 }
 
 /// Opens sources. The engine uses [`DefaultFactory`]; tests plug in sources that fail and recover on command.
 trait SourceFactory: Send + Sync {
-    /// `output_fps` is the output rate in effect (for `frame_interval` -1).
+    /// `output_fps` is the output rate in effect (for `frame_interval` -1). `first_open`: no session has opened this
+    /// source yet, so a camera that sends no picture in a saved format may be treated as lacking it (see
+    /// [`Control::first_open`]).
     fn open(
         &self,
         spec: &SourceSpec,
         output_fps: Option<u32>,
         gpu: &Arc<GpuDevice>,
+        first_open: bool,
     ) -> Result<Box<dyn Source>, Failure>;
 
     /// Which Windows privacy switch keeps desktop apps from the camera, if any (read after a failure to tell "the
@@ -1852,31 +2152,42 @@ impl SourceFactory for DefaultFactory {
         spec: &SourceSpec,
         output_fps: Option<u32>,
         gpu: &Arc<GpuDevice>,
+        first_open: bool,
     ) -> Result<Box<dyn Source>, Failure> {
         if !matches!(spec, SourceSpec::Synthetic(_)) && crate::capture::privacy::test_access_denied() {
             return Err(Failure::in_use(Some(windows::Win32::Foundation::E_ACCESSDENIED)));
         }
         Ok(match spec {
-            SourceSpec::Camera(c) => Box::new(open_camera(c, gpu)?),
+            SourceSpec::Camera(c) => {
+                Box::new(open_retrying_decoder(c, |c| open_camera(c, gpu))?)
+            }
             SourceSpec::Configured(cap) => {
                 let (mut camera, fallback) = open_with_fallback(cap, |cap| {
                     let c = resolve_camera(cap, output_fps)?;
-                    // A camera that cannot deliver a picture in the format it lists is as good as one that lacks it.
-                    open_camera(&c, gpu).map_err(|f| match f {
-                        Failure::Retry(RetryKind::NoFrames, _) if !is_device_default(cap) => {
-                            Failure::Format(format!(
-                                "the camera delivers no picture in {}",
-                                describe_cap(cap)
-                            ))
-                        }
-                        other => other,
-                    })
+                    // A camera that cannot deliver a picture in the format it lists is as good as one that lacks it,
+                    // but only the first time this source is opened: one that did open and then timed out after a
+                    // reconnect is slow, not lacking the format, and is retried in the same format.
+                    open_retrying_decoder(&c, |c| open_camera(c, gpu))
+                        .map_err(|f| no_picture_as_format_problem(f, cap, first_open))
                 })?;
                 camera.info.fallback = finish_fallback(fallback, &camera.info);
                 Box::new(camera)
             }
             SourceSpec::Synthetic(s) => Box::new(SyntheticInput::new(*s)?),
         })
+    }
+}
+
+/// A camera that cannot deliver a picture in the format it lists is as good as one that lacks it, so the saved
+/// format gives way to the device default ([`open_with_fallback`]). But only the first time this source is opened
+/// (`first_open`: the Start, or the source just changed): a camera that did open and then sent no picture in time
+/// after a reconnect is slow, not lacking the format, and is retried in the same format.
+fn no_picture_as_format_problem(f: Failure, cap: &CaptureCfg, first_open: bool) -> Failure {
+    match f {
+        Failure::Retry(RetryKind::NoFrames, _) if first_open && !is_device_default(cap) => {
+            Failure::Format(format!("the camera delivers no picture in {}", describe_cap(cap)))
+        }
+        other => other,
     }
 }
 
@@ -1887,6 +2198,7 @@ fn finish_fallback(fallback: Option<FormatFallback>, opened: &SourceInfo) -> Opt
         f.used = describe_source(opened);
         f.width = opened.width;
         f.height = opened.height;
+        f.format = opened.format.clone();
         f.cfg.resolution = format!("{}x{}", opened.width, opened.height);
         // The rate that runs, as a frame interval (60 fps is 166667): the window shows it with the other fields.
         let fps = if (opened.fps - opened.fps.round()).abs() < 0.01 { opened.fps.round() } else { opened.fps };
@@ -1952,6 +2264,35 @@ fn describe_source(i: &SourceInfo) -> String {
     )
 }
 
+/// Open a camera; when the video decoder fails at the open or at the first frame, open it once more with hardware
+/// decoding off (plan 4.9), before anything else is given up: the next step, if the decoder fails again, is the format
+/// fallback ([`open_with_fallback`]), so a decoder that cannot run the saved format counts as lacking it.
+fn open_retrying_decoder<T>(
+    spec: &CameraSpec,
+    mut open: impl FnMut(&CameraSpec) -> Result<T, Failure>,
+) -> Result<T, Failure> {
+    match open(spec) {
+        Err(Failure::Retry(RetryKind::Decoder, why)) if spec.hw_decode => {
+            eprintln!("[engine] the video decoder failed ({why}); trying again with hardware decoding off");
+            let software = CameraSpec {
+                hw_decode: false,
+                ..spec.clone()
+            };
+            match open(&software) {
+                Err(Failure::Retry(RetryKind::Decoder, again)) => Err(Failure::Format(format!(
+                    "the video decoder cannot decode this format, also with hardware decoding off ({again})"
+                ))),
+                other => other,
+            }
+        }
+        // Hardware decoding was off already: nothing left to try for this format.
+        Err(Failure::Retry(RetryKind::Decoder, why)) => Err(Failure::Format(format!(
+            "the video decoder cannot decode this format ({why})"
+        ))),
+        other => other,
+    }
+}
+
 /// Open with the settings; when the camera lacks the format, open once more with the device default (plan 4.9).
 /// Returns the note for the toast and the settings now in effect when the fallback was used. A second failure to
 /// find a format, or any other failure, is returned as it is.
@@ -1976,6 +2317,7 @@ fn open_with_fallback<T>(
                         used: String::new(),
                         width: 0,
                         height: 0,
+                        format: String::new(),
                         cfg: fallback,
                     }),
                 )),
@@ -2459,6 +2801,16 @@ fn gpu_failure(renderer: &Renderer, e: GpuError) -> Failure {
     }
 }
 
+/// A failure of the camera side, or a lost GPU device when the device reports one (a stream that stops, an open that
+/// fails: the decoder shares the device, so its failures are the device's).
+fn device_check(renderer: &Renderer, f: Failure) -> Failure {
+    match (&f, renderer.gpu.removed_reason()) {
+        (Failure::GpuLost(_), _) => f,
+        (_, Some(hr)) => Failure::GpuLost(format!("DXGI device removed ({})", hr_text(hr))),
+        (_, None) => f,
+    }
+}
+
 fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
     let SessionCtx {
         shared,
@@ -2469,7 +2821,13 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
         ..
     } = ctx;
     let output_fps = lock(&shared.output).fps;
-    let mut source: Box<dyn Source> = ctx.factory.open(&ctx.source, output_fps, &renderer.gpu)?;
+    // A failed open is looked at through the device first: with the device gone, the open fails with whatever code
+    // the decoder or the media type happens to give, and none of them is about the camera or its format.
+    let mut source: Box<dyn Source> =
+        match ctx.factory.open(&ctx.source, output_fps, &renderer.gpu, ctx.first_open) {
+            Ok(s) => s,
+            Err(f) => return Err(device_check(renderer, f)),
+        };
     if stop.load(Ordering::Acquire) {
         return Ok(());
     }
@@ -2510,7 +2868,6 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
         .map_err(|e| gpu_failure(renderer, e))?;
     let mut timer = GpuTimer::new(&renderer.gpu.device).ok();
 
-    let mut advertised = (0u32, 0u32, 0u32, true);
     let mut published_any = false;
     let mut was_paused = false;
     let mut window = Window::new(0);
@@ -2529,9 +2886,12 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
     let mut last_heartbeat = Instant::now();
     let mut first_error: Option<String> = None;
     // A stream that stops because the GPU device went (the decoder shares it) is a device loss, not a camera error.
-    let gpu_check = |f: Failure| match renderer.gpu.removed_reason() {
-        Some(hr) => Failure::GpuLost(format!("DXGI device removed ({})", hr_text(hr))),
-        None => f,
+    let gpu_check = |f: Failure| device_check(renderer, f);
+    // The first published frame is the only thing that sets the writer `Live` (see `Shared::live_gen`).
+    let go_live = || {
+        let mut live = lock(&shared.live_gen);
+        *live = ctx.gen;
+        writer.set_state(WriterState::Live);
     };
 
     store_stats(shared, &stats);
@@ -2553,11 +2913,7 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
         // Keep the DLL's picture of what we advertise current.
         let out_settings = *lock(&shared.output);
         let (ow, oh, ofps) = resolve_output(&out_settings, source.info());
-        if advertised != (ow, oh, ofps, out_settings.extra_sizes) {
-            writer.set_advertised(&advertised_list(ow, oh, ofps, out_settings.extra_sizes));
-            advertised = (ow, oh, ofps, out_settings.extra_sizes);
-            *lock(&shared.advertised) = Some((ow, oh, ofps));
-        }
+        advertise_session(shared, writer, (ow, oh, ofps, out_settings.extra_sizes));
         color = effective_color(*lock(&shared.color));
 
         // Pause: keep the camera open, read and drop its frames, show the paused slate.
@@ -2602,7 +2958,7 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                     &p,
                     &mut published,
                     &mut published_any,
-                    writer,
+                    &go_live,
                     &mut latency,
                     &mut pipeline,
                     &mut window,
@@ -2648,6 +3004,11 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
             {
+                // A real loss leaves the device reporting it from then on.
+                renderer
+                    .gpu
+                    .simulate_removed
+                    .store(true, Ordering::SeqCst);
                 return Err(GpuError::Api(windows::core::Error::from(
                     windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED,
                 )));
@@ -2745,7 +3106,7 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                         &p,
                         &mut published,
                         &mut published_any,
-                        writer,
+                        &go_live,
                         &mut latency,
                         &mut pipeline,
                         &mut window,
@@ -2768,7 +3129,7 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                         &p,
                         &mut published,
                         &mut published_any,
-                        writer,
+                        &go_live,
                         &mut latency,
                         &mut pipeline,
                         &mut window,
@@ -2837,14 +3198,14 @@ fn note_published(
     p: &Published,
     published: &mut u64,
     published_any: &mut bool,
-    writer: &Writer,
+    go_live: &dyn Fn(),
     latency: &mut LatencyTrack,
     pipeline: &mut LatencyTrack,
     window: &mut Window,
 ) {
     if !*published_any {
         *published_any = true;
-        writer.set_state(WriterState::Live);
+        go_live();
     }
     *published += 1;
     window.published += 1;
@@ -3165,6 +3526,7 @@ mod tests {
             error_cap: Duration::from_millis(1500),
             stable_after: Duration::from_millis(600),
             gpu_failure_window: Duration::from_secs(5),
+            gpu_slate_delay: Duration::from_secs(1),
         }
     }
 
@@ -3184,11 +3546,29 @@ mod tests {
         privacy: AtomicBool,
         /// Open sources fail with this stream error while it is set (a hiccup of the driver).
         stream_error: Arc<AtomicBool>,
+        /// The next source to read fails with the stream error once.
+        stream_error_once: Arc<AtomicBool>,
+        /// The stream error that `stream_error_once` makes comes with a lost GPU device (the same read: no frame
+        /// is drawn in between to find the loss first).
+        lose_device_with_error: Arc<AtomicBool>,
         /// How long an open takes.
         open_delay: Mutex<Duration>,
         /// Formats the camera does not list: opening a `SourceSpec::Configured` that names one fails as a format.
         /// `VideoFormat::Any` here is a camera that offers nothing the engine can read.
         lacks: Mutex<Vec<VideoFormat>>,
+        /// The `first_open` flag of every open, in order.
+        first_opens: Mutex<Vec<bool>>,
+        /// A `SourceSpec::Configured` open of a camera that "sends no picture" in a saved format fails like the
+        /// real factory does (a no-frames failure, a format failure on the first open of a source only).
+        silent_formats: Mutex<Vec<VideoFormat>>,
+        /// While set, an open waits for a message (or for the sender to go away) before it goes on.
+        open_gate: Mutex<Option<Mutex<std::sync::mpsc::Receiver<()>>>>,
+        /// Whether the device the open was handed was removed, for every open.
+        opened_on_removed: Mutex<Vec<bool>>,
+        /// The next open loses the GPU device while it runs (once).
+        lose_device_in_open: AtomicBool,
+        /// The registry says the privacy switch is off, but opens work (Windows does not enforce it for every app).
+        registry_deny: AtomicBool,
     }
 
     /// The symbolic link the fake camera has.
@@ -3200,6 +3580,9 @@ mod tests {
         controls: Arc<FakeControls>,
         gone: Arc<AtomicBool>,
         stream_error: Arc<AtomicBool>,
+        stream_error_once: Arc<AtomicBool>,
+        lose_device_with_error: Arc<AtomicBool>,
+        gpu: Arc<GpuDevice>,
         alive: Arc<std::sync::atomic::AtomicU32>,
     }
 
@@ -3220,7 +3603,10 @@ mod tests {
             if self.gone.load(Ordering::SeqCst) {
                 return SourceEvent::Stopped(Failure::disconnected(None));
             }
-            if self.stream_error.load(Ordering::SeqCst) {
+            if self.stream_error.load(Ordering::SeqCst) || self.stream_error_once.swap(false, Ordering::SeqCst) {
+                if self.lose_device_with_error.swap(false, Ordering::SeqCst) {
+                    self.gpu.simulate_removed.store(true, Ordering::SeqCst);
+                }
                 return SourceEvent::Stopped(Failure::from_stop(StopReason::Error(HRESULT(
                     0xC00D_3E8C_u32 as i32,
                 ))));
@@ -3237,13 +3623,26 @@ mod tests {
             &self,
             spec: &SourceSpec,
             _output_fps: Option<u32>,
-            _gpu: &Arc<GpuDevice>,
+            gpu: &Arc<GpuDevice>,
+            first_open: bool,
         ) -> Result<Box<dyn Source>, Failure> {
             self.opens.fetch_add(1, Ordering::SeqCst);
             self.specs.lock().unwrap().push(spec.clone());
+            self.first_opens.lock().unwrap().push(first_open);
+            // What a camera does when it is handed a device that is gone (the real factory fails to set the media
+            // type, which `from_capture` used to call a format problem), and one that goes while it opens.
+            let removed = gpu.removed_reason().is_some();
+            self.opened_on_removed.lock().unwrap().push(removed);
+            if removed || self.lose_device_in_open.swap(false, Ordering::SeqCst) {
+                gpu.simulate_removed.store(true, Ordering::SeqCst);
+                return Err(Failure::Format("SetCurrentMediaType failed: the device was removed".into()));
+            }
             let delay = *self.open_delay.lock().unwrap();
             if !delay.is_zero() {
                 std::thread::sleep(delay);
+            }
+            if let Some(gate) = self.open_gate.lock().unwrap().as_ref() {
+                let _ = gate.lock().unwrap().recv();
             }
             if let Some(f) = self.failures.lock().unwrap().pop_front() {
                 return Err(f);
@@ -3267,6 +3666,14 @@ mod tests {
                                 "camera does not list {}",
                                 describe_cap(c)
                             )));
+                        }
+                        if self.silent_formats.lock().unwrap().contains(&c.video_format) {
+                            // What `DefaultFactory` makes of a camera that opens and sends nothing.
+                            return Err(no_picture_as_format_problem(
+                                Failure::from_capture(&CaptureError::Timeout("the first frame")),
+                                c,
+                                first_open,
+                            ));
                         }
                         match bars(30) {
                             SourceSpec::Synthetic(s) => Ok(s),
@@ -3294,19 +3701,23 @@ mod tests {
                 controls: self.controls.clone(),
                 gone: self.gone.clone(),
                 stream_error: self.stream_error.clone(),
+                stream_error_once: self.stream_error_once.clone(),
+                lose_device_with_error: self.lose_device_with_error.clone(),
+                gpu: gpu.clone(),
                 alive: self.alive.clone(),
             }))
         }
 
         fn privacy_blocked(&self) -> Option<crate::capture::privacy::Blocked> {
-            self.privacy
-                .load(Ordering::SeqCst)
+            (self.privacy.load(Ordering::SeqCst) || self.registry_deny.load(Ordering::SeqCst))
                 .then_some(crate::capture::privacy::Blocked::DesktopApps)
         }
     }
 
     struct Rig {
         engine: Engine,
+        /// The device the engine started with (the next ones are its own).
+        gpu: Arc<GpuDevice>,
         fake: Arc<Fake>,
         file: MappedFile,
         events: Arc<Mutex<Vec<(Instant, EngineEvent)>>>,
@@ -3330,8 +3741,16 @@ mod tests {
                 controls: crate::camera_controls::fake::camera(),
                 privacy: AtomicBool::new(false),
                 stream_error: Arc::new(AtomicBool::new(false)),
+                stream_error_once: Arc::new(AtomicBool::new(false)),
+                lose_device_with_error: Arc::new(AtomicBool::new(false)),
                 open_delay: Mutex::new(Duration::ZERO),
                 lacks: Mutex::new(Vec::new()),
+                first_opens: Mutex::new(Vec::new()),
+                silent_formats: Mutex::new(Vec::new()),
+                open_gate: Mutex::new(None),
+                opened_on_removed: Mutex::new(Vec::new()),
+                lose_device_in_open: AtomicBool::new(false),
+                registry_deny: AtomicBool::new(false),
             });
             let opener = Arc::new(crate::camera_controls::fake::FakeOpener {
                 camera: fake.controls.clone(),
@@ -3340,7 +3759,7 @@ mod tests {
                 closed: Default::default(),
             });
             let probe = writer.clone();
-            let engine = Engine::build(gpu, writer, timings, fake.clone(), opener).unwrap();
+            let engine = Engine::build(gpu.clone(), writer, timings, fake.clone(), opener).unwrap();
             let events: Arc<Mutex<Vec<(Instant, EngineEvent)>>> = Arc::default();
             let writer_at: Arc<Mutex<Vec<(EngineEvent, u32)>>> = Arc::default();
             let (sink, seen) = (events.clone(), writer_at.clone());
@@ -3353,6 +3772,7 @@ mod tests {
             }));
             Rig {
                 engine,
+                gpu,
                 fake,
                 file: MappedFile::open(&path, Access::ReadWrite).unwrap(),
                 events,
@@ -3821,11 +4241,12 @@ mod tests {
         });
         assert_eq!(rig.engine.state(), EngineState::Reconnecting);
 
-        // plugged in again: Live within one retry interval (plus the open)
+        // plugged in again: Live on the next retry (counted in opens, not in seconds)
+        let opens_when_back = rig.opens();
         rig.fake.gone.store(false, Ordering::SeqCst);
-        let back = rig.wait_state(EngineState::Live, Duration::from_secs(5));
+        let back = rig.wait_state(EngineState::Live, Duration::from_secs(10));
         eprintln!("camera back -> live in {back:?}");
-        assert!(back < Duration::from_millis(1200), "{back:?}");
+        assert!(rig.opens() <= opens_when_back + 2, "{} opens before, {} after", opens_when_back, rig.opens());
         rig.wait("video", Duration::from_secs(10), |r| {
             r.writer_state() == LIVE
         });
@@ -4447,31 +4868,17 @@ mod tests {
         rig.wait("live again", Duration::from_secs(5), |r| {
             r.engine.state() == EngineState::Live && r.writer_state() == LIVE
         });
-        // Stays up well past `stable_after`: the next failure starts a new count instead of adding to the old one.
-        std::thread::sleep(Duration::from_millis(900));
-        rig.fake.stream_error.store(true, Ordering::SeqCst);
-        rig.wait_state(EngineState::Reconnecting, Duration::from_secs(5));
-        std::thread::sleep(Duration::from_millis(1000));
-        assert_ne!(
-            rig.engine.state(),
-            EngineState::Stopped,
-            "a second hiccup of a camera that was up must not inherit the first one's time"
-        );
-        rig.fake.stream_error.store(false, Ordering::SeqCst);
-        rig.wait("live again", Duration::from_secs(5), |r| {
-            r.engine.state() == EngineState::Live && r.writer_state() == LIVE
-        });
+        // (That a camera that stayed up starts a new count instead of adding to the old one is `the_failure_count_*`,
+        // on a clock the test controls.)
 
         // A camera that keeps failing: Reconnecting for `error_cap`, then Stopped with a plain error.
         std::thread::sleep(Duration::from_millis(700)); // up for longer than `stable_after`: a fresh count
         let t = Instant::now();
         rig.fake.stream_error.store(true, Ordering::SeqCst);
         assert!(rig.engine.wait_stopped(Duration::from_secs(10)));
+        // not before the cap (the engine cannot know earlier); how much later is no business of a wall clock
         let took = t.elapsed();
-        assert!(
-            took >= Duration::from_millis(1400) && took < Duration::from_secs(4),
-            "stopped after {took:?}"
-        );
+        assert!(took >= Duration::from_millis(1400), "stopped after {took:?}");
         let err = rig.engine.last_error().expect("an error");
         assert!(err.contains("kept failing") && err.contains("stream failed"), "{err}");
         assert_eq!(rig.writer_state(), PAUSED);
@@ -4534,6 +4941,7 @@ mod tests {
                 width: 320,
                 height: 180,
                 interval: 333_333,
+                format: "nv12".into(),
             }]
         );
         assert!(rig.engine.last_error().is_none());
@@ -4664,11 +5072,12 @@ mod tests {
         assert!(rig.opens() >= opens + 3, "retries go on: {} -> {}", opens, rig.opens());
         assert!(rig.engine.last_error().is_none());
 
-        // access is back: live by itself within one retry interval, no restart
+        // access is back: live by itself on the next retry, no restart (counted in opens, not in seconds)
+        let opens_when_back = rig.opens();
         rig.fake.privacy.store(false, Ordering::SeqCst);
-        let back = rig.wait_state(EngineState::Live, Duration::from_secs(3));
+        let back = rig.wait_state(EngineState::Live, Duration::from_secs(10));
         eprintln!("access back -> live in {back:?}");
-        assert!(back < Duration::from_millis(1200), "{back:?}");
+        assert!(rig.opens() <= opens_when_back + 2, "{} opens before, {} after", opens_when_back, rig.opens());
         rig.wait("video", Duration::from_secs(10), |r| r.writer_state() == LIVE);
         assert!(rig.states().last() == Some(&(EngineState::Live, None)));
     }
@@ -4749,14 +5158,13 @@ mod tests {
 
         // the device goes
         let lost = Instant::now();
-        rig.engine.shared.gpu_faults.store(1, Ordering::SeqCst);
+        rig.engine.inject_device_loss(1);
         rig.wait("a new device", Duration::from_secs(10), |r| r.engine.gpu_generation() == 2);
         rig.wait("live again", Duration::from_secs(10), |r| {
             r.engine.state() == EngineState::Live && r.writer_state() == LIVE && r.opens() == 2
         });
-        let back = lost.elapsed();
-        eprintln!("device lost -> live again in {back:?}");
-        assert!(back < Duration::from_secs(2), "{back:?}");
+        // How long it took is for the log; what has to hold is the order, not a time.
+        eprintln!("device lost -> live again in {:?}", lost.elapsed());
 
         // capture reopened, tap told, chain on the new device: still grey, frames keep coming
         assert_eq!(device_changes.load(Ordering::SeqCst), 1);
@@ -4776,36 +5184,87 @@ mod tests {
         assert_eq!(rig.alive(), 1, "the old camera was released");
     }
 
-    /// Plan 4.9: after a device loss the last frame stays on the file for about a second; a recovery that takes
-    /// longer shows the "starting" slate until the first new frame.
+    /// Plan 4.9: after a device loss the last frame stays on the file for `gpu_slate_delay` (1 s); a recovery that
+    /// takes longer shows the "starting" slate until the first new frame. Driven by the delay (made short here) and
+    /// by event order, not by a window of wall-clock time.
     #[test]
-    fn a_slow_recovery_from_a_device_loss_shows_the_slate_after_a_second() {
-        let rig = Rig::new("p15-gpu-slow.bin", fast());
+    fn a_slow_recovery_from_a_device_loss_shows_the_slate_after_the_delay() {
+        let mut t = fast();
+        t.gpu_slate_delay = Duration::from_millis(200);
+        let rig = Rig::new("p15-gpu-slow.bin", t);
         rig.engine.start(settings(bars(30), false));
         rig.engine.wait_live(Duration::from_secs(20)).unwrap();
         rig.wait("video", Duration::from_secs(10), |r| r.writer_state() == LIVE);
-        // the camera needs two seconds to open again
-        *rig.fake.open_delay.lock().unwrap() = Duration::from_millis(2000);
-        let lost = Instant::now();
-        rig.engine.shared.gpu_faults.store(1, Ordering::SeqCst);
+        // the camera is held up until the test lets it go: the recovery lasts as long as the test wants
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        *rig.fake.open_gate.lock().unwrap() = Some(Mutex::new(hold));
+        rig.engine.inject_device_loss(1);
         rig.wait("the device is rebuilt", Duration::from_secs(10), |r| r.engine.gpu_generation() == 2);
-        // right after the loss the picture on the file is still the last one (unless a loaded machine took a second
-        // to rebuild the device)...
-        if lost.elapsed() < Duration::from_millis(800) {
-            assert_eq!(rig.writer_state(), LIVE, "the last frame is repeated at first");
-        }
-        assert_eq!(rig.engine.reason().as_deref(), Some("reopening"));
-        // ...and about a second later the slate takes over, while the camera is still opening
-        let at = rig.wait("the slate", Duration::from_secs(4), |r| r.writer_state() == STARTING);
-        assert!(
-            lost.elapsed() >= Duration::from_millis(900) && lost.elapsed() < Duration::from_millis(1900),
-            "slate after {:?} ({at:?} of waiting)",
-            lost.elapsed()
+        // the loss was announced with the last picture still on the file (the slate comes after the delay)...
+        assert_eq!(
+            rig.writer_at_state(EngineState::Standby)[1],
+            (Some("reopening".into()), LIVE),
+            "the last frame is repeated at first"
         );
-        assert_eq!(rig.engine.state(), EngineState::Standby);
+        // ...and while the camera is still opening, the slate takes over
+        rig.wait("the slate", Duration::from_secs(4), |r| r.writer_state() == STARTING);
+        assert_eq!(rig.engine.state(), EngineState::Standby, "still opening: the slate came first");
         // the first frame of the new session ends it
+        release.send(()).unwrap();
         rig.wait_state(EngineState::Live, Duration::from_secs(10));
         rig.wait("video again", Duration::from_secs(10), |r| r.writer_state() == LIVE);
+    }
+
+    /// A recovery that is quicker than the delay never shows the slate.
+    #[test]
+    fn a_quick_recovery_from_a_device_loss_never_shows_the_slate() {
+        let mut t = fast();
+        t.gpu_slate_delay = Duration::from_secs(30);
+        let rig = Rig::new("p15-gpu-quick.bin", t);
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("video", Duration::from_secs(10), |r| r.writer_state() == LIVE);
+        rig.engine.inject_device_loss(1);
+        rig.wait("a new device", Duration::from_secs(10), |r| r.engine.gpu_generation() == 2);
+        rig.wait("live again", Duration::from_secs(10), |r| {
+            r.engine.state() == EngineState::Live && r.writer_state() == LIVE && r.opens() == 2
+        });
+        // the loss was announced over the last picture, which the file kept (no slate: the delay is far away)
+        assert_eq!(rig.writer_at_state(EngineState::Standby)[1], (Some("reopening".into()), LIVE));
+    }
+
+    /// L1: the slate that follows a slow recovery is cancelled by a Stop and a Start (and by a failure): it must
+    /// not cover a session that is live by then. The slate comes `gpu_slate_delay` after the loss, which is what
+    /// the test waits out (there is nothing to observe when it does not come).
+    #[test]
+    fn a_device_loss_slate_never_covers_a_session_that_started_after_it() {
+        let mut t = fast();
+        t.gpu_slate_delay = Duration::from_millis(300);
+        let rig = Rig::new("p15-gpu-slate-cancel.bin", t);
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("video", Duration::from_secs(10), |r| r.writer_state() == LIVE);
+        // the loss, with the camera held up so the recovery is still going on
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        *rig.fake.open_gate.lock().unwrap() = Some(Mutex::new(hold));
+        let lost = Instant::now();
+        rig.engine.inject_device_loss(1);
+        rig.wait("a new device", Duration::from_secs(10), |r| r.engine.gpu_generation() == 2);
+        // Stop and Start before the slate is due. The Stop waits for the session thread that is held up in its open,
+        // so the camera is let go first (a gate whose sender is gone does not hold anything back).
+        rig.engine.stop();
+        drop(release);
+        assert!(rig.engine.wait_stopped(Duration::from_secs(10)));
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("video", Duration::from_secs(10), |r| r.writer_state() == LIVE);
+        // wait out the delay of the loss that is long gone
+        let due = Duration::from_millis(300) * 3;
+        if let Some(rest) = due.checked_sub(lost.elapsed()) {
+            std::thread::sleep(rest);
+        }
+        assert_eq!(rig.engine.state(), EngineState::Live);
+        assert_eq!(rig.writer_state(), LIVE, "the old slate covered the live picture");
     }
 
     #[test]
@@ -5043,6 +5502,615 @@ mod tests {
         assert!(other.engine.wait_stopped(Duration::from_secs(5)));
         assert!(other.engine.resume_state().is_none());
         assert!(!other.engine.is_started());
+    }
+
+    // ---- review fixes: GPU device, pause, queued commands, formats, failure counts ------------------------------------
+
+    fn fallbacks(rig: &Rig) -> Vec<FormatFallbackEvent> {
+        rig.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(_, e)| match e {
+                EngineEvent::FormatFallback(f) => Some(f.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn pauses(rig: &Rig) -> Vec<bool> {
+        rig.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(_, e)| match e {
+                EngineEvent::Paused(p) => Some(p.paused),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// H1: a device that was removed while nothing used it (a driver update while the app sat in the tray, the camera
+    /// off in standby) is replaced before the camera opens, not handed to the camera.
+    #[test]
+    fn a_device_lost_while_idle_is_rebuilt_when_the_camera_wakes() {
+        let rig = Rig::new("rf-h1-idle.bin", fast());
+        rig.engine.start(settings(bars(30), true));
+        rig.wait("idle standby", Duration::from_secs(5), |r| {
+            r.engine.state() == EngineState::Standby && r.engine.reason().as_deref() == Some("idle")
+        });
+        assert_eq!(rig.opens(), 0);
+        rig.gpu.simulate_removed.store(true, Ordering::SeqCst);
+        rig.engine.set_window_visible(true);
+        rig.wait_state(EngineState::Live, Duration::from_secs(10));
+        assert_eq!(rig.engine.gpu_generation(), 2, "a new device");
+        assert_eq!(*rig.fake.opened_on_removed.lock().unwrap(), vec![false], "the camera got a working device");
+        assert!(rig.engine.last_error().is_none());
+        assert!(fallbacks(&rig).is_empty(), "a lost device is not a format problem");
+        rig.wait("video", Duration::from_secs(10), |r| r.writer_state() == LIVE);
+    }
+
+    /// H1: a device lost while the engine is stopped is replaced by the next Start.
+    #[test]
+    fn a_device_lost_while_stopped_is_rebuilt_by_the_next_start() {
+        let rig = Rig::new("rf-h1-stopped.bin", fast());
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.engine.stop();
+        assert!(rig.engine.wait_stopped(Duration::from_secs(10)));
+        rig.gpu.simulate_removed.store(true, Ordering::SeqCst);
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        assert_eq!(rig.engine.gpu_generation(), 2);
+        assert_eq!(*rig.fake.opened_on_removed.lock().unwrap(), vec![false, false]);
+        assert!(rig.engine.last_error().is_none());
+    }
+
+    /// H1: the open itself reports the loss (the decoder or the media type fails because the device went): it is
+    /// a device loss, not a format problem (which would replace the saved format) or a camera error (30 s of retries).
+    #[test]
+    fn a_device_loss_that_shows_in_the_open_is_rebuilt_and_not_called_a_format_error() {
+        let rig = Rig::new("rf-h1-open.bin", fast());
+        rig.fake.lose_device_in_open.store(true, Ordering::SeqCst);
+        rig.engine.start(settings(configured(VideoFormat::Format(PixelFormat::Yuy2)), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        assert_eq!(rig.engine.gpu_generation(), 2);
+        assert_eq!(rig.opens(), 2, "opened again on the new device");
+        assert!(fallbacks(&rig).is_empty());
+        assert!(rig.engine.last_error().is_none());
+        assert!(rig.states().iter().all(|(s, _)| *s != EngineState::Stopped));
+        // and the saved format was kept: both opens asked for it
+        let specs = rig.fake.specs.lock().unwrap().clone();
+        assert!(specs.iter().all(|s| *s == configured(VideoFormat::Format(PixelFormat::Yuy2))));
+    }
+
+    /// The same, in the classification: a device-lost code is a GPU loss before it is anything else.
+    #[test]
+    fn device_lost_codes_are_a_gpu_loss_first() {
+        use windows::core::Error;
+        use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET};
+        for (what, code) in [
+            ("SetCurrentMediaType", DXGI_ERROR_DEVICE_REMOVED),
+            ("first ReadSample", DXGI_ERROR_DEVICE_RESET),
+            ("MFCreateSourceReaderFromMediaSource", DXGI_ERROR_DEVICE_REMOVED),
+        ] {
+            let e = CaptureError::Api { what, error: Error::from(code) };
+            assert!(matches!(Failure::from_capture(&e), Failure::GpuLost(m) if m.contains("0x887A0005") || m.contains("0x887A0007")), "{what}");
+        }
+        assert!(matches!(
+            Failure::from_stop(StopReason::Error(DXGI_ERROR_DEVICE_REMOVED)),
+            Failure::GpuLost(_)
+        ));
+        // without a lost device the same call is what it was: a format problem
+        let e = CaptureError::Api { what: "SetCurrentMediaType", error: Error::from(HRESULT(0xC00D_36B4_u32 as i32)) };
+        assert!(matches!(Failure::from_capture(&e), Failure::Format(_)));
+    }
+
+    /// H1: after the engine stopped itself for repeated losses it holds the lost device; the next Start rebuilds it.
+    #[test]
+    fn start_after_the_stop_by_repeated_losses_builds_a_new_device() {
+        let rig = Rig::new("rf-h1-three.bin", fast());
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.engine.inject_device_loss(1_000);
+        assert!(rig.engine.wait_stopped(Duration::from_secs(20)));
+        assert!(rig.engine.last_error().unwrap().contains("3 times"));
+        assert_eq!(rig.engine.gpu_generation(), 3);
+        rig.engine.inject_device_loss(0);
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        assert_eq!(rig.engine.gpu_generation(), 4, "the device of the stop was lost: a new one");
+        assert!(rig.engine.last_error().is_none());
+        assert!(rig.fake.opened_on_removed.lock().unwrap().iter().all(|r| !r));
+    }
+
+    /// L9: the render loop looks at the device after a frame (a draw call reports nothing when the device is gone).
+    #[test]
+    fn a_device_that_goes_between_frames_is_found_after_the_frame() {
+        let rig = Rig::new("rf-l9-frame.bin", fast());
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("video", Duration::from_secs(10), |r| r.writer_state() == LIVE);
+        // no frame fails: only the device reports itself removed
+        rig.gpu.simulate_removed.store(true, Ordering::SeqCst);
+        rig.wait("a new device", Duration::from_secs(10), |r| r.engine.gpu_generation() == 2);
+        rig.wait_state(EngineState::Live, Duration::from_secs(10));
+        assert_eq!(rig.opens(), 2);
+        assert!(rig.engine.last_error().is_none());
+    }
+
+    /// L9: a stream that stops because the device went is a device loss, not a camera error (no 30 s of retries).
+    #[test]
+    fn a_stream_that_stops_with_the_device_is_a_device_loss() {
+        let rig = Rig::new("rf-l9-stream.bin", fast());
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        // the stream stops with a camera error code, and the device is gone in the same read: no frame is drawn
+        // between them, so only the stop can show the loss
+        rig.fake.lose_device_with_error.store(true, Ordering::SeqCst);
+        rig.fake.stream_error_once.store(true, Ordering::SeqCst);
+        rig.wait("a new device", Duration::from_secs(10), |r| r.engine.gpu_generation() == 2);
+        rig.wait_state(EngineState::Live, Duration::from_secs(10));
+        assert!(
+            rig.states().iter().all(|(s, _)| *s != EngineState::Reconnecting),
+            "never a camera problem: {:?}",
+            rig.states()
+        );
+    }
+
+    /// M6: the heartbeat of the file goes on while the GPU device is rebuilt (the virtual camera says "not running"
+    /// after a second without one).
+    #[test]
+    fn the_heartbeat_goes_on_while_the_gpu_device_is_rebuilt() {
+        let rig = Rig::new("rf-m6.bin", fast());
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("video", Duration::from_secs(10), |r| r.writer_state() == LIVE);
+        // a rebuild that takes two seconds on top of the real work
+        *rig.engine.shared.rebuild_delay.lock().unwrap() = Duration::from_secs(2);
+        let age_ms = |r: &Rig| {
+            let h = r.file.shared().header();
+            vcam_protocol::qpc_to_hns(vcam_protocol::qpc_now().saturating_sub(h.writer_heartbeat)) / 10_000
+        };
+        rig.engine.inject_device_loss(1);
+        let mut worst = 0;
+        let end = Instant::now() + Duration::from_secs(20);
+        while rig.engine.gpu_generation() < 2 || rig.engine.state() != EngineState::Live {
+            worst = worst.max(age_ms(&rig));
+            assert!(Instant::now() < end, "no new device");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        eprintln!("oldest heartbeat while the device was rebuilt: {worst} ms");
+        assert!(worst < 500, "the heartbeat was {worst} ms old");
+    }
+
+    /// M5: the failure count of generic failures starts over after idle standby.
+    #[test]
+    fn the_failure_count_does_not_run_through_idle_standby() {
+        let mut t = fast();
+        t.error_cap = Duration::from_millis(1000);
+        let rig = Rig::new("rf-m5.bin", t);
+        let no_picture = || Failure::from_capture(&CaptureError::Timeout("the first frame"));
+        // the open and its first retry (300 ms later) fail: the run is 300 ms old when the camera is given up
+        for _ in 0..2 {
+            rig.fake.failures.lock().unwrap().push_back(no_picture());
+        }
+        rig.engine.set_window_visible(true);
+        rig.engine.start(settings(bars(30), true));
+        rig.wait_state(EngineState::Reconnecting, Duration::from_secs(5));
+        // nobody watches: the camera is given up, and stays so for longer than the cap
+        rig.engine.set_window_visible(false);
+        rig.wait("idle standby", Duration::from_secs(5), |r| {
+            r.engine.state() == EngineState::Standby && r.engine.reason().as_deref() == Some("idle")
+        });
+        std::thread::sleep(Duration::from_millis(1100));
+        // the first failure after the wake-up is the first of a new run, not the one that ends the old
+        rig.fake.failures.lock().unwrap().push_back(no_picture());
+        rig.engine.set_window_visible(true);
+        rig.wait_state(EngineState::Reconnecting, Duration::from_secs(5));
+        assert!(rig.engine.last_error().is_none());
+        rig.wait_state(EngineState::Live, Duration::from_secs(5));
+    }
+
+    /// M5, on a clock the test controls: the run starts at the first generic failure and a camera that was up
+    /// starts a new one.
+    #[test]
+    fn the_failure_count_has_the_run_the_timings_say() {
+        let t = fast(); // cap 1500 ms, stable after 600 ms
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut first = None;
+        let note = |first: &mut Option<Instant>, kind, lived: Option<u64>, now: u64| {
+            streak_exhausted(first, kind, lived.map(Duration::from_millis), at(now), &t)
+        };
+        assert!(!note(&mut first, RetryKind::Error, None, 0));
+        assert!(!note(&mut first, RetryKind::NoFrames, None, 1_000));
+        assert!(note(&mut first, RetryKind::Decoder, None, 1_500), "the cap, counted from the first");
+        // a camera that was up for 600 ms or more starts a new run
+        assert!(!note(&mut first, RetryKind::Error, Some(600), 1_600));
+        assert_eq!(first, Some(at(1_600)));
+        assert!(!note(&mut first, RetryKind::Error, Some(599), 3_000), "up for less: the same run");
+        assert!(note(&mut first, RetryKind::Error, Some(599), 3_100));
+        // a failure that may last as long as it likes ends the run and counts for nothing
+        for kind in [RetryKind::InUse, RetryKind::AccessDenied, RetryKind::Disconnected, RetryKind::NotFound, RetryKind::Privacy] {
+            first = Some(at(0));
+            assert!(!note(&mut first, kind, None, 100_000), "{kind:?}");
+            assert_eq!(first, None, "{kind:?}");
+        }
+    }
+
+    /// M4: a camera that sends no picture in the saved format is taken for lacking it on the first open of a Start
+    /// only. The device default runs for that Start; the next Start tries the saved format again.
+    #[test]
+    fn a_saved_format_without_a_picture_falls_back_for_one_start_only() {
+        let rig = Rig::new("rf-m4-first.bin", fast());
+        let saved = || configured(VideoFormat::Format(PixelFormat::Yuy2));
+        rig.fake.silent_formats.lock().unwrap().push(VideoFormat::Format(PixelFormat::Yuy2));
+        rig.engine.start(settings(saved(), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        assert_eq!(fallbacks(&rig).len(), 1);
+        assert_eq!(fallbacks(&rig)[0].format, "nv12");
+        assert_eq!(*rig.fake.first_opens.lock().unwrap(), vec![true]);
+        // it runs the device default, and the owner's `set_source` with those same settings is no change
+        let running = match rig.engine.resume_state().unwrap().settings.source {
+            SourceSpec::Configured(c) => c,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!((running.res_type, running.video_format), (ResType::Preferred, VideoFormat::Any));
+
+        // Stop, and the camera is fine again: the next Start asks for the saved format, and gets it
+        rig.engine.stop();
+        assert!(rig.engine.wait_stopped(Duration::from_secs(10)));
+        rig.fake.silent_formats.lock().unwrap().clear();
+        rig.engine.start(settings(saved(), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        assert_eq!(*rig.fake.specs.lock().unwrap().last().unwrap(), saved());
+        assert_eq!(fallbacks(&rig).len(), 1, "no second fallback");
+        let running = match rig.engine.resume_state().unwrap().settings.source {
+            SourceSpec::Configured(c) => c,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(running.video_format, VideoFormat::Format(PixelFormat::Yuy2), "the saved format runs");
+        assert_eq!(*rig.fake.first_opens.lock().unwrap(), vec![true, true], "each Start opens as a first open");
+    }
+
+    /// M4: once a source has opened, a camera that comes back after an unplug and is slow with its first picture is
+    /// retried in the same format; the saved format is not replaced.
+    #[test]
+    fn a_slow_first_picture_after_a_reconnect_is_retried_in_the_same_format() {
+        let mut t = fast();
+        t.error_cap = Duration::from_secs(60);
+        let rig = Rig::new("rf-m4-retry.bin", t);
+        let saved = || configured(VideoFormat::Format(PixelFormat::Yuy2));
+        rig.engine.start(settings(saved(), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        // unplugged, and back with a camera that sends nothing for a while
+        rig.fake.gone.store(true, Ordering::SeqCst);
+        rig.wait_state(EngineState::Reconnecting, Duration::from_secs(5));
+        rig.fake.silent_formats.lock().unwrap().push(VideoFormat::Format(PixelFormat::Yuy2));
+        rig.fake.gone.store(false, Ordering::SeqCst);
+        let opens = rig.opens();
+        rig.wait("two retries of the camera that is back", Duration::from_secs(10), |r| r.opens() >= opens + 3);
+        assert_eq!(rig.engine.state(), EngineState::Reconnecting);
+        assert!(rig.engine.reason().unwrap().contains("picture"), "{:?}", rig.engine.reason());
+        assert!(fallbacks(&rig).is_empty(), "the saved format is not replaced by the device default");
+        // it answers in the end: live in the saved format
+        rig.fake.silent_formats.lock().unwrap().clear();
+        rig.wait_state(EngineState::Live, Duration::from_secs(10));
+        assert!(fallbacks(&rig).is_empty());
+        let specs = rig.fake.specs.lock().unwrap().clone();
+        assert!(specs.iter().all(|s| *s == saved()), "every open asked for the saved format");
+        let firsts = rig.fake.first_opens.lock().unwrap().clone();
+        assert!(firsts[0]);
+        assert!(firsts[1..].iter().all(|f| !f), "{firsts:?}");
+    }
+
+    /// M4: choosing the saved format again (a `set_source` with it) is a new first open: the fallback applies again.
+    #[test]
+    fn trying_the_saved_format_again_can_fall_back_again() {
+        let rig = Rig::new("rf-m4-again.bin", fast());
+        let saved = || configured(VideoFormat::Format(PixelFormat::Yuy2));
+        rig.fake.silent_formats.lock().unwrap().push(VideoFormat::Format(PixelFormat::Yuy2));
+        rig.engine.start(settings(saved(), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        assert_eq!(fallbacks(&rig).len(), 1);
+        rig.engine.set_source(SourceUpdate {
+            source: saved(),
+            flip_vertical: false,
+            color: ColorSettings::default(),
+            deactivate_when_not_showing: false,
+        });
+        rig.wait("the second fallback", Duration::from_secs(10), |r| fallbacks(r).len() == 2);
+        rig.wait_state(EngineState::Live, Duration::from_secs(10));
+        assert_eq!(*rig.fake.first_opens.lock().unwrap(), vec![true, true]);
+    }
+
+    /// M1: pause is reported as it changes, and a Stop or a fatal error that clears it says so.
+    #[test]
+    fn pause_is_reported_when_it_changes() {
+        let rig = Rig::new("rf-m1.bin", fast());
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        assert!(pauses(&rig).is_empty(), "nothing to report: it was never paused");
+        rig.engine.set_pause(true);
+        rig.wait("paused", Duration::from_secs(5), |r| pauses(r) == vec![true]);
+        rig.engine.set_pause(true);
+        rig.engine.set_pause(false);
+        rig.wait("resumed", Duration::from_secs(5), |r| pauses(r) == vec![true, false]);
+        rig.engine.set_pause(true);
+        rig.wait("paused again", Duration::from_secs(5), |r| pauses(r) == vec![true, false, true]);
+        // a Stop clears the pause: the window is told
+        rig.engine.stop();
+        assert!(rig.engine.wait_stopped(Duration::from_secs(5)));
+        rig.wait("cleared by the stop", Duration::from_secs(5), |r| pauses(r) == vec![true, false, true, false]);
+        // a pause that arrives while stopped has nothing to pause
+        rig.engine.set_pause(true);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(pauses(&rig), vec![true, false, true, false]);
+        assert!(!rig.engine.paused());
+    }
+
+    /// M3: what a snapshot of the engine says, asked while the control thread has not read the messages that were
+    /// queued before the question.
+    fn frozen_snapshot(rig: &Rig, queue: impl FnOnce(&Engine)) -> Option<ResumeState> {
+        let engine = &rig.engine;
+        let gate = lock(&engine.shared.control_gate);
+        queue(engine);
+        let asked = engine.shared.snapshots.load(Ordering::SeqCst);
+        std::thread::scope(|s| {
+            let answer = s.spawn(move || engine.resume_state());
+            let end = Instant::now() + Duration::from_secs(10);
+            // The question is on its way once it is counted; the answer cannot come before the gate is let go.
+            while engine.shared.snapshots.load(Ordering::SeqCst) == asked && !answer.is_finished() {
+                assert!(Instant::now() < end, "the question was never asked");
+                std::thread::yield_now();
+            }
+            drop(gate);
+            answer.join().unwrap()
+        })
+    }
+
+    fn running_rig(name: &str) -> Rig {
+        let rig = Rig::new(name, fast());
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig
+    }
+
+    fn output_of(width: u32) -> OutputSettings {
+        OutputSettings {
+            width: Some(width),
+            height: Some(width * 9 / 16),
+            ..OutputSettings::default()
+        }
+    }
+
+    #[test]
+    fn the_snapshot_sees_a_stop_that_was_queued_before_it() {
+        let rig = running_rig("rf-m3-stop.bin");
+        assert!(frozen_snapshot(&rig, |e| e.stop()).is_none(), "the engine is stopped: nothing to resume");
+        assert!(!rig.engine.is_started());
+    }
+
+    #[test]
+    fn the_snapshot_sees_a_start_that_was_queued_before_it() {
+        let rig = running_rig("rf-m3-start.bin");
+        rig.engine.stop();
+        assert!(rig.engine.wait_stopped(Duration::from_secs(10)));
+        let s = frozen_snapshot(&rig, |e| {
+            e.start(Settings {
+                output: output_of(800),
+                ..settings(bars(25), true)
+            })
+        })
+        .expect("started");
+        assert_eq!(s.settings.source, bars(25));
+        assert_eq!(s.settings.output.width, Some(800));
+        assert!(s.settings.deactivate_when_not_showing);
+        // a Start that waits in the queue counts as started
+        rig.engine.stop();
+        assert!(rig.engine.wait_stopped(Duration::from_secs(10)));
+        let engine = &rig.engine;
+        let gate = lock(&engine.shared.control_gate);
+        engine.start(settings(bars(30), false));
+        let started = std::thread::scope(|sc| {
+            let asked = engine.shared.snapshots.load(Ordering::SeqCst);
+            let h = sc.spawn(move || engine.is_started());
+            while engine.shared.snapshots.load(Ordering::SeqCst) == asked && !h.is_finished() {
+                std::thread::yield_now();
+            }
+            drop(gate);
+            h.join().unwrap()
+        });
+        assert!(started);
+    }
+
+    #[test]
+    fn the_snapshot_sees_settings_changes_that_were_queued_before_it() {
+        let rig = running_rig("rf-m3-settings.bin");
+        let chain = crate::fx::parse_chain(&serde_json::json!([
+            { "id": "c", "kind": "color_filter", "enabled": true, "params": {} }
+        ]))
+        .unwrap();
+        let s = frozen_snapshot(&rig, |e| {
+            e.set_output(output_of(640));
+            e.set_chain(chain);
+            e.set_source(SourceUpdate {
+                source: bars(15),
+                flip_vertical: true,
+                color: ColorSettings::default(),
+                deactivate_when_not_showing: true,
+            });
+            e.set_pause(true);
+        })
+        .expect("running");
+        assert_eq!(s.settings.output.width, Some(640));
+        assert_eq!(s.chain.len(), 1);
+        assert_eq!(s.settings.source, bars(15));
+        assert!(s.settings.flip_vertical && s.settings.deactivate_when_not_showing);
+        assert!(s.paused);
+    }
+
+    /// L7: a deterministic error stops at once with its name; one that may pass is retried.
+    #[test]
+    fn errors_that_cannot_change_stop_at_once_and_the_others_are_retried() {
+        use windows::core::Error;
+        let api = |what: &'static str, code: u32| CaptureError::Api { what, error: Error::from(HRESULT(code as i32)) };
+        for code in [0x8007_0057_u32, 0x8000_4001, 0x8000_4002, 0x8007_0032] {
+            let f = Failure::from_capture(&api("MFCreateSourceReaderFromMediaSource", code));
+            assert!(matches!(&f, Failure::Fatal(m) if m.contains("MFCreateSourceReaderFromMediaSource") && m.contains(&format!("0x{code:08X}"))), "{f:?}");
+        }
+        for code in [0x8000_4005_u32, 0xC00D_3E8C, 0x8007_001F] {
+            assert!(matches!(
+                Failure::from_capture(&api("MFCreateSourceReaderFromMediaSource", code)),
+                Failure::Retry(RetryKind::Error, _)
+            ));
+        }
+        // and through the engine: a fatal open stops it with that error, no reconnecting
+        let rig = Rig::new("rf-l7.bin", fast());
+        rig.fake.failures.lock().unwrap().push_back(Failure::from_capture(&api("MFCreateSourceReaderFromMediaSource", 0x8007_0057)));
+        rig.engine.start(settings(bars(30), false));
+        let err = rig.engine.wait_live(Duration::from_secs(5)).unwrap_err();
+        assert!(err.contains("0x80070057"), "{err}");
+        assert!(rig.engine.wait_stopped(Duration::from_secs(5)));
+        assert!(rig.states().iter().all(|(s, _)| *s != EngineState::Reconnecting));
+    }
+
+    /// L6: a decoder failure at the open is retried once with hardware decoding off, before the format fallback.
+    #[test]
+    fn a_decoder_failure_is_retried_once_with_hardware_decoding_off() {
+        use windows::core::Error;
+        let decoder = || {
+            Failure::from_capture(&CaptureError::Api {
+                what: "first ReadSample",
+                error: Error::from(HRESULT(0xC00D_6D60_u32 as i32)),
+            })
+        };
+        assert!(matches!(decoder(), Failure::Retry(RetryKind::Decoder, _)));
+        let spec = |hw| CameraSpec {
+            link: FAKE_LINK.into(),
+            request: FormatRequest { format: PixelFormat::Mjpeg, size: None, fps: None },
+            hw_decode: hw,
+        };
+        // hardware first, software works
+        let mut seen = Vec::new();
+        let r = open_retrying_decoder(&spec(true), |s| {
+            seen.push(s.hw_decode);
+            if s.hw_decode { Err(decoder()) } else { Ok(7) }
+        });
+        assert_eq!(r.unwrap(), 7);
+        assert_eq!(seen, vec![true, false]);
+        // both fail: a format problem, which the fallback to the device default takes up
+        let mut calls = 0;
+        let r: Result<u8, Failure> = open_retrying_decoder(&spec(true), |_| {
+            calls += 1;
+            Err(decoder())
+        });
+        assert!(matches!(r, Err(Failure::Format(m)) if m.contains("hardware decoding off")));
+        assert_eq!(calls, 2, "once more, not more");
+        // software from the start: nothing to retry with, and nothing else to blame
+        let mut calls = 0;
+        let r: Result<u8, Failure> = open_retrying_decoder(&spec(false), |_| {
+            calls += 1;
+            Err(decoder())
+        });
+        assert!(matches!(r, Err(Failure::Format(_))));
+        assert_eq!(calls, 1);
+        // other failures are not the decoder's
+        let mut calls = 0;
+        let r: Result<u8, Failure> = open_retrying_decoder(&spec(true), |_| {
+            calls += 1;
+            Err(Failure::in_use(None))
+        });
+        assert!(matches!(r, Err(Failure::Retry(RetryKind::InUse, _))) && calls == 1);
+    }
+
+    /// L4: only a refusal ("access denied") of the open is Windows' privacy setting, and only while a switch is off.
+    /// A value that says `Deny` that Windows does not enforce never relabels anything else.
+    #[test]
+    fn a_privacy_switch_only_explains_an_access_denied() {
+        let rig = Rig::new("rf-l4.bin", fast());
+        rig.fake.registry_deny.store(true, Ordering::SeqCst);
+        let privacy = |f: Failure| outcome_with_privacy(Err(f), &*rig.fake);
+        for other in [
+            Failure::Retry(RetryKind::Error, "the camera stream failed (0xC00D3E8C)".into()),
+            Failure::Retry(RetryKind::NoFrames, "no picture".into()),
+            Failure::Retry(RetryKind::InUse, "camera in use by another app (0xC00D3704)".into()),
+            Failure::Retry(RetryKind::Disconnected, "camera disconnected".into()),
+            Failure::Format("no such format".into()),
+            Failure::Fatal("boom".into()),
+        ] {
+            assert_eq!(privacy(other.clone()), Err(other));
+        }
+        let denied = Failure::in_use(Some(windows::Win32::Foundation::E_ACCESSDENIED));
+        assert!(matches!(&denied, Failure::Retry(RetryKind::AccessDenied, _)));
+        assert!(matches!(privacy(denied.clone()), Err(Failure::Retry(RetryKind::Privacy, r)) if r.contains("privacy")));
+        // no switch is off: it stays what it looks like, a camera that is in use
+        rig.fake.registry_deny.store(false, Ordering::SeqCst);
+        assert_eq!(privacy(denied.clone()), Err(denied));
+    }
+
+    /// L4 through the engine: the registry says `Deny`, Windows lets the app in anyway: a stream error stays a
+    /// stream error, and an open that is refused is the privacy wait.
+    #[test]
+    fn a_deny_value_that_windows_does_not_enforce_does_not_make_a_privacy_wait() {
+        let rig = Rig::new("rf-l4-engine.bin", fast());
+        rig.fake.registry_deny.store(true, Ordering::SeqCst);
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.fake.stream_error.store(true, Ordering::SeqCst);
+        rig.wait_state(EngineState::Reconnecting, Duration::from_secs(5));
+        assert_eq!(last_kind(&rig), Some("error"), "{:?}", rig.engine.reason());
+        assert!(!rig.engine.reason().unwrap().contains("privacy"));
+        rig.fake.stream_error.store(false, Ordering::SeqCst);
+        rig.wait_state(EngineState::Live, Duration::from_secs(5));
+        // an open that is refused is what the switch explains
+        rig.fake.privacy.store(true, Ordering::SeqCst);
+        rig.fake.stream_error.store(true, Ordering::SeqCst);
+        rig.wait("the privacy wait", Duration::from_secs(5), |r| last_kind(r) == Some("privacy"));
+    }
+
+    /// L10: the file holds what the last writer of the advertised list wrote, whoever that is.
+    #[test]
+    fn the_advertised_list_is_never_left_stale_by_the_other_writer() {
+        let rig = Rig::new("rf-l10.bin", fast());
+        let (shared, writer) = (&rig.engine.shared, rig.engine.writer());
+        let first = |r: &Rig| {
+            let h = r.file.shared().header();
+            (h.advertised[0].width, h.advertised[0].height)
+        };
+        advertise_session(shared, writer, (1280, 720, 30, false));
+        assert_eq!(first(&rig), (1280, 720));
+        // the control thread writes the configured output while no camera delivers
+        *lock(&shared.output) = output_of(640);
+        advertise_configured(shared, writer);
+        assert_eq!(first(&rig), (640, 360));
+        // the render thread asks for what it advertised last (1280x720): the file holds something else, so it is
+        // written again (comparing with its own last value would leave the control thread's list)
+        advertise_session(shared, writer, (1280, 720, 30, false));
+        assert_eq!(first(&rig), (1280, 720));
+        // and the control thread works from the latest list, not from an older one
+        *lock(&shared.output) = OutputSettings { fps: Some(25), ..OutputSettings::default() };
+        advertise_configured(shared, writer);
+        assert_eq!(first(&rig), (1280, 720), "no explicit size: what the session advertised");
+        assert_eq!(*lock(&shared.advertised), Some((1280, 720, 25, true)));
+
+        // two threads at it: the file and the record always agree in the end
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for i in 0..300u32 {
+                    advertise_session(shared, writer, (1920 - (i % 2) * 640, 1080, 30, true));
+                }
+            });
+            s.spawn(|| {
+                *lock(&shared.output) = output_of(640);
+                for _ in 0..300 {
+                    advertise_configured(shared, writer);
+                }
+            });
+        });
+        let record = lock(&shared.advertised).unwrap();
+        assert_eq!(first(&rig).0, record.0, "the file holds what was recorded");
     }
 
     #[test]

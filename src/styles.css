@@ -236,6 +236,12 @@ button.ghost:hover:not(:disabled) { color: var(--text); box-shadow: none; border
 .fields .wide { grid-column: 1 / -1; }
 .source .devices { align-items: flex-end; }
 .source .card-title.fold { margin: 0 0 -4px -4px; }
+/* P15 review: the format that runs when the camera cannot deliver the saved one, with the saved one named. */
+.format-in-use { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 8px 12px; border: 1px solid var(--line); border-left: 2px solid var(--warn); border-radius: var(--r); }
+.format-in-use-text { display: flex; flex-direction: column; min-width: 0; }
+.format-in-use-text b { font-weight: 600; color: var(--text); }
+.format-in-use-text small { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.format-in-use button { flex: none; }
 .toggles { display: flex; flex-direction: column; gap: 2px; }
 .toggle { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 30px; color: var(--dim); cursor: pointer; }
 .toggle:hover { color: var(--text); }

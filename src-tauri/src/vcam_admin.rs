@@ -357,11 +357,13 @@ pub fn run_claimed(
     user_sid: &str,
 ) -> Result<ActionDone, String> {
     let mut change = svc.begin_vcam_change(true)?;
-    if action == Action::Uninstall {
-        // The virtual camera goes away: the engine has nothing to write to and stays released.
+    let done = run_action(launcher, exe, action, user_sid);
+    if action == Action::Uninstall && done.is_ok() {
+        // The virtual camera is gone: the engine has nothing to write to and stays released. A removal that was
+        // declined or failed leaves the camera where it was, and the engine comes back to what it was doing.
         change.keep_engine_released();
     }
-    run_action(launcher, exe, action, user_sid)
+    done
 }
 
 /// Install, update or repair: asks for administrator rights once. The DLL is looked for first, so a copy of the
@@ -693,6 +695,74 @@ mod tests {
         let f = fake(LaunchOutcome::Cancelled);
         assert!(run_claimed(&svc, &f, "x.exe", Action::Install, SID).is_err());
         assert!(svc.begin_vcam_change(true).is_ok());
+    }
+
+    /// A service whose engines run on WARP and write to temporary files (never the real `frames.bin`).
+    fn warp_service() -> Service {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!("bettercam-vadmin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Service::with_maker(Arc::new(move || {
+            let path = dir.join(format!("engine-{}.bin", N.fetch_add(1, Ordering::SeqCst)));
+            let _ = std::fs::remove_file(&path);
+            let gpu = Arc::new(crate::gpu::GpuDevice::new(crate::gpu::AdapterKind::Warp).map_err(|e| e.to_string())?);
+            let writer = Arc::new(vcam_protocol::Writer::create(&path).map_err(|e| e.to_string())?);
+            crate::engine::Engine::with_parts(gpu, writer)
+        }))
+    }
+
+    fn running(svc: &Service) {
+        use crate::engine::{OutputSettings, ReadbackPolicy, Settings, SourceSpec, SyntheticSpec};
+        use crate::gpu::convert::ColorSettings;
+        svc.start_with(
+            Settings {
+                source: SourceSpec::Synthetic(SyntheticSpec {
+                    width: 320,
+                    height: 180,
+                    fps: 30,
+                    format: crate::capture::PixelFormat::Nv12,
+                    color: ColorSettings::default(),
+                }),
+                output: OutputSettings::default(),
+                flip_vertical: false,
+                color: ColorSettings::default(),
+                readback: ReadbackPolicy::Immediate,
+                deactivate_when_not_showing: false,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        svc.engine().unwrap().wait_live(std::time::Duration::from_secs(20)).unwrap();
+    }
+
+    /// L3: a removal that was declined or failed leaves the virtual camera where it was, and the engine comes back
+    /// to what it was doing; only one that worked leaves it released.
+    #[test]
+    fn a_removal_that_did_not_happen_gives_the_engine_back() {
+        for outcome in [
+            LaunchOutcome::Cancelled,
+            LaunchOutcome::Failed("no prompt".into()),
+            LaunchOutcome::Exited(1),
+            LaunchOutcome::Exited(EXIT_BUSY as u32),
+        ] {
+            let svc = warp_service();
+            running(&svc);
+            let result = run_claimed(&svc, &fake(outcome.clone()), "x.exe", Action::Uninstall, "");
+            assert!(result.is_err(), "{outcome:?}");
+            let e = svc.engine().unwrap();
+            e.wait_live(std::time::Duration::from_secs(20)).unwrap_or_else(|why| panic!("{outcome:?}: {why}"));
+        }
+        // the removal worked: nothing is brought back (the next use makes an engine, which runs nothing)
+        let svc = warp_service();
+        running(&svc);
+        assert_eq!(run_claimed(&svc, &fake(LaunchOutcome::Exited(0)), "x.exe", Action::Uninstall, ""), Ok(ActionDone::Done));
+        assert!(!svc.engine().unwrap().is_started());
+        // an install or a repair that did not happen brings it back too
+        let svc = warp_service();
+        running(&svc);
+        assert!(run_claimed(&svc, &fake(LaunchOutcome::Cancelled), "x.exe", Action::Install, SID).is_err());
+        svc.engine().unwrap().wait_live(std::time::Duration::from_secs(20)).unwrap();
     }
 
     #[test]

@@ -31,6 +31,13 @@ export interface FormatFallback {
   width: number;
   height: number;
   interval: number;
+  /** The camera's native format that runs (`mjpeg`, `nv12`, ...). */
+  format: string;
+}
+
+/** `engine-paused`: the pause flag changed. Sent with every change, also for the one a Start or a Stop makes. */
+export interface EnginePaused {
+  paused: boolean;
 }
 
 export interface Stats {
@@ -139,6 +146,8 @@ export const api = {
   deletePreset: (name: string) => invoke<void>("delete_preset", { name }),
   onEngineState: (cb: (s: EngineState) => void) => listen<EngineState>("engine-state", (e) => cb(e.payload)),
   onEngineError: (cb: (msg: string) => void) => listen<string>("engine-error", (e) => cb(e.payload)),
+  /** The pause flag of the engine; the window follows it (a restored engine reports the pause it was given). */
+  onEnginePaused: (cb: (p: EnginePaused) => void) => listen<EnginePaused>("engine-paused", (e) => cb(e.payload)),
   /** The camera lacks the saved format and the device default was opened instead (the engine already runs with it). */
   onFormatFallback: (cb: (f: FormatFallback) => void) => listen<FormatFallback>("format-fallback", (e) => cb(e.payload)),
   /**

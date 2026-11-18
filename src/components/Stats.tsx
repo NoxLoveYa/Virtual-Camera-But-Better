@@ -20,7 +20,7 @@ export function Stats() {
     text = state === "live" ? "Starting…" : "Opening the camera…";
   } else {
     const { capture: c, output: o, consumers } = stats;
-    const decode = c.decode === "hw" ? " (HW)" : c.decode === "sw" ? " (SW)" : "";
+    const decode = c.decode === "hw" ? " (HW)" : c.decode === "sw" ? " (software decode)" : "";
     const used = consumers === 0 ? "No app is using Better Cam" : `In use by ${consumers} ${consumers === 1 ? "app" : "apps"}`;
     text = [
       `${c.width}×${c.height} ${formatLabel(c.format)} ${measuredFps(c.fps)} fps${decode} → ${o.width}×${o.height} ${measuredFps(o.fps)} fps`,
@@ -30,6 +30,7 @@ export function Stats() {
     ].join(" · ");
     if (paused) text = `Paused · ${text}`;
     title = `Dropped ${stats.dropped} · repeated ${stats.repeated} · latency is the 95th percentile`;
+    if (c.decode === "sw") title += " · software decoding (hardware decoding is off or failed for this format)";
   }
 
   return (

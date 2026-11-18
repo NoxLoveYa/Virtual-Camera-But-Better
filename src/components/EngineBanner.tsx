@@ -1,7 +1,24 @@
 import { api } from "../api";
+import { isDeviceDefault } from "../camera/schema";
 import { useStore } from "../store";
 
 const sentence = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+
+/**
+ * Which switch the engine's words for a privacy wait name. The engine says "privacy" only for an open that Windows
+ * refused (access denied) while a switch is off; the switches only decide this wording.
+ */
+function privacyText(reason: string | null): string {
+  const r = reason ?? "";
+  const afterwards = "Better Cam goes live by itself afterwards.";
+  if (r.includes("policy")) {
+    return `Windows is not letting apps use the camera: a Windows policy turns camera access off, and no setting in Windows Settings changes it. ${afterwards}`;
+  }
+  if (r.includes("desktop apps")) {
+    return `Windows is not letting desktop apps use the camera. Turn on “Let desktop apps access your camera” in Windows camera privacy settings. ${afterwards}`;
+  }
+  return `Windows is not letting apps use the camera. Turn on “Camera access” in Windows camera privacy settings. ${afterwards}`;
+}
 
 /** What the banner says while the camera is being waited for, by the engine's `kind` (plan 4.9). `reason` is the detail. */
 function waitingText(kind: string | null, reason: string | null): string {
@@ -13,7 +30,7 @@ function waitingText(kind: string | null, reason: string | null): string {
     case "not_found":
       return "Camera not found. Connect it or pick another camera; Better Cam goes live as soon as it is there.";
     case "privacy":
-      return "Windows is not letting desktop apps use the camera. Turn on “Let desktop apps access your camera” in Windows camera privacy settings; Better Cam goes live by itself afterwards.";
+      return privacyText(reason);
     default:
       return `${reason ? sentence(reason) : "The camera is not answering"}. Better Cam keeps trying for a little while.`;
   }
@@ -30,8 +47,8 @@ export function EngineBanner() {
   const kind = useStore((s) => s.engine.kind);
   const error = useStore((s) => s.error);
   const errorKind = useStore((s) => s.errorKind);
-  const onDefault = useStore((s) => s.source.res_type === "preferred" && s.source.video_format === "any");
-  const { dismissError, patchSource } = useStore.getState();
+  const onDefault = useStore((s) => isDeviceDefault(s.source));
+  const { dismissError, startWithDeviceDefault } = useStore.getState();
 
   const waiting = state === "reconnecting";
   if (!error && !waiting) return null;
@@ -44,10 +61,11 @@ export function EngineBanner() {
           {errorKind === "format" && !onDefault && (
             <button
               className="primary"
+              title="Starts the camera with its own default format. Your saved format stays as it is; the next Start tries it again."
               onClick={(e) => {
                 e.stopPropagation();
-                patchSource({ res_type: "preferred", video_format: "any" });
                 dismissError();
+                void startWithDeviceDefault();
               }}
             >
               Use device default

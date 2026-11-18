@@ -10,6 +10,7 @@ import {
   cameraFormats,
   cameraIntervals,
   cameraSizes,
+  effectiveSource,
   findCamera,
   formatLabel,
   fpsLabel,
@@ -24,9 +25,13 @@ import { ToggleRow } from "./ToggleRow";
 const intervalLabel = (i: number) => (i === MATCH_OUTPUT_FPS ? "Match output FPS" : i === HIGHEST_FPS ? "Highest FPS" : fpsLabel(i));
 
 export function SourcePanel() {
-  const source = useStore((s) => s.source);
+  const saved = useStore((s) => s.source);
+  const inUse = useStore((s) => s.inUse);
   const cameras = useStore((s) => s.cameras);
-  const { patchSource, refreshCameras } = useStore.getState();
+  const { patchSource, refreshCameras, trySavedFormat } = useStore.getState();
+  // The fields show what runs: while the camera cannot deliver the saved format that is the device default, and the
+  // saved format is named under them (it stays saved; the next Start, or the button, tries it again).
+  const source = effectiveSource(saved, inUse);
   const [advanced, setAdvanced] = useState(false);
   const [scanning, setScanning] = useState(false);
 
@@ -120,6 +125,17 @@ export function SourcePanel() {
           />
         </Field>
       </div>
+      {inUse && (
+        <div className="format-in-use" role="status">
+          <span className="format-in-use-text" title={`The camera does not deliver ${inUse.asked}. It stays your saved choice.`}>
+            <b>Using the device default</b>
+            <small>Saved: {inUse.asked}</small>
+          </span>
+          <button onClick={trySavedFormat} title="Open the camera with the saved format again">
+            Try saved format
+          </button>
+        </div>
+      )}
 
       <h3 className={`card-title fold${advanced ? "" : " folded"}`}>
         <button aria-expanded={advanced} onClick={() => setAdvanced(!advanced)}>

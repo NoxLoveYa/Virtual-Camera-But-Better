@@ -1016,4 +1016,100 @@ mod tests {
         assert_eq!(tap.ring.as_ref().unwrap().1, (480, 270));
         assert_eq!(tap.ring.as_ref().unwrap().0.pending(), 1, "the 960x540 picture is gone");
     }
+
+    /// L9: the staging ring and the downscale constants belong to the GPU device; the engine tells the tap when it
+    /// built a new one, and the tap makes pictures again on it.
+    #[test]
+    fn the_tap_starts_again_on_a_new_device() {
+        let old = warp();
+        let src = old.texture(640, 360).unwrap();
+        fill(&old, &src, |_, _| [9, 9, 9, 255]);
+        let shared = Shared::new(ACK_TIMEOUT);
+        let mut tap = PreviewTap::new(shared.clone(), Arc::new(AtomicU32::new(0)), Arc::new(AtomicBool::new(false)), (640, 360));
+        tap.capture(&old, &src).unwrap();
+        assert!(tap.ring.is_some());
+        tap.device_changed();
+        assert!(tap.ring.is_none(), "the ring of the old device is gone");
+        // the old device is gone for good: only the new one is used from now on
+        drop(src);
+        drop(old);
+        let new = warp();
+        let src = new.texture(640, 360).unwrap();
+        fill(&new, &src, |_, _| [7, 7, 7, 255]);
+        let end = Instant::now() + Duration::from_secs(5);
+        while shared.made.load(Ordering::Relaxed) == 0 {
+            tap.on_frame(&new, &src, 0);
+            assert!(Instant::now() < end, "no picture from the new device");
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        let picture = lock(&shared.gate).take(Instant::now()).expect("a picture");
+        assert_eq!(pixel(&picture, 3, 3), [7, 7, 7, 255]);
+    }
+
+    /// L9: inside a real engine, a lost GPU device does not end the preview: it goes on with frames of the new one.
+    #[test]
+    fn the_preview_goes_on_after_the_engine_rebuilds_its_device() {
+        use crate::capture::PixelFormat;
+        use crate::engine::{OutputSettings, ReadbackPolicy, Settings, SourceSpec, SyntheticSpec};
+        use crate::gpu::convert::ColorSettings;
+
+        let gpu = Arc::new(GpuDevice::new(AdapterKind::Warp).expect("WARP"));
+        let dir = std::env::temp_dir().join(format!("bettercam-preview-loss-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("engine.bin");
+        let _ = std::fs::remove_file(&path);
+        let writer = Arc::new(vcam_protocol::Writer::create(&path).unwrap());
+        let engine = Engine::with_parts(gpu, writer).unwrap();
+        engine.start(Settings {
+            source: SourceSpec::Synthetic(SyntheticSpec {
+                width: 640,
+                height: 360,
+                fps: 30,
+                format: PixelFormat::Nv12,
+                color: ColorSettings::default(),
+            }),
+            output: OutputSettings::default(),
+            flip_vertical: false,
+            color: ColorSettings::default(),
+            readback: ReadbackPolicy::Immediate,
+            deactivate_when_not_showing: false,
+        });
+        engine.wait_live(Duration::from_secs(20)).unwrap();
+
+        let got = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let sink: Sink = {
+            let got = got.clone();
+            Arc::new(move |bytes| {
+                lock(&got).push(bytes);
+                true
+            })
+        };
+        let preview = Preview::new();
+        preview.start(&engine, (480, 270), sink).unwrap();
+        // every frame that arrives is acknowledged, like the page does
+        let ack_until = |sent: u64, what: &str| {
+            let end = Instant::now() + Duration::from_secs(30);
+            while preview.frames_sent() < sent {
+                let last = lock(&got).last().and_then(|b| Header::decode(b));
+                if let Some(h) = last {
+                    preview.ack(h.frame);
+                }
+                assert!(Instant::now() < end, "{what}: {} frames", preview.frames_sent());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        ack_until(3, "before the loss");
+
+        engine.inject_device_loss(1);
+        let end = Instant::now() + Duration::from_secs(30);
+        while engine.gpu_generation() < 2 {
+            assert!(Instant::now() < end, "the device was never rebuilt");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        engine.wait_live(Duration::from_secs(30)).unwrap();
+        let at_rebuild = preview.frames_sent();
+        ack_until(at_rebuild + 5, "after the rebuild");
+        preview.stop(Some(&engine));
+        engine.close();
+    }
 }

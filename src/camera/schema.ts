@@ -286,6 +286,71 @@ export function repairSource(src: SourceCfg, cams: CameraInfo[]): SourceCfg {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// What runs when it is not what is saved
+
+/** The capture fields of `SourceCfg`: a change to one of them reopens the camera. */
+export const CAPTURE_KEYS = ["video_device_id", "res_type", "resolution", "frame_interval", "video_format", "hw_decode", "buffering"] as const;
+
+/** Whether `patch` changes how the camera is opened (the other fields apply to the next frame). */
+export const touchesCapture = (patch: Partial<SourceCfg>): boolean => CAPTURE_KEYS.some((k) => k in patch);
+
+/** What the engine runs for the saved format when it is not the saved format: the device default of the camera. */
+export interface InUse {
+  /** What was saved, for a sentence: `1920×1080 YUY2 60 fps`. */
+  asked: string;
+  /** The capture fields the engine holds (the backend compares them with what it is sent, so they must be exact). */
+  source: Pick<SourceCfg, "res_type" | "video_format" | "resolution" | "frame_interval">;
+}
+
+/** The saved source as the engine runs it: the in-use capture fields over the saved ones. */
+export const effectiveSource = (saved: SourceCfg, inUse: InUse | null): SourceCfg => (inUse ? { ...saved, ...inUse.source } : saved);
+
+/** What the settings ask for, in words: `1920×1080 YUY2 60 fps`, `YUY2` or `device default` (as the backend words it). */
+export const describeSaved = (s: SourceCfg): string => {
+  const custom = s.res_type === "custom";
+  const size = custom ? parseSize(s.resolution) : null;
+  const parts = [
+    size ? `${size[0]}×${size[1]}` : null,
+    s.video_format === "any" ? null : formatLabel(s.video_format),
+    custom && s.frame_interval > 0 ? `${fpsLabel(s.frame_interval)} fps` : null,
+  ].filter((p): p is string => p !== null);
+  return parts.length ? parts.join(" ") : "device default";
+};
+
+/** Whether the saved settings ask for the device default already. */
+export const isDeviceDefault = (s: SourceCfg): boolean => s.res_type === "preferred" && s.video_format === "any";
+
+/** `format-fallback`: the engine opened the device default at the size and rate the camera delivers. */
+export const inUseFromFallback = (f: { asked: string; width: number; height: number; interval: number }): InUse => ({
+  asked: f.asked,
+  source: { res_type: "preferred", video_format: "any", resolution: sizeKey(f.width, f.height), frame_interval: f.interval },
+});
+
+/** The user asked for the device default (after a format error): the saved size and rate stay in the fields. */
+export const inUseDeviceDefault = (saved: SourceCfg): InUse => ({
+  asked: describeSaved(saved),
+  source: { res_type: "preferred", video_format: "any", resolution: saved.resolution, frame_interval: saved.frame_interval },
+});
+
+/**
+ * The saved settings after the user edited the camera fields while a fallback runs: the edit starts from what the
+ * fields show (the in-use values), and is the new saved choice. Without a fallback it is the plain merge.
+ */
+export const savedAfterEdit = (saved: SourceCfg, inUse: InUse | null, patch: Partial<SourceCfg>): SourceCfg =>
+  ({ ...(touchesCapture(patch) ? effectiveSource(saved, inUse) : saved), ...patch });
+
+/** Pause follows `engine-paused`; a stop clears it, except the one announced for a virtual camera change. */
+export const pausedAfterState = (paused: boolean, e: { state: string; reason?: string | null }): boolean =>
+  e.state === "stopped" && e.reason !== "vcam-change" ? false : paused;
+
+/** The in-use format goes with a stop, except the one announced for a virtual camera change (the engine comes back with it). */
+export const inUseAfterState = (inUse: InUse | null, e: { state: string; reason?: string | null }): InUse | null =>
+  e.state === "stopped" && e.reason !== "vcam-change" ? null : inUse;
+
+/** Whether source, output and chain edits go to the backend: while the engine runs, and while the virtual camera is changed (it parks them). */
+export const shouldPushSettings = (engineState: string, vcamBusy: string | null): boolean => engineState !== "stopped" || vcamBusy !== null;
+
+// ---------------------------------------------------------------------------------------------------------------
 // Colour
 
 const clampByte = (n: number) => Math.max(0, Math.min(255, Math.round(n)));

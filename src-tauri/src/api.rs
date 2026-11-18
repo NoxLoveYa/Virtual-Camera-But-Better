@@ -28,7 +28,39 @@ pub const VCAM_NOT_INSTALLED: &str =
     "Better Cam's virtual camera is not installed. Use the “Install virtual camera” button above.";
 const VCAM_BEING_CHANGED: &str = "The virtual camera is being changed. Try again in a moment.";
 
+/// A change to the parked state, made by a command that arrived while the engine was released.
+type ParkEdit = Box<dyn FnOnce(&mut Option<ResumeState>) + Send>;
+
+/// What the commands do while the virtual camera is changed: the engine is gone and they write to what is parked.
+#[derive(Default)]
+struct Park {
+    /// The engine is released for a virtual camera change (or the change is ending): commands go to `parked`.
+    blocked: bool,
+    /// What the engine was doing when a virtual camera change released it, or what the owner asked for meanwhile
+    /// (a Start at launch that raced with a Repair, a Stop, a changed source). The change brings it back at its end.
+    parked: Option<ResumeState>,
+    /// While the release waits for the engine to say what it was doing (the wait is not made under the lock: the
+    /// control thread may be busy for seconds, and a command must not make the window wait for it): the edits that
+    /// commands made meanwhile, to be applied to the answer, in order.
+    awaiting: Option<Vec<ParkEdit>>,
+}
+
+impl Park {
+    /// Apply an edit to the parked state now, or when the engine's answer is in.
+    fn edit(&mut self, edit: ParkEdit) {
+        match self.awaiting.as_mut() {
+            Some(queue) => queue.push(edit),
+            None => edit(&mut self.parked),
+        }
+    }
+}
+
 /// The engine and everything the commands need around it.
+///
+/// Every command that reaches the engine, and the release and the restore of it, take the `park` lock first (then the
+/// `engine` lock, never the other way round). So a command lands either in the engine, before the release has read
+/// its state (the snapshot is ordered after every message that is queued), or in the parked state, which the restore
+/// reads under the same lock: none arrives where nobody looks.
 #[derive(Default)]
 pub struct Service {
     engine: Mutex<Option<Arc<Engine>>>,
@@ -37,14 +69,32 @@ pub struct Service {
     preview: Preview,
     /// An install, repair or removal of the virtual camera is running (one at a time).
     vcam_busy: AtomicBool,
-    /// A removal is running: no engine may be created, or it would map `frames.bin` again.
+    /// Mirrors `Park::blocked` for the code that creates the engine (it holds the `engine` lock, not the `park` one):
+    /// no engine may be made while the virtual camera is being replaced, or it would map `frames.bin` again.
     engine_blocked: AtomicBool,
-    /// What the engine was doing when a virtual camera change released it, or what the owner asked for meanwhile
-    /// (a Start at launch that raced with a Repair, a Stop, a changed source). The change brings it back at its end.
-    parked: Mutex<Option<ResumeState>>,
+    park: Mutex<Park>,
+    /// The app is quitting: no engine is made any more (a change that ends after the exit began must not make one).
+    closed: AtomicBool,
     /// Makes the engine. `None` is the real thing (the virtual camera must be installed); tests give their own.
     maker: Option<EngineMaker>,
+    #[cfg(test)]
+    hooks: Mutex<Hooks>,
 }
+
+/// Test hooks at the points of a virtual camera change where a command can arrive. Each runs once.
+#[cfg(test)]
+#[derive(Default)]
+struct Hooks {
+    /// After the engine was blocked and its state read, before it is shut down (no lock is held).
+    after_block: Option<Box<dyn FnOnce() + Send>>,
+    /// In the restore, right after the parked state was taken and before the block is lifted: the moment a command
+    /// used to be written where nobody reads it. The restore holds the lock then, so the hook starts the command
+    /// on its own thread and waits a moment for it; the command is ordered after the restore, whatever the timing.
+    in_restore: Option<Box<dyn FnOnce() + Send>>,
+}
+
+/// What `engine()` says once the app began to quit.
+const APP_CLOSING: &str = "Better Cam is closing.";
 
 /// How a [`Service`] makes its engine.
 pub type EngineMaker = Arc<dyn Fn() -> Result<Engine, String> + Send + Sync>;
@@ -149,17 +199,52 @@ impl Service {
             restore: true,
         };
         if release_engine {
-            self.engine_blocked.store(true, Ordering::Release);
             guard.released = true;
-            // What the engine is doing, to bring it back: read before it goes. An engine that is being created
-            // right now (the app was just launched) finishes first: this waits for the lock it holds.
-            let resume = lock(&self.engine).as_ref().and_then(|e| e.resume_state());
-            *lock(&self.parked) = resume;
-            self.shutdown();
+            let (engine, answer) = {
+                let mut park = lock(&self.park);
+                // From here on the commands write to the parked state; the ones before this point are in the
+                // engine's queue, ahead of the question that is asked next.
+                park.blocked = true;
+                park.parked = None;
+                park.awaiting = Some(Vec::new());
+                self.engine_blocked.store(true, Ordering::Release);
+                // What the engine is doing, to bring it back: read before it goes, by the engine itself, after
+                // everything queued. An engine that is being created right now (the app was just launched)
+                // finishes first: this waits for the lock it holds.
+                let engine = lock(&self.engine).take();
+                let answer = engine.as_ref().map(|e| e.ask_state());
+                (engine, answer)
+            };
+            #[cfg(test)]
+            self.run_hook(|h| h.after_block.take());
+            // The answer is waited for outside the lock; the commands that came meanwhile are applied to it.
+            let state = match (&engine, answer) {
+                (Some(e), Some(answer)) => answer.wait().unwrap_or_else(|| e.resume_state()),
+                _ => None,
+            };
+            {
+                let mut park = lock(&self.park);
+                park.parked = state;
+                for edit in park.awaiting.take().unwrap_or_default() {
+                    edit(&mut park.parked);
+                }
+            }
+            self.preview.stop(None);
+            if let Some(e) = engine {
+                e.close();
+            }
             // The engine is gone: say so, so the window shows the truth until it is back.
             self.emit_state(EngineState::Stopped, "vcam-change");
         }
         Ok(guard)
+    }
+
+    #[cfg(test)]
+    fn run_hook(&self, take: impl FnOnce(&mut Hooks) -> Option<Box<dyn FnOnce() + Send>>) {
+        let hook = take(&mut lock(&self.hooks));
+        if let Some(h) = hook {
+            h();
+        }
     }
 
     fn emit_state(&self, state: EngineState, reason: &str) {
@@ -176,15 +261,22 @@ impl Service {
     /// doing (`restore`). Nothing to bring back when the engine was stopped (the next use makes one, as before), or
     /// when the camera was removed.
     fn end_release(&self, restore: bool) {
-        let parked = lock(&self.parked).take();
+        // The whole restore is under the lock the commands take: one that comes first is in the parked state read
+        // here, one that comes later finds the new engine.
+        let mut park = lock(&self.park);
+        let parked = park.parked.take();
+        #[cfg(test)]
+        self.run_hook(|h| h.in_restore.take());
+        park.blocked = false;
         self.engine_blocked.store(false, Ordering::Release);
         let (true, Some(parked)) = (restore, parked) else {
             return;
         };
         let engine = match self.engine() {
             Ok(e) => e,
-            // Without the virtual camera there is nothing to bring back; the banner says what to do.
-            Err(e) if e == VCAM_NOT_INSTALLED => return,
+            // Without the virtual camera there is nothing to bring back; the banner says what to do. After the app
+            // began to quit there is nobody to bring it back for.
+            Err(e) if e == VCAM_NOT_INSTALLED || e == APP_CLOSING => return,
             Err(e) => {
                 if let Some(s) = lock(&self.sink).clone() {
                     s.emit(EngineEvent::Error(e));
@@ -192,16 +284,23 @@ impl Service {
                 return;
             }
         };
-        // A Start that came in after the block was lifted wins over the old state.
         if !engine.is_started() {
             engine.resume(parked);
         }
     }
 
-    /// Change what is parked while the engine is released. Does nothing when nothing is parked.
-    fn with_parked(&self, f: impl FnOnce(&mut ResumeState)) {
-        if let Some(p) = lock(&self.parked).as_mut() {
-            f(p);
+    /// Run a command on the engine, or on the parked state while the engine is released (and nothing when there is
+    /// neither: the engine does not exist yet). Under the lock that orders it with the release and the restore.
+    fn route(
+        &self,
+        on_engine: impl FnOnce(&Arc<Engine>),
+        on_parked: impl FnOnce(&mut Option<ResumeState>) + Send + 'static,
+    ) {
+        let mut park = lock(&self.park);
+        if park.blocked {
+            park.edit(Box::new(on_parked));
+        } else if let Some(e) = self.existing() {
+            on_engine(&e);
         }
     }
 
@@ -212,6 +311,9 @@ impl Service {
             let mut g = lock(&self.engine);
             if let Some(e) = g.as_ref() {
                 return Ok(e.clone());
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return Err(APP_CLOSING.into());
             }
             if self.engine_blocked.load(Ordering::Acquire) {
                 return Err(VCAM_BEING_CHANGED.into());
@@ -279,12 +381,11 @@ impl Service {
     ) -> Result<(), String> {
         let chain = chain.as_ref().map(fx::parse_chain).transpose()?;
         let record = parse_record(controls.as_ref())?;
-        let engine = match self.engine() {
-            Ok(e) => e,
-            // The virtual camera is being changed (a Repair clicked right after launch, before the first Start went
-            // through): the engine starts when the change ends, with these settings.
-            Err(_) if self.engine_blocked.load(Ordering::Acquire) => {
-                let mut parked = lock(&self.parked);
+        let mut park = lock(&self.park);
+        // The virtual camera is being changed (a Repair clicked right after launch, before the first Start went
+        // through): the engine starts when the change ends, with these settings.
+        if park.blocked {
+            park.edit(Box::new(move |parked| {
                 let chain = chain
                     .or_else(|| parked.as_ref().map(|p| p.chain.clone()))
                     .unwrap_or_default();
@@ -294,10 +395,10 @@ impl Service {
                     chain,
                     record,
                 });
-                return Ok(());
-            }
-            Err(e) => return Err(e),
-        };
+            }));
+            return Ok(());
+        }
+        let engine = self.engine()?;
         engine.controls().set_record(record);
         if let Some(chain) = chain {
             // Before `start`: both go over the same channel, so the first frame already has the chain.
@@ -313,10 +414,15 @@ impl Service {
         let Some(record) = parse_record(controls.as_ref())? else {
             return Ok(());
         };
-        match self.existing() {
-            Some(e) => e.controls().set_record(Some(record)),
-            None => self.with_parked(|p| p.record = Some(record)),
-        }
+        let parked_record = record.clone();
+        self.route(
+            |e| e.controls().set_record(Some(record)),
+            |p| {
+                if let Some(p) = p {
+                    p.record = Some(parked_record);
+                }
+            },
+        );
         Ok(())
     }
 
@@ -344,43 +450,53 @@ impl Service {
 
     /// `stop_engine`.
     pub fn stop_engine(&self) -> Result<(), String> {
-        match self.existing() {
-            Some(e) => e.stop(),
+        self.route(
+            |e| e.stop(),
             // Released for a virtual camera change: it stays stopped when the change ends.
-            None => *lock(&self.parked) = None,
-        }
+            |p| *p = None,
+        );
         Ok(())
     }
 
-    /// `retry_now`: the window got the focus back; a camera that is being waited for is tried at once.
+    /// `retry_now`: the window got the focus back; a camera that is being waited for is tried at once. Called on the
+    /// UI thread: it never waits for a lock (the engine is being created, or replaced); the focus event comes again.
     pub fn retry_now(&self) {
-        if let Some(e) = self.existing() {
-            e.retry_now();
+        if let Ok(g) = self.engine.try_lock() {
+            if let Some(e) = g.as_ref() {
+                e.retry_now();
+            }
         }
     }
 
     /// `set_source(source)`: reopens the camera only when a capture setting changed. Ignored while stopped.
     pub fn set_source(&self, source: SourceCfg) -> Result<(), String> {
         let update = update_from(&source)?;
-        match self.existing() {
-            Some(e) => e.set_source(update),
-            None => self.with_parked(|p| {
-                p.settings.source = update.source;
-                p.settings.flip_vertical = update.flip_vertical;
-                p.settings.color = update.color;
-                p.settings.deactivate_when_not_showing = update.deactivate_when_not_showing;
-            }),
-        }
+        let parked_update = update.clone();
+        self.route(
+            |e| e.set_source(update),
+            move |p| {
+                if let Some(p) = p {
+                    p.settings.source = parked_update.source;
+                    p.settings.flip_vertical = parked_update.flip_vertical;
+                    p.settings.color = parked_update.color;
+                    p.settings.deactivate_when_not_showing = parked_update.deactivate_when_not_showing;
+                }
+            },
+        );
         Ok(())
     }
 
     /// `set_output(output)`: applies live; the advertised types follow for the next consumer.
     pub fn set_output(&self, output: OutputCfg) -> Result<(), String> {
         let settings = config::output_settings(&output)?;
-        match self.existing() {
-            Some(e) => e.set_output(settings),
-            None => self.with_parked(|p| p.settings.output = settings),
-        }
+        self.route(
+            |e| e.set_output(settings),
+            move |p| {
+                if let Some(p) = p {
+                    p.settings.output = settings;
+                }
+            },
+        );
         Ok(())
     }
 
@@ -392,19 +508,28 @@ impl Service {
     /// that `start_engine` carries is the one that counts then.
     pub fn set_chain(&self, chain: &Value) -> Result<(), String> {
         let chain = fx::parse_chain(chain)?;
-        match self.existing() {
-            Some(e) => e.set_chain(chain),
-            None => self.with_parked(|p| p.chain = chain),
-        }
+        let parked_chain = chain.clone();
+        self.route(
+            |e| e.set_chain(chain),
+            |p| {
+                if let Some(p) = p {
+                    p.chain = parked_chain;
+                }
+            },
+        );
         Ok(())
     }
 
     /// `set_pause(on)`.
     pub fn set_pause(&self, on: bool) -> Result<(), String> {
-        match self.existing() {
-            Some(e) => e.set_pause(on),
-            None => self.with_parked(|p| p.paused = on),
-        }
+        self.route(
+            |e| e.set_pause(on),
+            move |p| {
+                if let Some(p) = p {
+                    p.paused = on;
+                }
+            },
+        );
         Ok(())
     }
 
@@ -447,9 +572,10 @@ impl Service {
         changed
     }
 
-    /// Stop the engine and release the camera and `frames.bin` (the app quits, or the virtual camera is removed). A
-    /// later call that needs the engine creates a new one.
+    /// The app quits: stop the engine and release the camera and `frames.bin`. No engine is made after this, not
+    /// even by a virtual camera change that is still running and restores its engine when it ends.
     pub fn shutdown(&self) {
+        self.closed.store(true, Ordering::Release);
         self.preview.stop(None);
         let e = lock(&self.engine).take();
         if let Some(e) = e {
@@ -566,6 +692,10 @@ mod tests {
 
     /// Makes engines on WARP that write to their own temporary file (never the real `frames.bin`).
     fn warp_service_maker() -> EngineMaker {
+        warp_service_maker_with(fast())
+    }
+
+    fn warp_service_maker_with(timings: Timings) -> EngineMaker {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!("bettercam-api-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -574,13 +704,17 @@ mod tests {
             let _ = std::fs::remove_file(&path);
             let gpu = Arc::new(GpuDevice::new(AdapterKind::Warp).map_err(|e| e.to_string())?);
             let writer = Arc::new(vcam_protocol::Writer::create(&path).map_err(|e| e.to_string())?);
-            Engine::with_timings(gpu, writer, fast())
+            Engine::with_timings(gpu, writer, timings)
         })
     }
 
     /// A service whose engines run on WARP with synthetic bars.
     fn warp_service() -> (Arc<Service>, Arc<Mutex<Vec<EngineEvent>>>) {
-        let svc = Arc::new(Service::with_maker(warp_service_maker()));
+        warp_service_with(fast())
+    }
+
+    fn warp_service_with(timings: Timings) -> (Arc<Service>, Arc<Mutex<Vec<EngineEvent>>>) {
+        let svc = Arc::new(Service::with_maker(warp_service_maker_with(timings)));
         let events: Arc<Mutex<Vec<EngineEvent>>> = Arc::default();
         let sink = events.clone();
         svc.set_sink(Arc::new(move |e: EngineEvent| lock(&sink).push(e)));
@@ -717,7 +851,7 @@ mod tests {
         change.keep_engine_released();
         drop(change);
         assert!(svc.existing().is_none(), "no engine is made after a removal");
-        assert!(lock(&svc.parked).is_none());
+        assert!(lock(&svc.park).parked.is_none());
         // the next use makes one, as before
         assert!(svc.engine().is_ok());
     }
@@ -748,7 +882,12 @@ mod tests {
     /// Rough edge 4: what the window reports and what the engine does with it.
     #[test]
     fn window_visibility_reports_drive_the_camera() {
-        let (svc, _events) = warp_service();
+        // The delay is a second: the things that must hold within it are checked right after the report, with all of
+        // it to spare; the standby itself is waited for by its event, whatever time it takes.
+        let (svc, _events) = warp_service_with(Timings {
+            standby_delay: Duration::from_secs(1),
+            ..fast()
+        });
         // reported before the engine exists (the window shows during start-up): the engine starts knowing
         assert!(svc.set_window_visible(true));
         assert!(!svc.set_window_visible(true), "the same report again changes nothing");
@@ -756,9 +895,8 @@ mod tests {
         let e = svc.engine().unwrap();
         e.wait_live(Duration::from_secs(20)).unwrap();
 
-        // minimized or hidden: Standby after the delay (400 ms here), not before
+        // minimized or hidden: Standby after the delay, not at once
         assert!(svc.set_window_visible(false));
-        std::thread::sleep(Duration::from_millis(200));
         assert_eq!(e.state(), EngineState::Live, "the camera stays on for the delay");
         wait_until("standby", || e.state() == EngineState::Standby);
         assert_eq!(e.reason().as_deref(), Some("idle"));
@@ -773,11 +911,10 @@ mod tests {
         }
         assert_eq!(e.state(), EngineState::Live);
 
-        // hide and restore faster than the delay: the camera never closed
+        // hide and restore at once, long before the delay: the camera never closed
         assert!(svc.set_window_visible(false));
-        std::thread::sleep(Duration::from_millis(150));
         assert!(svc.set_window_visible(true));
-        std::thread::sleep(Duration::from_millis(700));
+        std::thread::sleep(Duration::from_millis(100));
         assert_eq!(e.state(), EngineState::Live);
 
         // hide to the tray, show from it (a second hide report in between changes nothing)
@@ -809,6 +946,231 @@ mod tests {
         svc.set_window_visible(true);
         drop(change);
         svc.engine().unwrap().wait_live(Duration::from_secs(20)).unwrap();
+    }
+
+    // ---- review fixes: pause, commands that race with the release and the restore, quitting ---------------------
+
+    fn pauses(events: &Mutex<Vec<EngineEvent>>) -> Vec<bool> {
+        lock(events)
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::Paused(p) => Some(p.paused),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// M1: a paused engine is brought back paused, and the window is told so by an `engine-paused` event after the
+    /// restore; at no point does the owner hear that the pause went away.
+    #[test]
+    fn a_paused_engine_comes_back_paused_and_the_window_is_told() {
+        let (svc, events) = warp_service();
+        svc.start_with(bars_settings(false), None, None).unwrap();
+        svc.engine().unwrap().wait_live(Duration::from_secs(20)).unwrap();
+        svc.set_pause(true).unwrap();
+        wait_until("the pause is reported", || pauses(&events) == vec![true]);
+
+        let change = svc.begin_vcam_change(true).unwrap();
+        drop(change);
+        let e = svc.engine().unwrap();
+        e.wait_live(Duration::from_secs(20)).unwrap();
+        assert!(e.paused(), "the new engine is paused");
+        // the new engine reports it: the window follows what is true
+        wait_until("the pause is reported again", || pauses(&events).len() == 2);
+        assert_eq!(pauses(&events), vec![true, true], "never a report that the pause is gone");
+        // one Pause click resumes video
+        svc.set_pause(false).unwrap();
+        wait_until("the resume is reported", || pauses(&events) == vec![true, true, false]);
+    }
+
+    /// What the owner does around a virtual camera change: each case is one command at one of the three points.
+    #[derive(Clone, Copy)]
+    enum When {
+        /// Just before the release: the command is queued in the engine and the control thread has not read it.
+        BeforeRelease,
+        /// After the engine was blocked, before it is shut down.
+        DuringChange,
+        /// At the start of the restore.
+        AtRestore,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Command {
+        Start,
+        Stop,
+        Settings,
+    }
+
+    fn run_command(svc: &Service, c: Command) {
+        match c {
+            Command::Start => svc
+                .start_with(
+                    Settings {
+                        source: SourceSpec::Synthetic(SyntheticSpec {
+                            width: 320,
+                            height: 180,
+                            fps: 25,
+                            format: crate::capture::PixelFormat::Nv12,
+                            color: ColorSettings::default(),
+                        }),
+                        output: crate::config::output_settings(&OutputCfg {
+                            resolution: "640x360".into(),
+                            ..OutputCfg::default()
+                        })
+                        .unwrap(),
+                        ..bars_settings(false)
+                    },
+                    None,
+                    None,
+                )
+                .unwrap(),
+            Command::Stop => svc.stop_engine().unwrap(),
+            Command::Settings => {
+                svc.set_output(OutputCfg {
+                    resolution: "800x450".into(),
+                    ..OutputCfg::default()
+                })
+                .unwrap();
+                svc.set_pause(true).unwrap();
+            }
+        }
+    }
+
+    fn command_survives(when: When, command: Command) {
+        let (svc, _events) = warp_service();
+        // what the restore's hook starts on a thread of its own, to be waited for before the checks
+        let racer: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+        svc.start_with(bars_settings(false), None, None).unwrap();
+        let engine = svc.engine().unwrap();
+        engine.wait_live(Duration::from_secs(20)).unwrap();
+
+        let change = match when {
+            When::BeforeRelease => {
+                // the control thread is held up: the command waits in its queue, unread, when the release asks
+                // for the engine's state
+                let gate = lock(engine.control_gate());
+                run_command(&svc, command);
+                let asked = engine.snapshot_requests();
+                std::thread::scope(|s| {
+                    let begin = s.spawn(|| svc.begin_vcam_change(true).unwrap());
+                    while engine.snapshot_requests() == asked && !begin.is_finished() {
+                        std::thread::yield_now();
+                    }
+                    drop(gate);
+                    begin.join().unwrap()
+                })
+            }
+            When::DuringChange => {
+                let again = svc.clone();
+                lock(&svc.hooks).after_block = Some(Box::new(move || run_command(&again, command)));
+                svc.begin_vcam_change(true).unwrap()
+            }
+            When::AtRestore => {
+                let change = svc.begin_vcam_change(true).unwrap();
+                let (again, slot) = (svc.clone(), racer.clone());
+                lock(&svc.hooks).in_restore = Some(Box::new(move || {
+                    let (done, finished) = std::sync::mpsc::channel();
+                    let handle = std::thread::spawn(move || {
+                        run_command(&again, command);
+                        let _ = done.send(());
+                    });
+                    *lock(&slot) = Some(handle);
+                    // Where nothing is locked the command is through at once; under the lock it waits for the restore.
+                    let _ = finished.recv_timeout(Duration::from_millis(300));
+                }));
+                change
+            }
+        };
+        drop(engine);
+        drop(change);
+        if let Some(h) = lock(&racer).take() {
+            h.join().unwrap();
+        }
+
+        let restored = svc.engine().unwrap();
+        match command {
+            Command::Stop => {
+                // after everything the restore queued (a Start of the old state would be in it)
+                assert!(restored.settled().is_none(), "the Stop was lost: the engine runs again");
+                assert_eq!(restored.state(), EngineState::Stopped);
+            }
+            Command::Start => {
+                restored.wait_live(Duration::from_secs(20)).unwrap();
+                let s = restored.settled().expect("started");
+                assert_eq!(s.settings.output.width, Some(640), "the Start was lost: the old settings run");
+                match s.settings.source {
+                    SourceSpec::Synthetic(b) => assert_eq!(b.fps, 25),
+                    other => panic!("{other:?}"),
+                }
+            }
+            Command::Settings => {
+                restored.wait_live(Duration::from_secs(20)).unwrap();
+                let s = restored.settled().expect("started");
+                assert_eq!(s.settings.output.width, Some(800), "the settings change was lost");
+                assert!(s.paused && restored.paused(), "the pause was lost");
+            }
+        }
+    }
+
+    macro_rules! command_case {
+        ($name:ident, $when:expr, $command:expr) => {
+            #[test]
+            fn $name() {
+                command_survives($when, $command);
+            }
+        };
+    }
+
+    command_case!(a_start_queued_before_the_release_survives, When::BeforeRelease, Command::Start);
+    command_case!(a_stop_queued_before_the_release_survives, When::BeforeRelease, Command::Stop);
+    command_case!(settings_queued_before_the_release_survive, When::BeforeRelease, Command::Settings);
+    command_case!(a_start_between_the_block_and_the_shutdown_survives, When::DuringChange, Command::Start);
+    command_case!(a_stop_between_the_block_and_the_shutdown_survives, When::DuringChange, Command::Stop);
+    command_case!(settings_between_the_block_and_the_shutdown_survive, When::DuringChange, Command::Settings);
+    command_case!(a_start_at_the_restore_survives, When::AtRestore, Command::Start);
+    command_case!(a_stop_at_the_restore_survives, When::AtRestore, Command::Stop);
+    command_case!(settings_at_the_restore_survive, When::AtRestore, Command::Settings);
+
+    /// L2: the focus event runs on the UI thread; it must never wait for the engine to be created or replaced.
+    #[test]
+    fn retry_now_never_waits_for_the_engine_lock() {
+        let (svc, _events) = warp_service();
+        svc.init().unwrap();
+        std::thread::scope(|s| {
+            // the engine lock is taken the way creating or replacing the engine takes it
+            let held = lock(&svc.engine);
+            let (done, finished) = std::sync::mpsc::channel();
+            let svc = &svc;
+            s.spawn(move || {
+                svc.retry_now();
+                let _ = done.send(());
+            });
+            assert!(
+                finished.recv_timeout(Duration::from_secs(10)).is_ok(),
+                "retry_now waits for the lock the engine is created under"
+            );
+            drop(held);
+        });
+    }
+
+    /// L11: a change that ends after the app began to quit does not make an engine again.
+    #[test]
+    fn no_engine_is_made_after_the_app_began_to_quit() {
+        let (svc, _events) = warp_service();
+        svc.start_with(bars_settings(false), None, None).unwrap();
+        svc.engine().unwrap().wait_live(Duration::from_secs(20)).unwrap();
+        let change = svc.begin_vcam_change(true).unwrap();
+        svc.shutdown(); // the app exits while the helper still runs
+        drop(change);
+        assert!(svc.existing().is_none(), "the restore made an engine after the exit began");
+        assert_eq!(svc.engine().err().as_deref(), Some(APP_CLOSING));
+        assert!(svc.start_with(bars_settings(false), None, None).is_err());
+
+        // and without a change running: no engine after shutdown either
+        let (svc, _events) = warp_service();
+        svc.init().unwrap();
+        svc.shutdown();
+        assert!(svc.engine().is_err());
     }
 
     #[test]

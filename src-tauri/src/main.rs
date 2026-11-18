@@ -71,6 +71,7 @@ fn forward_events(app: &AppHandle) -> Arc<dyn better_cam::engine::EventSink> {
             EngineEvent::FilterError(e) => app.emit("filter-error", e),
             EngineEvent::FilterStatus(s) => app.emit("filter-status", s),
             EngineEvent::FormatFallback(f) => app.emit("format-fallback", f),
+            EngineEvent::Paused(p) => app.emit("engine-paused", p),
         };
     })
 }

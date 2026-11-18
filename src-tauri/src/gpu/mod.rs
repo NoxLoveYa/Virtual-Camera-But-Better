@@ -147,6 +147,10 @@ pub struct GpuDevice {
     /// The device was created with `D3D11_CREATE_DEVICE_VIDEO_SUPPORT` (always true for `Hardware`; WARP may
     /// lack it, in which case decoders cannot use this device).
     pub video_support: bool,
+    /// Test hook: the device reports itself removed (`DXGI_ERROR_DEVICE_REMOVED`) from now on, as a real one does
+    /// after a driver update or a reset. A device built after it is a new one and works.
+    #[cfg(test)]
+    pub simulate_removed: std::sync::atomic::AtomicBool,
 }
 
 // SAFETY: ID3D11Device and IMFDXGIDeviceManager are thread-safe objects. The immediate context is only reachable
@@ -221,6 +225,8 @@ impl GpuDevice {
                 feature_level,
                 kind,
                 video_support,
+                #[cfg(test)]
+                simulate_removed: Default::default(),
             })
         }
     }
@@ -230,6 +236,10 @@ impl GpuDevice {
     /// Why the device was removed (`GetDeviceRemovedReason`), or `None` while it works. Cheap: the engine asks every
     /// frame.
     pub fn removed_reason(&self) -> Option<windows::core::HRESULT> {
+        #[cfg(test)]
+        if self.simulate_removed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Some(windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED);
+        }
         // SAFETY: plain COM call on the live device.
         unsafe { self.device.GetDeviceRemovedReason() }
             .err()

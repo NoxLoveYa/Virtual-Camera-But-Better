@@ -10,13 +10,22 @@ import {
   normalizeSource,
   repairSource,
   controlsRecord,
+  touchesCapture,
+  effectiveSource,
   findCamera,
   forgetControls,
+  inUseAfterState,
+  inUseDeviceDefault,
+  inUseFromFallback,
+  pausedAfterState,
   rememberControl,
+  savedAfterEdit,
+  shouldPushSettings,
   sortControls,
   type CameraInfo,
   type ControlInfo,
   type ControlKey,
+  type InUse,
   type OutputCfg,
   type SourceCfg,
   type StoredControls,
@@ -119,8 +128,14 @@ interface State extends Saved {
   /** `null` until the first `list_cameras` answer. */
   cameras: CameraInfo[] | null;
   engine: EngineInfo;
-  /** Pause is not an engine state and no event reports it: the store keeps the flag; Start and Stop clear it. */
+  /** Pause is not an engine state: the backend reports it (`engine-paused`) and this follows; a stop clears it. */
   paused: boolean;
+  /**
+   * What runs instead of the saved format when the camera could not deliver it (`format-fallback`, or "Use device
+   * default" after a format error). Not saved: the saved settings stay the user's choice, the next Start tries them
+   * again, and the panel shows this and the saved format.
+   */
+  inUse: InUse | null;
   error: string | null;
   /** The `kind` the engine gave the stop that `error` is about (`format`: the camera lacks the format asked for). */
   errorKind: string | null;
@@ -186,6 +201,10 @@ interface State extends Saved {
   /** Like `patchOutput({ background_color })`, but the running engine hears of it at most every ~100 ms (colour pickers). */
   setBackground: (abgr: number) => void;
   toggleRun: () => Promise<void>;
+  /** Starts with the device default of the camera, as the format that runs, and keeps the saved settings (the banner's button). */
+  startWithDeviceDefault: () => Promise<void>;
+  /** Asks the running engine for the saved format again (the panel's button). */
+  trySavedFormat: () => void;
   togglePause: () => void;
   setAutostart: (on: boolean) => Promise<void>;
   setCloseToTray: (on: boolean) => void;
@@ -305,17 +324,21 @@ export const useStore = create<State>((set, get) => {
   };
 
   const running = () => isRunning(get().engine);
+  /** Edits reach the backend while it runs and while the virtual camera is changed (it keeps them for the new engine). */
+  const pushing = () => shouldPushSettings(get().engine.state, get().vcamBusy);
   /** The camera the saved source names, among the connected ones. */
   const selectedCam = () => {
     const { cameras, source } = get();
     return cameras ? findCamera(cameras, source.video_device_id) : null;
   };
   const record = () => controlsRecord(get().controls, selectedCam());
+  /** What the engine is sent: the saved source, with the format that runs while a fallback does. */
+  const runningSource = () => effectiveSource(get().source, get().inUse);
   const pushSource = () => {
-    if (running()) api.setSource(get().source, record()).catch(fail);
+    if (pushing()) api.setSource(runningSource(), record()).catch(fail);
   };
   const pushOutput = () => {
-    if (running()) api.setOutput(get().output).catch(fail);
+    if (pushing()) api.setOutput(get().output).catch(fail);
   };
 
   /** One `list_cameras` at a time; a request that arrives meanwhile makes the running one go round again. */
@@ -336,11 +359,17 @@ export const useStore = create<State>((set, get) => {
 
   let backgroundTimer: ReturnType<typeof setTimeout> | undefined;
 
-  /** Starts the engine with the saved state; false when the call was rejected (the error banner says why). */
-  const begin = async (): Promise<boolean> => {
+  /**
+   * Starts the engine with the saved state; false when the call was rejected (the error banner says why). A Start
+   * tries the saved format, so an earlier fallback is forgotten; `deviceDefault` starts with the device default as the
+   * format that runs (the saved settings stay as they are).
+   */
+  const begin = async (deviceDefault = false): Promise<boolean> => {
     const { source, output, chain } = get();
+    const inUse = deviceDefault ? inUseDeviceDefault(source) : null;
+    set({ inUse });
     try {
-      await api.startEngine(source, output, chain, record());
+      await api.startEngine(effectiveSource(source, inUse), output, chain, record());
       // The events may already have said more than "standby"; only fill in when they have not. Not while the virtual
       // camera is being changed: the engine is released then (the events said so) and starts when the change ends.
       if (!running() && !get().vcamBusy) set({ engine: { state: "standby", reason: "opening", kind: null } });
@@ -429,7 +458,7 @@ export const useStore = create<State>((set, get) => {
   const finish = async () => {
     try {
       await api.stopEngine();
-      set({ engine: STOPPED, paused: false, wasRunning: false });
+      set({ engine: STOPPED, paused: false, inUse: null, wasRunning: false });
       useStats.setState({ stats: null });
       persist();
     } catch (e) {
@@ -443,6 +472,7 @@ export const useStore = create<State>((set, get) => {
     cameras: null,
     engine: STOPPED,
     paused: false,
+    inUse: null,
     error: null,
     errorKind: null,
     notice: null,
@@ -546,7 +576,7 @@ export const useStore = create<State>((set, get) => {
     removeVcam: async () => {
       if (get().vcamBusy) return;
       // The backend shuts the engine down before it asks for administrator rights; the window follows at once.
-      set({ vcamBusy: "remove", engine: STOPPED, paused: false, wasRunning: false });
+      set({ vcamBusy: "remove", engine: STOPPED, paused: false, inUse: null, wasRunning: false });
       useStats.setState({ stats: null });
       persist();
       try {
@@ -566,30 +596,31 @@ export const useStore = create<State>((set, get) => {
 
     init: async () => {
       await api.onEngineState((e) => {
-        set({
+        set((s) => ({
           engine: { state: e.state, reason: e.reason ?? null, kind: e.kind ?? null },
-          // The kind of a stop that has an error says what the error is about (`format`).
-          ...(e.state === "stopped" && { paused: false, filterStatus: {}, ...(e.kind && { errorKind: e.kind }) }),
-        });
+          // A stop clears the pause and the fallback, except the one the virtual camera change announces: the engine
+          // comes back with both (the backend reports the pause again). The kind of a stop that has an error says what
+          // the error is about (`format`).
+          paused: pausedAfterState(s.paused, e),
+          inUse: inUseAfterState(s.inUse, e),
+          ...(e.state === "stopped" && { filterStatus: {}, ...(e.kind && { errorKind: e.kind }) }),
+        }));
         if (e.state === "stopped") useStats.setState({ stats: null });
       });
+      await api.onEnginePaused(({ paused }) => set({ paused }));
       await api.onEngineError((error) => {
         api.stopEngine().catch(() => {});
         // The `stopped` event with the error's kind follows this one.
-        set({ error, errorKind: null, engine: STOPPED, paused: false, wasRunning: false });
+        set({ error, errorKind: null, engine: STOPPED, paused: false, inUse: null, wasRunning: false });
         useStats.setState({ stats: null });
         persist();
       });
-      await api.onFormatFallback(({ asked, used, width, height, interval }) => {
-        say(`${asked} isn't available; using device default (${used}).`);
-        // The fields show what runs now: the device default, at the size and rate the camera delivers. The engine
-        // already runs with these settings, so nothing is sent (it would not change anything).
-        const prev = get().source;
-        const next: SourceCfg = { ...prev, res_type: "preferred", video_format: "any", resolution: `${width}x${height}`, frame_interval: interval };
-        if (JSON.stringify(next) !== JSON.stringify(prev)) {
-          set({ source: next });
-          persist();
-        }
+      await api.onFormatFallback((f) => {
+        say(`${f.asked} isn't available; using device default (${f.used}).`);
+        // What runs now is the device default at the size and rate the camera delivers. The saved settings stay the
+        // user's choice (the next Start tries them again); the panel shows both. The engine holds these settings, so
+        // later edits send them (anything else would reopen the camera).
+        set({ inUse: inUseFromFallback(f) });
       });
       await api.onFilterError(({ id, message }) => {
         // An empty message clears the card's line (the file loaded, or its path was cleared).
@@ -766,13 +797,25 @@ export const useStore = create<State>((set, get) => {
 
     patchSource: (patch) => {
       const prev = get().source;
-      const next = { ...prev, ...patch };
+      // An edit of the camera fields while a fallback runs starts from what the fields show, and is the new choice.
+      const next = savedAfterEdit(prev, get().inUse, patch);
       const { cameras } = get();
       const fixed = cameras ? repairSource(next, cameras) : next;
-      if (JSON.stringify(fixed) === JSON.stringify(prev)) return;
-      set({ source: fixed });
+      const picked = get().inUse !== null && touchesCapture(patch);
+      if (JSON.stringify(fixed) === JSON.stringify(prev) && !picked) return;
+      set({ source: fixed, ...(picked && { inUse: null }) });
       persist();
       pushSource();
+    },
+
+    trySavedFormat: () => {
+      if (get().inUse === null) return;
+      set({ inUse: null });
+      pushSource();
+    },
+
+    startWithDeviceDefault: async () => {
+      if (!running()) await begin(true);
     },
 
     patchOutput: (patch) => {
