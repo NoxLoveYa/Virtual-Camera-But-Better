@@ -3050,8 +3050,10 @@ fn an_encrypted_data_folder_is_replaced_by_a_plain_one() {
     }
     let report = encryption_problem(&s.paths).expect("the report says so");
     assert!(
-        report.contains(&s.paths.data.display().to_string()) && report.contains("Run Repair"),
-        "{report}"
+        report.text.contains(&s.paths.data.display().to_string())
+            && report.text.contains("Run Repair")
+            && report.repairable,
+        "{report:?}"
     );
     let mut log = VecLog::default();
     run(&s, &mut log).unwrap_or_else(|e| panic!("{e}: {:?}", log.0));
@@ -3149,7 +3151,9 @@ fn a_data_folder_made_inside_an_encrypted_program_data_is_refused_until_that_is_
     )
     .unwrap();
     // the report says the same
-    assert_eq!(encryption_problem(&s.paths), Some(err));
+    let problem = encryption_problem(&s.paths).expect("the report says so");
+    assert_eq!(problem.text, err);
+    assert!(!problem.repairable, "Repair cannot help here");
     // what the sentence says to do works: the encrypted folder is replaced by a plain one
     assert!(cipher(&["/d"], &s.paths.program_data));
     // `cipher /d` without `/s` changes what is made in it from now on, not the refused folder: it is Repair that
@@ -3185,8 +3189,10 @@ fn an_encrypted_frame_file_in_a_plain_folder_is_replaced_by_a_plain_one() {
     }
     let report = encryption_problem(&s.paths).expect("the report says so");
     assert!(
-        report.contains("frames.bin") && report.contains("Run Repair"),
-        "{report}"
+        report.text.contains("frames.bin")
+            && report.text.contains("Run Repair")
+            && report.repairable,
+        "{report:?}"
     );
     let mut log = VecLog::default();
     run(&s, &mut log).unwrap_or_else(|e| panic!("{e}: {:?}", log.0));
@@ -3273,14 +3279,32 @@ fn an_encrypted_data_folder_in_an_encrypted_program_data_is_kept_not_replaced() 
 }
 
 fn prepare_seeing(s: &Sandbox, folder: u32, parent: Option<u32>) -> Res<()> {
+    prepare_seeing_with(s, &mut VecLog::default(), None, folder, parent)
+}
+
+/// [`prepare_reading`] with `inspected` as the attributes the data folder has when it is looked at first (`None`:
+/// as they are), `folder` those of the held folder after it is locked and `parent` those of `%ProgramData%`.
+fn prepare_seeing_with(
+    s: &Sandbox,
+    log: &mut VecLog,
+    inspected: Option<u32>,
+    folder: u32,
+    parent: Option<u32>,
+) -> Res<()> {
     prepare_reading(
         &s.paths,
         &s.p,
         &mut || false,
-        &mut VecLog::default(),
+        log,
         &mut NoLedger,
-        &|| parent,
-        &|_| Ok(folder),
+        &Reading {
+            parent: &|| parent,
+            folder: &|_| Ok(folder),
+            seen: &|obj, a| match (obj, inspected) {
+                (Object::DataDir, Some(i)) => i,
+                _ => a,
+            },
+        },
     )
 }
 
@@ -3334,6 +3358,59 @@ fn prepare_refuses_a_data_folder_that_is_encrypted_after_it_is_locked_and_before
     assert!(s.paths.frames().exists() && s.paths.install_log().exists());
 }
 
+/// The Keep path for a data folder that is encrypted in an encrypted `%ProgramData%`, through `prepare` and a real
+/// folder (the attribute is injected where it is looked at: no cipher): the folder is kept with what is in it (never
+/// moved aside, its logs stay), locked, and refused with the sentence for the folder around it, before anything is
+/// made in it. With a plain `%ProgramData%` the same folder is moved aside and a new one is made.
+#[test]
+fn prepare_keeps_an_encrypted_data_folder_in_an_encrypted_program_data_and_refuses_it() {
+    let s = sandbox("keep-injected");
+    run(&s, &mut VecLog::default()).unwrap();
+    let old_log = s.paths.logs().join("vcam-1.log");
+    std::fs::write(&old_log, b"keep me").unwrap();
+    std::fs::remove_file(s.paths.frames()).unwrap();
+    let enc = ATTRIBUTE_ENCRYPTED | 0x10;
+
+    let mut log = VecLog::default();
+    let err = prepare_seeing_with(&s, &mut log, Some(enc), enc, Some(enc)).expect_err("refused");
+    assert_eq!(
+        Some(err),
+        encryption_refusal(&s.paths, ATTRIBUTE_ENCRYPTED, Some(ATTRIBUTE_ENCRYPTED))
+    );
+    assert!(
+        mentions(&log, &format!("{}: kept", s.paths.data.display())),
+        "{:?}",
+        log.0
+    );
+    assert!(!mentions(&log, "moving it aside"), "{:?}", log.0);
+    assert!(
+        crate::testkit::asides_in(&s.paths).is_empty(),
+        "the folder was moved aside"
+    );
+    assert_eq!(std::fs::read(&old_log).unwrap(), b"keep me");
+    assert!(
+        !s.paths.frames().exists(),
+        "nothing was made below it, not even the file that was missing"
+    );
+    acl::check(
+        &security_of(&s.paths.data),
+        &acl::expected(Object::DataDir, &s.p),
+        &s.p.owner,
+    )
+    .unwrap();
+
+    // the folder around it is plain: the folder is replaced, not kept
+    let mut log = VecLog::default();
+    prepare_seeing_with(&s, &mut log, Some(enc), 0x10, Some(0x10))
+        .unwrap_or_else(|e| panic!("{e}: {:?}", log.0));
+    assert!(
+        mentions(&log, "it is encrypted (Windows EFS); moving it aside"),
+        "{:?}",
+        log.0
+    );
+    assert!(s.paths.frames().exists());
+}
+
 /// The status sentence, from the attributes of the data folder, `%ProgramData%` and the frame file.
 #[test]
 fn the_status_sentence_is_for_the_folder_around_it_or_for_repair() {
@@ -3347,35 +3424,41 @@ fn the_status_sentence_is_for_the_folder_around_it_or_for_repair() {
     assert_eq!(encryption_problem_from(&paths, plain, plain, plain), None);
     assert_eq!(encryption_problem_from(&paths, None, enc, None), None);
     assert_eq!(encryption_problem_from(&paths, plain, enc, plain), None);
-    // encrypted and the folder around it is too: Repair cannot help, the administrator's step is the sentence
+    // encrypted and the folder around it is too: Repair cannot help, the administrator's step is the sentence, and
+    // the window shows no Repair button for it
     let around = encryption_problem_from(&paths, enc, enc, plain).unwrap();
     assert_eq!(
-        Some(around.clone()),
+        Some(around.text.clone()),
         encryption_refusal(&paths, ATTRIBUTE_ENCRYPTED, enc)
     );
+    assert!(!around.repairable, "{around:?}");
     assert!(
-        around.contains(&format!(r#"cipher /d "{parent}""#)),
-        "{around}"
+        around.text.contains(&format!(r#"cipher /d "{parent}""#)),
+        "{around:?}"
     );
     // encrypted alone: Repair puts it right, and the sentence says that only what is made in it is affected
     for around_it in [plain, None] {
         let alone = encryption_problem_from(&paths, enc, around_it, plain).unwrap();
         assert!(
-            alone.starts_with(&format!("The folder {data} is encrypted (Windows EFS): new files made in it are encrypted too"))
-                && alone.contains("Run Repair")
-                && !alone.contains("would show nothing"),
-            "{alone}"
+            alone.text.starts_with(&format!("The folder {data} is encrypted (Windows EFS): new files made in it are encrypted too"))
+                && alone.text.contains("Run Repair")
+                && !alone.text.contains("would show nothing")
+                && alone.repairable,
+            "{alone:?}"
         );
     }
     // a frame file that is encrypted in a folder that is not
     let frames = encryption_problem_from(&paths, plain, plain, enc).unwrap();
     assert!(
-        frames.contains("frames.bin") && frames.contains("Run Repair"),
-        "{frames}"
+        frames.text.contains("frames.bin")
+            && frames.text.contains("Run Repair")
+            && frames.repairable,
+        "{frames:?}"
     );
     // the folder's own sentence comes first
     assert!(encryption_problem_from(&paths, enc, plain, enc)
         .unwrap()
+        .text
         .contains("The folder"));
 }
 
@@ -3393,21 +3476,36 @@ fn a_failed_install_says_the_refusal_when_the_data_folder_is_encrypted_and_never
             "{data:?} {parent:?}"
         );
     }
-    // encrypted: the refusal, for both ways it can be
-    for parent in [plain, enc, None] {
+    // encrypted in an encrypted `%ProgramData%`: the refusal (that is why, and what an administrator does)
+    let said = encryption_after_failed_install_from(&paths, enc, enc).unwrap();
+    assert_eq!(
+        Some(said.clone()),
+        encryption_refusal(&paths, ATTRIBUTE_ENCRYPTED, enc)
+    );
+    assert!(
+        said.contains("is encrypted (Windows EFS)") && !said.contains("Run Repair"),
+        "{said}"
+    );
+    // encrypted with a plain (or unreadable) `%ProgramData%`: the install may have failed for another reason with the
+    // folder encrypted before and never replaced, so only the fact is said, never "something encrypts new folders"
+    for parent in [plain, None] {
         let said = encryption_after_failed_install_from(&paths, enc, parent).unwrap();
         assert_eq!(
-            Some(said.clone()),
-            encryption_refusal(&paths, ATTRIBUTE_ENCRYPTED, parent)
+            said,
+            format!(
+                "The folder {} is encrypted (Windows EFS); this run did not replace it.",
+                paths.data.display()
+            )
         );
         assert!(
-            said.contains("is encrypted (Windows EFS)") && !said.contains("Run Repair"),
+            !said.contains("something on this PC") && !said.contains("Run Repair"),
             "{said}"
         );
     }
     // the status report, for a folder nobody has tried to replace, does say so
     assert!(encryption_problem_from(&paths, enc, plain, plain)
         .unwrap()
+        .text
         .contains("Run Repair"));
 }
 
@@ -3427,11 +3525,11 @@ fn a_data_folder_another_program_holds_without_sharing_is_said_so() {
     )
     .unwrap();
     let said = format!(
-        "Another program has {} open without sharing it. Close it or restart Windows, then run Repair again.",
+        "Another program has {} open without sharing it (os error 32). Close it or restart Windows, then run Repair again.",
         s.paths.data.display()
     );
     assert_eq!(open_checked(&s.paths, Object::DataDir).unwrap_err(), said);
-    // the whole run says the same, and a raw error number is nowhere
+    // the whole run says the same, raw code included
     assert_eq!(run(&s, &mut VecLog::default()).unwrap_err(), said);
     assert!(is_sharing_violation(&std::io::Error::from_raw_os_error(32)));
     assert!(!is_sharing_violation(&std::io::Error::from_raw_os_error(5)));
@@ -3445,7 +3543,7 @@ fn a_logs_folder_that_stays_encrypted_says_so_and_what_to_do() {
     let said = still_encrypted_message(Path::new(r"C:\x\BetterCam\logs"));
     assert_eq!(
         said,
-        r"C:\x\BetterCam\logs is still encrypted because it is in use; close the camera apps and run Repair again"
+        r"C:\x\BetterCam\logs is still encrypted because it is in use; install.log is encrypted for the account that approved this run, so the app may not be able to show later errors. Close the camera apps and run Repair again"
     );
 }
 
@@ -3478,7 +3576,7 @@ fn an_encrypted_logs_folder_that_is_in_use_is_emptied_in_place_and_the_log_says_
         mentions(
             &log,
             &format!(
-                "{} is still encrypted because it is in use; close the camera apps and run Repair again",
+                "{} is still encrypted because it is in use; install.log is encrypted for the account that approved this run, so the app may not be able to show later errors. Close the camera apps and run Repair again",
                 s.paths.logs().display()
             )
         ),

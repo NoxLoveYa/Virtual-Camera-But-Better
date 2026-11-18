@@ -43,6 +43,8 @@ function vcamText(state: VcamStatus["state"] | undefined, busy: VcamAction | nul
 function VcamRow() {
   const state = useStore((s) => s.vcam?.state);
   const busy = useStore((s) => s.vcamBusy);
+  // false while `%ProgramData%` itself is encrypted: Repair and Update would be refused again (the banner says what to do)
+  const repairable = useStore((s) => s.vcam?.repairable ?? true);
   const { runVcam, removeVcam } = useStore.getState();
   const [confirm, setConfirm] = useState(false);
 
@@ -78,8 +80,12 @@ function VcamRow() {
       </span>
       <span className="row-actions">
         <button
-          disabled={busy !== null || state === undefined}
-          title="Sets the virtual camera up for this Windows account. It works for one account at a time."
+          disabled={busy !== null || state === undefined || !repairable}
+          title={
+            repairable
+              ? "Sets the virtual camera up for this Windows account. It works for one account at a time."
+              : "An administrator must turn off encryption first (see the message in the window)."
+          }
           onClick={() => void runVcam(state === "outdated" ? "update" : "repair")}
         >
           {state === "outdated" ? "Update" : "Repair"}

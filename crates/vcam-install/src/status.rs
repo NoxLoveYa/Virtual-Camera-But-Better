@@ -44,8 +44,8 @@ pub struct Facts {
     /// A plain sentence when the data folder or the frame file is encrypted (EFS): the camera service cannot read
     /// it, so the camera shows nothing whatever else is right. `None` when it is fine or not there yet. It does not
     /// change [`state_from`]; the app's status (`VcamStatus::problem`) carries it next to the state, and the window
-    /// shows it with a Repair button.
-    pub data_problem: Option<String>,
+    /// shows it with a Repair button, unless Repair cannot help ([`crate::datadir::DataProblem::repairable`]).
+    pub data_problem: Option<crate::datadir::DataProblem>,
 }
 
 /// [`VcamState`] for `facts`.

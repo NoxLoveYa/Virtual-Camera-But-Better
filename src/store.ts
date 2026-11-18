@@ -52,6 +52,10 @@ import {
 const STORAGE_KEY = "better-cam";
 /** The most often `localStorage` is written (see `persist`). */
 const SAVE_GAP_MS = 300;
+/** How often the virtual camera's status is read again while a problem with its data folder is shown. */
+const VCAM_PROBLEM_POLL_MS = 10_000;
+/** The timer of that poll (one for the page, whatever number of times `init` runs). */
+let vcamTimer: number | undefined;
 
 /** `npm run tauri dev` (the Vite dev server); false in a release build. The project has no `vite/client` types. */
 const IS_DEV_BUILD = (import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV === true;
@@ -819,6 +823,20 @@ export const useStore = create<State>((set, get) => {
       // (a repair by hand, or `vcam-tool`, shows up without a restart).
       const vcamRead = get().refreshVcam();
       window.addEventListener("focus", () => void get().refreshVcam());
+      // While a problem is shown (its Repair button is hidden until an administrator has run `cipher /d`), the status is
+      // read again every 10 s, so the button comes back without a click on the window. The timer exists only while a
+      // problem is shown, and a tick does nothing while the window is hidden (the focus read covers the way back).
+      const watchVcamProblem = () => {
+        const want = !!get().vcam?.problem;
+        if (want && vcamTimer === undefined) {
+          vcamTimer = window.setInterval(() => document.visibilityState === "visible" && void get().refreshVcam(), VCAM_PROBLEM_POLL_MS);
+        } else if (!want && vcamTimer !== undefined) {
+          window.clearInterval(vcamTimer);
+          vcamTimer = undefined;
+        }
+      };
+      useStore.subscribe(watchVcamProblem);
+      void vcamRead.then(watchVcamProblem);
       // NVIDIA's runtime is read at startup, after an install and whenever the window gets focus back, so installing it by
       // hand shows up without a restart. The install dialog does not open from here: `addFilter` opens it the first time
       // an NVIDIA filter is added, and a card's "Install it now" opens it later.

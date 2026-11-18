@@ -216,6 +216,10 @@ pub struct VcamStatus {
     /// the camera is black whatever `state` says. Repair puts it right (except in an encrypted `%ProgramData%`, where
     /// the sentence says what an administrator does). `null` when there is nothing to say.
     pub problem: Option<String>,
+    /// Repair can put `problem` right (`true` too when there is none). `false` when `%ProgramData%` itself is
+    /// encrypted: Repair would refuse again, so the window shows the sentence without a Repair button. Once an
+    /// administrator has turned encryption off there, the next status says "Run Repair" and this is `true`.
+    pub repairable: bool,
 }
 
 /// The status for `facts` and the consumer count.
@@ -224,7 +228,8 @@ pub fn status_from(facts: &vcam_install::Facts, consumers: u32) -> VcamStatus {
         state: vcam_install::state_from(facts).as_str(),
         listed: facts.listed,
         consumers,
-        problem: facts.data_problem.clone(),
+        problem: facts.data_problem.as_ref().map(|p| p.text.clone()),
+        repairable: facts.data_problem.as_ref().map_or(true, |p| p.repairable),
     }
 }
 
@@ -233,10 +238,22 @@ pub fn status() -> VcamStatus {
     let dll = locate_dll().ok();
     let facts = vcam_install::gather_facts(dll.as_deref());
     let status = status_from(&facts, vcam_install::consumers());
-    // a debug build can show the banner of a problem without encrypting anything (screenshots of the window)
+    // a debug build can show the banner of a problem without encrypting anything (screenshots of the window);
+    // `BETTER_CAM_TEST_VCAM_REPAIRABLE=0` says that Repair cannot help with it
     #[cfg(debug_assertions)]
     let status = match std::env::var("BETTER_CAM_TEST_VCAM_PROBLEM") {
-        Ok(text) if !text.is_empty() => VcamStatus { problem: Some(text), ..status },
+        Ok(text) if !text.is_empty() => VcamStatus {
+            problem: Some(text),
+            repairable: std::env::var("BETTER_CAM_TEST_VCAM_REPAIRABLE").map_or(true, |v| v != "0"),
+            ..status
+        },
+        _ => status,
+    };
+    // `BETTER_CAM_TEST_VCAM_STATE=missing|outdated` shows the install/update banner next to the problem banner
+    #[cfg(debug_assertions)]
+    let status = match std::env::var("BETTER_CAM_TEST_VCAM_STATE").as_deref() {
+        Ok("missing") => VcamStatus { state: "missing", ..status },
+        Ok("outdated") => VcamStatus { state: "outdated", ..status },
         _ => status,
     };
     status
@@ -848,10 +865,14 @@ mod tests {
 
     #[test]
     fn the_status_names_match_the_command_contract() {
-        let json = serde_json::to_value(VcamStatus { state: "outdated", listed: true, consumers: 1, problem: None }).unwrap();
-        assert_eq!(json, serde_json::json!({ "state": "outdated", "listed": true, "consumers": 1, "problem": null }));
-        let json = serde_json::to_value(VcamStatus { state: "ok", listed: true, consumers: 0, problem: Some("X".into()) }).unwrap();
+        let json = serde_json::to_value(VcamStatus { state: "outdated", listed: true, consumers: 1, problem: None, repairable: true }).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "state": "outdated", "listed": true, "consumers": 1, "problem": null, "repairable": true })
+        );
+        let json = serde_json::to_value(VcamStatus { state: "ok", listed: true, consumers: 0, problem: Some("X".into()), repairable: false }).unwrap();
         assert_eq!(json["problem"], "X");
+        assert_eq!(json["repairable"], false);
     }
 
     fn healthy_facts() -> vcam_install::Facts {
@@ -875,13 +896,35 @@ mod tests {
     #[test]
     fn the_status_carries_the_data_problem_next_to_the_state() {
         let ok = status_from(&healthy_facts(), 1);
-        assert_eq!(ok, VcamStatus { state: "ok", listed: true, consumers: 1, problem: None });
+        assert_eq!(ok, VcamStatus { state: "ok", listed: true, consumers: 1, problem: None, repairable: true });
         let sentence = "The folder X is encrypted (Windows EFS)".to_string();
-        let facts = vcam_install::Facts { data_problem: Some(sentence.clone()), ..healthy_facts() };
+        let problem = |repairable| vcam_install::datadir::DataProblem { text: sentence.clone(), repairable };
+        let facts = vcam_install::Facts { data_problem: Some(problem(true)), ..healthy_facts() };
         let with = status_from(&facts, 1);
-        assert_eq!(with, VcamStatus { state: "ok", listed: true, consumers: 1, problem: Some(sentence.clone()) });
+        assert_eq!(
+            with,
+            VcamStatus { state: "ok", listed: true, consumers: 1, problem: Some(sentence.clone()), repairable: true }
+        );
         // a camera that is not installed carries it too (a Repair would put it right)
         let missing = vcam_install::Facts { registered: None, ..facts };
-        assert_eq!(status_from(&missing, 0), VcamStatus { state: "missing", listed: true, consumers: 0, problem: Some(sentence) });
+        assert_eq!(
+            status_from(&missing, 0),
+            VcamStatus { state: "missing", listed: true, consumers: 0, problem: Some(sentence.clone()), repairable: true }
+        );
+    }
+
+    /// An encrypted `%ProgramData%` is something Repair cannot put right: the status says so, so the window shows the
+    /// sentence without a Repair button (an administrator's `cipher /d` first; the next status is repairable again).
+    #[test]
+    fn a_problem_repair_cannot_fix_is_not_repairable() {
+        let sentence = "Ask an administrator".to_string();
+        let facts = vcam_install::Facts {
+            data_problem: Some(vcam_install::datadir::DataProblem { text: sentence.clone(), repairable: false }),
+            ..healthy_facts()
+        };
+        assert_eq!(
+            status_from(&facts, 0),
+            VcamStatus { state: "ok", listed: true, consumers: 0, problem: Some(sentence), repairable: false }
+        );
     }
 }

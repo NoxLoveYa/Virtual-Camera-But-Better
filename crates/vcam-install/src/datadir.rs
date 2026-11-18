@@ -212,7 +212,14 @@ fn path_of(paths: &Paths, obj: Object) -> PathBuf {
 }
 
 /// Open `path` for reading its kind and permissions, not following a link. `None` when it does not exist.
-fn inspect(paths: &Paths, obj: Object, p: &Principals) -> Res<Option<Facts>> {
+/// `seen` is given the attributes read on the handle and returns the ones the facts are made from (the identity
+/// function for real use; a test says what an encrypted folder makes of a run without encrypting anything).
+fn inspect(
+    paths: &Paths,
+    obj: Object,
+    p: &Principals,
+    seen: &dyn Fn(Object, u32) -> u32,
+) -> Res<Option<Facts>> {
     let path = path_of(paths, obj);
     let h = match secure::open_with(
         &path,
@@ -241,6 +248,7 @@ fn inspect(paths: &Paths, obj: Object, p: &Principals) -> Res<Option<Facts>> {
         }
     };
     let kind = secure::kind(secure::raw(&h)).map_err(|e| werr("inspect", e))?;
+    let attributes = seen(obj, kind.attributes);
     let in_place = match secure::expected_path(&paths.program_data, &path) {
         Ok(expect) => secure::verify_place(secure::raw(&h), &expect).is_ok(),
         Err(_) => false,
@@ -263,12 +271,12 @@ fn inspect(paths: &Paths, obj: Object, p: &Principals) -> Res<Option<Facts>> {
         in_place,
         owner_trusted,
         acl_as_expected,
-        bad_attributes: kind.attributes & BAD_FILE_ATTRIBUTES != 0,
-        sparse_or_compressed: kind.attributes
+        bad_attributes: attributes & BAD_FILE_ATTRIBUTES != 0,
+        sparse_or_compressed: attributes
             & (secure::ATTRIBUTE_SPARSE | secure::ATTRIBUTE_COMPRESSED)
             != 0,
         extra_streams,
-        encrypted: kind.attributes & ATTRIBUTE_ENCRYPTED != 0,
+        encrypted: attributes & ATTRIBUTE_ENCRYPTED != 0,
     }))
 }
 
@@ -672,7 +680,7 @@ fn open_checked(paths: &Paths, obj: Object) -> Res<OwnedHandle> {
                 None => return Err(locked_message(&path)),
             },
             Err(e) if obj == Object::DataDir && is_sharing_violation(&e) => {
-                return Err(not_shared_message(&path))
+                return Err(not_shared_message(&path, &e))
             }
             Err(e) => return Err(werr(&format!("open {}", path.display()), e)),
         }
@@ -687,11 +695,13 @@ fn is_sharing_violation(e: &std::io::Error) -> bool {
 }
 
 /// The sentence for a data folder that another program has open without sharing it. The standard user can list the
-/// folder, so a program of theirs can hold it with share mode 0, and then even a listing right is refused.
-fn not_shared_message(path: &Path) -> String {
+/// folder, so a program of theirs can hold it with share mode 0, and then even a listing right is refused. The raw
+/// code stays in the sentence (it is what a person searches for when this is not the whole story).
+fn not_shared_message(path: &Path, e: &std::io::Error) -> String {
     format!(
-        "Another program has {} open without sharing it. Close it or restart Windows, then run Repair again.",
-        path.display()
+        "Another program has {} open without sharing it (os error {}). Close it or restart Windows, then run Repair again.",
+        path.display(),
+        e.raw_os_error().unwrap_or(32)
     )
 }
 
@@ -724,6 +734,20 @@ pub(crate) fn create_new(paths: &Paths, obj: Object, p: &Principals) -> Res<Owne
     Ok(h)
 }
 
+/// What [`ensure_exists`] knows of the world around an object: whether the folder around it is encrypted
+/// ([`decide_below`]), and `seen`, which maps the attributes read on its handle to the ones its facts are made from
+/// (see [`inspect`]).
+#[derive(Clone, Copy)]
+struct Below<'a> {
+    parent_encrypted: bool,
+    seen: &'a dyn Fn(Object, u32) -> u32,
+}
+
+/// The attributes as they were read.
+fn as_read(_: Object, attributes: u32) -> u32 {
+    attributes
+}
+
 /// Make `obj` exist as the right kind of object and return its verified handle. A new object has its final
 /// permissions already; one that was kept gets them from [`lock`].
 ///
@@ -736,11 +760,11 @@ fn ensure_exists(
     stop_service: &mut dyn FnMut() -> bool,
     log: &mut dyn Log,
     ledger: &mut dyn Ledger,
-    parent_encrypted: bool,
+    below: Below,
 ) -> Res<OwnedHandle> {
     let path = path_of(paths, obj);
-    let facts = inspect(paths, obj, p)?;
-    let plan = decide_below(obj, facts.as_ref(), parent_encrypted);
+    let facts = inspect(paths, obj, p, below.seen)?;
+    let plan = decide_below(obj, facts.as_ref(), below.parent_encrypted);
     match plan {
         Plan::Keep => {
             let h = open_checked(paths, obj)?;
@@ -794,7 +818,8 @@ fn replace(
             let h = open_checked(paths, obj)?;
             empty_in_place(&h, &path, log);
             // a folder that is replaced for being encrypted and is in use stays that way: what the helper makes in it
-            // (`install.log`) is encrypted too, which is no worse than before but is worth a line
+            // (`install.log`) is encrypted too, under the key of the account that approved this run, and the log line
+            // says what that means (see [`still_encrypted_message`])
             if secure::kind(secure::raw(&h)).is_ok_and(|k| k.attributes & ATTRIBUTE_ENCRYPTED != 0)
             {
                 log.line(&still_encrypted_message(&path));
@@ -805,10 +830,12 @@ fn replace(
     }
 }
 
-/// The line of the log for a `logs` folder that stays encrypted because it could not be moved.
+/// The line of the log for a `logs` folder that stays encrypted because it could not be moved. What is made in it is
+/// encrypted too: `install.log` is then encrypted for the account that approved this run (the elevated one), and the
+/// app, when it runs as another account, cannot read it later.
 fn still_encrypted_message(logs: &Path) -> String {
     format!(
-        "{} is still encrypted because it is in use; close the camera apps and run Repair again",
+        "{} is still encrypted because it is in use; install.log is encrypted for the account that approved this run, so the app may not be able to show later errors. Close the camera apps and run Repair again",
         logs.display()
     )
 }
@@ -1021,10 +1048,15 @@ fn is_encrypted(attributes: Option<u32>) -> bool {
     attributes.is_some_and(|a| a & ATTRIBUTE_ENCRYPTED != 0)
 }
 
-/// What the app can say about a failed install whose log has no reason: the sentence of [`encryption_refusal`] when
-/// the data folder is still encrypted, else `None`. A folder that is still encrypted after a failed install is one
-/// that Repair could not put right (it replaces an encrypted folder first), so this never says "run Repair" the way
-/// [`encryption_problem`] does for a folder nobody has tried to replace. For the app, which reads attributes only.
+/// What the app can say about a failed install whose log has no reason, when the data folder is encrypted (else
+/// `None`). A folder that is still encrypted after a failed install is one that Repair did not put right, so this
+/// never says "run Repair" the way [`encryption_problem`] does for a folder nobody has tried to replace. For the app,
+/// which reads attributes only.
+///
+/// With an encrypted `%ProgramData%` that is the sentence of [`encryption_refusal`] (that is why the folder is
+/// encrypted, and what to do about it). With a plain one only the fact is known: the run may have failed for another
+/// reason (a held `install.log`, a helper that crashed) with the folder encrypted before and never replaced, so no
+/// cause is claimed.
 pub fn encryption_after_failed_install(paths: &Paths) -> Option<String> {
     encryption_after_failed_install_from(
         paths,
@@ -1038,7 +1070,25 @@ fn encryption_after_failed_install_from(
     data: Option<u32>,
     parent: Option<u32>,
 ) -> Option<String> {
-    encryption_refusal(paths, data?, parent)
+    let data = data.filter(|a| a & ATTRIBUTE_ENCRYPTED != 0)?;
+    if is_encrypted(parent) {
+        return encryption_refusal(paths, data, parent);
+    }
+    Some(format!(
+        "The folder {} is encrypted (Windows EFS); this run did not replace it.",
+        paths.data.display()
+    ))
+}
+
+/// What the status report says is wrong with the data folder or the frame file, and whether Repair can put it right.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DataProblem {
+    /// The sentence the window shows.
+    pub text: String,
+    /// Repair can put it right. `false` when `%ProgramData%` itself is encrypted: a new data folder is encrypted too,
+    /// Repair refuses it, and only an administrator's `cipher /d` helps (the sentence says so). The window then shows
+    /// no Repair button; after the administrator has run it the next status says "Run Repair" and the button is back.
+    pub repairable: bool,
 }
 
 /// Whether the data folder or the frame file is encrypted right now, as the sentence that says so and what to do. For
@@ -1046,9 +1096,10 @@ fn encryption_after_failed_install_from(
 ///
 /// An encrypted data folder or frame file is something Repair puts right (it replaces it with a new one that is
 /// not encrypted), so the sentence says "run Repair"; except when `%ProgramData%` itself is encrypted, where Repair
-/// cannot help and the sentence is [`encryption_refusal`]'s. A data folder that is encrypted without its files being
-/// so (`cipher /e` without `/s` encrypts what is made in it from then on) says so: only new files are affected.
-pub fn encryption_problem(paths: &Paths) -> Option<String> {
+/// cannot help and the sentence is [`encryption_refusal`]'s ([`DataProblem::repairable`] is `false`). A data folder
+/// that is encrypted without its files being so (`cipher /e` without `/s` encrypts what is made in it from then on)
+/// says so: only new files are affected.
+pub fn encryption_problem(paths: &Paths) -> Option<DataProblem> {
     // attributes only, no link followed, nothing opened for data (no lock of another program is broken or waited for)
     encryption_problem_from(
         paths,
@@ -1065,24 +1116,31 @@ fn encryption_problem_from(
     data: Option<u32>,
     parent: Option<u32>,
     frames_attributes: Option<u32>,
-) -> Option<String> {
+) -> Option<DataProblem> {
     if let Some(a) = data.filter(|a| a & ATTRIBUTE_ENCRYPTED != 0) {
         if is_encrypted(parent) {
-            return encryption_refusal(paths, a, parent);
+            return encryption_refusal(paths, a, parent).map(|text| DataProblem {
+                text,
+                repairable: false,
+            });
         }
-        return Some(format!(
-            "The folder {} is encrypted (Windows EFS): new files made in it are encrypted too, and the camera service cannot read an encrypted file, so the virtual camera may show nothing. Run Repair: it replaces the folder with a new one that is not encrypted.",
-            paths.data.display()
-        ));
+        return Some(DataProblem {
+            text: format!(
+                "The folder {} is encrypted (Windows EFS): new files made in it are encrypted too, and the camera service cannot read an encrypted file, so the virtual camera may show nothing. Run Repair: it replaces the folder with a new one that is not encrypted.",
+                paths.data.display()
+            ),
+            repairable: true,
+        });
     }
     let frames = paths.frames();
     frames_attributes
         .filter(|a| a & ATTRIBUTE_ENCRYPTED != 0)
-        .map(|_| {
-            format!(
+        .map(|_| DataProblem {
+            text: format!(
                 "{} is encrypted (Windows EFS), so the camera service cannot read it and the virtual camera would show nothing. Run Repair: it replaces the file with a new one that is not encrypted.",
                 frames.display()
-            )
+            ),
+            repairable: true,
         })
 }
 
@@ -1504,25 +1562,37 @@ pub fn prepare_recording(
         stop_service,
         log,
         ledger,
-        &|| attributes_of_path(&paths.program_data),
-        &|h| {
-            secure::kind(secure::raw(h))
-                .map(|k| k.attributes)
-                .map_err(|e| werr(&format!("look at {}", paths.data.display()), e))
+        &Reading {
+            parent: &|| attributes_of_path(&paths.program_data),
+            folder: &|h| {
+                secure::kind(secure::raw(h))
+                    .map(|k| k.attributes)
+                    .map_err(|e| werr(&format!("look at {}", paths.data.display()), e))
+            },
+            seen: &as_read,
         },
     )
 }
 
-/// [`prepare_recording`] with the attributes it reads of `%ProgramData%` and of the held data folder given, so that a
-/// test can say what an encrypted `%ProgramData%` makes of the folder without encrypting anything.
+/// The attributes [`prepare_reading`] reads, as functions a test can replace.
+struct Reading<'a> {
+    /// Those of `%ProgramData%`.
+    parent: &'a dyn Fn() -> Option<u32>,
+    /// Those of the held data folder, once it is locked.
+    folder: &'a dyn Fn(&OwnedHandle) -> Res<u32>,
+    /// Those of an object that is looked at before it is kept or replaced (see [`inspect`]).
+    seen: &'a dyn Fn(Object, u32) -> u32,
+}
+
+/// [`prepare_recording`] with the attributes it reads given, so that a test can say what an encrypted `%ProgramData%`
+/// or an encrypted data folder makes of a run without encrypting anything.
 fn prepare_reading(
     paths: &Paths,
     p: &Principals,
     stop_service: &mut dyn FnMut() -> bool,
     log: &mut dyn Log,
     ledger: &mut dyn Ledger,
-    parent_attributes: &dyn Fn() -> Option<u32>,
-    folder_attributes: &dyn Fn(&OwnedHandle) -> Res<u32>,
+    reading: &Reading,
 ) -> Res<()> {
     // a log file of ours inside `logs` would keep the folder from being moved: close it, lines wait meanwhile
     log.release_folder();
@@ -1532,7 +1602,11 @@ fn prepare_reading(
     // create nor rename anything in it, and what it hands down to new children is only what the helper wants. Read
     // before anything is replaced: a folder that is encrypted in an encrypted `%ProgramData%` is kept, not replaced
     // (a new one would be encrypted too, and its logs would be gone for nothing)
-    let parent = parent_attributes();
+    let parent = (reading.parent)();
+    let below = |parent_encrypted| Below {
+        parent_encrypted,
+        seen: reading.seen,
+    };
     let data = ensure_exists(
         paths,
         Object::DataDir,
@@ -1540,7 +1614,7 @@ fn prepare_reading(
         stop_service,
         log,
         ledger,
-        is_encrypted(parent),
+        below(is_encrypted(parent)),
     )?;
     // (a folder made inside a compressed `%ProgramData%` is compressed, and would hand that on to what is made in it)
     clear_folder_compression(paths, &data, log);
@@ -1549,9 +1623,18 @@ fn prepare_reading(
     // an encrypted `%ProgramData%`, or one that was kept for that reason. After the lock (so that the permissions an
     // older version left are gone whatever happens next), before anything is made in it: a child of an encrypted
     // folder is encrypted too, and the camera service could not read it
-    refuse_if_encrypted(paths, folder_attributes(&data)?, parent_attributes())?;
+    // (`%ProgramData%` is not read a second time: the helper holds the machine-wide lock and nothing above changed it)
+    refuse_if_encrypted(paths, (reading.folder)(&data)?, parent)?;
     // 2. the folder's children, each with a protected DACL of its own
-    let logs = ensure_exists(paths, Object::LogsDir, p, stop_service, log, ledger, false)?;
+    let logs = ensure_exists(
+        paths,
+        Object::LogsDir,
+        p,
+        stop_service,
+        log,
+        ledger,
+        below(false),
+    )?;
     lock(&logs, Object::LogsDir, p, log)?;
     let mut trusted = p.trusted_owners.clone();
     trusted.extend([p.system.clone(), p.admins.clone(), p.local_service.clone()]);
@@ -1563,7 +1646,7 @@ fn prepare_reading(
         stop_service,
         log,
         ledger,
-        false,
+        below(false),
     )?;
     finish_frame_file(&frames, log)?;
     lock(&frames, Object::FramesFile, p, log)?;
@@ -1577,7 +1660,7 @@ fn prepare_reading(
         stop_service,
         log,
         ledger,
-        false,
+        below(false),
     )?;
     lock(&install_log, Object::InstallLog, p, log)?;
     let left = sweep(paths, log);
