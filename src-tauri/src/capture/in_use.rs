@@ -1,19 +1,24 @@
 //! Which programs use a camera right now, for the banner that says who holds it when Better Cam cannot open the
 //! camera (`Failure::in_use`).
 //!
-//! The source is the capability access manager's consent store, the same one [`super::privacy`] reads:
-//! `{HKCU,HKLM}\...\ConsentStore\webcam` has one subkey per packaged app (the package family name) and, under
-//! `NonPackaged`, one per desktop program (its full exe path with `\` written as `#`). Each has `LastUsedTimeStart` and
-//! `LastUsedTimeStop` (QWORD FILETIMEs); a program that is using a camera now has a start and a stop of 0.
+//! Two sources, in this order, merged by [`merge`]:
 //!
-//! What the record does not say: *which* camera. A program that reads Better Cam's own virtual camera is in the list
-//! like one that holds the physical camera, and with several cameras the program may hold another one. The engine says
-//! "may be in use by" when a consumer is attached to the virtual camera (the one case it can see), see
+//! 1. The capability access manager's consent store, the same one [`super::privacy`] reads:
+//!    `{HKCU,HKLM}\...\ConsentStore\webcam` has one subkey per packaged app (the package family name) and, under
+//!    `NonPackaged`, one per desktop program (its full exe path with `\` written as `#`). Each has `LastUsedTimeStart`
+//!    and `LastUsedTimeStop` (QWORD FILETIMEs); a program that is using a camera now has a start and a stop of 0.
+//! 2. The camera service's event log ([`super::in_use_log`]), which names the process that streams the physical camera
+//!    Better Cam wants, checked against the running processes.
+//!
+//! What the registry record does not say: *which* camera. A program that reads Better Cam's own virtual camera is in
+//! the list like one that holds the physical camera, and with several cameras the program may hold another one. The
+//! engine says "may be in use by" when a consumer is attached to the virtual camera (the one case it can see), see
 //! [`reason`]. Windows also does not write the record on every PC (it is missing here for every webcam program), and a
-//! program that is killed while it uses the camera can leave a start without a stop behind; an empty list gives the
-//! words "another app".
+//! program that is killed while it uses the camera can leave a start without a stop behind. The log names the camera
+//! and checks the process, but cannot always tell two clients that opened the camera together; that is a doubt as
+//! well. An empty list gives the words "another app".
 //!
-//! The parsing is separate from the registry reads so it can be tested without either.
+//! The parsing is separate from the registry and log reads so it can be tested without either.
 
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Win32::System::Registry::{
@@ -68,6 +73,11 @@ pub fn key_of_path(path: &str) -> String {
 /// program in the user's and in the device's store, or in two versions of its folder, counts once). `own` is this
 /// process's exe path as a key ([`key_of_path`]): Better Cam is never named.
 pub fn users(records: &[Record], own: Option<&str>) -> Vec<String> {
+    timed_users(records, own).into_iter().map(|(_, name)| name).collect()
+}
+
+/// [`users`] with the start of each program's record (FILETIME), most recent first.
+pub fn timed_users(records: &[Record], own: Option<&str>) -> Vec<(u64, String)> {
     let mut live: Vec<(u64, String)> = records
         .iter()
         .filter(|r| using_now(r.start, r.stop))
@@ -78,13 +88,39 @@ pub fn users(records: &[Record], own: Option<&str>) -> Vec<String> {
         })
         .collect();
     live.sort_by_key(|(start, _)| std::cmp::Reverse(*start));
+    let mut out: Vec<(u64, String)> = Vec::new();
+    for (start, name) in live {
+        if !out.iter().any(|(_, n)| n.eq_ignore_ascii_case(&name)) {
+            out.push((start, name));
+        }
+    }
+    out
+}
+
+/// The programs found for a camera in use.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CameraUsers {
+    pub names: Vec<String>,
+    /// The list may include a program that does not hold the camera (the `apps_maybe` of the state event).
+    pub maybe: bool,
+}
+
+/// The registry's programs and the log's, as one list: the union, once per name (ignoring case), the most recent
+/// start first. `maybe` when the log doubts its attribution, or a program only the registry names may be a reader of
+/// Better Cam's virtual camera (`vcam_consumer`: one is attached).
+pub fn merge(registry: Vec<(u64, String)>, log: super::in_use_log::Holders, vcam_consumer: bool) -> CameraUsers {
+    let in_log = |name: &str| log.names.iter().any(|(_, n)| n.eq_ignore_ascii_case(name));
+    let registry_only = registry.iter().any(|(_, n)| !in_log(n));
+    let maybe = (!log.names.is_empty() && log.maybe) || (registry_only && vcam_consumer);
+    let mut all: Vec<(u64, String)> = registry.into_iter().chain(log.names).collect();
+    all.sort_by_key(|(start, _)| std::cmp::Reverse(*start)); // stable: the registry's entry wins a tie
     let mut names: Vec<String> = Vec::new();
-    for (_, name) in live {
+    for (_, name) in all {
         if !names.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
             names.push(name);
         }
     }
-    names
+    CameraUsers { names, maybe }
 }
 
 /// The names as they read in a sentence: `Discord.exe`, `Discord.exe and chrome.exe`,
@@ -195,10 +231,13 @@ pub fn read_records() -> Vec<Record> {
     all
 }
 
-/// The programs that use a camera now, Better Cam excluded: two or three dozen small registry reads, no handle on
-/// any process.
-pub fn camera_users() -> Vec<String> {
-    users(&read_records(), own_key().as_deref())
+/// The programs that use the camera `target` (the symbolic link Better Cam wants; `None` for the first camera) now,
+/// Better Cam excluded: the registry records and the camera service's event log (bounded to about 50 ms, see
+/// [`super::in_use_log`]). `vcam_consumer`: a program reads Better Cam's virtual camera, which the registry records
+/// cannot tell from a holder of the physical camera.
+pub fn camera_users(target: Option<&str>, vcam_consumer: bool) -> CameraUsers {
+    let registry = timed_users(&read_records(), own_key().as_deref());
+    merge(registry, super::in_use_log::lookup(target), vcam_consumer)
 }
 
 #[cfg(test)]
@@ -357,11 +396,53 @@ mod tests {
         assert_eq!(users(&got, None), s(&["WindowsCamera", "Discord.exe"]));
     }
 
+    fn holders(names: &[(u64, &str)], maybe: bool) -> super::super::in_use_log::Holders {
+        super::super::in_use_log::Holders { names: names.iter().map(|(t, n)| (*t, n.to_string())).collect(), maybe }
+    }
+
+    fn timed(v: &[(u64, &str)]) -> Vec<(u64, String)> {
+        v.iter().map(|(t, n)| (*t, n.to_string())).collect()
+    }
+
+    #[test]
+    fn the_registry_and_the_log_are_one_list_newest_first_once_each() {
+        let got = merge(timed(&[(300, "chrome.exe"), (100, "Discord.exe")]), holders(&[(200, "Zoom.exe"), (250, "DISCORD.EXE")], false), false);
+        assert_eq!(got.names, s(&["chrome.exe", "DISCORD.EXE", "Zoom.exe"]));
+        assert!(!got.maybe);
+        assert_eq!(merge(vec![], holders(&[], false), false), CameraUsers::default());
+        assert_eq!(merge(timed(&[(1, "a.exe")]), holders(&[], false), false).names, s(&["a.exe"]));
+        assert_eq!(merge(vec![], holders(&[(1, "b.exe")], false), false).names, s(&["b.exe"]));
+    }
+
+    #[test]
+    fn the_list_is_a_maybe_for_a_doubt_of_the_log_or_a_registry_name_next_to_a_virtual_camera_reader() {
+        // the log doubts its own attribution
+        assert!(merge(vec![], holders(&[(1, "b.exe")], true), false).maybe);
+        // a doubt without a name says nothing
+        assert!(!merge(vec![], holders(&[], true), false).maybe);
+        // a reader of the virtual camera could be what the registry names ...
+        assert!(merge(timed(&[(1, "a.exe")]), holders(&[], false), true).maybe);
+        // ... but not when the log confirms that very program streams the physical camera
+        assert!(!merge(timed(&[(1, "a.exe")]), holders(&[(2, "A.exe")], false), true).maybe);
+        // and a consumer with nothing from the registry is no doubt for the log's names
+        assert!(!merge(vec![], holders(&[(2, "b.exe")], false), true).maybe);
+    }
+
     #[test]
     fn this_machine_reads_without_panicking() {
         // What is in use differs per machine (and the record may be missing altogether); the read itself must work.
-        let t = std::time::Instant::now();
-        let names = camera_users();
-        eprintln!("programs using a camera here: {names:?} (read in {:?})", t.elapsed());
+        let mut times = Vec::new();
+        let mut found = CameraUsers::default();
+        for _ in 0..20 {
+            let t = std::time::Instant::now();
+            found = camera_users(None, false);
+            times.push(t.elapsed());
+        }
+        times.sort();
+        eprintln!(
+            "programs using a camera here: {found:?} (20 lookups: median {:?}, worst {:?})",
+            times[times.len() / 2],
+            times[times.len() - 1]
+        );
     }
 }

@@ -1610,11 +1610,13 @@ impl Control {
         self.advertise_idle();
     }
 
-    /// Say which programs use the camera (the registry is read again with every failed try, so the names follow
-    /// reality). The code of the failure goes to the log, not to the window.
+    /// Say which programs use the camera (the registry and the camera service's log are read again with every failed
+    /// try, so the names follow reality). The code of the failure goes to the log, not to the window.
     fn name_camera_users(&self, event: &mut StateEvent) {
-        let names = self.factory.camera_users();
-        let maybe = !names.is_empty() && self.writer.consumer_active();
+        let target = self.target_link();
+        let found = self.factory.camera_users(target.as_deref(), self.writer.consumer_active());
+        let names = found.names;
+        let maybe = !names.is_empty() && found.maybe;
         let code = event.reason.take().unwrap_or_default();
         event.reason = Some(crate::capture::in_use::reason(&names, maybe));
         event.apps_maybe = maybe;
@@ -2179,10 +2181,11 @@ trait SourceFactory: Send + Sync {
         crate::capture::privacy::desktop_access_blocked()
     }
 
-    /// The programs that use a camera now (read after a failure with "in use"). A few registry reads; it never
-    /// opens a process.
-    fn camera_users(&self) -> Vec<String> {
-        crate::capture::in_use::camera_users()
+    /// The programs that use the camera `target` (its symbolic link; `None`: the first camera) now (read after a
+    /// failure with "in use"): a few registry reads and a bounded read of the camera service's event log. It runs on
+    /// the control thread, at most once per retry. `vcam_consumer`: a program reads Better Cam's virtual camera.
+    fn camera_users(&self, target: Option<&str>, vcam_consumer: bool) -> crate::capture::in_use::CameraUsers {
+        crate::capture::in_use::camera_users(target, vcam_consumer)
     }
 }
 
@@ -3613,6 +3616,10 @@ mod tests {
         registry_deny: AtomicBool,
         /// The programs the registry says use a camera (`SourceFactory::camera_users`).
         users: Mutex<Vec<String>>,
+        /// `camera_users` goes to the real lookup (registry and camera log, both moved to test sources by the caller).
+        real_users: AtomicBool,
+        /// The target link of every `camera_users` call.
+        targets: Mutex<Vec<Option<String>>>,
     }
 
     /// The symbolic link the fake camera has.
@@ -3757,8 +3764,14 @@ mod tests {
                 .then_some(crate::capture::privacy::Blocked::DesktopApps)
         }
 
-        fn camera_users(&self) -> Vec<String> {
-            self.users.lock().unwrap().clone()
+        fn camera_users(&self, target: Option<&str>, vcam_consumer: bool) -> crate::capture::in_use::CameraUsers {
+            self.targets.lock().unwrap().push(target.map(str::to_string));
+            if self.real_users.load(Ordering::SeqCst) {
+                return crate::capture::in_use::camera_users(target, vcam_consumer);
+            }
+            let names = self.users.lock().unwrap().clone();
+            let maybe = !names.is_empty() && vcam_consumer;
+            crate::capture::in_use::CameraUsers { names, maybe }
         }
     }
 
@@ -3800,6 +3813,8 @@ mod tests {
                 lose_device_in_open: AtomicBool::new(false),
                 registry_deny: AtomicBool::new(false),
                 users: Mutex::new(Vec::new()),
+                real_users: AtomicBool::new(false),
+                targets: Mutex::new(Vec::new()),
             });
             let opener = Arc::new(crate::camera_controls::fake::FakeOpener {
                 camera: fake.controls.clone(),
@@ -4415,6 +4430,113 @@ mod tests {
         assert!(maybe, "a consumer is attached: the list may name it");
         consumer.detach();
         rig.fake.failures.lock().unwrap().clear();
+    }
+
+    /// Moves the lookup to test sources for one test and puts everything back (the variables are process-wide, so only
+    /// the test that sets them reads the real lookup).
+    struct TestSources {
+        log: std::path::PathBuf,
+        child: Option<std::process::Child>,
+    }
+
+    impl TestSources {
+        fn new(name: &str) -> TestSources {
+            let log = std::env::temp_dir().join(format!("better-cam-{name}-{}.txt", std::process::id()));
+            std::fs::write(&log, "").unwrap();
+            std::env::set_var(crate::capture::in_use_log::TEST_LOG_ENV, &log);
+            // a registry root that does not exist: no record from the real consent store
+            std::env::set_var(
+                crate::capture::in_use::TEST_ROOT_ENV,
+                format!(r"Software\BetterCamTest\none-{}", std::process::id()),
+            );
+            TestSources { log, child: None }
+        }
+
+        /// Starts a program that stays for a minute; returns its process id.
+        fn client(&mut self) -> u32 {
+            let child = std::process::Command::new("ping")
+                .args(["-n", "60", "127.0.0.1"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("ping");
+            let pid = child.id();
+            self.child = Some(child);
+            pid
+        }
+
+        fn kill_client(&mut self) {
+            if let Some(mut c) = self.child.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+
+        fn write(&self, text: &str) {
+            std::fs::write(&self.log, text).unwrap();
+        }
+    }
+
+    impl Drop for TestSources {
+        fn drop(&mut self) {
+            self.kill_client();
+            std::env::remove_var(crate::capture::in_use_log::TEST_LOG_ENV);
+            std::env::remove_var(crate::capture::in_use::TEST_ROOT_ENV);
+            let _ = std::fs::remove_file(&self.log);
+        }
+    }
+
+    #[test]
+    fn the_camera_log_names_the_program_that_streams_the_camera_and_the_name_follows_each_retry() {
+        let mut src = TestSources::new("camlog");
+        let client = src.client();
+        // events are written relative to "now": the program must be older than the events
+        std::thread::sleep(Duration::from_millis(1200));
+        let me = std::process::id(); // stands for the camera service host: a running process older than the events
+        let link = FAKE_LINK;
+        let virtual_link = r"\\?\swd#vcamdevapi#d8f8cb27#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\{fcebba03}";
+        src.write(&format!(
+            "open 800 {client} {link}\nstart 700 {me} 7 {link}\n"
+        ));
+
+        let rig = Rig::new("sm-inuse-camlog.bin", fast());
+        rig.fake.real_users.store(true, Ordering::SeqCst);
+        for _ in 0..400 {
+            rig.fake.failures.lock().unwrap().push_back(Failure::in_use(Some(HRESULT(0xC00D_3704_u32 as i32))));
+        }
+        let mut cap = saved_format(VideoFormat::Any);
+        cap.device = Some(FAKE_LINK.to_string());
+        rig.engine.start(settings(SourceSpec::Configured(cap), false));
+        rig.wait_state(EngineState::Reconnecting, Duration::from_secs(5));
+        let named = |r: &Rig| last_in_use(r).is_some_and(|(_, a, _)| a.is_some());
+        rig.wait("the program from the log", Duration::from_secs(5), named);
+        let (reason, apps, maybe) = last_in_use(&rig).unwrap();
+        let app = apps.as_ref().and_then(|a| a.first()).cloned().unwrap();
+        assert!(app.eq_ignore_ascii_case("ping.exe"), "{app}");
+        assert_eq!(apps.as_ref().map(Vec::len), Some(1));
+        assert_eq!(reason.as_deref(), Some(format!("camera is in use by {app}").as_str()));
+        assert!(!maybe, "one client opened just before the stream: no doubt");
+        assert_eq!(rig.fake.targets.lock().unwrap().last(), Some(&Some(FAKE_LINK.to_string())), "the lookup is told the camera");
+
+        // a client of the virtual camera is not a holder of the physical camera
+        src.write(&format!("open 800 {client} {virtual_link}\nstart 700 {me} 7 {virtual_link}\n"));
+        rig.wait("nobody", Duration::from_secs(5), |r| last_in_use(r).is_some_and(|(_, a, _)| a.is_none()));
+        assert_eq!(last_in_use(&rig).unwrap().0.as_deref(), Some("camera is in use by another app"));
+
+        // the stream stops: nobody; starts again: named; the program dies without a stop event: nobody again
+        src.write(&format!("open 800 {client} {link}\nstart 700 {me} 7 {link}\nstop 100 {me} 7 {link}\n"));
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(last_in_use(&rig).unwrap().1.is_none(), "a stopped stream names nobody");
+        src.write(&format!("open 800 {client} {link}\nstart 700 {me} 7 {link}\n"));
+        rig.wait("named again", Duration::from_secs(5), named);
+        src.kill_client();
+        rig.wait("the dead program is dropped", Duration::from_secs(5), |r| {
+            last_in_use(r).is_some_and(|(_, a, _)| a.is_none())
+        });
+
+        rig.fake.failures.lock().unwrap().clear();
+        rig.engine.wait_live(Duration::from_secs(10)).unwrap();
+        let events = rig.states();
+        assert!(events.windows(2).all(|w| w[0] != w[1]), "every state event is a change: {events:?}");
     }
 
     #[test]
@@ -5807,6 +5929,34 @@ mod tests {
         }
         eprintln!("oldest heartbeat while the device was rebuilt: {worst} ms");
         assert!(worst < 500, "the heartbeat was {worst} ms old");
+    }
+
+    /// The real lookup (registry and the camera service's log) on the control thread, at every retry: the file's
+    /// heartbeat does not stall.
+    #[test]
+    fn the_heartbeat_goes_on_while_the_camera_log_is_read_at_every_retry() {
+        let rig = Rig::new("rf-camlog-heartbeat.bin", fast());
+        rig.fake.real_users.store(true, Ordering::SeqCst);
+        for _ in 0..400 {
+            rig.fake.failures.lock().unwrap().push_back(Failure::in_use(Some(HRESULT(0xC00D_3704_u32 as i32))));
+        }
+        rig.engine.start(settings(bars(30), false));
+        rig.wait_state(EngineState::Reconnecting, Duration::from_secs(5));
+        let age_ms = |r: &Rig| {
+            let h = r.file.shared().header();
+            vcam_protocol::qpc_to_hns(vcam_protocol::qpc_now().saturating_sub(h.writer_heartbeat)) / 10_000
+        };
+        let end = Instant::now() + Duration::from_secs(5);
+        let mut worst = 0;
+        while Instant::now() < end {
+            worst = worst.max(age_ms(&rig));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let lookups = rig.fake.targets.lock().unwrap().len();
+        eprintln!("oldest heartbeat over {lookups} real lookups: {worst} ms");
+        assert!(lookups >= 10, "{lookups} lookups in 5 s at 300 ms retries");
+        assert!(worst < 500, "the heartbeat was {worst} ms old");
+        rig.fake.failures.lock().unwrap().clear();
     }
 
     /// M5: the failure count of generic failures starts over after idle standby.

@@ -11,6 +11,7 @@
 pub mod controls;
 pub mod hotplug;
 pub mod in_use;
+pub mod in_use_log;
 pub mod privacy;
 pub mod reader;
 
