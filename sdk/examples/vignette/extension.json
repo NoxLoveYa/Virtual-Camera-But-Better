@@ -1,0 +1,17 @@
+{
+  "apiVersion": 1,
+  "id": "vignette",
+  "name": "Vignette",
+  "version": "1.0.0",
+  "author": "Better Cam examples",
+  "license": "MIT",
+  "kind": "filter",
+  "hint": "Darken the edges of the picture",
+  "shader": "vignette.wgsl",
+  "params": [
+    { "type": "slider", "key": "amount", "label": "Strength", "min": 0, "max": 1, "step": 0.01, "def": 0.6 },
+    { "type": "slider", "key": "inner", "label": "Clear centre", "min": 0, "max": 1, "step": 0.01, "def": 0.35, "hint": "Distance from the middle where the darkening starts" },
+    { "type": "slider", "key": "outer", "label": "Fade out by", "min": 0, "max": 1, "step": 0.01, "def": 0.75, "hint": "Distance from the middle where the darkening is full" },
+    { "type": "slider", "key": "cell", "label": "Pixel size", "min": 1, "max": 64, "step": 1, "def": 1, "int": true, "unit": "px", "hint": "1 keeps the picture sharp; more makes big blocks" }
+  ]
+}

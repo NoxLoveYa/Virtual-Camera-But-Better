@@ -480,6 +480,26 @@ button.reset-btn:hover:not(:disabled) { color: var(--text); box-shadow: none; bo
 @keyframes spin { to { transform: rotate(360deg); } }
 .filter-error button.link { display: inline; margin: 0 0 0 8px; font-size: 12px; }
 .rtx-badge { margin-left: 8px; color: var(--warn); font-size: 10px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; }
+/* Extensions (E3): menu group and badge, the card line of an extension that does not run, Settings → Extensions */
+.ext-badge { margin-left: 8px; color: var(--accent); font-size: 10px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; white-space: nowrap; }
+.card-head .ext-badge { margin: 0 8px 0 0; font-weight: 500; letter-spacing: 0.06em; }
+.pm-group { margin: 6px 0 2px; padding: 8px 10px 4px; color: var(--faint); font-size: 10px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; border-top: 1px solid var(--line); }
+.filter-status.ext-note { border-left-color: var(--warn); background: rgba(255, 255, 255, 0.04); }
+.ext-modal { width: min(560px, calc(100vw - 48px)); max-height: calc(100vh - var(--titlebar) - 48px); display: flex; flex-direction: column; }
+.ext-modal .modal-actions { flex: none; }
+.ext-list { flex: 1; min-height: 0; margin: 0 0 4px; padding: 0; overflow-y: auto; list-style: none; }
+.ext-item { display: flex; flex-direction: column; gap: 4px; padding: 10px 0; border-top: 1px solid var(--line); }
+.ext-head { display: flex; align-items: center; gap: 10px; }
+.ext-head .fill { flex: 1; }
+.ext-name { font-weight: 600; }
+.ext-meta { color: var(--faint); font-size: 11px; }
+.ext-state { font-size: 10px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; color: var(--accent); }
+.ext-state.disabled { color: var(--faint); }
+.ext-state.error { color: var(--danger); }
+.ext-hint { color: var(--dim); }
+.ext-folder { color: var(--faint); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ext-item .filter-error { margin: 2px 0; }
+.ext-summary { color: var(--text); }
 
 input[type="range"] { appearance: none; width: 100%; height: 16px; margin: 0; background: transparent; cursor: pointer; }
 input[type="range"]::-webkit-slider-runnable-track {

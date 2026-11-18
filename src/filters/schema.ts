@@ -6,6 +6,7 @@ export type ParamValue = number | string | boolean;
 
 export interface FilterCfg {
   id: string;
+  /** A built-in filter's OBS id, or `ext:<id>` for a card of an installed extension (it stays when the extension is gone). */
   kind: FilterKind;
   enabled: boolean;
   params: Record<string, ParamValue>;
@@ -68,7 +69,15 @@ export interface ComboDef extends ParamBase {
   placeholder?: string;
 }
 
-export type ParamDef = SliderDef | SelectDef | BoolDef | IntDef | ColorDef | PathDef | ComboDef;
+/** A line of text typed by the user (extensions only). */
+export interface TextDef extends ParamBase {
+  type: "text";
+  def: string;
+  /** At most 200, default 80. */
+  maxLength?: number;
+}
+
+export type ParamDef = SliderDef | SelectDef | BoolDef | IntDef | ColorDef | PathDef | ComboDef | TextDef;
 
 export interface FilterDef {
   label: string;
@@ -324,28 +333,111 @@ const CATALOGUE = {
   },
 } satisfies Record<string, FilterDef>;
 
-export type FilterKind = keyof typeof CATALOGUE;
+/** The built-in filters: the keys of the catalogue. */
+export type BuiltinKind = keyof typeof CATALOGUE;
 
-export const FILTERS: Record<FilterKind, FilterDef> = CATALOGUE;
+/** A built-in filter, or `ext:<extension id>`. */
+export type FilterKind = BuiltinKind | `ext:${string}`;
+
+export const FILTERS: Record<BuiltinKind, FilterDef> = CATALOGUE;
 
 /** One-liners for the "Add filter" menu. */
-export const FILTER_HINTS = Object.fromEntries(Object.entries(FILTERS).map(([k, f]) => [k, f.hint])) as Record<FilterKind, string>;
+export const FILTER_HINTS = Object.fromEntries(Object.entries(FILTERS).map(([k, f]) => [k, f.hint])) as Record<BuiltinKind, string>;
 
-export const isFilterKind = (kind: unknown): kind is FilterKind =>
+export const isBuiltinKind = (kind: unknown): kind is BuiltinKind =>
   typeof kind === "string" && Object.prototype.hasOwnProperty.call(FILTERS, kind);
 
-export const defaultParams = (kind: FilterKind): Record<string, ParamValue> =>
-  Object.fromEntries(FILTERS[kind].params.map((p) => [p.key, p.def]));
+/** `ext:` plus an extension id (`^[a-z0-9][a-z0-9-]{1,47}$`). */
+const EXT_KIND = /^ext:[a-z0-9][a-z0-9-]{1,47}$/;
+
+export const isExtKind = (kind: unknown): kind is `ext:${string}` => typeof kind === "string" && EXT_KIND.test(kind);
+
+export const isFilterKind = (kind: unknown): kind is FilterKind => isBuiltinKind(kind) || isExtKind(kind);
+
+// ---- Extensions (docs/EXTENSIONS.md): what the app reports about the folders under %APPDATA%\dev.bettercam.app\extensions ----
+
+/** A `ParamDef` as the backend writes it: a combo's `pattern` is the source of a regular expression, not a `RegExp`. */
+export type ExtParamJson = Exclude<ParamDef, ComboDef> | (Omit<ComboDef, "pattern"> & { pattern?: string });
+
+/** `list_extensions` and the `extensions-changed` event. */
+export interface ExtensionInfo {
+  /** The folder name; `ext:<id>` is the kind of its cards. */
+  id: string;
+  name: string;
+  version: string;
+  author: string | null;
+  license: string | null;
+  hint: string | null;
+  /** `null` when the manifest could not be read. */
+  kind: "filter" | "overlay" | "widget" | null;
+  render: "scene" | "shader" | null;
+  api_version: number | null;
+  folder: string;
+  /** Empty when the manifest is invalid. */
+  params: ExtParamJson[];
+  actions: { id: string; label: string }[];
+  /** `ready`; `disabled`: switched off in Settings, its cards are bypassed; `error`: see `error`. */
+  state: "ready" | "disabled" | "error";
+  enabled: boolean;
+  error: string | null;
+}
+
+export const extIdOf = (kind: string): string => kind.slice("ext:".length);
+
+/** The installed extension behind an `ext:` kind (also one that failed to load, or is switched off). */
+export const extOf = (kind: string, extensions: readonly ExtensionInfo[]): ExtensionInfo | undefined =>
+  isExtKind(kind) ? extensions.find((e) => e.id === extIdOf(kind)) : undefined;
+
+const regexOf = (source: string): RegExp | undefined => {
+  try {
+    return new RegExp(source);
+  } catch {
+    return undefined; // a pattern the page cannot compile limits nothing
+  }
+};
+
+const toParamDef = (p: ExtParamJson): ParamDef => {
+  if (p.type !== "combo") return p;
+  const { pattern, ...rest } = p;
+  const re = pattern === undefined ? undefined : regexOf(pattern);
+  return re ? { ...rest, pattern: re } : rest;
+};
+
+const defCache = new WeakMap<ExtensionInfo, FilterDef>();
+
+/**
+ * The definition of a filter kind: the catalogue entry of a built-in, the manifest of an installed extension (a
+ * disabled one included, its cards keep their values), `undefined` for an `ext:` kind that is not installed or whose
+ * manifest is invalid (its params are unknown).
+ */
+export const defOf = (kind: string, extensions: readonly ExtensionInfo[] = []): FilterDef | undefined => {
+  if (isBuiltinKind(kind)) return FILTERS[kind];
+  const ext = extOf(kind, extensions);
+  if (!ext || ext.state === "error") return undefined;
+  let def = defCache.get(ext);
+  if (!def) {
+    def = { label: ext.name, hint: ext.hint ?? "", params: ext.params.map(toParamDef) };
+    defCache.set(ext, def);
+  }
+  return def;
+};
+
+/** The name a card shows: the label of a built-in, the extension's name, or its id when it is not installed. */
+export const labelOf = (kind: string, extensions: readonly ExtensionInfo[] = []): string =>
+  isBuiltinKind(kind) ? FILTERS[kind].label : (extOf(kind, extensions)?.name ?? (isExtKind(kind) ? extIdOf(kind) : kind));
+
+export const defaultParams = (kind: FilterKind, extensions: readonly ExtensionInfo[] = []): Record<string, ParamValue> =>
+  Object.fromEntries((defOf(kind, extensions)?.params ?? []).map((p) => [p.key, p.def]));
 
 /** Whether a param is shown for these values (a hidden param keeps its value and still goes to the backend). */
 export const isShown = (p: ParamDef, params: Record<string, ParamValue>): boolean =>
   !p.showIf || p.showIf.in.includes(params[p.showIf.key]);
 
-export const makeFilter = (kind: FilterKind, enabled = true): FilterCfg => ({
+export const makeFilter = (kind: FilterKind, enabled = true, extensions: readonly ExtensionInfo[] = []): FilterCfg => ({
   id: crypto.randomUUID(),
   kind,
   enabled,
-  params: defaultParams(kind),
+  params: defaultParams(kind, extensions),
 });
 
 /** The chain a fresh install starts with: empty. */

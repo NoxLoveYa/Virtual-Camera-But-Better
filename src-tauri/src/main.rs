@@ -142,6 +142,19 @@ fn main() {
                 }
             });
 
+            // The extensions folder is read now (so the page's first `list_extensions` is complete) and watched once a
+            // second; a change reaches the page as `extensions-changed`.
+            match app.path().app_data_dir() {
+                Ok(dir) => {
+                    let handle = app.handle().clone();
+                    let sink: better_cam::ext::Sink = Arc::new(move |list| {
+                        let _ = handle.emit("extensions-changed", list);
+                    });
+                    app.state::<commands::AppState>().extensions.start(dir.join("extensions"), dir.join("extensions-state.json"), Some(sink));
+                }
+                Err(e) => eprintln!("[ext] no app data folder, extensions are off: {e}"),
+            }
+
             // The window starts hidden; a login launch stays in the tray, a manual one shows it.
             if commands::launched_at_startup() {
                 report_visibility(app.handle());
@@ -203,6 +216,10 @@ fn main() {
             commands::nvidia_status,
             commands::nvidia_gpu,
             commands::install_nvidia_sdk,
+            commands::list_extensions,
+            commands::reload_extensions,
+            commands::set_extension_enabled,
+            commands::open_extensions_folder,
         ])
         .build(context)
         .expect("error while building Better Cam")

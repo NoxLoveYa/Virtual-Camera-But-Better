@@ -1,8 +1,11 @@
 # Better Cam — Extension API design
 
-Status: design; phase E1 done. Written 2026-11-18 against `main` at `b121ea7`. Spike E1 (commit `a627ce7`,
+Status: design; phases E1, E2 and E3 done. Written 2026-11-18 against `main` at `b121ea7`. Spike E1 (commit `a627ce7`,
 `docs/SPIKE-EXT.md`, code in `src-tauri/src/ext/`) proved the WGSL filter path; the corrections of SPIKE-EXT.md
-section 8 are applied below (3.1, 3.4, 4.3, 4.7, 4.8, 5.1, 5.2, 5.4, 6.3, 6.4, 7). No other extension code exists yet.
+section 8 are applied below (3.1, 3.4, 4.3, 4.7, 4.8, 5.1, 5.2, 5.4, 6.3, 6.4, 7). Spike E2 (commit `7e2bc83`,
+`docs/SPIKE-EXT.md` "Spike E2") settled the overlay raster: Direct2D on the engine device, on the render thread; its
+results are applied in 3.2, 3.4, 5.2, 6.3 and 7. E3 added the registry and manifest (`src-tauri/src/ext/{mod,manifest}.rs`,
+section 7). The owner accepted all ten recommendations of section 8 on 2026-11-18.
 Owner request: "Custom api for widgets / overlay / filter (in ts and webgpu if possible)".
 Facts were checked on 2026-11-18 against docs.rs (`naga`, `rquickjs`, `wgpu`), Microsoft Learn (WebView2,
 Windows.Graphics.Capture, Direct3D 11), the `MicrosoftEdge/WebView2Feedback`, `tauri-apps/wry` and `gfx-rs/wgpu`
@@ -115,7 +118,7 @@ the fail-closed sampler fix of E1 (`docs/SPIKE-EXT.md` 2 and 5.1); spike E1 pass
 | # | Option | How it works | Latency / cost | Risks | Effort |
 |---|---|---|---|---|---|
 | O4 | Offscreen WebView2 "browser layer" (like OBS's browser source) | `ICoreWebView2CompositionController` attached to a `Windows.UI.Composition` visual; `GraphicsCaptureItem.CreateFromVisual` (Windows 10 1809+, S) + `Direct3D11CaptureFramePool` gives D3D11 textures with alpha; copy into a shared texture; engine composites | 1–3 frames behind (E); Microsoft says its own capture-based WebView2 control has "lower framerates" (S: WPF `WebView2CompositionControl` spec); +100–300 MB RAM and a few % CPU per page (E, unverified) | No supported offscreen rendering in WebView2 (S: feature request #547/#20 still open); Tauri/wry has no offscreen API (S: wry #391 open); capture needs the visual in a live composition tree, so a host window must exist; whether a hidden or cloaked one keeps rendering at full rate is **unverified** (a third-party project notes hidden pages can pause animation callbacks); WinRT composition + capture plumbing from Rust; network must be blocked by hand | L (spike + 3 sessions) |
-| **O5** | **Native layer API: scenes or WGSL shader layers** | Scene mode: a script returns a scene (JSON-like nodes); the render thread draws it with Direct2D/DirectWrite into a BGRA layer texture on the engine's own D3D11 device (it has `BGRA_SUPPORT`), only when the scene changed. Shader mode: a WGSL fragment shader (F1's compile path) draws the layer. Both are blended over the output frame | Raster 0.1–0.5 ms CPU for a typical scene, 1–3 ms for the cap (E, **spike E2 measures**); shader layer ≈ one filter pass (E); blend ~0.01–0.03 ms GPU per layer (E); script tick 0.05–1 ms on its own thread (E); 0 added latency | D2D shares the immediate context and may leave D3D state set **(unverified, E2 checks)**; text and fonts limited to DirectWrite; a new drawing vocabulary for authors | M (3–4 sessions) |
+| **O5** | **Native layer API: scenes or WGSL shader layers** | Scene mode: a script returns a scene (JSON-like nodes); the render thread draws it with Direct2D/DirectWrite into a BGRA layer texture on the engine's own D3D11 device (it has `BGRA_SUPPORT`), only when the scene changed. Shader mode: a WGSL fragment shader (F1's compile path) draws the layer. Both are blended over the output frame | Raster **0.07–0.23 ms CPU p95 for a typical scene (M, spike E2, RTX 5080 and WARP)**; the old 512-node / 4 096-character cap scene cost 3.0–5.9 ms p50 cold, so the caps came down (6.3; 256 nodes and 1 024 characters ≈ 1.6–2.1 ms p50 cold, M); shader layer ≈ one filter pass (E); blend ~0.01–0.03 ms GPU per layer (E); script tick 0.05–1 ms on its own thread (E); 0 added latency | **D2D left no D3D11 state changed (24 states checked, empty diff) and the next engine pass rendered byte-identical (M, spike E2)**; text and fonts limited to DirectWrite; a new drawing vocabulary for authors | M (3–4 sessions) |
 | O6 | Shader-only overlays | WGSL layers and nothing else | As a filter pass (E) | Text in shaders is impractical: no clock, no label, no timer | S |
 | O7 | Skia (`skia-safe`) or `tiny-skia` raster | CPU raster of a canvas-like API, upload each change | 1080p layer upload ~8 MB per change; 1–5 ms CPU raster (E) | GPU Skia has no D3D11 backend (E); +~20 MB binary (E) | M |
 | O8 | Overlays drawn in the app's own webview | DOM/Canvas in the main window, captured | Same as F3 | Same window dependency as F3 | — |
@@ -125,12 +128,16 @@ the tenths of a millisecond; covers every listed example except ones that need n
 way to get full HTML/CSS/WebGPU overlays; it is recorded as a later spike (open question 2), not v1, because offscreen
 WebView2 is unsupported by Microsoft today and its cost and hidden-window behaviour are unknown.
 
-Threading inside O5: raster on the render thread, bounded by caps (6.3) and a measured budget; unchanged scenes are
-never re-rastered. Fallback if spike E2 fails: an overlay thread with its own D3D11 device and D2D, double-buffered
-`SHARED_NTHANDLE | SHARED_KEYEDMUTEX` textures, render thread `AcquireSync(key, 0)` and reuse of the previous layer
-when it is busy. Not the default because it doubles device-loss handling. D2D on the engine device from *another*
-thread is ruled out: with multithread protection on, the render thread would block on the device lock while D2D
-draws **(unverified detail; follows from `ID3D11Multithread` semantics)**.
+Threading inside O5: **raster on the render thread, on the engine's own device, chosen by spike E2** (`docs/SPIKE-EXT.md`
+"Spike E2"). It is bounded by the caps of 6.3 and the 2 ms raster budget; unchanged scenes are never re-rastered. The
+layer is a premultiplied `B8G8R8A8_UNORM` texture, text uses grayscale antialiasing (ClearType makes no sense on a
+transparent layer), and the D2D factory is `D2D1_FACTORY_TYPE_MULTI_THREADED` (Media Foundation threads share the
+device; the factory type made no speed difference). The fallback the spike would have needed, an overlay thread with its
+own D3D11 device and D2D, double-buffered `SHARED_NTHANDLE | SHARED_KEYEDMUTEX` textures, render thread
+`AcquireSync(key, 0)` and reuse of the previous layer when it is busy, stays on paper: not needed, and it doubles
+device-loss handling. D2D on the engine device from *another* thread is ruled out: with multithread protection on, the
+render thread would block on the device lock while D2D draws **(unverified detail; follows from `ID3D11Multithread`
+semantics; spike E2 did not test it)**.
 
 ### 3.3 Script runtime
 
@@ -178,8 +185,11 @@ Unverified:
 2. Future `naga` releases keep FXC-compatible output (wgpu no longer fixes FXC issues). Still open; mitigated by the
    exact pin `=30.0.2`, the corpus test (`cargo test -p better-cam --lib ext::`) and a sampler fix that fails closed
    if `naga`'s output changes shape. Upgrade procedure: `docs/SPIKE-EXT.md` 2.
-3. Direct2D on the engine device leaves D3D11 state usable and costs ≤ 0.5 ms for typical scenes (E2).
-4. D2D from another thread on a multithread-protected device would block the render thread (reasoned, not tested).
+3. ~~Direct2D on the engine device leaves D3D11 state usable and costs ≤ 0.5 ms for typical scenes (E2).~~ Verified by
+   spike E2 (RTX 5080 and WARP): empty state diff after `EndDraw`, next pass byte-identical, typical scene 0.11–0.23 ms
+   p95 cold. The cap scene did not fit: caps lowered (6.3).
+4. D2D from another thread on a multithread-protected device would block the render thread (reasoned, not tested; spike
+   E2 did not cover it).
 5. `rquickjs` interrupt granularity inside long native calls.
 6. QuickJS-NG lacks `Intl`; how its `Date` applies the Windows time zone.
 7. Binary size added by `oxc` and `rquickjs`. `naga` (`wgsl-in`, `hlsl-out`, validation) measured by E1: +1.8 MiB
@@ -239,6 +249,20 @@ New param type for scripts:
 ```ts
 interface TextDef extends ParamBase { type: "text"; def: string; maxLength?: number /* ≤ 200, default 80 */ }
 ```
+
+E3 rules (`ext::manifest`, the 22 cases in `src-tauri/tests/ext_manifests/`). Every error starts with the field path
+(`params[2].min: …`). Unknown fields are ignored, so an additive change keeps `apiVersion`; an unknown `kind` or param
+`type` is refused. `apiVersion` is checked first (`Needs a newer Better Cam (extension API 2)`).
+
+| Field | Rule |
+|---|---|
+| `name`, `version` | Required. `name` 1–48 characters; `version` is `MAJOR.MINOR.PATCH` with optional `-pre` / `+build`, no leading zeros. `author` ≤ 80, `license` ≤ 64, `hint` ≤ 80 characters, all optional, none empty, no control characters |
+| `id` | The 4.2 pattern, 2–48 characters, and equal to the folder name. Folders starting with `.` (`.sdk`) are never extensions |
+| `shader`, `script` | A path inside the folder: no drive, no leading slash, no `.` or `..` part. `shader` is `.wgsl` or `.hlsl`, `script` is `.ts`, `.js` or `.mjs`. The file must exist, be a regular file, stay inside the folder once links are resolved, and be ≤ 256 KB (`extension.json` too) |
+| `kind` rules | Filter: `shader` required, `render`, `actions` not allowed. Overlay and widget: `render` required (`scene` needs `script` and no `shader`; `shader` needs `shader`; widgets are `scene` only), `history` not allowed; `actions` only for widgets (≤ 6, unique) |
+| `fps` | Filters 1–240; overlays and widgets 0–30 |
+| `params` | ≤ 32. Keys `^[a-z][a-z0-9_]{0,31}$` (they become WGSL member names), unique among params and uniforms. `label` 1–60 characters. `slider`: `min < max`, `step > 0`, `def` in range. `int`: whole numbers, same rules. `color`: `def` 0–4294967295. `select`: 1–64 options of `{value, label}`, values unique and all numbers or all strings, `def` one of them. `combo`: `def` is an option unless a `pattern` (≤ 200 characters, JavaScript regex source, compiled by the page, not checked in Rust) is given. `path`: `def` `""`, `filter` `"image"`, ≤ 4 of them. `text`: `def` ≤ `maxLength`. `showIf.key` names another param |
+| `uniforms` | ≤ 16, only for filters and shader layers, and only with a `script` |
 
 ### 4.3 Shader conventions
 
@@ -880,13 +904,13 @@ translucent filter results over the background in linear light (`output_fit.hlsl
 | `src-tauri/src/ext/script/{mod,host,api,transpile,limits}.rs` | New. One thread per card, `rquickjs` runtime (features `loader`; not `rust-alloc`), module resolver confined to the folder, `better-cam` module, timers, storage file, event queue, status/log rate limits |
 | `src-tauri/src/ext/scene.rs` | New. Scene types from JS values, validation and caps, structural hash for "unchanged" |
 | `src-tauri/src/gpu/layers.rs` | New. `LayerStack`: slots kept by id+kind like `Chain`; layer textures; `apply(cfg)`, `run(&fitted)` |
-| `src-tauri/src/gpu/d2d.rs` | New. D2D device/context on the engine's `IDXGIDevice`, DirectWrite factory, raster of a `Scene` into a BGRA texture, text layout cache; resets D3D11 blend, rasterizer and depth state after `EndDraw` |
+| `src-tauri/src/gpu/d2d.rs` | New. D2D device/context on the engine's `IDXGIDevice` (multi-threaded factory), DirectWrite factory, raster of a `Scene` into a premultiplied BGRA texture with grayscale text antialiasing, text format, text layout and mask geometry caches. **No D3D11 state reset after `EndDraw`: spike E2 measured an empty diff (24 states) on the RTX 5080 and WARP.** E8 keeps the spike's probe-pass and state-snapshot diff (`Snap`, `PROBE_HLSL`, `max_diff`, `layer_check` in `examples/layer_spike.rs`) as a regression test on WARP and hardware; if a driver ever leaks, `Snap::restore` is the shape of the fix |
 | `src-tauri/src/gpu/shaders/layer_over.hlsl` | New. Samples a layer (premultiplied or straight flag) for blending |
 | `src-tauri/src/gpu/mod.rs` | Edit. `Renderer::draw_with(&Pass, DrawExtras { constants_b1, blend })`: leaves `Pass` and its ~20 call sites untouched. One premultiplied-over `ID3D11BlendState`. Still needed: `Renderer::draw` binds only constant slot 0; the E1 tests bound `b1` by hand with `PSSetConstantBuffers(1, …)` |
 | `src-tauri/src/fx/mod.rs` | Edit. `Chain` gets an optional registry handle: kinds starting with `ext:` are made by `ExtRegistry::make_filter`. New default trait method `GpuFilter::set_frame(&FrameInfo)`, called like `set_canvas` |
 | `src-tauri/src/engine.rs` | Edit. `Msg::SetOverlays`, `Msg::SetExtensions`, `Msg::ExtAction`; session clock (`FrameInfo`); `LayerStack::run` between `stage.run` and the tap; ext instances follow chain and overlays; GPU-loss suspects (6.4) |
 | `src-tauri/src/api.rs`, `commands.rs`, `main.rs` | Edit. Commands below; registry start at launch |
-| `src-tauri/Cargo.toml` | Edit. `naga = { version = "=30.0.2", default-features = false, features = ["wgsl-in", "hlsl-out"] }` is already there (E1; exact pin on purpose, upgrade procedure in `docs/SPIKE-EXT.md` 2). Add: `rquickjs` (`loader`), `oxc` (`transformer`, `codegen`), `zip`; `windows` features `Win32_Graphics_Direct2D`, `Win32_Graphics_Direct2D_Common`, `Win32_Graphics_DirectWrite` |
+| `src-tauri/Cargo.toml` | Edit. `naga = { version = "=30.0.2", default-features = false, features = ["wgsl-in", "hlsl-out"] }` is already there (E1; exact pin on purpose, upgrade procedure in `docs/SPIKE-EXT.md` 2). Add: `rquickjs` (`loader`), `oxc` (`transformer`, `codegen`), `zip`; E8 also `windows-numerics = "0.3"` (`windows` 0.62 takes `Vector2` and `Matrix3x2` from it and does not re-export them; it is already in `Cargo.lock` at 0.3.1). The `windows` features `Win32_Graphics_Direct2D`, `Win32_Graphics_Direct2D_Common`, `Win32_Graphics_DirectWrite` are in since spike E2 |
 | `Cargo.toml` (workspace) | `workspace.package.rust-version` must be ≥ 1.87 (`naga` 30 declares 1.87; it was 1.82). Raised to `1.87` in `a627ce7`; keep it there or higher |
 
 New commands: `list_extensions`, `reload_extensions`, `set_extension_enabled(id, on)`, `install_extension(path)`,
@@ -957,8 +981,8 @@ people you trust." An out-of-process script host is a later hardening step, not 
 | Event queue | 64 per card; ticks coalesce | Oldest tick dropped |
 | Cards with scripts | 16 | Further cards show "Too many extension cards" |
 | Overlay layers | 8 | Same |
-| Scene | 512 nodes, depth 16, 16 images, 4096 text chars, 256 KB as JSON | Validation error; previous scene kept |
-| Layer raster | Budget 2 ms p95 per layer | Raster rate halves; status "Overlay is slow to draw" |
+| Scene | **256 nodes, depth 16, 16 images, 1 024 text characters, 32 text runs, 256 KB as JSON** (spike E2: nodes 512 → 256, text 4 096 → 1 024; the rest unchanged; the 32-run cap is new because layout cost is per run, ≈ 19 µs, more than per character, ≈ 0.5 µs; E8 may instead count each text run as 8 nodes) | Validation error; previous scene kept |
+| Layer raster | Budget 2 ms p95 per layer (a full 256-node scene with every text changed sits right at it: 1.6–2.1 ms p50 cold, 2.1–3.0 ms p95 on a quiet PC, M; a 192-node, 768-character scene is the safe fallback, 1.4–1.9 ms) | Raster rate halves; status "Overlay is slow to draw" |
 | Shader source | 256 KB; 4 image params; `Params` ≤ 4 KB; calls expand to ≤ 20 000 statements | Refused at load |
 | Shader translation / compile | `naga` ≤ 10 s, FXC ≤ 30 s, each on a 512 MiB-stack worker (5.1) | Error, shader not used; worker left running and counted; 2 still running → further compiles refused until restart |
 | Shader GPU time | 3 ms mean over 1 s at the current size | Bypassed; "Too slow for live video (x ms per frame)" |
@@ -992,7 +1016,7 @@ Each phase is one coding session. "Depends on" lists hard prerequisites. Phases 
 separate worktrees.
 
 ```
-Wave A:  E1 SPIKE wgsl→fxc (DONE)  E2 SPIKE d2d layer        E3 registry + manifest + listing
+Wave A:  E1 SPIKE wgsl→fxc (DONE)  E2 SPIKE d2d layer (DONE)  E3 registry + manifest + listing (DONE)
 Wave B:  E4 extension filters (E1, E3)                      E5 script host core (E3)
 Wave C:  E6 filter scripts + VHS (E4, E5)                   E7 layer stack + shader overlays (E4)
 Wave D:  E8 scene overlays (E2, E5, E7)
@@ -1021,8 +1045,21 @@ second to merge resolves the conflict.
   bounded workers with the 20 000-statement limit, and the device-loss net for shaders that hang the GPU.
 - What E4 reuses as is: `docs/SPIKE-EXT.md` 9.
 
-### E2 — SPIKE: Direct2D layer on the engine device (parallel with E3; E1 is done)
+### E2 — SPIKE: Direct2D layer on the engine device — **DONE, verdict "only the cap scene misses"** (commit `7e2bc83`, report `docs/SPIKE-EXT.md` "Spike E2")
 
+- Result (RTX 5080 and WARP): D2D/DirectWrite draw into a texture on the engine device without changing any D3D11 state
+  (24 states checked, empty diff; the next `Renderer::draw` pass byte-identical; the layer byte-identical after a probe
+  pass). Typical scene 0.11–0.23 ms p95 cold (limit 0.5). The cap scene of the old 6.3 (512 nodes, 4 096 characters)
+  cost 3.0–5.9 ms p50 cold (limit 3 ms p95), so by this spike's own fail rule O5 stays on the render thread and the
+  caps came down.
+- Decisions it settled (applied above): 3.2 O5 threading = **raster on the render thread on the engine device** (the
+  separate-device design stays on paper); 5.2 `gpu/d2d.rs` **reset list is empty**, the probe/snapshot diff is kept as an
+  E8 regression test; 6.3 scene caps **256 nodes and 1 024 text characters** (images 16, depth 16, 256 KB JSON
+  unchanged) plus a cap on text runs (32); layer = **premultiplied BGRA, grayscale text antialiasing**; **multi-threaded
+  D2D factory**; E8 adds `windows-numerics = "0.3"`; 3.4 unverified item 3 verified.
+- Not tested by the spike: D2D from a thread other than the render thread (3.4 item 4), device loss during a raster,
+  binding the layer as an SRV in the blend pass (the spike read it back with `CopyResource`).
+- Original brief (kept for the record):
 - Goal: answer two questions before E8 builds scene overlays. (1) Can Direct2D/DirectWrite draw into a texture on the
   engine's own D3D11 device, on the render thread, without changing what the next `Renderer::draw` pass produces?
   (2) What does rasterizing a scene cost on the CPU, for a typical scene and for the 6.3 cap scene?
@@ -1101,8 +1138,48 @@ second to merge resolves the conflict.
 - Decisions it settles: 3.2 O5 threading; 6.3 scene and raster caps; the reset list of the 5.2 `gpu/d2d.rs` row;
   3.4 unverified item 3.
 
-### E3 — Registry, manifest and listing (parallel with E2)
+### E3 — Registry, manifest and listing — **DONE** (2026-11-18)
 
+- Built: `src-tauri/src/ext/manifest.rs` (parse and validate, `check_files`), the registry in `src-tauri/src/ext/mod.rs`
+  (`ExtRegistry`, `ExtensionInfo`, `Snapshot`; E1's code untouched), commands `list_extensions`, `reload_extensions`,
+  `set_extension_enabled(id, on)`, `open_extensions_folder` (`commands.rs`, registered in `main.rs`; the registry lives in
+  `AppState.extensions` and starts in `setup`), event `extensions-changed`, `sdk/examples/vignette/` (manifest + the E1
+  shader, not yet runnable), 22 invalid manifests in `src-tauri/tests/ext_manifests/`, `npm run test:ext`
+  (`src/filters/ext.test.ts`), and the page: `schema.ts` (`FilterKind = BuiltinKind | ext:<id>`, `ExtensionInfo`, `defOf`,
+  `labelOf`, `TextDef`), `chain.ts` (`normalizeChain(raw, extensions)`, `refreshExtParams`, `signature(chain, overlays)`,
+  `presetFile(chain, overlays)`), `store.ts` (`extensions`, `extensionsRead`, `extensionsOpen`, `applyExtensions`),
+  `AddFilter` (group "Extension filters"), `FilterCard` (Extension badge; notes "not installed", "failed to load",
+  "switched off"), `ParamField` (`text`), `ExtensionsPanel` (Settings → Extensions → Manage…, a dialog), `styles.css`.
+- Registry design: one thread `ext registry` polls the folder once a second (a folder added, removed, or any file the
+  manifest names changing modification time or size reloads that extension); `reload_extensions` and
+  `set_extension_enabled` run on the caller's thread and scan at once. All locks are held for a moment, the folder is read
+  outside them; a panic in a poll is caught and the thread goes on. The list is a `Snapshot` (`Arc`, swapped whole;
+  `Snapshot::ready(id)` gives the `Arc<Manifest>` of an extension that is valid and switched on, which is what E4's
+  `make_filter` takes). `extensions-changed` carries the whole list and is sent only when it differs from the previous one.
+  The extensions folder need not exist (an empty list); `open_extensions_folder` creates it. "Switched off" ids are kept in
+  `%APPDATA%\dev.bettercam.app\extensions-state.json` (`{"disabled": [...]}`, written only on a toggle; ids of uninstalled
+  extensions stay in it, so a reinstall stays off).
+- `ExtensionInfo` (snake_case JSON): `id` (folder name), `name`, `version`, `author`, `license`, `hint`, `kind`
+  (`filter | overlay | widget | null`), `render`, `api_version`, `folder`, `params` (the validated `ParamDef`s as
+  `src/filters/schema.ts` reads them; a combo's `pattern` is a string the page compiles), `actions`,
+  `state` (`ready | disabled | error`), `enabled`, `error`. An invalid manifest is listed too (`state: error`, `params`
+  empty, `name`/`version` salvaged when they are readable), so Settings can show what is wrong; its cards keep their
+  settings. Errors read `extension.json: params[2].min: must be below max (1)`; a missing shader reads
+  `shader: vignette.wgsl does not exist`.
+- Decisions E3 took that 4.2 left open (now in 4.2): see the "E3 rules" paragraph there.
+- Checks as run: `cargo test -p better-cam ext::manifest` 11 tests (every `sdk/examples/*/extension.json` parses and
+  its files exist; all 22 invalid manifests rejected with the field named); `ext::registry_tests` 6 tests (scan, change,
+  deletion, errors, disable, the thread); `cargo test -p better-cam --lib ext::` 47 pass (E1's 30 unchanged);
+  `npm run test:ext` ok; `npm run build` ok; live check 4 all PASS (listed 0.1 s and 0.8 s after the copy, "not installed"
+  0.1–0.7 s after the delete, preset entry survives, switch off/on, a broken manifest is listed with its error).
+- E4 must know: the page already sends `ext:<id>` cards to the engine in `set_chain`; `Chain::apply` skips kinds it has no
+  factory for, so they are inert until E4's `make_filter` exists. A disabled or missing extension must stay a no-op there
+  (the card shows the note, the engine just skips it). `ExtensionInfo.params` is validated, so E4 can map
+  `Manifest::params` to `ParamDecl` without re-checking ranges. Overlays and widgets are listed in Settings but not
+  offered in the Add menu until E7; the preset file's `overlays` section is written by `presetFile(chain, overlays)` but
+  the Rust `save_preset` / `load_preset` still keep only `chain` (E7 must carry `overlays` through `preset_to_write` and
+  `preset_from_file`). The store has no `overlays` yet (E7).
+- Original brief (kept for the record):
 - Goal: the app finds extension folders, validates manifests, lists them, and keeps `ext:` cards in chains and presets.
 - Files: `src-tauri/src/ext/{mod.rs,manifest.rs}` (`mod.rs` and `pub mod ext;` in `lib.rs` exist since E1: add the
   registry next to E1's contents, change none of them), `commands.rs` (`list_extensions`, `reload_extensions`,
@@ -1194,7 +1271,9 @@ second to merge resolves the conflict.
 - Files: `src-tauri/src/ext/scene.rs`, `src-tauri/src/gpu/d2d.rs` (or the separate-device variant if E2 failed),
   `src-tauri/src/gpu/layers.rs`, `src-tauri/src/ext/script/api.rs` (`render`, `measureText`, `fromObsColor`,
   `requestRender`), `sdk/examples/{clock,logo}/`, `src-tauri/examples/scripts/ext_scene_perf.json`.
-- Decisions: 3.2 O5, 4.4 scene, 4.9, 6.3 scene and raster rows.
+- Decisions: 3.2 O5, 4.4 scene, 4.9, 6.3 scene and raster rows. Takes from spike E2 (`docs/SPIKE-EXT.md` E2.6): the
+  caps above (256 nodes, 1 024 characters, 32 text runs), `windows-numerics = "0.3"`, premultiplied BGRA with the
+  premultiplied-over blend, no state reset after `EndDraw`, the probe/`Snap` diff as a regression test.
 - Check:
   1. `cargo test -p better-cam scene` passes: each cap in 6.3 rejects; bad colours rejected with the node path
      (`nodes[3].fill`); `src` outside the folder rejected; WARP raster of a red rect gives red pixels at the right
@@ -1251,6 +1330,12 @@ second to merge resolves the conflict.
 ---
 
 ## 8. Open questions for the owner
+
+**Answered 2026-11-18: the owner accepted all ten recommendations below** (overlays and widgets as designed, no in-app
+HTML panel, no HTML/CSS/WebGPU browser layer, MIT SDK with the written exception for extensions, no network, no audio or
+media signals, global hotkeys after E9, repeat the last camera frame later, raw HLSL as a port path, overlays in their
+own section, folders and zip files only). Every row of the table now reads as a decision, not a question; the "What it
+changes" column is the cost of reversing it.
 
 Status after spike E1: no question was answered by it; question 8 changed (WGSL is proven, so raw HLSL is only a
 port path, not a fallback). None of the questions blocks E2, E3 or E4.

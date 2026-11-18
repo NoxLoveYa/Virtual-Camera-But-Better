@@ -1,6 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { FilterCfg } from "./filters/schema";
+import type { ExtensionInfo, FilterCfg } from "./filters/schema";
 import { presetChain, presetFile } from "./filters/chain";
 import type { AutoCfg, AutoStatus, CameraInfo, ControlInfo, ControlKey, ControlMode, Learned, OutputCfg, SourceCfg, StoredControl } from "./camera/schema";
 
@@ -167,8 +167,12 @@ export const api = {
   listPresets: () => invoke<string[]>("list_presets"),
   /** Writes the preset file of plan 5.4 (no ids). */
   savePreset: (name: string, chain: FilterCfg[]) => invoke<void>("save_preset", { name, preset: presetFile(chain) }),
-  /** The chain of the preset file (the object, or the old bare array), normalized, with fresh ids. */
-  loadPreset: (name: string) => invoke<unknown>("load_preset", { name }).then(presetChain),
+  /**
+   * The chain of the preset file (the object, or the old bare array), normalized, with fresh ids. `extensions` coerces
+   * the `ext:` entries of installed extensions; other `ext:` entries stay as they are.
+   */
+  loadPreset: (name: string, extensions: readonly ExtensionInfo[] = []) =>
+    invoke<unknown>("load_preset", { name }).then((raw) => presetChain(raw, extensions)),
   deletePreset: (name: string) => invoke<void>("delete_preset", { name }),
   /**
    * The preset file at `path` (a file dropped on the window; the object format, or the old bare array wrapped in it),
@@ -194,6 +198,19 @@ export const api = {
    */
   onFilterStatus: (cb: (e: { id: string; message: string }) => void) =>
     listen<{ id: string; message: string }>("filter-status", (e) => cb(e.payload)),
+  /** The extensions found in `%APPDATA%\dev.bettercam.app\extensions`, valid or not (see `ExtensionInfo.state`). */
+  listExtensions: () => invoke<ExtensionInfo[]>("list_extensions"),
+  /** Reads every extension folder again now; resolves to the list. */
+  reloadExtensions: () => invoke<ExtensionInfo[]>("reload_extensions"),
+  /** Switches an installed extension on or off (remembered); resolves to the list. Its cards stay and are bypassed while it is off. */
+  setExtensionEnabled: (id: string, on: boolean) => invoke<ExtensionInfo[]>("set_extension_enabled", { id, on }),
+  /** Opens the extensions folder in Explorer (created when missing). */
+  openExtensionsFolder: () => invoke<void>("open_extensions_folder"),
+  /**
+   * The list of extensions changed: a folder was added, removed or edited (the app looks about once a second), or one
+   * was switched on or off. Carries the whole list.
+   */
+  onExtensionsChanged: (cb: (list: ExtensionInfo[]) => void) => listen<ExtensionInfo[]>("extensions-changed", (e) => cb(e.payload)),
   onStats: (cb: (s: Stats) => void) => listen<Stats>("stats", (e) => cb(e.payload)),
   onDevicesChanged: (cb: () => void) => listen("devices-changed", () => cb()),
   /**

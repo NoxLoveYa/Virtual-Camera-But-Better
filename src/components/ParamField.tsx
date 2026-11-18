@@ -75,6 +75,15 @@ export function ParamField({ def, params, onChange }: Props) {
         </div>
       );
 
+    case "text":
+      return (
+        <label data-key={def.key} title={def.hint}>
+          {def.label}
+          <input type="text" value={String(value)} maxLength={def.maxLength ?? 80} aria-label={def.label} spellCheck={false} onChange={(e) => set(e.target.value)} />
+          {hint}
+        </label>
+      );
+
     case "path":
       return (
         <div className="pf pf-wide" data-key={def.key} title={def.hint}>

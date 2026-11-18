@@ -1,0 +1,1 @@
+{ "apiVersion": 1, "id": "sample", "name": "Sample", "version": "1.0.0", "kind": "filter", "shader": "sample.wgsl", "params": [ { "type": "text", "key": "label", "label": "Label", "def": "this is far too long", "maxLength": 5 } ] }

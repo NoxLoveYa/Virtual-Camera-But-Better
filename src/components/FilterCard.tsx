@@ -1,7 +1,7 @@
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { useStore } from "../store";
 import { stripCodes } from "../camera/schema";
-import { FILTERS, type FilterCfg } from "../filters/schema";
+import { defOf, extIdOf, extOf, isExtKind, labelOf, type ExtensionInfo, type FilterCfg } from "../filters/schema";
 import { Icon } from "./Icon";
 import { ParamField } from "./ParamField";
 import { moveWithFocus, type Reorder } from "../ui/useChainDrag";
@@ -13,9 +13,23 @@ interface Props {
   reorder: Reorder;
 }
 
+/** What a card of an extension says when the extension is not running: not installed, failed to load, or switched off. */
+function extNoteOf(id: string, ext: ExtensionInfo | undefined) {
+  if (!ext) return { state: "missing", failed: true, text: `Extension “${id}” is not installed. The card is bypassed and keeps its settings.` };
+  if (ext.state === "error") return { state: "error", failed: true, text: `Extension “${id}” failed to load: ${ext.error ?? "unknown error"}` };
+  if (ext.state === "disabled") return { state: "disabled", failed: false, text: `Extension “${ext.name}” is switched off in Settings → Extensions. The card is bypassed.` };
+  return null;
+}
+
 export function FilterCard({ filter, index, count, reorder }: Props) {
   const { toggleFilter, removeFilter, setParam, collapsed, toggleCollapsed } = useStore();
-  const def = FILTERS[filter.kind];
+  const extensions = useStore((s) => s.extensions);
+  const extensionsRead = useStore((s) => s.extensionsRead);
+  // `def` is missing for an extension that is not installed or failed to load: the card keeps its settings and says why.
+  const def = defOf(filter.kind, extensions);
+  const label = labelOf(filter.kind, extensions);
+  const ext = extOf(filter.kind, extensions);
+  const extNote = !isExtKind(filter.kind) || !extensionsRead ? null : extNoteOf(extIdOf(filter.kind), ext);
   const folded = !!collapsed[filter.id];
   const error = useStore((s) => s.filterErrors[filter.id]);
   const status = useStore((s) => s.filterStatus[filter.id]);
@@ -27,7 +41,7 @@ export function FilterCard({ filter, index, count, reorder }: Props) {
   // both without the engine, so a card in a loaded preset says it before the first frame (the engine says the same
   // thing, and the picture is passed through meanwhile).
   const needs =
-    !def.rtx || !gpuRead
+    !def?.rtx || !gpuRead
       ? null
       : !gpu
         ? { text: "Needs an NVIDIA RTX GPU (GeForce RTX 20 series or newer).", install: false }
@@ -55,7 +69,7 @@ export function FilterCard({ filter, index, count, reorder }: Props) {
             className="grip"
             data-act="grip"
             title="Drag to reorder. From the keyboard: Space lifts the card, the arrow keys move it, Space drops it, Escape cancels."
-            aria-label={`Move ${def.label}, step ${index + 1} of ${count}`}
+            aria-label={`Move ${label}, step ${index + 1} of ${count}`}
             aria-pressed={mode === "keyboard"}
             aria-disabled={!movable}
             onPointerDown={gripDown}
@@ -67,10 +81,15 @@ export function FilterCard({ filter, index, count, reorder }: Props) {
           <h3 className={`card-title${folded ? " folded" : ""}`}>
             <button aria-expanded={!folded} title={folded ? "Expand" : "Collapse"} onClick={() => toggleCollapsed(filter.id)}>
               <Icon name="chevron" />
-              {def.label}
+              {label}
             </button>
           </h3>
-          {!filter.enabled && <span className="tag">Bypassed</span>}
+          {ext && ext.state !== "error" && (
+            <span className="ext-badge" title={`${ext.name} ${ext.version}${ext.author ? ` by ${ext.author}` : ""}`}>
+              Extension {ext.version}
+            </span>
+          )}
+          {(!filter.enabled || extNote) && <span className="tag">Bypassed</span>}
           <span className="fill" onPointerDown={gripDown} />
           <button className="ghost icon" data-act="up" disabled={index === 0} onClick={() => moveWithFocus(index, index - 1)} title="Apply earlier" aria-label="Move up">
             <Icon name="up" />
@@ -81,7 +100,7 @@ export function FilterCard({ filter, index, count, reorder }: Props) {
           <button
             role="switch"
             aria-checked={filter.enabled}
-            aria-label={`${def.label} enabled`}
+            aria-label={`${label} enabled`}
             className="switch"
             title={filter.enabled ? "Bypass" : "Enable"}
             onClick={() => toggleFilter(filter.id)}
@@ -101,6 +120,11 @@ export function FilterCard({ filter, index, count, reorder }: Props) {
           </p>
         ) : (
           <>
+            {extNote && (
+              <p className={extNote.failed ? "filter-error" : "filter-status ext-note"} role={extNote.failed ? "alert" : "status"} data-ext-note={extNote.state}>
+                {extNote.text}
+              </p>
+            )}
             {error && (
               <p className="filter-error" role="alert" title={error}>
                 {stripCodes(error)}
@@ -114,7 +138,7 @@ export function FilterCard({ filter, index, count, reorder }: Props) {
             )}
           </>
         )}
-        {def.params.length > 0 && !folded && (
+        {def && def.params.length > 0 && !folded && (
           <div className={`params${def.layout ? ` layout-${def.layout}` : ""}`}>
             {def.params.map((p) => (
               <ParamField key={p.key} def={p} params={filter.params} onChange={(key, value) => setParam(filter.id, key, value)} />

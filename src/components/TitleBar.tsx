@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { VcamStatus } from "../api";
+import type { ExtensionInfo } from "../filters/schema";
 import { useStore, type EngineInfo, type VcamAction } from "../store";
+import { ExtensionsPanel } from "./ExtensionsPanel";
 import { Icon as Glyph } from "./Icon";
 import { Popover } from "./Popover";
 
@@ -90,8 +92,31 @@ function VcamRow() {
   );
 }
 
+/** What the "Extensions" row says: how many were found and whether any has a problem. */
+function extensionsText(list: ExtensionInfo[]) {
+  if (list.length === 0) return "None installed";
+  const errors = list.filter((e) => e.state === "error").length;
+  const count = list.length === 1 ? "1 installed" : `${list.length} installed`;
+  return errors > 0 ? `${count}, ${errors} with a problem` : count;
+}
+
+function ExtensionsRow({ onOpen }: { onOpen: () => void }) {
+  const list = useStore((s) => s.extensions);
+  return (
+    <div className="row static" data-row="extensions">
+      <span>
+        <b>Extensions</b>
+        <small>{extensionsText(list)}</small>
+      </span>
+      <span className="row-actions">
+        <button onClick={onOpen}>Manage…</button>
+      </span>
+    </div>
+  );
+}
+
 function Settings() {
-  const { autostart, closeToTray, setAutostart, setCloseToTray } = useStore();
+  const { autostart, closeToTray, setAutostart, setCloseToTray, setExtensionsOpen } = useStore();
   const [open, setOpen] = useState(false);
 
   return (
@@ -120,6 +145,12 @@ function Settings() {
         hint="Closing the window keeps the camera running. Quit from the tray icon."
         on={closeToTray}
         onToggle={() => setCloseToTray(!closeToTray)}
+      />
+      <ExtensionsRow
+        onOpen={() => {
+          setOpen(false);
+          setExtensionsOpen(true);
+        }}
       />
       <VcamRow />
     </Popover>
@@ -190,6 +221,7 @@ export function TitleBar() {
           <Icon d="M0 0l10 10M10 0L0 10" />
         </button>
       </div>
+      <ExtensionsPanel />
     </div>
   );
 }

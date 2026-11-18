@@ -2,6 +2,7 @@ use better_cam::api::Service;
 use better_cam::auto_controls::Mode as ControlMode;
 use better_cam::camera_controls::ControlInfoDto;
 use better_cam::config::{CameraDto, OutputCfg, SourceCfg};
+use better_cam::ext::{ExtRegistry, ExtensionInfo};
 use better_cam::file_dialog;
 use better_cam::fx::nvidia;
 use better_cam::preview::Sink;
@@ -21,6 +22,8 @@ pub struct AppState {
     pub close_to_tray: AtomicBool,
     /// The engine and the logic behind the engine commands (`better_cam::api`).
     pub service: Arc<Service>,
+    /// The extensions found in `%APPDATA%\dev.bettercam.app\extensions` (started in `main`'s setup).
+    pub extensions: ExtRegistry,
 }
 
 /// Run a blocking job off the UI thread. Media Foundation calls (enumerating formats, opening a camera, creating
@@ -398,6 +401,46 @@ fn read_preset_at(path: &std::path::Path) -> Result<serde_json::Value, String> {
 #[tauri::command]
 pub fn read_preset_file(path: String) -> Result<serde_json::Value, String> {
     read_preset_at(std::path::Path::new(&path))
+}
+
+/// The extensions found in the extensions folder, valid or not (`state`: `ready`, `error` or `disabled`). The list also
+/// arrives as the `extensions-changed` event whenever it changes.
+#[tauri::command]
+pub fn list_extensions(state: State<AppState>) -> Vec<ExtensionInfo> {
+    state.extensions.list()
+}
+
+/// Read every extension folder again now, whether or not a file changed; returns the list.
+#[tauri::command]
+pub async fn reload_extensions(state: State<'_, AppState>) -> Result<Vec<ExtensionInfo>, String> {
+    let registry = state.extensions.clone();
+    blocking(move || Ok(registry.reload())).await
+}
+
+/// Switch an installed extension on or off (remembered). Its cards stay in the chain and are bypassed while it is off.
+#[tauri::command]
+pub async fn set_extension_enabled(state: State<'_, AppState>, id: String, on: bool) -> Result<Vec<ExtensionInfo>, String> {
+    let registry = state.extensions.clone();
+    blocking(move || registry.set_enabled(&id, on)).await
+}
+
+/// Open the extensions folder in Explorer (created when it does not exist yet). Returns at once.
+#[tauri::command]
+pub fn open_extensions_folder(state: State<AppState>) -> Result<(), String> {
+    use windows::core::{w, HSTRING};
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let dir = state.extensions.root().ok_or("The extensions folder is not known yet.")?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("could not create the extensions folder: {e}"))?;
+    // SAFETY: plain call with owned strings; the shell opens the folder in Explorer.
+    let r = unsafe { ShellExecuteW(None, w!("open"), &HSTRING::from(dir.as_os_str()), None, None, SW_SHOWNORMAL) };
+    // ShellExecute reports success with a value above 32.
+    if r.0 as isize > 32 {
+        Ok(())
+    } else {
+        Err(format!("Explorer did not open the folder (code {})", r.0 as isize))
+    }
 }
 
 #[cfg(test)]

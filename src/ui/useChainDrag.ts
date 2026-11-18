@@ -9,7 +9,7 @@
  */
 import { useLayoutEffect, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { useStore } from "../store";
-import { FILTERS } from "../filters/schema";
+import { labelOf } from "../filters/schema";
 import { DRAG_THRESHOLD, edgeSpeed, finalIndex, insertionIndex, keyboardGap, snapToSource, type StepKey } from "./chainDrag";
 
 export interface DragView {
@@ -100,7 +100,7 @@ function findScroller(from: HTMLElement | null): HTMLElement {
 
 const labelAt = (index: number) => {
   const f = useStore.getState().chain[index];
-  return f ? FILTERS[f.kind].label : "";
+  return f ? labelOf(f.kind, useStore.getState().extensions) : "";
 };
 
 export function useChainDrag() {
@@ -199,7 +199,7 @@ export function useChainDrag() {
       s.started = true;
       const f = useStore.getState().chain[s.from];
       setDrag({ id: s.id, from: s.from, k: s.from, mode: "pointer" });
-      setLift({ id: s.id, label: FILTERS[f.kind].label, bypassed: !f.enabled, left: s.left, width: s.width });
+      setLift({ id: s.id, label: labelOf(f.kind, useStore.getState().extensions), bypassed: !f.enabled, left: s.left, width: s.width });
       document.body.classList.add("reordering");
       getSelection()?.removeAllRanges();
 

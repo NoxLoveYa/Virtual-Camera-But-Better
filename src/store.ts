@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { api, type EngineState, type NvidiaGpu, type NvidiaInstallProgress, type NvidiaStatus, type Stats, type VcamStatus } from "./api";
-import { FILTERS, defaultChain, makeFilter, type FilterCfg, type FilterKind, type ParamValue } from "./filters/schema";
-import { normalizeChain, presetChain, signature } from "./filters/chain";
+import { defOf, defaultChain, labelOf, makeFilter, type ExtensionInfo, type FilterCfg, type FilterKind, type ParamValue } from "./filters/schema";
+import { normalizeChain, presetChain, refreshExtParams, signature } from "./filters/chain";
 import { presetNameFor, stemOf } from "./ui/fileDrop";
 import { DEFAULT_UI, normalizeUi, type UiState } from "./ui/layout";
 import {
@@ -173,6 +173,12 @@ interface State extends Saved {
   /** Lines the engine shows on a card that are not errors ("Loading model…"), by filter id; gone when the engine stops or the card is. */
   filterStatus: Record<string, string>;
   presets: string[];
+  /** The extensions the app found (Settings → Extensions); empty until `extensionsRead`. Not saved: the folder is the truth. */
+  extensions: ExtensionInfo[];
+  /** `extensions` has been read once, so a card of an extension that is not in it is "not installed" and not "not read yet". */
+  extensionsRead: boolean;
+  /** The Extensions dialog (Settings → Extensions) is open. */
+  extensionsOpen: boolean;
   /** What the selected camera's controls say now; `null` until they were read. */
   controlInfos: ControlInfo[] | null;
   /** The camera `controlInfos` belong to. */
@@ -269,6 +275,14 @@ interface State extends Saved {
   toggleCollapsed: (id: string) => void;
   setAllCollapsed: (on: boolean) => void;
 
+  /** Takes a new extension list: coerces the `ext:` cards to the manifests (a reloaded extension may have other params). */
+  applyExtensions: (list: ExtensionInfo[]) => void;
+  /** Reads the folder again now (Settings → Extensions → Reload). */
+  reloadExtensions: () => Promise<void>;
+  setExtensionEnabled: (id: string, on: boolean) => Promise<void>;
+  openExtensionsFolder: () => Promise<void>;
+  setExtensionsOpen: (open: boolean) => void;
+
   refreshPresets: () => Promise<void>;
   /** Saves the current chain under `name` (replacing any preset with that name) and makes it the active preset. */
   savePreset: (name: string) => Promise<void>;
@@ -342,11 +356,12 @@ export const useStore = create<State>((set, get) => {
         const now = chain.find((f) => f.id === id);
         if (was === undefined || now === undefined) return false;
         if (was === now) return true;
+        const def = defOf(now.kind, get().extensions);
         return (
           was.kind === now.kind &&
-          (FILTERS[now.kind].rtx === true ||
+          (def?.rtx === true ||
             (message.startsWith("could not load ") &&
-              FILTERS[now.kind].params.every((p) => p.type !== "path" || was.params[p.key] === now.params[p.key])))
+              (def?.params ?? []).every((p) => p.type !== "path" || was.params[p.key] === now.params[p.key])))
         );
       }),
     );
@@ -582,6 +597,9 @@ export const useStore = create<State>((set, get) => {
     filterErrors: {},
     filterStatus: {},
     presets: [],
+    extensions: [],
+    extensionsRead: false,
+    extensionsOpen: false,
     controlInfos: null,
     controlsFor: null,
     controlsError: null,
@@ -761,6 +779,10 @@ export const useStore = create<State>((set, get) => {
         }
         if (get().chain.some((f) => f.id === id)) set((s) => ({ filterStatus: { ...s.filterStatus, [id]: message } }));
       });
+      // The extension list: the event first, so a change between the two calls is not lost. The list is complete from the
+      // first call (the app reads the folder before the window loads), so cards of missing extensions are only then "not installed".
+      await api.onExtensionsChanged((list) => get().applyExtensions(list));
+      await api.listExtensions().then((list) => get().applyExtensions(list)).catch(() => set({ extensionsRead: true }));
       await api.onStats((stats) => useStats.setState({ stats }));
       await api.onNvidiaInstall((p) => get().nvidiaInstall && set({ nvidiaInstall: p }));
       await api.onDevicesChanged(() => void get().refreshCameras());
@@ -792,7 +814,7 @@ export const useStore = create<State>((set, get) => {
       if (!get().activePreset) {
         const sig = signature(get().chain);
         for (const name of presets) {
-          const saved = await api.loadPreset(name).catch(() => null);
+          const saved = await api.loadPreset(name, get().extensions).catch(() => null);
           if (saved && signature(saved) === sig) {
             set({ activePreset: name, presetBaseline: sig });
             break;
@@ -1079,17 +1101,18 @@ export const useStore = create<State>((set, get) => {
 
     addFilter: (kind, at, params) => {
       const prev = snapshot();
-      const made = makeFilter(kind);
+      const { extensions } = get();
+      const made = makeFilter(kind, true, extensions);
       const filter = params ? { ...made, params: { ...made.params, ...params } } : made;
       const index = at == null ? prev.chain.length : Math.max(0, Math.min(prev.chain.length, at));
       setChain([...prev.chain.slice(0, index), filter, ...prev.chain.slice(index)]);
-      say(`Added ${FILTERS[kind].label} as step ${index + 1}`, prev);
+      say(`Added ${labelOf(kind, extensions)} as step ${index + 1}`, prev);
     },
     removeFilter: (id) => {
       const prev = snapshot();
       const gone = prev.chain.find((f) => f.id === id);
       setChain(prev.chain.filter((f) => f.id !== id));
-      if (gone) say(`Removed ${FILTERS[gone.kind].label}`, prev);
+      if (gone) say(`Removed ${labelOf(gone.kind, get().extensions)}`, prev);
     },
     moveFilter: (from, to) => {
       const prev = snapshot();
@@ -1098,7 +1121,7 @@ export const useStore = create<State>((set, get) => {
       const chain = [...prev.chain];
       chain.splice(to, 0, chain.splice(from, 1)[0]);
       setChain(chain);
-      say(`Moved ${FILTERS[moved.kind].label} to step ${to + 1}`, prev);
+      say(`Moved ${labelOf(moved.kind, get().extensions)} to step ${to + 1}`, prev);
     },
     toggleFilter: (id) => setChain(get().chain.map((f) => (f.id === id ? { ...f, enabled: !f.enabled } : f))),
     setParam: (id, key, value) =>
@@ -1112,6 +1135,35 @@ export const useStore = create<State>((set, get) => {
       set((s) => ({ collapsed: Object.fromEntries(s.chain.map((f) => [f.id, on])) }));
       persist();
     },
+
+    applyExtensions: (list) => {
+      set({ extensions: list, extensionsRead: true });
+      // The cards of an extension that was edited (or that just arrived) follow its manifest.
+      const chain = refreshExtParams(get().chain, list);
+      if (chain !== get().chain) setChain(chain);
+    },
+    reloadExtensions: async () => {
+      try {
+        get().applyExtensions(await api.reloadExtensions());
+      } catch (e) {
+        say(String(e));
+      }
+    },
+    setExtensionEnabled: async (id, on) => {
+      try {
+        get().applyExtensions(await api.setExtensionEnabled(id, on));
+      } catch (e) {
+        say(String(e));
+      }
+    },
+    openExtensionsFolder: async () => {
+      try {
+        await api.openExtensionsFolder();
+      } catch (e) {
+        say(String(e));
+      }
+    },
+    setExtensionsOpen: (extensionsOpen) => set({ extensionsOpen }),
 
     refreshPresets: async () => set({ presets: await api.listPresets() }),
     savePreset: async (name) => {
@@ -1132,7 +1184,7 @@ export const useStore = create<State>((set, get) => {
     },
     loadPreset: async (name) => {
       try {
-        const chain = await api.loadPreset(name);
+        const chain = await api.loadPreset(name, get().extensions);
         const prev = snapshot();
         replaceChain(chain, name, signature(chain));
         say(`Loaded “${name}”`, signature(prev.chain) === signature(chain) ? null : prev);
@@ -1142,7 +1194,7 @@ export const useStore = create<State>((set, get) => {
     },
     importPreset: async (path) => {
       try {
-        const chain = presetChain(await api.readPresetFile(path));
+        const chain = presetChain(await api.readPresetFile(path), get().extensions);
         await get().refreshPresets();
         const name = presetNameFor(stemOf(path), get().presets);
         await api.savePreset(name, chain);

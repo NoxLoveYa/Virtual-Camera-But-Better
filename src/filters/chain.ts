@@ -1,15 +1,25 @@
-import { FILTERS, defaultChain, defaultParams, isFilterKind, type FilterCfg, type ParamDef, type ParamValue } from "./schema";
+import {
+  defOf,
+  defaultChain,
+  isBuiltinKind,
+  isFilterKind,
+  type ExtensionInfo,
+  type FilterCfg,
+  type ParamDef,
+  type ParamValue,
+} from "./schema";
 import { snap, toColorInt } from "./values";
 
-/** Fingerprint of what a chain does, ignoring the random ids. Equal fingerprints mean "no unsaved changes". */
-export const signature = (chain: FilterCfg[]): string =>
-  JSON.stringify(
-    chain.map((f) => [
-      f.kind,
-      f.enabled,
-      Object.entries(f.params).sort(([a], [b]) => (a < b ? -1 : 1)),
-    ]),
-  );
+const part = (list: FilterCfg[]) =>
+  list.map((f) => [f.kind, f.enabled, Object.entries(f.params).sort(([a], [b]) => (a < b ? -1 : 1))]);
+
+/**
+ * Fingerprint of what a chain (and the overlays above the output, when there are any) does, ignoring the random ids.
+ * Equal fingerprints mean "no unsaved changes". Without overlays it is the chain's own fingerprint, as it always was,
+ * so a baseline saved by an older version still matches.
+ */
+export const signature = (chain: FilterCfg[], overlays: FilterCfg[] = []): string =>
+  JSON.stringify(overlays.length === 0 ? part(chain) : { chain: part(chain), overlays: part(overlays) });
 
 export const DEFAULT_SIGNATURE = signature(defaultChain());
 
@@ -53,24 +63,43 @@ export const coerceParam = (p: ParamDef, v: unknown): ParamValue => {
       return p.options.includes(v) || (p.pattern ? p.pattern.test(v) : false) ? v : p.def;
     case "path":
       return typeof v === "string" ? v : p.def;
+    case "text":
+      return typeof v === "string" ? v.slice(0, p.maxLength ?? 80) : p.def;
   }
 };
 
 const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 
+const isValue = (v: unknown): v is ParamValue => typeof v === "number" || typeof v === "string" || typeof v === "boolean";
+
+/**
+ * The params of one entry for its filter kind. A kind with a definition (a built-in, an installed extension) gets every
+ * param present with a valid value (hidden `showIf` params included) and unknown params dropped. An `ext:` kind
+ * without one (not installed, or its manifest is invalid) keeps what it was given, so nothing is lost until the
+ * extension is back.
+ */
+const paramsFor = (kind: FilterCfg["kind"], given: Record<string, unknown>, extensions: readonly ExtensionInfo[]): Record<string, ParamValue> => {
+  const def = defOf(kind, extensions);
+  if (!def) return Object.fromEntries(Object.entries(given).filter((e): e is [string, ParamValue] => isValue(e[1])));
+  const params: Record<string, ParamValue> = Object.fromEntries(def.params.map((p) => [p.key, p.def]));
+  for (const p of def.params) if (p.key in given) params[p.key] = coerceParam(p, given[p.key]);
+  return params;
+};
+
 /**
  * Makes a chain read from disk (saved state, a preset file) safe to use: unknown filters dropped, every param present
  * with a valid value (hidden `showIf` params included), unknown params dropped, ids kept when valid and unique, else fresh.
+ * An `ext:` entry is coerced against its extension's manifest when `extensions` has it, and kept as it is otherwise
+ * (the extension may not be installed, or not read yet).
  */
-export const normalizeChain = (raw: unknown): FilterCfg[] => {
+export const normalizeChain = (raw: unknown, extensions: readonly ExtensionInfo[] = []): FilterCfg[] => {
   if (!Array.isArray(raw)) return [];
   const seen = new Set<string>();
   const out: FilterCfg[] = [];
   for (const f of raw) {
     if (!isObject(f) || !isFilterKind(f.kind)) continue;
     const given = isObject(f.params) ? f.params : {};
-    const params = defaultParams(f.kind);
-    for (const p of FILTERS[f.kind].params) if (p.key in given) params[p.key] = coerceParam(p, given[p.key]);
+    const params = paramsFor(f.kind, given, extensions);
     const id = typeof f.id === "string" && f.id !== "" && !seen.has(f.id) ? f.id : crypto.randomUUID();
     seen.add(id);
     out.push({ id, kind: f.kind, enabled: f.enabled !== false, params });
@@ -78,25 +107,51 @@ export const normalizeChain = (raw: unknown): FilterCfg[] => {
   return out;
 };
 
+/**
+ * The chain with its `ext:` entries coerced against the extensions as they are now (the list arrived, or an extension
+ * was edited and reloaded). The same array when nothing changed, so callers can compare by identity.
+ */
+export const refreshExtParams = (chain: FilterCfg[], extensions: readonly ExtensionInfo[]): FilterCfg[] => {
+  let changed = false;
+  const next = chain.map((f) => {
+    if (isBuiltinKind(f.kind) || !defOf(f.kind, extensions)) return f;
+    const params = paramsFor(f.kind, f.params, extensions);
+    if (JSON.stringify(Object.entries(params).sort()) === JSON.stringify(Object.entries(f.params).sort())) return f;
+    changed = true;
+    return { ...f, params };
+  });
+  return changed ? next : chain;
+};
+
 /** Same rule the backend enforces for preset file names. */
 export const PRESET_NAME = /^[\p{L}\p{N} _-]+$/u;
+
+type PresetEntry = { kind: string; enabled: boolean; params: Record<string, ParamValue> };
 
 /** The preset file of plan 5.4: the chain without ids. Presets hold filters only, never device controls. */
 export interface PresetFile {
   app: "better-cam";
   version: 1;
-  chain: { kind: string; enabled: boolean; params: Record<string, ParamValue> }[];
+  chain: PresetEntry[];
+  /** The overlays above the output, in the same form. Written only when there are some; an older version ignores it. */
+  overlays?: PresetEntry[];
 }
 
-export const presetFile = (chain: FilterCfg[]): PresetFile => ({
+const entry = ({ kind, enabled, params }: FilterCfg): PresetEntry => ({ kind, enabled, params });
+
+export const presetFile = (chain: FilterCfg[], overlays: FilterCfg[] = []): PresetFile => ({
   app: "better-cam",
   version: 1,
-  chain: chain.map(({ kind, enabled, params }) => ({ kind, enabled, params })),
+  chain: chain.map(entry),
+  ...(overlays.length > 0 && { overlays: overlays.map(entry) }),
 });
 
-/** The chain inside a preset file: the object of plan 5.4 or the old bare array. Other sections (`camera`) are ignored. */
-export const presetChain = (raw: unknown): FilterCfg[] => {
+/**
+ * The chain inside a preset file: the object of plan 5.4 or the old bare array. Other sections (`camera`, `overlays`)
+ * are ignored. `extensions` coerces the `ext:` entries of installed extensions (see `normalizeChain`).
+ */
+export const presetChain = (raw: unknown, extensions: readonly ExtensionInfo[] = []): FilterCfg[] => {
   const list = Array.isArray(raw) ? raw : isObject(raw) ? raw.chain : undefined;
   if (!Array.isArray(list)) throw new Error("This is not a Better Cam preset");
-  return normalizeChain(list);
+  return normalizeChain(list, extensions);
 };

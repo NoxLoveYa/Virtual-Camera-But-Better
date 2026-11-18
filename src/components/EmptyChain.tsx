@@ -1,9 +1,9 @@
 import { useStore } from "../store";
-import { FILTERS, type FilterKind } from "../filters/schema";
+import { FILTERS, type BuiltinKind } from "../filters/schema";
 
 /** The quick adds of an empty chain; the NVIDIA one only on a machine with an RTX GPU. */
-const QUICK: FilterKind[] = ["color_filter", "auto_adjust", "crop_filter"];
-const RTX_QUICK: FilterKind = "nv_background_blur_filter";
+const QUICK: BuiltinKind[] = ["color_filter", "auto_adjust", "crop_filter"];
+const RTX_QUICK: BuiltinKind = "nv_background_blur_filter";
 
 /** Opens the toolbar's Add filter menu (its anchor carries `data-add-filter`). */
 const openAddMenu = () => {
