@@ -43,12 +43,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D11::ID3D11PixelShader;
 
-use super::effect::{Kind, Pipeline, Spec, MIN_SEGMENTATION_SIZE};
+use super::effect::{live_pipelines, Kind, Pipeline, Spec, MIN_SEGMENTATION_SIZE};
 use super::Runtime;
 use crate::fx::{pf, pi, GpuFilter, Note, Params};
 use crate::gpu::{ConstantBuffer, GpuDevice, GpuResult, Pass, Renderer, RgbaTexture};
@@ -75,6 +75,36 @@ const RETRY_EVERY: Duration = Duration::from_secs(3);
 /// engine stood still. When it comes back, a failure it was showing is tried again: switching a failed filter off and on
 /// is how the user asks for another go. Frames come every 33 ms or so, so a gap this long is no hiccup of the camera.
 const RETRY_AFTER_GAP: Duration = Duration::from_millis(250);
+
+/// A filter that stays switched off this long lets go of its pipeline (450 to 850 MB of GPU memory, see docs/PERF.md);
+/// switched on again, it builds a new one like the first time. Short enough to give the memory back to a game, long
+/// enough that a quick off and on keeps the running pipeline.
+pub const IDLE_FREE_AFTER: Duration = Duration::from_secs(30);
+
+/// How long a filter has been switched off, on the clock the caller passes in (the chain's frame time), so tests need
+/// no real waiting.
+#[derive(Debug)]
+struct IdleTimer {
+    after: Duration,
+    since: Option<Instant>,
+}
+
+impl IdleTimer {
+    fn new(after: Duration) -> IdleTimer {
+        IdleTimer { after, since: None }
+    }
+
+    /// The filter renders: it is in use again.
+    fn resume(&mut self) {
+        self.since = None;
+    }
+
+    /// A frame at `now` in which the filter is switched off. True when it has been off for `after` or longer.
+    fn off_at(&mut self, now: Instant) -> bool {
+        let since = *self.since.get_or_insert(now);
+        now.saturating_duration_since(since) >= self.after
+    }
+}
 
 /// The settings of one filter.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -147,9 +177,21 @@ struct Built {
     retry: bool,
 }
 
-/// Once a pipeline was built the runtime stays loaded for the rest of the process, as it does in OBS: unloading CUDA
-/// and TensorRT libraries that have run is not something to do for a filter that was removed.
-static RESIDENT: OnceLock<Arc<Runtime>> = OnceLock::new();
+/// The runtime stays loaded between a pipeline's build and the next one while any pipeline exists, and is let go by the
+/// loader thread when the last one is released and no build follows ([`unload_idle_runtime`]). It matters for memory:
+/// a pipeline that is freed leaves the CUDA context and the loaded libraries behind, which on the RTX 5080 are about
+/// two thirds of the memory the first pipeline brought (measured in `docs/PERF.md`'s hardware test). Every pipeline
+/// holds its own `Arc<Runtime>`, so a pipeline that is alive or being built never loses its libraries.
+static RESIDENT: Mutex<Option<Arc<Runtime>>> = Mutex::new(None);
+
+/// Lets the runtime unload when no pipeline of any filter exists any more. Runs on a loader thread, never on the
+/// render thread: unloading CUDA and TensorRT takes a while.
+fn unload_idle_runtime() {
+    if live_pipelines() == 0 {
+        let held = RESIDENT.lock().unwrap_or_else(|e| e.into_inner()).take();
+        drop(held);
+    }
+}
 
 fn build(job: &BuildJob) -> Built {
     let fail = |message: String, retry: bool| Built { gen: job.gen, result: Err(message), retry };
@@ -173,7 +215,7 @@ fn build(job: &BuildJob) -> Built {
     }
     match Pipeline::build(&rt, &job.gpu, job.spec, job.strength) {
         Ok(p) => {
-            let _ = RESIDENT.set(rt);
+            *RESIDENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(rt);
             Built { gen: job.gen, result: Ok(Box::new(p)), retry: false }
         }
         Err(message) => fail(message, false),
@@ -184,9 +226,13 @@ fn loader(jobs: Receiver<Job>, done: Sender<Built>) {
     while let Ok(first) = jobs.recv() {
         // Everything that queued up meanwhile: releases run, only the newest build matters.
         let mut newest = None;
+        let mut released = false;
         for job in std::iter::once(first).chain(std::iter::from_fn(|| jobs.try_recv().ok())) {
             match job {
-                Job::Release(pipeline) => drop(pipeline),
+                Job::Release(pipeline) => {
+                    drop(pipeline);
+                    released = true;
+                }
                 Job::Build(b) => newest = Some(b),
             }
         }
@@ -196,6 +242,9 @@ fn loader(jobs: Receiver<Job>, done: Sender<Built>) {
             if done.send(built).is_err() {
                 break;
             }
+        } else if released {
+            // Nothing is built next (a change of picture size or mode would have): the last pipeline may have gone.
+            let _ = catch_unwind(unload_idle_runtime);
         }
     }
 }
@@ -260,6 +309,8 @@ pub struct Stats {
     pub runs: u64,
     /// Pipelines built.
     pub builds: u64,
+    /// Pipelines given back because the filter stayed switched off ([`IDLE_FREE_AFTER`]).
+    pub idle_frees: u64,
     /// How long the newest build took (model load included).
     pub last_load: Option<Duration>,
 }
@@ -278,6 +329,8 @@ pub struct NvFilter {
     stats: Stats,
     /// When `render` was last called ([`RETRY_AFTER_GAP`]).
     last_render: Option<Instant>,
+    /// How long the chain has not rendered the filter ([`GpuFilter::bypassed`]).
+    idle: IdleTimer,
 }
 
 pub fn make_removal() -> Box<dyn GpuFilter> {
@@ -307,11 +360,34 @@ impl NvFilter {
             constants: None,
             stats: Stats::default(),
             last_render: None,
+            idle: IdleTimer::new(IDLE_FREE_AFTER),
         }
     }
 
     pub fn stats(&self) -> Stats {
         self.stats
+    }
+
+    /// Tests: a shorter time than [`IDLE_FREE_AFTER`].
+    #[cfg(test)]
+    pub fn set_idle_free_after(&mut self, after: Duration) {
+        self.idle.after = after;
+    }
+
+    /// A pipeline exists or is being built.
+    #[cfg(test)]
+    pub fn holds_pipeline(&self) -> bool {
+        self.active.is_some() || self.requested.is_some()
+    }
+
+    /// Switched off for long enough: gives the pipeline back, on the loader thread like every release. A build that is
+    /// still running is dropped by [`NvFilter::collect`] when it arrives (it is no longer the one asked for).
+    fn free_idle(&mut self) {
+        self.requested = None;
+        if let Some(a) = self.active.take() {
+            self.release(a.pipeline);
+        }
+        self.stats.idle_frees += 1;
     }
 
     /// A pipeline for the newest settings and the picture size it last saw is running.
@@ -538,8 +614,19 @@ impl GpuFilter for NvFilter {
         out.append(&mut self.notes);
     }
 
+    fn bypassed(&mut self, now: Instant) {
+        // A build that finishes while the filter is off is taken in (and freed with the rest when the time is up), so
+        // its memory is never left in the channel.
+        self.collect();
+        if self.idle.off_at(now) && (self.active.is_some() || self.requested.is_some()) {
+            self.free_idle();
+        }
+        self.sync_notes();
+    }
+
     fn render(&mut self, r: &Renderer, input: &RgbaTexture, output: &RgbaTexture) -> GpuResult<()> {
         self.stats.frames += 1;
+        self.idle.resume();
         let now = Instant::now();
         if self.last_render.is_some_and(|t| now.duration_since(t) > RETRY_AFTER_GAP) {
             // Switched off and on again: forget the failure, so `ensure` builds once more.
@@ -681,6 +768,153 @@ mod tests {
         // Said once: the next frame has nothing new.
         let _ = chain.run(&r, r.texture(8, 8).unwrap()).unwrap();
         assert!(chain.take_status().is_empty() && chain.take_errors().is_empty());
+    }
+
+    #[test]
+    fn nvidia_idle_timer_frees_after_30_s_of_being_off_and_not_before() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut t = IdleTimer::new(IDLE_FREE_AFTER);
+        assert_eq!(IDLE_FREE_AFTER, s(30));
+        // The first frame off starts the clock.
+        assert!(!t.off_at(t0));
+        assert!(!t.off_at(t0 + s(10)));
+        assert!(!t.off_at(t0 + Duration::from_millis(29_999)), "just under 30 s keeps the pipeline");
+        assert!(t.off_at(t0 + s(30)), "30 s frees");
+        assert!(t.off_at(t0 + s(300)), "and stays due");
+
+        // Back on within the time: the clock starts over at the next switch off.
+        let mut t = IdleTimer::new(IDLE_FREE_AFTER);
+        assert!(!t.off_at(t0));
+        assert!(!t.off_at(t0 + s(29)));
+        t.resume();
+        assert!(!t.off_at(t0 + s(31)), "a new off period starts at its own first frame");
+        assert!(!t.off_at(t0 + s(60)));
+        assert!(t.off_at(t0 + s(61)));
+
+        // A clock that goes backwards never frees.
+        let mut t = IdleTimer::new(s(5));
+        assert!(!t.off_at(t0 + s(10)));
+        assert!(!t.off_at(t0));
+    }
+
+    /// (renders, frees, builds) of a [`Probe`].
+    type ProbeLog = std::sync::Arc<std::sync::Mutex<(u32, u32, u32)>>;
+
+    /// A filter that uses the same timer as the NVIDIA one and fakes a held pipeline that the timer frees.
+    struct Probe {
+        timer: IdleTimer,
+        held: bool,
+        log: ProbeLog,
+    }
+
+    impl GpuFilter for Probe {
+        fn update(&mut self, _r: &Renderer, _p: &Params) {}
+        fn render(&mut self, r: &Renderer, input: &RgbaTexture, output: &RgbaTexture) -> GpuResult<()> {
+            self.timer.resume();
+            let mut l = self.log.lock().unwrap();
+            l.0 += 1;
+            if !self.held {
+                self.held = true;
+                l.2 += 1;
+            }
+            drop(l);
+            r.copy(input, output)
+        }
+        fn bypassed(&mut self, now: Instant) {
+            if self.timer.off_at(now) && self.held {
+                self.held = false;
+                self.log.lock().unwrap().1 += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn nvidia_the_chain_tells_a_switched_off_filter_the_time() {
+        use crate::fx::{Chain, FilterCfg};
+        use std::sync::{Arc, Mutex};
+        static LOG: Mutex<Option<ProbeLog>> = Mutex::new(None);
+        fn probe(kind: &str) -> Option<Box<dyn GpuFilter>> {
+            (kind == "probe").then(|| {
+                let log = LOG.lock().unwrap().clone().unwrap();
+                Box::new(Probe { timer: IdleTimer::new(IDLE_FREE_AFTER), held: false, log }) as Box<dyn GpuFilter>
+            })
+        }
+        let log: ProbeLog = Arc::default();
+        *LOG.lock().unwrap() = Some(log.clone());
+        let r = crate::gpu::pipeline_tests::warp();
+        let cfg = |enabled| [FilterCfg { id: "p".into(), kind: "probe".into(), enabled, params: Params::new() }];
+        let mut chain = Chain::with_factory(probe);
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let frame = |chain: &mut Chain, at: Instant| {
+            let _ = chain.run_at(&r, r.texture(8, 8).unwrap(), at).unwrap();
+        };
+        let state = || *log.lock().unwrap();
+
+        // On: renders, builds once.
+        chain.apply(&r, &cfg(true));
+        frame(&mut chain, t0);
+        frame(&mut chain, t0 + s(1));
+        assert_eq!(state(), (2, 0, 1));
+
+        // Off for 29 s: kept. On again: reused, no new build.
+        chain.apply(&r, &cfg(false));
+        frame(&mut chain, t0 + s(2));
+        frame(&mut chain, t0 + s(31));
+        assert_eq!(state(), (2, 0, 1), "29 s off keeps the pipeline");
+        chain.apply(&r, &cfg(true));
+        frame(&mut chain, t0 + s(32));
+        assert_eq!(state(), (3, 0, 1), "back on within 30 s: no rebuild");
+
+        // Off for 30 s: freed once. On again: rebuilt.
+        chain.apply(&r, &cfg(false));
+        frame(&mut chain, t0 + s(33));
+        frame(&mut chain, t0 + s(62));
+        assert_eq!(state().1, 0);
+        frame(&mut chain, t0 + s(63));
+        frame(&mut chain, t0 + s(90));
+        assert_eq!(state(), (3, 1, 1), "30 s off frees, once");
+        chain.apply(&r, &cfg(true));
+        frame(&mut chain, t0 + s(91));
+        assert_eq!(state(), (4, 1, 2), "switched on after the free: rebuilt");
+
+        // An enabled filter is never told it is off.
+        for n in 0..40 {
+            frame(&mut chain, t0 + s(100 + n * 10));
+        }
+        assert_eq!(state().1, 1);
+    }
+
+    #[test]
+    fn nvidia_a_build_in_flight_is_dropped_when_the_filter_stays_off_and_the_loading_line_clears() {
+        let mut f = NvFilter::new(Kind::Removal);
+        f.set_idle_free_after(Duration::from_secs(30));
+        let t0 = Instant::now();
+        // A filter that holds nothing frees nothing, however long it is off.
+        f.bypassed(t0);
+        f.bypassed(t0 + Duration::from_secs(100));
+        assert_eq!(f.stats().idle_frees, 0);
+
+        // A build that was asked for and has not come back: the card says "Loading model…".
+        let spec = f.wanted((1280, 720));
+        f.requested = Some(Requested { gen: 1, spec, strength: 0.5, quiet: false });
+        f.idle.resume();
+        f.bypassed(t0 + Duration::from_secs(200));
+        let mut notes = Vec::new();
+        f.take_notes(&mut notes);
+        assert_eq!(notes, [Note::Status(LOADING.into())], "29 s later the build still counts");
+        assert!(f.holds_pipeline());
+        f.bypassed(t0 + Duration::from_secs(229));
+        assert!(f.holds_pipeline() && f.stats().idle_frees == 0);
+        f.bypassed(t0 + Duration::from_secs(230));
+        assert!(!f.holds_pipeline(), "30 s off cancels the build");
+        assert_eq!(f.stats().idle_frees, 1);
+        f.take_notes(&mut notes);
+        assert_eq!(notes, [Note::Status(LOADING.into()), Note::Status(String::new())], "the loading line is cleared");
+        // Nothing left to free: not counted again.
+        f.bypassed(t0 + Duration::from_secs(500));
+        assert_eq!(f.stats().idle_frees, 1);
     }
 
     #[test]

@@ -178,6 +178,12 @@ pub trait GpuFilter: Send {
     /// every frame the filter rendered. A filter that works around a problem by passing the picture through (so its
     /// `render` succeeds) reports it here instead of failing.
     fn take_notes(&mut self, _out: &mut Vec<Note>) {}
+
+    /// Called by the chain on every frame for each filter that is in the chain but switched off (`render` is not
+    /// called then). `now` is the frame's time. A filter that holds a lot of memory while it is not used lets go of it
+    /// after it was switched off for a while, and rebuilds it in `render` when it is switched on again. Cheap when
+    /// nothing is due; runs on the render thread.
+    fn bypassed(&mut self, _now: std::time::Instant) {}
 }
 
 type Maker = fn() -> Box<dyn GpuFilter>;
@@ -335,27 +341,37 @@ impl Chain {
     /// Render `image` through the enabled filters. A filter that fails is bypassed: its input goes on to the next
     /// one, and the failure is queued for [`Chain::take_errors`] unless the filter was already failing. An empty
     /// chain hands the input back untouched.
-    pub fn run(&mut self, r: &Renderer, mut image: Pooled) -> GpuResult<Pooled> {
+    pub fn run(&mut self, r: &Renderer, image: Pooled) -> GpuResult<Pooled> {
+        self.run_at(r, image, std::time::Instant::now())
+    }
+
+    /// [`Chain::run`] with the frame's time given (tests drive the clock of [`GpuFilter::bypassed`] with it).
+    pub fn run_at(&mut self, r: &Renderer, mut image: Pooled, now: std::time::Instant) -> GpuResult<Pooled> {
         let mut notes = Vec::new();
-        for slot in self.slots.iter_mut().filter(|s| s.enabled) {
-            let (w, h) = slot.filter.output_size((image.width, image.height));
-            let out = r.texture(w, h)?;
-            match slot.filter.render(r, &image, &out) {
-                Ok(()) => {
-                    slot.failing = false;
-                    // `image` returns to the pool here and may become the next filter's output.
-                    image = out;
-                }
-                Err(e) => {
-                    if !slot.failing {
-                        slot.failing = true;
-                        self.errors.push(FilterError {
-                            id: slot.id.clone(),
-                            message: e.to_string(),
-                        });
+        for slot in self.slots.iter_mut() {
+            if slot.enabled {
+                let (w, h) = slot.filter.output_size((image.width, image.height));
+                let out = r.texture(w, h)?;
+                match slot.filter.render(r, &image, &out) {
+                    Ok(()) => {
+                        slot.failing = false;
+                        // `image` returns to the pool here and may become the next filter's output.
+                        image = out;
+                    }
+                    Err(e) => {
+                        if !slot.failing {
+                            slot.failing = true;
+                            self.errors.push(FilterError {
+                                id: slot.id.clone(),
+                                message: e.to_string(),
+                            });
+                        }
                     }
                 }
+            } else {
+                slot.filter.bypassed(now);
             }
+            // A switched off filter may have something to say too (its loading line goes away when it lets go).
             notes.clear();
             slot.filter.take_notes(&mut notes);
             for note in notes.drain(..) {

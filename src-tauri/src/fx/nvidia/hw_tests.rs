@@ -599,6 +599,234 @@ fn nvidia_dropping_the_filter_releases_everything() {
     assert!(after <= after_first + 64, "memory grew from {after_first} to {after} MiB over 19 more cycles");
 }
 
+// ---- giving the memory back ----------------------------------------------------------------------------------------
+
+/// What this process uses of the GPU's own memory now, in MiB: DXGI's `QueryVideoMemoryInfo(CurrentUsage)` of the
+/// adapter the renderer runs on (CUDA and TensorRT allocations of the process count, as the video memory manager owns
+/// them).
+fn process_gpu_mib(r: &Renderer) -> f64 {
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Dxgi::{IDXGIAdapter3, IDXGIDevice, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO};
+    // SAFETY: plain COM calls on the live device; the out structure lives through the call.
+    unsafe {
+        let adapter: IDXGIAdapter3 = r.gpu.device.cast::<IDXGIDevice>().unwrap().GetAdapter().unwrap().cast().unwrap();
+        let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info).unwrap();
+        info.CurrentUsage as f64 / (1024.0 * 1024.0)
+    }
+}
+
+/// A 1280x720 picture with a lot of fine detail, so that a blur is easy to see (it has no person: the memory does not
+/// care).
+fn detailed(r: &Renderer) -> Pooled {
+    let t = r.texture(1280, 720).expect("texture");
+    fill_rgba(r, &t, |x, y| {
+        let h = x.wrapping_mul(2654435761).wrapping_add(y.wrapping_mul(40503)).wrapping_mul(2246822519);
+        let v = (h >> 24) as u8;
+        [v, v.wrapping_mul(3), 255 - v, 255]
+    });
+    t
+}
+
+/// The whole path of a filter that is switched off: bypassed in the real chain on the real clock for 30 s (the real
+/// `IDLE_FREE_AFTER`), the GPU memory of this process before and after, the rebuild when it is switched on again, and
+/// the same for a filter that is removed.
+#[test]
+fn nvidia_a_filter_switched_off_for_30_s_gives_its_gpu_memory_back_and_rebuilds_on_return() {
+    use super::filter::IDLE_FREE_AFTER;
+    let _g = exclusive();
+    let name = "nvidia_a_filter_switched_off_for_30_s_gives_its_gpu_memory_back_and_rebuilds_on_return";
+    let Some((r, rt)) = hardware(name) else { return };
+    // The test's own copy of the runtime would keep it loaded: the filter alone must be what holds it.
+    drop(rt);
+    let kind = "nv_background_blur_filter";
+    let params = json!({ "intensity": 0.5 });
+    let on = [cfg("b", kind, params.clone())];
+    let off = [FilterCfg { enabled: false, ..cfg("b", kind, params.clone()) }];
+    let flat = (0.0, 0.0, 1.0, 1.0);
+    let src = detailed(&r);
+    let src_energy = energy(&read_rgba(&r, &src), 1280, 720, flat);
+    // Fresh input every frame, as the engine's chain gets it.
+    let frame = |chain: &mut Chain| {
+        let started = Instant::now();
+        let out = chain.run(&r, detailed(&r)).expect("run");
+        (out, started.elapsed())
+    };
+    let filtered = |out: &Pooled| energy(&read_rgba(&r, out), 1280, 720, flat) < src_energy * 0.8;
+    let mib = || process_gpu_mib(&r);
+
+    let baseline = mib();
+    let mut chain = Chain::new();
+    chain.apply(&r, &on);
+    let (mut lines, started, mut passed, mut slowest) = (Vec::new(), Instant::now(), 0, Duration::ZERO);
+    loop {
+        assert!(started.elapsed() < Duration::from_secs(120), "never finished loading: {lines:?}");
+        let (out, took) = frame(&mut chain);
+        slowest = slowest.max(took);
+        lines.extend(chain.take_status().into_iter().map(|s| s.message));
+        if lines.iter().any(|m| m.is_empty()) && filtered(&out) {
+            break;
+        }
+        passed += 1;
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    let first_ready = started.elapsed();
+    for _ in 0..20 {
+        frame(&mut chain);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let running = mib();
+    eprintln!("first enable: ready after {first_ready:?} ({passed} frames passed through, slowest chain.run {slowest:?}); process GPU memory: before {baseline:.0} MiB, running {running:.0} MiB (pipeline ~{:.0} MiB)", running - baseline);
+    assert!(running - baseline > 100.0, "the pipeline should be visible in the process's GPU memory: {baseline} -> {running}");
+
+    // Off for 5 s (well under the time): the pipeline is kept, and switching on again filters at once, no loading line.
+    chain.apply(&r, &off);
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(5) {
+        let (out, _) = frame(&mut chain);
+        assert!(!filtered(&out), "a bypassed filter passes the picture through");
+        std::thread::sleep(Duration::from_millis(33));
+    }
+    assert_eq!(live_pipelines(), 1, "5 s off keeps the pipeline");
+    chain.apply(&r, &on);
+    let (out, took) = frame(&mut chain);
+    assert!(filtered(&out), "switched on within the time: filtered at once");
+    assert!(chain.take_status().is_empty(), "no loading line when the pipeline was kept");
+    eprintln!("off 5 s, on again: first frame already filtered, chain.run {took:?}, pipelines alive {}", live_pipelines());
+
+    // Off for the real 30 s: frames at the camera's pace, then every millisecond near the end to time the teardown.
+    chain.apply(&r, &off);
+    let bypass_started = Instant::now();
+    let mut slowest_off = Duration::ZERO;
+    let mut zero_at = None;
+    let limit = IDLE_FREE_AFTER + Duration::from_secs(20);
+    while zero_at.is_none() {
+        let elapsed = bypass_started.elapsed();
+        assert!(elapsed < limit, "the pipeline was not freed {elapsed:?} after the switch off");
+        let (out, took) = frame(&mut chain);
+        slowest_off = slowest_off.max(took);
+        assert!(!filtered(&out) || elapsed < Duration::from_millis(100), "bypassed: pass through");
+        if live_pipelines() == 0 {
+            zero_at = Some(Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(if elapsed + Duration::from_millis(200) < IDLE_FREE_AFTER { 33 } else { 1 }));
+        if elapsed + Duration::from_millis(100) < IDLE_FREE_AFTER {
+            assert_eq!(live_pipelines(), 1, "freed too early, {elapsed:?} after the switch off");
+        }
+    }
+    let freed_after = zero_at.unwrap().duration_since(bypass_started);
+    let mut memory = mib();
+    for _ in 0..40 {
+        std::thread::sleep(Duration::from_millis(50));
+        memory = mib();
+    }
+    eprintln!(
+        "bypassed: pipeline gone {freed_after:?} after the switch off (limit {IDLE_FREE_AFTER:?}, so teardown on the loader thread <= ~{:?}); slowest chain.run during the 30 s {slowest_off:?}; process GPU memory {running:.0} -> {memory:.0} MiB (freed {:.0} MiB)",
+        freed_after.saturating_sub(IDLE_FREE_AFTER),
+        running - memory
+    );
+    assert!(freed_after >= IDLE_FREE_AFTER, "freed before the time: {freed_after:?}");
+    assert!(running - memory > (running - baseline) * 0.8, "most of the pipeline's memory is given back: {running} -> {memory} (baseline {baseline})");
+    assert!(slowest_off < Duration::from_millis(40), "a frame stalled for {slowest_off:?} while the filter was off");
+
+    // Switched on again: the loading line, the picture passes through meanwhile, then it is filtered again.
+    chain.apply(&r, &on);
+    let (started, mut lines, mut passed, mut slowest) = (Instant::now(), Vec::new(), 0, Duration::ZERO);
+    let first = frame(&mut chain);
+    assert!(!filtered(&first.0), "the first frame after the free passes through");
+    slowest = slowest.max(first.1);
+    lines.extend(chain.take_status().into_iter().map(|s| s.message));
+    loop {
+        assert!(started.elapsed() < Duration::from_secs(120), "never rebuilt: {lines:?}");
+        let (out, took) = frame(&mut chain);
+        slowest = slowest.max(took);
+        lines.extend(chain.take_status().into_iter().map(|s| s.message));
+        if lines.iter().any(|m| m.is_empty()) && filtered(&out) {
+            break;
+        }
+        passed += 1;
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    let rebuilt = started.elapsed();
+    for _ in 0..20 {
+        frame(&mut chain);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let again = mib();
+    eprintln!("switched on after the free: card lines {lines:?}; filtered again after {rebuilt:?} ({passed} frames passed through, slowest chain.run {slowest:?}); process GPU memory {memory:.0} -> {again:.0} MiB; pipelines alive {}", live_pipelines());
+    assert_eq!(lines.first().map(String::as_str), Some("Loading model…"), "{lines:?}");
+    assert_eq!(live_pipelines(), 1);
+    assert!(slowest < Duration::from_millis(250), "a frame stalled for {slowest:?} during the rebuild");
+    assert!(again - memory > (running - baseline) * 0.7, "the pipeline is back: {memory} -> {again}");
+
+    // Removed from the chain: freed at once (the filter's Drop hands it to the loader thread).
+    let removed = Instant::now();
+    chain.apply(&r, &[]);
+    let apply_took = removed.elapsed();
+    wait_for_pipelines(0);
+    let gone = removed.elapsed();
+    let mut after = mib();
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(50));
+        after = mib();
+    }
+    eprintln!("removed from the chain: chain.apply took {apply_took:?}, pipeline gone after {gone:?}; process GPU memory {again:.0} -> {after:.0} MiB");
+    assert!(again - after > (running - baseline) * 0.8, "removing frees the memory too: {again} -> {after}");
+    assert!(apply_took < Duration::from_millis(40), "removing a filter stalled the chain for {apply_took:?}");
+}
+
+/// The runtime (CUDA, TensorRT) unloads when the last pipeline goes and loads again for the next one: eight times over,
+/// every kind, with the memory of the process back near its start each time. Needs no picture of a person.
+#[test]
+fn nvidia_the_runtime_unloads_with_the_last_pipeline_and_loads_again_eight_times() {
+    let _g = exclusive();
+    let name = "nvidia_the_runtime_unloads_with_the_last_pipeline_and_loads_again_eight_times";
+    let Some((r, rt)) = hardware(name) else { return };
+    // The test's own copy would keep the runtime loaded.
+    drop(rt);
+    let flat = (0.0, 0.0, 1.0, 1.0);
+    let src = detailed(&r);
+    let src_energy = energy(&read_rgba(&r, &src), 1280, 720, flat);
+    let mib = || process_gpu_mib(&r);
+    let base = mib();
+    let (mut first_peak, mut worst_after) = (0.0f64, 0.0f64);
+    for n in 0..8 {
+        let kind = [Kind::BackgroundBlur, Kind::Removal, Kind::Blur][n % 3];
+        let mut rig = Rig::new(&r, kind, json!({ "mode": 1, "intensity": 0.5 }));
+        let started = Instant::now();
+        rig.wait_ready(&src, Duration::from_secs(60));
+        let ready = started.elapsed();
+        let mut out = rig.frame(&src).0;
+        for _ in 0..5 {
+            out = rig.frame(&src).0;
+        }
+        if kind.blurs() {
+            assert!(energy(&read_rgba(&r, &out), 1280, 720, flat) < src_energy * 0.8, "cycle {n}: the blur works after the reload");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let peak = mib();
+        let dropped = Instant::now();
+        drop(rig);
+        wait_for_pipelines(0);
+        let pipeline_down = dropped.elapsed();
+        // The runtime unloads on the loader thread right after: poll until the memory is down.
+        while mib() > base + 30.0 {
+            assert!(dropped.elapsed() < Duration::from_secs(10), "cycle {n}: the memory never came back");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let teardown = dropped.elapsed();
+        std::thread::sleep(Duration::from_millis(1500));
+        let after = mib();
+        eprintln!("cycle {n} {kind:?}: ready after {ready:?}; {base:.0} -> {peak:.0} MiB running -> {after:.0} MiB after the last pipeline went; pipeline down after {pipeline_down:?}, memory back after {teardown:?} (loader thread)");
+        if n == 0 {
+            first_peak = peak;
+        }
+        worst_after = worst_after.max(after);
+        assert!(after - base < (first_peak - base) * 0.2 + 20.0, "cycle {n}: {after} MiB left over (base {base}, first peak {first_peak})");
+    }
+    eprintln!("worst memory after a release over 8 cycles: {worst_after:.0} MiB (base {base:.0})");
+}
+
 // ---- timing --------------------------------------------------------------------------------------------------------
 
 #[test]
