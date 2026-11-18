@@ -1,0 +1,89 @@
+{
+    "steps":  [
+                  {
+                      "do":  "print",
+                      "text":  "== 1080p live MJPEG, hardware decode, no filters"
+                  },
+                  {
+                      "do":  "start",
+                      "source":  {
+                                     "video_device_id":  null,
+                                     "res_type":  "custom",
+                                     "resolution":  "1920x1080",
+                                     "frame_interval":  166667,
+                                     "video_format":  "mjpeg",
+                                     "color_space":  "default",
+                                     "color_range":  "default",
+                                     "buffering":  "auto",
+                                     "flip_vertically":  false,
+                                     "autorotation":  true,
+                                     "hw_decode":  true,
+                                     "deactivate_when_not_showing":  false
+                                 },
+                      "output":  {
+                                     "resolution":  "1920x1080",
+                                     "fps":  "source",
+                                     "fit":  "fit",
+                                     "background_color":  4278190080,
+                                     "extra_sizes":  true
+                                 },
+                      "chain":  [
+
+                                ]
+                  },
+                  {
+                      "do":  "wait_state",
+                      "state":  "live",
+                      "timeout":  20,
+                      "label":  "start -\u003e live"
+                  },
+                  {
+                      "do":  "run",
+                      "cmd":  "C:\\Users\\Obnoxious\\AppData\\Local\\Temp\\opencode\\perf\\p6b-consumer.exe",
+                      "args":  [
+                                   "--size",
+                                   "1920x1080",
+                                   "--seconds",
+                                   "41",
+                                   "--label",
+                                   "live1080_none"
+                               ],
+                      "label":  "consumer live1080_none",
+                      "wait":  false
+                  },
+                  {
+                      "do":  "sleep",
+                      "seconds":  8
+                  },
+                  {
+                      "do":  "engine_stats",
+                      "label":  "live1080_none",
+                      "seconds":  25
+                  },
+                  {
+                      "do":  "stats_report",
+                      "label":  "live1080_none stats events",
+                      "seconds":  25
+                  },
+                  {
+                      "do":  "run",
+                      "cmd":  "D:\\Project\\Virtual-Camera-But-Better\\target\\release\\vcam-tool.exe",
+                      "args":  [
+                                   "stats"
+                               ],
+                      "label":  "vcam-tool stats"
+                  },
+                  {
+                      "do":  "join"
+                  },
+                  {
+                      "do":  "stop"
+                  },
+                  {
+                      "do":  "wait_state",
+                      "state":  "stopped",
+                      "timeout":  10,
+                      "label":  "stop -\u003e stopped"
+                  }
+              ]
+}

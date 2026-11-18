@@ -19,6 +19,8 @@
 //! * `wait_state` `{state, reason_contains?, timeout, max?, label}`: wait for an `engine-state` event after the
 //!   last command and print how long it took (`FAIL` past `max`, or when it never comes).
 //! * `stats_report` `{label}`: count the `stats` events since the last report and print the rate and the last one.
+//! * `engine_stats` `{label, seconds}`: the engine's own counters over a window (rates, GPU, readback and CPU-side
+//!   time, frame counts, latency, the DLL's header counters); the window is printed as `PERF_WINDOW_START/END`.
 //! * `consume` `{seconds, size, format?, label, dump?, background?, light?, fps?}`: open the Better Cam camera as an
 //!   app does, read frames, and say how many were video, which slate showed when, and how many pictures were
 //!   distinct. `dump` saves one video frame as PNG. NV12 frames are also measured on the colour bars (the widest
@@ -961,6 +963,61 @@ fn run() -> Result<(), String> {
                     );
                 }
                 last_report = Instant::now();
+            }
+            "engine_stats" => {
+                // The engine's full counters (the `stats` event leaves out the three rates, readback, CPU-side
+                // time and the frame counts), sampled twice a second for `seconds`; prints the window as
+                // `PERF_WINDOW_START`/`PERF_WINDOW_END` lines and a summary with the DLL's header counters.
+                let label = step["label"].as_str().unwrap_or("engine_stats");
+                let seconds = secs(step, "seconds", 20.0);
+                let engine = svc.engine()?;
+                let (s0, h0) = (engine.stats(), engine.writer().shared().header());
+                println!("PERF_WINDOW_START {label} t={:.3}", log.t());
+                let begin = Instant::now();
+                // capture fps, render fps, publish fps, gpu, readback, cpu
+                let mut v: Vec<[f64; 6]> = Vec::new();
+                while begin.elapsed().as_secs_f64() < seconds {
+                    std::thread::sleep(Duration::from_millis(500));
+                    let s = engine.stats();
+                    if s.gpu_ms > 0.0 {
+                        v.push([
+                            s.capture_fps,
+                            s.render_fps,
+                            s.publish_fps,
+                            s.gpu_ms,
+                            s.readback_ms,
+                            s.cpu_ms,
+                        ]);
+                    }
+                }
+                println!("PERF_WINDOW_END {label} t={:.3}", log.t());
+                let (s1, h1) = (engine.stats(), engine.writer().shared().header());
+                let mean = |i: usize| v.iter().map(|x| x[i]).sum::<f64>() / v.len().max(1) as f64;
+                let max = |i: usize| v.iter().map(|x| x[i]).fold(0.0f64, f64::max);
+                println!(
+                    "RESULT {label}: fps capture {:.2} render {:.2} publish {:.2} | gpu_ms mean {:.3} max {:.3} | readback_ms mean {:.3} max {:.3} | cpu_ms mean {:.3} max {:.3} | samples {}",
+                    mean(0), mean(1), mean(2), mean(3), max(3), mean(4), max(4), mean(5), max(5), v.len()
+                );
+                println!(
+                    "  counters over the window: captured +{} rendered +{} published +{} | dropped_mailbox +{} dropped_output +{} errors +{} | dll delivered +{} repeated +{}",
+                    s1.captured - s0.captured,
+                    s1.rendered - s0.rendered,
+                    s1.published - s0.published,
+                    s1.dropped_mailbox - s0.dropped_mailbox,
+                    s1.dropped_output - s0.dropped_output,
+                    s1.errors - s0.errors,
+                    h1.delivered - h0.delivered,
+                    h1.repeated - h0.repeated
+                );
+                println!(
+                    "  latency (engine: capture timestamp to published) p50 {:.2} p95 {:.2} max {:.2} ms, pipeline p95 {:.2} ms, whole run p95 {:.2} ms | header (capture timestamp to delivered by the DLL) p50 {} us p95 {} us | decode {} | output {}x{} {} | totals captured {} rendered {} published {} dropped_mailbox {} dropped_output {} delivered {} repeated {}",
+                    s1.latency_p50_ms, s1.latency_p95_ms, s1.latency_max_ms, s1.pipeline_p95_ms,
+                    s1.total_latency_p95_ms,
+                    h1.latency_p50_us, h1.latency_p95_us, s1.decode,
+                    s1.output_width, s1.output_height, s1.output_format,
+                    s1.captured, s1.rendered, s1.published, s1.dropped_mailbox, s1.dropped_output,
+                    h1.delivered, h1.repeated
+                );
             }
             "consume" => {
                 let seconds = secs(step, "seconds", 3.0);

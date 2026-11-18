@@ -1,0 +1,126 @@
+{
+    "steps":  [
+                  {
+                      "do":  "print",
+                      "text":  "== 1080p live MJPEG, hardware decode, four filters"
+                  },
+                  {
+                      "do":  "start",
+                      "source":  {
+                                     "video_device_id":  null,
+                                     "res_type":  "custom",
+                                     "resolution":  "1920x1080",
+                                     "frame_interval":  166667,
+                                     "video_format":  "mjpeg",
+                                     "color_space":  "default",
+                                     "color_range":  "default",
+                                     "buffering":  "auto",
+                                     "flip_vertically":  false,
+                                     "autorotation":  true,
+                                     "hw_decode":  true,
+                                     "deactivate_when_not_showing":  false
+                                 },
+                      "output":  {
+                                     "resolution":  "1920x1080",
+                                     "fps":  "source",
+                                     "fit":  "fit",
+                                     "background_color":  4278190080,
+                                     "extra_sizes":  true
+                                 },
+                      "chain":  [
+                                    {
+                                        "params":  {
+                                                       "contrast":  0.15,
+                                                       "hue_shift":  10,
+                                                       "gamma":  0.1,
+                                                       "brightness":  0.03,
+                                                       "saturation":  0.25
+                                                   },
+                                        "enabled":  true,
+                                        "id":  "cc",
+                                        "kind":  "color_filter"
+                                    },
+                                    {
+                                        "params":  {
+                                                       "sharpness":  0.35
+                                                   },
+                                        "enabled":  true,
+                                        "id":  "sh",
+                                        "kind":  "sharpness_filter"
+                                    },
+                                    {
+                                        "params":  {
+                                                       "clut_amount":  1,
+                                                       "image_path":  "C:\\Users\\Obnoxious\\AppData\\Local\\Temp\\opencode\\perf\\warm_33.cube"
+                                                   },
+                                        "enabled":  true,
+                                        "id":  "lu",
+                                        "kind":  "clut_filter"
+                                    },
+                                    {
+                                        "params":  {
+                                                       "resolution":  "1280x720",
+                                                       "sampling":  "bicubic"
+                                                   },
+                                        "enabled":  true,
+                                        "id":  "sc",
+                                        "kind":  "scale_filter"
+                                    }
+                                ]
+                  },
+                  {
+                      "do":  "wait_state",
+                      "state":  "live",
+                      "timeout":  20,
+                      "label":  "start -\u003e live"
+                  },
+                  {
+                      "do":  "run",
+                      "cmd":  "C:\\Users\\Obnoxious\\AppData\\Local\\Temp\\opencode\\perf\\p6b-consumer.exe",
+                      "args":  [
+                                   "--size",
+                                   "1920x1080",
+                                   "--seconds",
+                                   "41",
+                                   "--label",
+                                   "live1080_four"
+                               ],
+                      "label":  "consumer live1080_four",
+                      "wait":  false
+                  },
+                  {
+                      "do":  "sleep",
+                      "seconds":  8
+                  },
+                  {
+                      "do":  "engine_stats",
+                      "label":  "live1080_four",
+                      "seconds":  25
+                  },
+                  {
+                      "do":  "stats_report",
+                      "label":  "live1080_four stats events",
+                      "seconds":  25
+                  },
+                  {
+                      "do":  "run",
+                      "cmd":  "D:\\Project\\Virtual-Camera-But-Better\\target\\release\\vcam-tool.exe",
+                      "args":  [
+                                   "stats"
+                               ],
+                      "label":  "vcam-tool stats"
+                  },
+                  {
+                      "do":  "join"
+                  },
+                  {
+                      "do":  "stop"
+                  },
+                  {
+                      "do":  "wait_state",
+                      "state":  "stopped",
+                      "timeout":  10,
+                      "label":  "stop -\u003e stopped"
+                  }
+              ]
+}

@@ -1,0 +1,131 @@
+{
+    "steps":  [
+                  {
+                      "do":  "print",
+                      "text":  "== 1080p60 synthetic, Color Correction + Sharpen + Apply LUT + Scaling (bicubic 1280x720)"
+                  },
+                  {
+                      "do":  "start",
+                      "source":  {
+                                     "video_device_id":  null,
+                                     "res_type":  "custom",
+                                     "resolution":  "1920x1080",
+                                     "frame_interval":  166667,
+                                     "video_format":  "nv12",
+                                     "color_space":  "default",
+                                     "color_range":  "default",
+                                     "buffering":  "auto",
+                                     "flip_vertically":  false,
+                                     "autorotation":  true,
+                                     "hw_decode":  true,
+                                     "deactivate_when_not_showing":  false
+                                 },
+                      "output":  {
+                                     "resolution":  "1920x1080",
+                                     "fps":  "source",
+                                     "fit":  "fit",
+                                     "background_color":  4278190080,
+                                     "extra_sizes":  true
+                                 },
+                      "chain":  [
+                                    {
+                                        "params":  {
+                                                       "contrast":  0.15,
+                                                       "hue_shift":  10,
+                                                       "gamma":  0.1,
+                                                       "brightness":  0.03,
+                                                       "saturation":  0.25
+                                                   },
+                                        "enabled":  true,
+                                        "id":  "cc",
+                                        "kind":  "color_filter"
+                                    },
+                                    {
+                                        "params":  {
+                                                       "sharpness":  0.35
+                                                   },
+                                        "enabled":  true,
+                                        "id":  "sh",
+                                        "kind":  "sharpness_filter"
+                                    },
+                                    {
+                                        "params":  {
+                                                       "clut_amount":  1,
+                                                       "image_path":  "C:\\Users\\Obnoxious\\AppData\\Local\\Temp\\opencode\\perf\\warm_33.cube"
+                                                   },
+                                        "enabled":  true,
+                                        "id":  "lu",
+                                        "kind":  "clut_filter"
+                                    },
+                                    {
+                                        "params":  {
+                                                       "resolution":  "1280x720",
+                                                       "sampling":  "bicubic"
+                                                   },
+                                        "enabled":  true,
+                                        "id":  "sc",
+                                        "kind":  "scale_filter"
+                                    }
+                                ],
+                      "synthetic":  {
+                                        "width":  1920,
+                                        "height":  1080,
+                                        "fps":  60
+                                    }
+                  },
+                  {
+                      "do":  "wait_state",
+                      "state":  "live",
+                      "timeout":  20,
+                      "label":  "start -\u003e live"
+                  },
+                  {
+                      "do":  "run",
+                      "cmd":  "C:\\Users\\Obnoxious\\AppData\\Local\\Temp\\opencode\\perf\\p6b-consumer.exe",
+                      "args":  [
+                                   "--size",
+                                   "1920x1080",
+                                   "--seconds",
+                                   "34",
+                                   "--label",
+                                   "synth1080_four"
+                               ],
+                      "label":  "consumer synth1080_four",
+                      "wait":  false
+                  },
+                  {
+                      "do":  "sleep",
+                      "seconds":  6
+                  },
+                  {
+                      "do":  "engine_stats",
+                      "label":  "synth1080_four",
+                      "seconds":  20
+                  },
+                  {
+                      "do":  "stats_report",
+                      "label":  "synth1080_four stats events",
+                      "seconds":  20
+                  },
+                  {
+                      "do":  "run",
+                      "cmd":  "D:\\Project\\Virtual-Camera-But-Better\\target\\release\\vcam-tool.exe",
+                      "args":  [
+                                   "stats"
+                               ],
+                      "label":  "vcam-tool stats"
+                  },
+                  {
+                      "do":  "join"
+                  },
+                  {
+                      "do":  "stop"
+                  },
+                  {
+                      "do":  "wait_state",
+                      "state":  "stopped",
+                      "timeout":  10,
+                      "label":  "stop -\u003e stopped"
+                  }
+              ]
+}

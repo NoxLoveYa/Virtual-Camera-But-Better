@@ -1,0 +1,101 @@
+{
+    "steps":  [
+                  {
+                      "do":  "print",
+                      "text":  "== 1080p60 synthetic, NVIDIA Background Removal mode 0"
+                  },
+                  {
+                      "do":  "start",
+                      "source":  {
+                                     "video_device_id":  null,
+                                     "res_type":  "custom",
+                                     "resolution":  "1920x1080",
+                                     "frame_interval":  166667,
+                                     "video_format":  "nv12",
+                                     "color_space":  "default",
+                                     "color_range":  "default",
+                                     "buffering":  "auto",
+                                     "flip_vertically":  false,
+                                     "autorotation":  true,
+                                     "hw_decode":  true,
+                                     "deactivate_when_not_showing":  false
+                                 },
+                      "output":  {
+                                     "resolution":  "1920x1080",
+                                     "fps":  "source",
+                                     "fit":  "fit",
+                                     "background_color":  4278190080,
+                                     "extra_sizes":  true
+                                 },
+                      "chain":  [
+                                    {
+                                        "params":  {
+                                                       "mode":  0
+                                                   },
+                                        "enabled":  true,
+                                        "id":  "nv",
+                                        "kind":  "nv_greenscreen_filter"
+                                    }
+                                ],
+                      "synthetic":  {
+                                        "width":  1920,
+                                        "height":  1080,
+                                        "fps":  60
+                                    }
+                  },
+                  {
+                      "do":  "wait_state",
+                      "state":  "live",
+                      "timeout":  20,
+                      "label":  "start -\u003e live"
+                  },
+                  {
+                      "do":  "run",
+                      "cmd":  "C:\\Users\\Obnoxious\\AppData\\Local\\Temp\\opencode\\perf\\p6b-consumer.exe",
+                      "args":  [
+                                   "--size",
+                                   "1920x1080",
+                                   "--seconds",
+                                   "38",
+                                   "--label",
+                                   "nv_removal0"
+                               ],
+                      "label":  "consumer nv_removal0",
+                      "wait":  false
+                  },
+                  {
+                      "do":  "sleep",
+                      "seconds":  10
+                  },
+                  {
+                      "do":  "engine_stats",
+                      "label":  "nv_removal0",
+                      "seconds":  20
+                  },
+                  {
+                      "do":  "stats_report",
+                      "label":  "nv_removal0 stats events",
+                      "seconds":  20
+                  },
+                  {
+                      "do":  "run",
+                      "cmd":  "D:\\Project\\Virtual-Camera-But-Better\\target\\release\\vcam-tool.exe",
+                      "args":  [
+                                   "stats"
+                               ],
+                      "label":  "vcam-tool stats"
+                  },
+                  {
+                      "do":  "join"
+                  },
+                  {
+                      "do":  "stop"
+                  },
+                  {
+                      "do":  "wait_state",
+                      "state":  "stopped",
+                      "timeout":  10,
+                      "label":  "stop -\u003e stopped"
+                  }
+              ]
+}
