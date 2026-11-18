@@ -47,7 +47,9 @@ body {
 .scroll { flex: 1; min-height: 0; overflow-y: auto; scrollbar-gutter: stable; }
 
 /* The levels stay pinned under the scrolling area. The right padding mirrors the scrollbar gutter so both line up. */
-.footer { position: relative; flex: none; padding: 12px 40px 14px 28px; background: var(--surface); border-top: 1px solid var(--line); }
+/* The footer is one row: the stats (they give way first, with an ellipsis) and the toast. The row is as high as a one-line
+   toast, so such a toast never moves the columns; a longer one grows the footer and the columns give up that height. */
+.footer { position: relative; flex: none; display: flex; align-items: center; gap: 16px; min-height: 49px; padding: 8px 40px 8px 28px; background: var(--surface); border-top: 1px solid var(--line); }
 .footer .meters { padding: 0; background: none; border: 0; gap: 8px; }
 .app { padding: 20px 28px 40px; display: flex; flex-direction: column; gap: 20px; }
 
@@ -200,13 +202,13 @@ button.ghost:hover:not(:disabled) { color: var(--text); box-shadow: none; border
 .opt:disabled { opacity: 0.4; }
 
 /* ---------- banners ---------- */
-.banner { padding: 10px 14px; border-radius: var(--r); border: 1px solid var(--line); border-left-width: 2px; background: var(--surface); }
-.banner.error { border-left-color: var(--danger); cursor: pointer; }
-.banner.warn { border-left-color: var(--warn); display: flex; align-items: center; gap: 16px; justify-content: space-between; color: var(--dim); }
-.banner.warn button { flex-shrink: 0; }
-/* P15: an error banner with a button ("Use device default") lays out like the warning one. */
-.banner.error.with-action { display: flex; align-items: center; gap: 16px; justify-content: space-between; }
-.banner.error.with-action button { flex-shrink: 0; }
+.banner { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 14px; border-radius: var(--r); border: 1px solid var(--line); border-left-width: 2px; background: var(--surface); }
+.banner > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.banner.error { border-left-color: var(--danger); }
+.banner.warn { border-left-color: var(--warn); color: var(--dim); }
+.banner button { flex-shrink: 0; }
+/* The error banner's own Dismiss sits close to its edge. */
+.banner button.icon { margin: -4px -8px -4px -4px; }
 
 /* ---------- panels ---------- */
 .panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 16px; }
@@ -242,7 +244,8 @@ button.ghost:hover:not(:disabled) { color: var(--text); box-shadow: none; border
 .splitter:hover::after, .splitter.dragging::after, .splitter:focus-visible::after { background: var(--accent); box-shadow: var(--glow-soft); }
 .splitter:focus-visible { outline: none; }
 body.col-resizing, body.col-resizing * { cursor: col-resize !important; user-select: none; }
-.banners { display: flex; flex-direction: column; gap: 10px; }
+/* Banners span the window under the toolbar; the padding is the toolbar's, so their edges line up with it. */
+.banners { flex: none; display: flex; flex-direction: column; gap: 10px; padding: 12px 40px 0 28px; }
 .chain-block { display: flex; flex-direction: column; gap: 20px; }
 
 /* ---------- camera and output panels ---------- */
@@ -293,7 +296,7 @@ input[type="color"]::-webkit-color-swatch { border: 0; border-radius: 2px; }
 .cf-alpha b { color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; }
 
 /* ---------- stats (footer line) ---------- */
-.stats { overflow: hidden; color: var(--dim); font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+.stats { flex: 1 1 0; min-width: 0; overflow: hidden; color: var(--dim); font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ---------- meters ---------- */
 .meters { display: flex; flex-direction: column; gap: 12px; }
@@ -343,6 +346,13 @@ input[type="color"]::-webkit-color-swatch { border: 0; border-radius: 2px; }
 .pt-mod { flex: none; color: var(--warn); font-size: 10px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; }
 .preset-trigger svg { flex: none; color: var(--dim); }
 .chain-label { margin: -6px 0 -8px; }
+/* The empty chain (components/EmptyChain.tsx): between the terminals, on the rail. */
+.chain > li.empty { padding: 10px 0 14px; }
+.empty-body { grid-column: 2; display: flex; flex-direction: column; gap: 10px; min-width: 0; color: var(--dim); }
+.empty-body p { margin: 0; }
+.empty-add { display: flex; flex-wrap: wrap; gap: 8px; }
+.empty-add button { height: 28px; }
+.empty-body .empty-drop { color: var(--faint); font-size: 12px; }
 
 /* ---------- chain ---------- */
 
@@ -461,7 +471,7 @@ input[type="color"]::-webkit-color-swatch { border: 0; border-radius: 2px; }
 .filter-error { margin: 10px 0 0; padding: 8px 12px; color: var(--text); font-size: 12px; border-left: 2px solid var(--danger); background: rgba(255, 92, 108, 0.08); overflow-wrap: anywhere; }
 /* NVIDIA filters (P13b): a line that is not an error ("Loading model…"), the install link on an error line, the menu badge */
 .filter-status { display: flex; align-items: center; gap: 8px; margin: 10px 0 0; padding: 8px 12px; color: var(--dim); font-size: 12px; border-left: 2px solid var(--accent); background: var(--accent-soft); }
-.filter-status .spinner { flex: none; width: 10px; height: 10px; border: 1.5px solid rgba(46, 230, 214, 0.3); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
+.spinner { flex: none; width: 10px; height: 10px; border: 1.5px solid rgba(46, 230, 214, 0.3); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .filter-error button.link { display: inline; margin: 0 0 0 8px; font-size: 12px; }
 .rtx-badge { margin-left: 8px; color: var(--warn); font-size: 10px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; }
@@ -510,18 +520,21 @@ button.link:hover:not(:disabled) { box-shadow: none; text-decoration: underline;
 .progress > div.indeterminate { width: 30%; animation: slide 1.1s ease-in-out infinite alternate; }
 @keyframes slide { from { margin-left: 0; } to { margin-left: 70%; } }
 
-/* ---------- toast (sits just above the levels footer) ---------- */
+/* ---------- toast (in the footer row, next to the stats: it never covers a control) ---------- */
 .toast {
-  position: absolute; bottom: calc(100% + 12px); left: 50%; translate: -50% 0; z-index: 15;
-  display: flex; align-items: center; gap: 12px; max-width: min(560px, calc(100vw - 48px));
-  padding: 8px 8px 8px 16px;
+  flex: 0 1 auto; min-width: 0; max-width: 60%;
+  display: flex; align-items: center; gap: 8px;
+  padding: 2px 2px 2px 12px;
   background: var(--pop); backdrop-filter: var(--blur);
   border: 1px solid var(--line-strong); border-left: 2px solid var(--accent); border-radius: var(--r);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45), 0 0 18px -10px rgba(46, 230, 214, 0.3);
   animation: toast-in 0.18s ease-out;
 }
-.toast .toast-undo { display: flex; align-items: center; gap: 6px; height: 28px; color: var(--accent); }
-@keyframes toast-in { from { opacity: 0; translate: -50% 8px; } to { opacity: 1; translate: -50% 0; } }
+/* At most three lines. The text is the first span of the toast. */
+.toast > span { min-width: 0; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden; overflow-wrap: anywhere; padding: 3px 0; }
+.toast button { flex: none; height: 26px; }
+.toast .toast-undo { display: flex; align-items: center; gap: 6px; padding: 0 10px; color: var(--accent); }
+.toast .icon { width: 26px; }
+@keyframes toast-in { from { opacity: 0; } to { opacity: 1; } }
 
 /* ---------- narrow windows: the columns stack ---------- */
 @media (max-width: 1099px) {
@@ -529,7 +542,6 @@ button.link:hover:not(:disabled) { box-shadow: none; text-decoration: underline;
   .cols { scroll-padding-top: calc(var(--band, 0px) + 8px); }
   .col, .left-scroll { display: contents; }
   .splitter { display: none; }
-  .banners { order: -1; }
   .chain-block { order: 1; }
   /* The preview is a frosted band that sticks to the top of the scroll; it spans the full width, so nothing shows beside it.
      Its height is capped at 40 % of the scroll area (the width follows from 16:9). */
@@ -550,7 +562,7 @@ button.link:hover:not(:disabled) { box-shadow: none; text-decoration: underline;
   .panel { padding: 12px; }
   .devices label { gap: 6px; }
   .toolbar { padding-top: 6px; padding-bottom: 6px; }
-  .footer { padding-top: 8px; padding-bottom: 8px; }
+  .banners { padding-top: 8px; }
   .footer .meters { gap: 4px; }
   .meter.scale { display: none; }
   .track { height: 10px; }
@@ -565,7 +577,12 @@ button.link:hover:not(:disabled) { box-shadow: none; text-decoration: underline;
 .preview-box { position: relative; aspect-ratio: 16 / 9; background: #05070a; }
 .preview-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; object-fit: contain; }
 .preview-canvas.is-off { visibility: hidden; }
-.preview-ph { position: absolute; inset: 0; display: grid; place-items: center; padding: 16px; color: var(--faint); text-align: center; }
+/* Paused, or reopened with other settings: the last frame stays, clearly not live. */
+.preview-canvas.is-dim { opacity: 0.35; }
+.preview-ph { position: absolute; inset: 0; display: grid; place-items: center; padding: 16px; color: var(--dim); text-align: center; }
+.ph-stack { display: flex; flex-direction: column; align-items: center; gap: 10px; max-width: 100%; }
+.ph-text { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
+.ph-stack button { flex: none; height: 28px; }
 .preview-bar { position: absolute; top: 8px; left: 8px; right: 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px; pointer-events: none; }
 .preview-bar > * { pointer-events: auto; }
 .preview-fps, .preview-toggle { display: inline-flex; align-items: center; gap: 8px; min-height: 22px; padding: 2px 8px; background: rgba(9, 11, 14, 0.72); border: 1px solid var(--line); border-radius: var(--r); }
@@ -624,7 +641,7 @@ body.reordering, body.reordering * { cursor: grabbing !important; user-select: n
    is over it, a quiet pill above the footer, the chain's drop line, the path field's own highlight, and the "Use as" box. */
 body.file-drag::after { content: ""; position: fixed; inset: 0; z-index: 40; border: 1px solid var(--accent); pointer-events: none; }
 .drop-hint {
-  /* At the left, so a toast that is still up (centred, same height) does not sit under it. */
+  /* Above the footer, at the left; the toast is in the footer row, so the two never meet. */
   position: absolute; bottom: calc(100% + 12px); left: 24px; z-index: 15; max-width: calc(100vw - 48px);
   padding: 6px 14px; color: var(--accent); font-size: 12px; white-space: nowrap; pointer-events: none;
   background: var(--pop); backdrop-filter: var(--blur);

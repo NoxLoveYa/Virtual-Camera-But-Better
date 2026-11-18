@@ -385,6 +385,61 @@ export const cameraUsers = (apps?: readonly string[] | null): string => {
 export const inUseText = (apps?: readonly string[] | null, maybe?: boolean): string =>
   `The camera ${maybe && apps?.length ? "may be" : "is"} in use by ${cameraUsers(apps)}.`;
 
+/** `Camera disconnected (0xC00D3EA2)` to `Camera disconnected`: hex codes belong in a tooltip, never in visible text. */
+export const stripCodes = (s: string): string => s.replace(/\s*\(0x[0-9A-Fa-f]{8}\)/g, "");
+
+const sentence = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+
+/**
+ * Which switch the engine's words for a privacy wait name. The engine says "privacy" only for an open that Windows
+ * refused (access denied) while a switch is off; the switches only decide this wording.
+ */
+const privacyText = (reason: string | null): string => {
+  const r = reason ?? "";
+  const afterwards = "Better Cam goes live by itself afterwards.";
+  if (r.includes("policy")) {
+    return `Windows is not letting apps use the camera: a Windows policy turns camera access off, and no setting in Windows Settings changes it. ${afterwards}`;
+  }
+  if (r.includes("desktop apps")) {
+    return `Windows is not letting desktop apps use the camera. Turn on “Let desktop apps access your camera” in Windows camera privacy settings. ${afterwards}`;
+  }
+  return `Windows is not letting apps use the camera. Turn on “Camera access” in Windows camera privacy settings. ${afterwards}`;
+};
+
+/**
+ * What the window says while the camera is waited for, by the engine's `kind` (plan 4.9): `long` is the banner's text,
+ * `short` the preview's. Neither shows a hex code; the engine's own `reason` belongs in a tooltip.
+ */
+export const problemText = (
+  kind: string | null,
+  reason: string | null,
+  apps?: readonly string[] | null,
+  appsMaybe?: boolean,
+): { short: string; long: string } => {
+  const plain = reason ? sentence(stripCodes(reason)) : null;
+  switch (kind) {
+    case "in_use":
+      return { short: inUseText(apps, appsMaybe), long: `${inUseText(apps, appsMaybe)} Better Cam goes live as soon as it is free.` };
+    case "disconnected":
+      return {
+        short: "Camera disconnected",
+        long: "The camera was disconnected. Plug it in again; Better Cam goes live as soon as it is back.",
+      };
+    case "not_found":
+      return {
+        short: "Camera not found",
+        long: "Camera not found. Connect it or pick another camera; Better Cam goes live as soon as it is there.",
+      };
+    case "privacy":
+      return { short: "Camera blocked by Windows privacy settings", long: privacyText(reason) };
+    default:
+      return {
+        short: plain ?? "The camera stopped sending pictures",
+        long: `${plain?.replace(/[.!]+$/, "") ?? "The camera is not answering"}. Better Cam keeps trying for a little while.`,
+      };
+  }
+};
+
 /** Whether source, output and chain edits go to the backend: while the engine runs, and while the virtual camera is changed (it parks them). */
 export const shouldPushSettings = (engineState: string, vcamBusy: string | null): boolean => engineState !== "stopped" || vcamBusy !== null;
 

@@ -41,6 +41,11 @@ function chainGap(block: Element, y: number): { gap: number; lineTop: number } |
   if (!ol) return null;
   const items = Array.from(ol.children) as HTMLElement[];
   if (items.length === 0) return null;
+  // An empty chain shows its hint between the terminals: the line goes at the top of that box, not through the text.
+  const empty = ol.querySelector(".empty");
+  if (empty && !items.some((li) => li.classList.contains("step"))) {
+    return { gap: 0, lineTop: Math.round(empty.getBoundingClientRect().top - block.getBoundingClientRect().top - 1) };
+  }
   const cards = items.filter((li) => li.classList.contains("step")).map((li) => (li.querySelector(".card") ?? li).getBoundingClientRect());
   const first = items[0].getBoundingClientRect();
   const last = items[items.length - 1].getBoundingClientRect();
@@ -193,7 +198,17 @@ export function useFileDrop() {
       console.warn("Better Cam: file drops are not available:", err);
     }
     if (IS_DEV_BUILD) {
-      (window as unknown as { __betterCam: unknown }).__betterCam = { listening: false, drop, enter, over: update, leave: clear };
+      // `toast` shows a message as the app would; `set` patches the store (a test puts the app in a state it cannot reach without
+      // elevation or a camera, such as an outdated virtual camera).
+      (window as unknown as { __betterCam: unknown }).__betterCam = {
+        listening: false,
+        drop,
+        enter,
+        over: update,
+        leave: clear,
+        toast: (text: string) => useStore.getState().notify(text),
+        set: (patch: Record<string, unknown>) => useStore.setState(patch),
+      };
     }
     return () => {
       stopped = true;

@@ -1,5 +1,6 @@
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { useStore } from "../store";
+import { stripCodes } from "../camera/schema";
 import { FILTERS, type FilterCfg } from "../filters/schema";
 import { Icon } from "./Icon";
 import { ParamField } from "./ParamField";
@@ -101,8 +102,8 @@ export function FilterCard({ filter, index, count, reorder }: Props) {
         ) : (
           <>
             {error && (
-              <p className="filter-error" role="alert">
-                {error}
+              <p className="filter-error" role="alert" title={error}>
+                {stripCodes(error)}
               </p>
             )}
             {status && !error && (

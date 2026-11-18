@@ -17,7 +17,7 @@ export function AddFilter() {
       align="right"
       className="add-menu"
       anchor={
-        <button aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen(!open)}>
+        <button data-add-filter aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen(!open)}>
           <Icon name="plus" /> Add filter
         </button>
       }

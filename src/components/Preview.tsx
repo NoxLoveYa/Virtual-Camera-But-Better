@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
-import { inUseText } from "../camera/schema";
+import { CAPTURE_KEYS, effectiveSource, problemText } from "../camera/schema";
 import { useStore } from "../store";
 
 /** The preview frame of `src-tauri/src/preview.rs`: 16 header bytes (four little-endian u32), then RGBA pixels. */
@@ -101,7 +101,13 @@ function usePageVisible() {
   return visible;
 }
 
-const sentence = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+/** What the preview says when there is no live picture: a line, a tooltip with the engine's own words, and the next step. */
+interface Placeholder {
+  text: string;
+  title?: string;
+  spinner?: boolean;
+  action?: { label: string; onClick: () => void; primary?: boolean; disabled?: boolean };
+}
 
 /** The live picture: frames from the engine over a Tauri Channel, drawn on a canvas. */
 export function Preview() {
@@ -112,7 +118,11 @@ export function Preview() {
   const apps = useStore((s) => s.engine.apps);
   const appsMaybe = useStore((s) => s.engine.appsMaybe);
   const paused = useStore((s) => s.paused);
-  const { setPreviewOn } = useStore.getState();
+  const deviceId = useStore((s) => s.source.video_device_id);
+  const vcamMissing = useStore((s) => s.vcam?.state === "missing");
+  const vcamBusy = useStore((s) => s.vcamBusy);
+  const noCamera = useStore((s) => s.cameras !== null && s.cameras.length === 0);
+  const { setPreviewOn, toggleRun, runVcam, refreshCameras } = useStore.getState();
   const visible = usePageVisible();
 
   const boxRef = useRef<HTMLDivElement>(null);
@@ -243,29 +253,88 @@ export function Preview() {
     return () => clearInterval(t);
   }, []);
 
-  const picture = previewOn && state === "live" && !paused;
+  // The last frame stays on the canvas, dimmed, while the camera is paused or reopened with other settings, so the picture
+  // does not blink out. Any other state drops it, and so does another camera: a stale picture never stays up.
+  const keepFrame = previewOn && (state === "live" || (state === "standby" && reason === "reopening"));
   useEffect(() => {
-    if (!picture) setShown(false);
-  }, [picture]);
+    if (!keepFrame) setShown(false);
+  }, [keepFrame]);
+  useEffect(() => setShown(false), [deviceId]);
 
-  let placeholder: string | null = null;
-  if (!previewOn) placeholder = "Preview off";
-  else if (state === "stopped") placeholder = "Camera stopped";
-  else if (paused) placeholder = "Paused";
-  else if (state === "reconnecting") {
-    placeholder = kind === "in_use" ? inUseText(apps, appsMaybe) : reason ? sentence(reason) : "Waiting for the camera";
-  }
-  else if (state === "standby") placeholder = reason === "idle" ? "Camera off: no app is using Better Cam" : "Opening the camera…";
-  else if (!shown) placeholder = "Starting…";
-  const showing = placeholder === null;
+  // The engine announces a reopen a moment after the edit (it gathers edits first). The preview says so at once: a change
+  // to the capture settings of a live camera is "applying" until the engine has left live and come back (or 5 s pass).
+  const captureKey = useStore((s) => JSON.stringify(CAPTURE_KEYS.map((k) => effectiveSource(s.source, s.inUse)[k])));
+  const [applying, setApplying] = useState(false);
+  const seenKey = useRef(captureKey);
+  const left = useRef(false);
+  useEffect(() => {
+    if (seenKey.current === captureKey) return;
+    seenKey.current = captureKey;
+    if (state === "live") {
+      left.current = false;
+      setApplying(true);
+    }
+  }, [captureKey, state]);
+  useEffect(() => {
+    if (!applying) return;
+    if (state !== "live") left.current = true;
+    else if (left.current) setApplying(false);
+  }, [applying, state]);
+  useEffect(() => {
+    if (!applying) return;
+    const timer = setTimeout(() => setApplying(false), 5000);
+    return () => clearTimeout(timer);
+  }, [applying]);
+
+  const refresh = () => void refreshCameras();
+  let ph: Placeholder | null = null;
+  let dim = false;
+  if (!previewOn) ph = { text: "Preview off" };
+  else if (state === "stopped") {
+    if (vcamMissing) {
+      ph = {
+        text: "Install the virtual camera to start",
+        action: { label: "Install", onClick: () => void runVcam("install"), disabled: vcamBusy !== null },
+      };
+    } else if (noCamera) ph = { text: "No camera found", action: { label: "Refresh", onClick: refresh } };
+    else ph = { text: "Camera stopped", action: { label: "Start", onClick: () => void toggleRun(), primary: true } };
+  } else if (paused) {
+    ph = { text: "Paused: apps see the paused slate" };
+    dim = true;
+  } else if (state === "live" && applying) {
+    ph = { text: "Applying camera settings…", spinner: true };
+    dim = true;
+  } else if (state === "reconnecting") {
+    const p = problemText(kind, reason, apps, appsMaybe);
+    ph = { text: p.short, title: reason ?? undefined };
+  } else if (state === "standby") {
+    if (reason === "idle") ph = { text: "Camera off: no app is using Better Cam" };
+    else {
+      ph = { text: reason === "reopening" ? "Applying camera settings…" : "Opening the camera…", spinner: true };
+      dim = reason === "reopening";
+    }
+  } else if (!shown) ph = { text: "Starting…" };
+  const showing = ph === null;
+  // A dimmed state shows the last frame at 35 %; any other placeholder hides the canvas.
+  const canvasClass = showing ? "" : dim && shown ? " is-dim" : " is-off";
 
   return (
     <section className="panel preview" aria-label="Preview">
       <div className="preview-box" ref={boxRef}>
-        <canvas ref={canvasRef} className={`preview-canvas${showing ? "" : " is-off"}`} role="img" aria-label="Camera preview" />
-        {placeholder && (
-          <div className="preview-ph" role="status">
-            {placeholder}
+        <canvas ref={canvasRef} className={`preview-canvas${canvasClass}`} role="img" aria-label="Camera preview" />
+        {ph && (
+          <div className="preview-ph" title={ph.title}>
+            <div className="ph-stack">
+              <span className="ph-text" role="status">
+                {ph.spinner && <span className="spinner" aria-hidden />}
+                {ph.text}
+              </span>
+              {ph.action && (
+                <button type="button" className={ph.action.primary ? "primary" : undefined} disabled={ph.action.disabled} onClick={ph.action.onClick}>
+                  {ph.action.label}
+                </button>
+              )}
+            </div>
           </div>
         )}
         <div className="preview-bar">

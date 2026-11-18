@@ -20,8 +20,10 @@ import {
   inUseDeviceDefault,
   inUseFromFallback,
   pausedAfterState,
+  problemText,
   savedAfterEdit,
   shouldPushSettings,
+  stripCodes,
   touchesCapture,
   type SourceCfg,
 } from "./schema";
@@ -126,5 +128,45 @@ same(inUseText(["Discord.exe"]), "The camera is in use by Discord.exe.", "senten
 same(inUseText(undefined), "The camera is in use by another app.", "sentence without a list");
 same(inUseText(["Discord.exe"], true), "The camera may be in use by Discord.exe.", "may be");
 same(inUseText([], true), "The camera is in use by another app.", "nobody named, nothing to doubt");
+
+// P10: visible text never shows a hex code; the engine's own words stay available for a tooltip
+same(stripCodes("Camera disconnected (0xC00D3EA2)"), "Camera disconnected", "one code");
+same(stripCodes("failed (0xC00D3E8C) then (0x8007001F)"), "failed then", "two codes");
+same(stripCodes("path C:\\x (0x12) stays"), "path C:\\x (0x12) stays", "not an 8-digit code: left alone");
+same(stripCodes("Stream error(0xc00d3e8c)"), "Stream error", "lower case, no space");
+same(stripCodes("no code"), "no code", "nothing to strip");
+
+const raw = "camera disconnected (0xC00D3EA2)";
+same(problemText("disconnected", raw), {
+  short: "Camera disconnected",
+  long: "The camera was disconnected. Plug it in again; Better Cam goes live as soon as it is back.",
+}, "disconnected");
+same(problemText("not_found", null), {
+  short: "Camera not found",
+  long: "Camera not found. Connect it or pick another camera; Better Cam goes live as soon as it is there.",
+}, "not found");
+same(problemText("in_use", "camera is in use by Discord.exe", ["Discord.exe"], false), {
+  short: "The camera is in use by Discord.exe.",
+  long: "The camera is in use by Discord.exe. Better Cam goes live as soon as it is free.",
+}, "in use");
+same(problemText("in_use", null, [], false).short, "The camera is in use by another app.", "in use, nobody named");
+same(problemText("in_use", null, ["Zoom.exe"], true).short, "The camera may be in use by Zoom.exe.", "in use, maybe");
+same(problemText("privacy", "privacy: desktop apps").short, "Camera blocked by Windows privacy settings", "privacy short");
+same(problemText("privacy", "blocked by a policy").long.startsWith("Windows is not letting apps use the camera: a Windows policy"), true, "policy");
+same(problemText("privacy", "desktop apps are off").long.includes("“Let desktop apps access your camera”"), true, "desktop apps");
+same(problemText("privacy", "off").long.includes("“Camera access”"), true, "camera access");
+same(problemText("error", "the camera stream failed (0xC00D3E8C)"), {
+  short: "The camera stream failed",
+  long: "The camera stream failed. Better Cam keeps trying for a little while.",
+}, "generic: code stripped");
+same(problemText("error", null), {
+  short: "The camera stopped sending pictures",
+  long: "The camera is not answering. Better Cam keeps trying for a little while.",
+}, "generic without a reason");
+same(problemText(null, "Waiting.", [], false).long, "Waiting. Better Cam keeps trying for a little while.", "a reason that ends in a full stop");
+for (const kind of ["in_use", "disconnected", "not_found", "privacy", "error", null]) {
+  const p = problemText(kind, raw, ["a.exe"], false);
+  same(/0x[0-9A-Fa-f]{8}/.test(p.short + p.long), false, `no code in the text for ${kind}`);
+}
 
 console.log("ok");

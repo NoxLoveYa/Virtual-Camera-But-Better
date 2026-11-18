@@ -1,45 +1,12 @@
 import { api } from "../api";
-import { inUseText, isDeviceDefault } from "../camera/schema";
+import { isDeviceDefault, problemText, stripCodes } from "../camera/schema";
 import { useStore } from "../store";
-
-const sentence = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
-
-/**
- * Which switch the engine's words for a privacy wait name. The engine says "privacy" only for an open that Windows
- * refused (access denied) while a switch is off; the switches only decide this wording.
- */
-function privacyText(reason: string | null): string {
-  const r = reason ?? "";
-  const afterwards = "Better Cam goes live by itself afterwards.";
-  if (r.includes("policy")) {
-    return `Windows is not letting apps use the camera: a Windows policy turns camera access off, and no setting in Windows Settings changes it. ${afterwards}`;
-  }
-  if (r.includes("desktop apps")) {
-    return `Windows is not letting desktop apps use the camera. Turn on “Let desktop apps access your camera” in Windows camera privacy settings. ${afterwards}`;
-  }
-  return `Windows is not letting apps use the camera. Turn on “Camera access” in Windows camera privacy settings. ${afterwards}`;
-}
-
-/** What the banner says while the camera is being waited for, by the engine's `kind` (plan 4.9). `reason` is the detail. */
-function waitingText(kind: string | null, reason: string | null, apps: string[], appsMaybe: boolean): string {
-  switch (kind) {
-    case "in_use":
-      return `${inUseText(apps, appsMaybe)} Better Cam goes live as soon as it is free.`;
-    case "disconnected":
-      return "The camera was disconnected. Plug it in again; Better Cam goes live as soon as it is back.";
-    case "not_found":
-      return "Camera not found. Connect it or pick another camera; Better Cam goes live as soon as it is there.";
-    case "privacy":
-      return privacyText(reason);
-    default:
-      return `${reason ? sentence(reason) : "The camera is not answering"}. Better Cam keeps trying for a little while.`;
-  }
-}
+import { Icon } from "./Icon";
 
 /**
  * The one place for engine problems: a warning banner while the camera is waited for (what is wrong in plain words,
- * the engine's own words in a tooltip, and one button where it helps), and the error banner for a stop. Click an error
- * to dismiss it.
+ * the engine's own words in a tooltip, and one button where it helps), and the error banner for a stop. The error
+ * banner stays until its Dismiss button is pressed.
  */
 export function EngineBanner() {
   const state = useStore((s) => s.engine.state);
@@ -58,14 +25,15 @@ export function EngineBanner() {
   return (
     <>
       {error && (
-        <div className={`banner error${errorKind === "format" && !onDefault ? " with-action" : ""}`} onClick={dismissError}>
-          <span>{error}</span>
+        <div className="banner error" role="alert">
+          <span className="banner-text" title={error}>
+            {stripCodes(error)}
+          </span>
           {errorKind === "format" && !onDefault && (
             <button
               className="primary"
               title="Starts the camera with its own default format. Your saved format stays as it is; the next Start tries it again."
-              onClick={(e) => {
-                e.stopPropagation();
+              onClick={() => {
                 dismissError();
                 void startWithDeviceDefault();
               }}
@@ -73,12 +41,14 @@ export function EngineBanner() {
               Use device default
             </button>
           )}
+          <button className="ghost icon" aria-label="Dismiss" title="Dismiss" onClick={dismissError}>
+            <Icon name="close" />
+          </button>
         </div>
       )}
       {waiting && (
         <div className="banner warn" role="status" title={reason ?? undefined}>
-          {/* A program's file name has no break in it: let it wrap instead of pushing the banner wider. */}
-          <span style={{ minWidth: 0, overflowWrap: "anywhere" }}>{waitingText(kind, reason, apps, appsMaybe)}</span>
+          <span className="banner-text">{problemText(kind, reason, apps, appsMaybe).long}</span>
           {kind === "privacy" && (
             <button className="primary" onClick={() => void api.openCameraSettings().catch(() => {})}>
               Open camera settings

@@ -6,6 +6,7 @@ import { useFileDrop } from "./ui/useFileDrop";
 import { AddFilter } from "./components/AddFilter";
 import { ControlsCard } from "./components/ControlsCard";
 import { DropChooser } from "./components/DropChooser";
+import { EmptyChain } from "./components/EmptyChain";
 import { EngineBanner } from "./components/EngineBanner";
 import { FilterCard } from "./components/FilterCard";
 import { Icon } from "./components/Icon";
@@ -64,6 +65,13 @@ export default function App() {
         </button>
         <AddFilter />
       </div>
+      {/* Problems come first under the toolbar, across the whole window, and first in tab order after it. */}
+      {(error || waiting || vcamBanner) && (
+        <div className="banners">
+          <VcamBanner />
+          <EngineBanner />
+        </div>
+      )}
       {/* Two columns. The left one holds the pinned preview above its own scroll (Camera, controls, Output); the right one
           scrolls the chain; --split sets the left width. Below 1100 px the columns stack in one scroll under a sticky preview
           band (camera, output, then the chain) and the splitter is hidden. */}
@@ -81,18 +89,12 @@ export default function App() {
         <Splitter colsRef={colsRef} />
 
         <div className="scroll app col col-right">
-          {(error || waiting || vcamBanner) && (
-            <div className="banners">
-              <VcamBanner />
-              <EngineBanner />
-            </div>
-          )}
-
           <div className="chain-block" ref={reorder.blockRef} data-drop="chain">
             <span className="label chain-label">Filter chain · applied top to bottom</span>
 
             <ol className="chain" ref={reorder.chainRef}>
               <li className="terminal">Camera in</li>
+              {chain.length === 0 && <EmptyChain />}
               {chain.map((f, i) => (
                 <FilterCard key={f.id} filter={f} index={i} count={chain.length} reorder={reorder} />
               ))}
