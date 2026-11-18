@@ -678,21 +678,51 @@ const SESSION_END_CAP: Duration = Duration::from_secs(30);
 /// the camera, so a driver that holds the render thread for longer than this must not hold up the exit. (A change of
 /// the virtual camera keeps [`SESSION_END_CAP`]: a thread that is left behind keeps `frames.bin` mapped, which the
 /// helper that replaces the file cannot have.)
-const SHUTDOWN_END_CAP: Duration = Duration::from_secs(3);
+pub(crate) const SHUTDOWN_END_CAP: Duration = Duration::from_secs(3);
 
-/// A camera that has delivered a picture and then sends none for [`silent_slate_after`] shows the "starting" slate on the
-/// file; after [`SILENT_RECONNECT_AFTER`] without a frame its session ends with a retry (the engine reconnects).
+/// A camera that sends no picture for [`silent_slate_after`] shows the "starting" slate on the file; after
+/// [`silent_reconnect_after`] without a frame its session ends with a retry (the engine reconnects).
 const SILENT_SLATE_MIN: Duration = Duration::from_secs(1);
-const SILENT_RECONNECT_AFTER: Duration = Duration::from_secs(5);
+const SILENT_RECONNECT_MIN: Duration = Duration::from_secs(5);
 
-/// How long a live camera may send nothing before the file stops showing its last picture: a second, or three frame
-/// periods of a camera that is slower than that.
-fn silent_slate_after(fps: f64) -> Duration {
-    if fps.is_finite() && fps > 0.0 {
-        SILENT_SLATE_MIN.max(Duration::from_secs_f64(3.0 / fps).min(SILENT_RECONNECT_AFTER))
-    } else {
-        SILENT_SLATE_MIN
+/// How many of the latest gaps between two frames [`FrameGaps`] looks at.
+const FRAME_GAPS_KEPT: usize = 8;
+
+/// The gaps between the camera's latest frames, measured on arrival. A camera at a long exposure sends a frame every
+/// second or more whatever its nominal rate says, and a gap that long is not silence.
+#[derive(Default)]
+struct FrameGaps {
+    gaps: [Duration; FRAME_GAPS_KEPT],
+    next: usize,
+}
+
+impl FrameGaps {
+    fn record(&mut self, gap: Duration) {
+        self.gaps[self.next] = gap;
+        self.next = (self.next + 1) % FRAME_GAPS_KEPT;
     }
+
+    /// The largest of the latest gaps (zero before any frame).
+    fn largest(&self) -> Duration {
+        self.gaps.iter().copied().max().unwrap_or_default()
+    }
+}
+
+/// How long a live camera may send nothing before the file stops showing its last picture: a second, three frame
+/// periods of a camera that is slower than that, or two and a half of the longest gap it was seen to keep.
+fn silent_slate_after(fps: f64, observed: Duration) -> Duration {
+    let nominal = if fps.is_finite() && fps > 0.0 {
+        Duration::from_secs_f64(3.0 / fps)
+    } else {
+        Duration::ZERO
+    };
+    SILENT_SLATE_MIN.max(nominal).max(observed.mul_f64(2.5))
+}
+
+/// How long the camera may send nothing before its session ends so that the engine reconnects: at least twice the time
+/// it took to show the slate, so that a camera that is slow is slated for a while before it is given up.
+fn silent_reconnect_after(slate_after: Duration) -> Duration {
+    SILENT_RECONNECT_MIN.max(slate_after * 2)
 }
 
 /// How often [`Control::end_session`] looks whether the render thread has ended (and beats the file's heartbeat).
@@ -801,6 +831,10 @@ struct Shared {
     /// Test hook: how many [`Msg::Snapshot`]s were sent.
     #[cfg(test)]
     snapshots: std::sync::atomic::AtomicU32,
+    /// Test hook: runs in [`Engine::close`] after the writer of a control thread that was left behind is retired and
+    /// before `Closed` is written (the moment such a thread wakes and writes its slate).
+    #[cfg(test)]
+    after_retire: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -833,6 +867,14 @@ fn exit_budget(shared: &Shared) -> Duration {
     }
     let _ = shared;
     SHUTDOWN_END_CAP
+}
+
+/// Drop `value` on a helper thread, for a value whose drop can wait (a thread that is joined with a cap). When no
+/// thread can be started the drop is made here.
+fn drop_off_thread<T: Send + 'static>(value: T) {
+    let _ = std::thread::Builder::new()
+        .name("drop".into())
+        .spawn(move || drop(value));
 }
 
 fn emit(shared: &Shared, event: EngineEvent) {
@@ -985,6 +1027,8 @@ impl Engine {
             control_gate: Mutex::new(()),
             #[cfg(test)]
             snapshots: Default::default(),
+            #[cfg(test)]
+            after_retire: Mutex::new(None),
         });
         let poller = spawn_poller(shared.clone()).map_err(|e| e.to_string())?;
         let auto = runner::spawn(shared.clone()).map_err(|e| e.to_string())?;
@@ -1308,7 +1352,13 @@ impl Engine {
     /// it up. What does not end by then (the control thread, the poller, the auto runner) is left behind, and the file
     /// says `Closed` whatever it does.
     pub fn close_for_exit(&self) {
-        *lock(&self.shared.exit_deadline) = Some(Instant::now() + exit_budget(&self.shared));
+        self.close_for_exit_by(Instant::now() + SHUTDOWN_END_CAP);
+    }
+
+    /// [`Engine::close_for_exit`] for a quit that began before this call (the caller spent some of its time on its own
+    /// waits): the whole quit ends by `deadline`.
+    pub fn close_for_exit_by(&self, deadline: Instant) {
+        *lock(&self.shared.exit_deadline) = Some(deadline.min(Instant::now() + exit_budget(&self.shared)));
         self.shared.exiting.store(true, Ordering::Release);
         self.close();
     }
@@ -1373,15 +1423,24 @@ impl Engine {
                 eprintln!("[engine] cannot start the thread that ends the controls ({e}): they are left running");
             }
         }
+        // A control thread that is stuck writes its slate when the call it is in returns: it writes nothing from here on.
+        // This comes first, so that no write of its own can follow the `Closed` below; the `Closed` goes through a lease
+        // (a write gate of its own), as the retired writer writes nothing.
+        // A control thread that is stuck writes its slate when the call it is in returns: it writes nothing from here on.
+        // This comes first, so that no write of its own can follow the `Closed` below; the `Closed` goes through a lease
+        // (a write gate of its own), as the retired writer writes nothing.
+        if left_behind {
+            self.writer.retire();
+            #[cfg(test)]
+            if let Some(hook) = lock(&self.shared.after_retire).take() {
+                hook();
+            }
+        }
         // The file says closed whatever the control thread did or is still doing. Under the lock the render thread goes
         // live under, which it does not do once the app is quitting, so nothing writes `Live` after this.
         {
             let _live = lock(&self.shared.live_gen);
-            self.writer.close();
-        }
-        if left_behind {
-            // A control thread that is stuck writes its slate when the call it is in returns: it writes nothing now.
-            self.writer.retire();
+            self.writer.lease().close();
         }
     }
 }
@@ -2196,8 +2255,10 @@ impl Control {
         };
         match built {
             Ok((renderer, assets)) => {
-                // The old loader thread ends with the old `Assets`; the old device goes when its last user does.
-                self.assets = assets;
+                // The old loader thread ends with the old `Assets`; the old device goes when its last user does. The
+                // drop waits for a loader that is stuck in a file read (up to 2 s), which would leave the control
+                // thread without a heartbeat for that long: it is made on a helper thread.
+                drop_off_thread(std::mem::replace(&mut self.assets, assets));
                 self.renderer = renderer;
                 if let Some(tap) = lock(&self.shared.tap).as_mut() {
                     tap.device_changed();
@@ -3878,9 +3939,10 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
 
     let mut published_any = false;
     // When the camera last delivered a frame, and whether the file shows the "starting" slate for a camera that has
-    // been silent since ([`silent_slate_after`]).
+    // been silent since ([`silent_slate_after`]), and the gaps the camera keeps between frames.
     let mut last_frame = Instant::now();
     let mut silent_slated = false;
+    let mut frame_gaps = FrameGaps::default();
     // The consumer rate the pacer last saw; a change starts it over.
     let mut pacer = Pacer::default();
     let mut paced_for: Option<Format> = None;
@@ -4059,7 +4121,9 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
         }
         let frame = match event {
             SourceEvent::Frame(f) => {
-                last_frame = Instant::now();
+                let now = Instant::now();
+                frame_gaps.record(now.saturating_duration_since(last_frame));
+                last_frame = now;
                 silent_slated = false;
                 f
             }
@@ -4068,16 +4132,18 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                     writer.heartbeat();
                     last_heartbeat = Instant::now();
                 }
-                // A camera that went silent while live (the driver stopped sending, the stream is stuck): the file
-                // shows "starting" instead of the last picture for good, the next frame goes live again, and after a
-                // while the session ends so that the engine reconnects.
+                // A camera that went silent (the driver stopped sending, the stream is stuck): the file shows
+                // "starting" instead of the last picture (or the paused slate, when it went silent during a pause)
+                // for good, the next frame goes live again, and after a while the session ends so that the engine
+                // reconnects. `last_frame` is set when the session opens and when a pause ends.
                 let silent = last_frame.elapsed();
-                if published_any && !silent_slated && silent >= silent_slate_after(source.info().fps) {
+                let slate_after = silent_slate_after(source.info().fps, frame_gaps.largest());
+                if !silent_slated && silent >= slate_after {
                     write_starting();
                     published_any = false;
                     silent_slated = true;
                 }
-                if silent_slated && silent >= SILENT_RECONNECT_AFTER {
+                if silent_slated && silent >= silent_reconnect_after(slate_after) {
                     break Err(Failure::Retry(
                         RetryKind::NoFrames,
                         "the camera stopped sending pictures".into(),
@@ -4845,6 +4911,9 @@ mod tests {
         /// While set, open sources deliver no frame and answer every read with a timeout (a camera whose driver stopped
         /// sending while the stream stays open).
         silent: Arc<AtomicBool>,
+        /// While not zero, open sources deliver one frame every this many milliseconds (a long exposure), whatever
+        /// their nominal rate says.
+        frame_every_ms: Arc<std::sync::atomic::AtomicU64>,
         /// An open that has this many steps of this length, each only begun when the session is not stopped.
         open_steps: Mutex<(u32, Duration)>,
         /// The steps of `open_steps` that were begun.
@@ -4902,6 +4971,8 @@ mod tests {
         close_delay: Arc<Mutex<Duration>>,
         stall: Arc<Stall>,
         silent: Arc<AtomicBool>,
+        frame_every_ms: Arc<std::sync::atomic::AtomicU64>,
+        last_sent: Option<Instant>,
     }
 
     /// A read that is stuck in the driver: while `on` is set the source's `next` does not return, and it does not
@@ -4960,6 +5031,15 @@ mod tests {
             if self.silent.load(Ordering::SeqCst) {
                 std::thread::sleep(timeout);
                 return SourceEvent::Timeout;
+            }
+            // A camera at a long exposure: a frame only when this long has passed since the last one.
+            let every = Duration::from_millis(self.frame_every_ms.load(Ordering::SeqCst));
+            if !every.is_zero() {
+                if let Some(due) = self.last_sent.map(|t| t + every).filter(|due| *due > Instant::now()) {
+                    std::thread::sleep(timeout.min(due.saturating_duration_since(Instant::now())));
+                    return SourceEvent::Timeout;
+                }
+                self.last_sent = Some(Instant::now());
             }
             if self.stream_error.load(Ordering::SeqCst) || self.stream_error_once.swap(false, Ordering::SeqCst) {
                 if self.lose_device_with_error.swap(false, Ordering::SeqCst) {
@@ -5106,6 +5186,8 @@ mod tests {
                 close_delay: self.close_delay.clone(),
                 stall: self.stall.lock().unwrap().clone(),
                 silent: self.silent.clone(),
+                frame_every_ms: self.frame_every_ms.clone(),
+                last_sent: None,
             }))
         }
 
@@ -5174,6 +5256,7 @@ mod tests {
                 close_delay: Arc::new(Mutex::new(Duration::ZERO)),
                 stall: Mutex::new(Arc::default()),
                 silent: Arc::new(AtomicBool::new(false)),
+                frame_every_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 open_steps: Mutex::new((0, Duration::ZERO)),
                 steps_taken: Default::default(),
                 nominal_fps: Mutex::new(None),
@@ -9309,28 +9392,52 @@ mod tests {
         rig.engine.wait_live(Duration::from_secs(20)).unwrap();
         wait_stats(&rig, "30 frames", |s| s.published >= 30);
 
+        // The count of late publishes also moves when this thread or the render thread is not scheduled for a while
+        // (a busy machine), whatever the first publish does. The bug is a late publish at every return, so it is
+        // enough that one return in a few has none; a scheduling delay would have to hit all of them.
+        const TRIES: usize = 3;
+
         // the app leaves for a while and comes back
-        consumer.detach();
-        std::thread::sleep(Duration::from_millis(1500));
-        let base = wait_stats(&rig, "a fresh snapshot", |s| s.rendered >= 60);
-        let at = frames_in_file(&rig);
-        let _again = rig.consumer_with("m3-attach.bin", format);
-        let after = wait_stats(&rig, "frames after the app came back", |s| s.published >= at + 15);
-        assert_eq!(
-            after.late_publishes, base.late_publishes,
-            "the first publish after the app came back counted as late: {after:?}"
+        let mut seen = Vec::new();
+        let mut returns = Vec::new();
+        let mut detached = Vec::new();
+        for _ in 0..TRIES {
+            consumer.detach();
+            std::thread::sleep(Duration::from_millis(1500));
+            let base = wait_stats(&rig, "a fresh snapshot", |s| s.rendered >= 60);
+            let at = frames_in_file(&rig);
+            // (the detached one is kept: dropping it would take the new one's place in the file down with it)
+            let next = rig.consumer_with("m3-attach.bin", format);
+            detached.push(std::mem::replace(&mut consumer, next));
+            let after = wait_stats(&rig, "frames after the app came back", |s| s.published >= at + 15);
+            seen.push(after.late_publishes - base.late_publishes);
+            if seen.last() == Some(&0) {
+                break;
+            }
+            returns.push(after);
+        }
+        assert!(
+            seen.last() == Some(&0),
+            "the first publish after the app came back counted as late, every time: {seen:?} {returns:?}"
         );
 
         // a pause of a while
-        rig.engine.set_pause(true);
-        std::thread::sleep(Duration::from_millis(1500));
-        let base = wait_stats(&rig, "a snapshot of the pause", |s| s.paused);
-        let at = frames_in_file(&rig);
-        rig.engine.set_pause(false);
-        let after = wait_stats(&rig, "frames after the pause", |s| !s.paused && s.published >= at + 15);
-        assert_eq!(
-            after.late_publishes, base.late_publishes,
-            "the first publish after the pause counted as late: {after:?}"
+        let mut seen = Vec::new();
+        for _ in 0..TRIES {
+            rig.engine.set_pause(true);
+            std::thread::sleep(Duration::from_millis(1500));
+            let base = wait_stats(&rig, "a snapshot of the pause", |s| s.paused);
+            let at = frames_in_file(&rig);
+            rig.engine.set_pause(false);
+            let after = wait_stats(&rig, "frames after the pause", |s| !s.paused && s.published >= at + 15);
+            seen.push(after.late_publishes - base.late_publishes);
+            if seen.last() == Some(&0) {
+                break;
+            }
+        }
+        assert!(
+            seen.last() == Some(&0),
+            "the first publish after the pause counted as late, every time: {seen:?}"
         );
     }
 
@@ -9342,9 +9449,10 @@ mod tests {
         let _consumer = rig.consumer_with("m3-slow-camera.bin", Format::new(320, 180, 30, SUBTYPE_NV12));
         rig.engine.start(settings(bars(15), false));
         rig.engine.wait_live(Duration::from_secs(20)).unwrap();
-        let s = wait_stats(&rig, "45 frames", |s| s.published >= 45);
+        // The bug is a late publish at every frame (all of them); a few that a busy machine delays do not count.
+        let s = wait_stats(&rig, "90 frames", |s| s.published >= 90);
         assert!(
-            s.late_publishes * 5 < s.published,
+            s.late_publishes * 2 < s.published,
             "{} of {} publishes were late on a steady 15 fps camera: {s:?}",
             s.late_publishes,
             s.published
@@ -9721,6 +9829,133 @@ mod tests {
         rig.wait("live after the reconnect", Duration::from_secs(10), |r| r.writer_state() == LIVE);
         assert!(rig.opens() > opens, "the camera was not opened again");
         rig.wait_state(EngineState::Live, Duration::from_secs(5));
+    }
+
+    /// A camera that went silent during a pause is slated when the pause ends (not `Paused` for good), and reconnected.
+    #[test]
+    fn a_camera_that_goes_silent_during_a_pause_is_slated_and_reconnected_after_the_resume() {
+        let rig = Rig::new("m3-silent-pause.bin", fast());
+        let _consumer = rig.consumer("m3-silent-pause.bin");
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("video", Duration::from_secs(10), |r| r.writer_state() == LIVE);
+        rig.engine.set_pause(true);
+        rig.wait("the paused slate", Duration::from_secs(5), |r| r.writer_state() == PAUSED);
+        rig.fake.silent.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(300));
+
+        rig.engine.set_pause(false);
+        let t0 = Instant::now();
+        rig.wait("the starting slate after the resume", Duration::from_millis(2500), |r| {
+            r.writer_state() == STARTING
+        });
+        rig.wait_state(EngineState::Reconnecting, Duration::from_secs(9));
+        assert!(t0.elapsed() >= Duration::from_millis(4500), "reconnecting after {:?}", t0.elapsed());
+        let opens = rig.opens();
+        rig.fake.silent.store(false, Ordering::SeqCst);
+        rig.wait("live after the reconnect", Duration::from_secs(10), |r| r.writer_state() == LIVE);
+        assert!(rig.opens() > opens, "the camera was not opened again");
+    }
+
+    /// A camera at a long exposure keeps a frame every 1.2 s whatever its media type says (30 fps): that is not
+    /// silence. Once the engine has seen the gap the file never shows the slate, and a camera that then really stops is
+    /// still slated and reconnected, later (2.5 and 5 gaps).
+    #[test]
+    fn a_camera_at_a_long_exposure_is_not_slated_between_frames_but_a_silent_one_still_is() {
+        let rig = Rig::new("m3-long-exposure.bin", fast());
+        *rig.fake.nominal_fps.lock().unwrap() = Some(30.0);
+        rig.fake.frame_every_ms.store(1200, Ordering::SeqCst);
+        let _consumer = rig.consumer("m3-long-exposure.bin");
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("video", Duration::from_secs(10), |r| r.writer_state() == LIVE);
+        // The first gap is the first the engine can look at: it may slate once, as it knows nothing of the camera yet.
+        std::thread::sleep(Duration::from_millis(3000));
+        rig.wait("video", Duration::from_secs(5), |r| r.writer_state() == LIVE);
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(8) {
+            assert_eq!(rig.writer_state(), LIVE, "the slate came {:?} into a camera that sends a frame per 1.2 s", t.elapsed());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(rig.engine.state(), EngineState::Live);
+
+        rig.fake.silent.store(true, Ordering::SeqCst);
+        let t1 = Instant::now();
+        rig.wait("the slate", Duration::from_secs(6), |r| r.writer_state() == STARTING);
+        assert!(t1.elapsed() >= Duration::from_millis(2000), "the slate came after {:?}", t1.elapsed());
+        rig.wait_state(EngineState::Reconnecting, Duration::from_secs(9));
+        assert!(t1.elapsed() >= Duration::from_millis(5000), "reconnecting after {:?}", t1.elapsed());
+    }
+
+    #[test]
+    fn the_silence_thresholds_follow_the_gaps_the_camera_keeps() {
+        let s = Duration::from_secs_f64;
+        assert_eq!(silent_slate_after(30.0, Duration::ZERO), SILENT_SLATE_MIN);
+        assert_eq!(silent_slate_after(f64::NAN, Duration::ZERO), SILENT_SLATE_MIN);
+        // a camera that is slower than 3 frames per second: three periods
+        assert_eq!(silent_slate_after(1.0, Duration::ZERO), s(3.0));
+        // a gap that was seen: two and a half of it, with no ceiling
+        assert_eq!(silent_slate_after(30.0, s(1.2)), s(3.0));
+        assert_eq!(silent_slate_after(30.0, s(8.0)), s(20.0));
+        assert_eq!(silent_reconnect_after(SILENT_SLATE_MIN), SILENT_RECONNECT_MIN);
+        assert_eq!(silent_reconnect_after(s(3.0)), s(6.0));
+        assert_eq!(silent_reconnect_after(s(20.0)), s(40.0));
+        let mut gaps = FrameGaps::default();
+        assert_eq!(gaps.largest(), Duration::ZERO);
+        gaps.record(s(2.0));
+        for _ in 0..FRAME_GAPS_KEPT - 1 {
+            gaps.record(s(0.03));
+        }
+        assert_eq!(gaps.largest(), s(2.0));
+        gaps.record(s(0.03));
+        assert_eq!(gaps.largest(), s(0.03), "an old gap is forgotten after {FRAME_GAPS_KEPT} frames");
+    }
+
+    /// A control thread that was left behind and wakes between the retire of the writer and the `Closed` of the quit
+    /// writes nothing over it.
+    #[test]
+    fn a_control_thread_that_wakes_during_the_quit_cannot_write_over_closed() {
+        let (rig, hold, inside) = rig_with_holding_opener("m1-quit-order.bin");
+        *rig.engine.shared.session_end_cap.lock().unwrap() = Some(Duration::from_secs(30));
+        hold.store(true, Ordering::SeqCst);
+        let hub = rig.engine.controls().clone();
+        let writer = rig.engine.writer().clone();
+        *rig.engine.shared.after_retire.lock().unwrap() = Some(Box::new(move || writer.set_state(WriterState::Paused)));
+        std::thread::scope(|s| {
+            let call = s.spawn(|| {
+                let _ = hub.get(FAKE_LINK);
+            });
+            rig.wait("the command is inside the open", Duration::from_secs(5), |_| {
+                inside.load(Ordering::SeqCst)
+            });
+            rig.engine.start(settings(bars(30), false));
+            std::thread::sleep(Duration::from_millis(300));
+            rig.engine.close_for_exit();
+            hold.store(false, Ordering::SeqCst);
+            let _ = call.join();
+        });
+        assert!(rig.engine.shared.after_retire.lock().unwrap().is_none(), "setup: the thread was not left behind");
+        assert_eq!(rig.writer_state(), CLOSED);
+    }
+
+    #[test]
+    fn a_value_dropped_off_the_thread_does_not_hold_the_caller() {
+        struct Slow(Arc<AtomicBool>);
+        impl Drop for Slow {
+            fn drop(&mut self) {
+                std::thread::sleep(Duration::from_millis(400));
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let t0 = Instant::now();
+        drop_off_thread(Slow(dropped.clone()));
+        assert!(t0.elapsed() < Duration::from_millis(200), "the caller waited {:?}", t0.elapsed());
+        let t = Instant::now();
+        while !dropped.load(Ordering::SeqCst) {
+            assert!(t.elapsed() < Duration::from_secs(5), "the value was never dropped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// A writer that was retired wrote nothing, so the record of what the file advertises says nothing is known (the

@@ -7,6 +7,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -16,7 +17,7 @@ use crate::capture::controls::ControlKey;
 use crate::config::{self, CameraDto, OutputCfg, SourceCfg};
 use crate::engine::{
     Engine, EngineEvent, EngineState, EventSink, ReadbackPolicy, ResumeState, Settings, SourceSpec,
-    SourceUpdate, StateEvent,
+    SourceUpdate, StateEvent, SHUTDOWN_END_CAP,
 };
 use crate::fx;
 use crate::preview::{Preview, Sink};
@@ -24,6 +25,9 @@ use crate::preview::{Preview, Sink};
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
+
+/// How often the quit looks whether the engine lock is free and the preview has stopped.
+const QUIT_LOCK_POLL: Duration = Duration::from_millis(5);
 
 /// What `start_engine` says while the virtual camera is not installed: the engine would write frames nobody reads.
 pub const VCAM_NOT_INSTALLED: &str =
@@ -68,7 +72,8 @@ pub struct Service {
     engine: Mutex<Option<Arc<Engine>>>,
     sink: Mutex<Option<Arc<dyn EventSink>>>,
     window_visible: AtomicBool,
-    preview: Preview,
+    /// Shared so that the quit can stop it on a helper thread ([`Service::shutdown`]).
+    preview: Arc<Preview>,
     /// An install, repair or removal of the virtual camera is running (one at a time).
     vcam_busy: AtomicBool,
     /// Mirrors `Park::blocked` for the code that creates the engine (it holds the `engine` lock, not the `park` one):
@@ -601,13 +606,46 @@ impl Service {
 
     /// The app quits: stop the engine and release the camera and `frames.bin`. No engine is made after this, not
     /// even by a virtual camera change that is still running and restores its engine when it ends.
+    ///
+    /// The whole quit takes [`SHUTDOWN_END_CAP`] at most, the waits of this function included: the engine lock is held
+    /// while an engine is created (a driver that hangs there), and the preview's sender is joined while it is inside
+    /// the webview's call. What does not end by then is left behind (the process exits next and frees everything).
     pub fn shutdown(&self) {
         self.closed.store(true, Ordering::Release);
-        self.preview.stop(None);
-        let e = lock(&self.engine).take();
+        let deadline = Instant::now() + SHUTDOWN_END_CAP;
+        let preview = self.preview.clone();
+        let preview_stop = std::thread::Builder::new()
+            .name("preview stop".into())
+            .spawn(move || preview.stop(None));
+        let e = loop {
+            match self.engine.try_lock() {
+                Ok(mut g) => break g.take(),
+                Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner().take(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        eprintln!("[api] the engine is busy and did not free its lock within the quit: leaving it behind");
+                        break None;
+                    }
+                    std::thread::sleep(QUIT_LOCK_POLL);
+                }
+            }
+        };
         if let Some(e) = e {
-            // The process exits next and frees the camera: a render thread that does not end in 3 s is left behind.
-            e.close_for_exit();
+            // The process exits next and frees the camera: a render thread that does not end in time is left behind.
+            e.close_for_exit_by(deadline);
+        }
+        match preview_stop {
+            Ok(helper) => {
+                while !helper.is_finished() {
+                    if Instant::now() >= deadline {
+                        eprintln!("[api] the preview did not stop within the quit: leaving it behind");
+                        return;
+                    }
+                    std::thread::sleep(QUIT_LOCK_POLL);
+                }
+                let _ = helper.join();
+            }
+            Err(e) => eprintln!("[api] cannot start the thread that stops the preview ({e}): it is left running"),
         }
     }
 }
@@ -1199,6 +1237,57 @@ mod tests {
         svc.init().unwrap();
         svc.shutdown();
         assert!(svc.engine().is_err());
+    }
+
+    /// Runs `quit` (the quit of `svc`) on its own thread and says how long it took, giving up after 10 s so that a
+    /// quit that never ends fails the test instead of hanging it; `unblock` runs after that, whatever happened.
+    fn time_the_quit(svc: &Service, unblock: impl FnOnce()) -> Option<Duration> {
+        std::thread::scope(|s| {
+            let (done, finished) = std::sync::mpsc::channel();
+            s.spawn(move || {
+                let t0 = Instant::now();
+                svc.shutdown();
+                let _ = done.send(t0.elapsed());
+            });
+            let took = finished.recv_timeout(Duration::from_secs(10)).ok();
+            unblock();
+            took
+        })
+    }
+
+    /// The quit is over [`SHUTDOWN_END_CAP`] after it began even when the engine lock is held (an engine being made
+    /// by a driver that hangs).
+    #[test]
+    fn the_quit_does_not_wait_for_ever_for_the_engine_lock() {
+        let (svc, _events) = warp_service();
+        svc.init().unwrap();
+        let held = lock(&svc.engine);
+        let mut held = Some(held);
+        let took = time_the_quit(&svc, || drop(held.take()));
+        let took = took.expect("the quit waited for the engine lock for ever");
+        assert!(took >= Duration::from_millis(2500) && took < Duration::from_secs(5), "the quit took {took:?}");
+    }
+
+    /// The same for a preview whose sender is inside the webview's call: the stop of the preview is part of the 3 s.
+    #[test]
+    fn the_quit_does_not_wait_for_ever_for_a_preview_that_does_not_stop() {
+        let (svc, _events) = warp_service();
+        svc.start_with(bars_settings(false), None, None).unwrap();
+        svc.engine().unwrap().wait_live(Duration::from_secs(20)).unwrap();
+        let (inside, release) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (i, r) = (inside.clone(), release.clone());
+        let sink: Sink = Arc::new(move |_| {
+            i.store(true, Ordering::SeqCst);
+            while !r.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            true
+        });
+        svc.set_preview(true, 320, 180, sink).unwrap();
+        wait_until("the sender is inside the sink", || inside.load(Ordering::SeqCst));
+        let took = time_the_quit(&svc, || release.store(true, Ordering::SeqCst));
+        let took = took.expect("the quit waited for the preview for ever");
+        assert!(took >= Duration::from_millis(2500) && took < Duration::from_secs(5), "the quit took {took:?}");
     }
 
     #[test]
