@@ -703,6 +703,12 @@ struct Shared {
     running: Mutex<Option<Settings>>,
     /// Counts the GPU devices the engine has built: 1 for the first, one more after every device loss.
     gpu_generation: AtomicU64,
+    /// The controller wants the camera picture measured before the filter chain ([`Engine::set_metering`]).
+    metering: AtomicBool,
+    /// The newest measurement the render thread made ([`Engine::meter`]).
+    meter: crate::meter::Mailbox,
+    /// What the controller reads besides the samples ([`Engine::session_facts`]); the render loop keeps it current.
+    facts: Mutex<crate::meter::SessionFacts>,
     /// Test hook: frames that fail with `DXGI_ERROR_DEVICE_REMOVED` before they render. The first one also marks the
     /// current device removed, as a real loss would.
     #[cfg(test)]
@@ -811,6 +817,7 @@ impl Engine {
         let renderer = Arc::new(Renderer::new(gpu).map_err(|e| e.to_string())?);
         renderer.shaders.warm_up().map_err(|e| e.to_string())?;
         crate::fx::warm_up(&renderer).map_err(|e| e.to_string())?;
+        crate::meter::warm_up(&renderer).map_err(|e| e.to_string())?;
         let shared = Arc::new(Shared {
             state: Mutex::new(EngineState::Stopped),
             reason: Mutex::new(None),
@@ -836,6 +843,9 @@ impl Engine {
             hub: Arc::new(ControlsHub::new(opener)),
             running: Mutex::new(None),
             gpu_generation: AtomicU64::new(1),
+            metering: AtomicBool::new(false),
+            meter: crate::meter::Mailbox::default(),
+            facts: Mutex::new(crate::meter::SessionFacts::CLOSED),
             #[cfg(test)]
             gpu_faults: Default::default(),
             #[cfg(test)]
@@ -910,6 +920,30 @@ impl Engine {
     /// the record that is re-applied after every open.
     pub fn controls(&self) -> &Arc<ControlsHub> {
         &self.shared.hub
+    }
+
+    /// Switch the meter (docs/AUTO-CONTROLS.md 2.4): while on, the render thread measures the camera picture before
+    /// the filter chain, at most every 66 ms, and puts the result in [`Engine::meter`]. The controller sets it when
+    /// any control of the attached camera is in Better Cam auto. Turning it off drops what is in flight and in the
+    /// mailbox (on the next frame).
+    pub fn set_metering(&self, on: bool) {
+        self.shared.metering.store(on, Ordering::Release);
+    }
+
+    /// Whether the meter is switched on.
+    pub fn metering(&self) -> bool {
+        self.shared.metering.load(Ordering::Acquire)
+    }
+
+    /// The mailbox of the meter: one slot, the newest [`MeterSample`](crate::meter::MeterSample) wins.
+    pub fn meter(&self) -> &crate::meter::Mailbox {
+        &self.shared.meter
+    }
+
+    /// What the controller reads each tick besides the samples: [`SessionFacts::CLOSED`](crate::meter::SessionFacts)
+    /// while no camera session runs.
+    pub fn session_facts(&self) -> crate::meter::SessionFacts {
+        *lock(&self.shared.facts)
     }
 
     /// Where the engine reports to (replaces the previous sink). Events come from the control thread.
@@ -1772,6 +1806,7 @@ impl Control {
                     let renderer = Arc::new(Renderer::new(gpu).map_err(|e| e.to_string())?);
                     renderer.shaders.warm_up().map_err(|e| e.to_string())?;
                     crate::fx::warm_up(&renderer).map_err(|e| e.to_string())?;
+                    crate::meter::warm_up(&renderer).map_err(|e| e.to_string())?;
                     let events = shared.clone();
                     let assets = Assets::new(
                         renderer.gpu.clone(),
@@ -3215,6 +3250,16 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
     let mut output = OutputWriter::new(renderer.clone(), writer.clone())
         .map_err(|e| gpu_failure(renderer, e))?;
     let mut timer = GpuTimer::new(&renderer.gpu.device).ok();
+    // The meter's GPU resources live and die with this session (a lost device ends it); what a session before it left
+    // in the mailbox is gone, and the facts are this session's until it ends.
+    let mut meter = crate::meter::Meter::new();
+    let mut meter_failed = false;
+    shared.meter.clear();
+    let mut facts = crate::meter::FactsFeed::new(
+        &shared.facts,
+        _controls.as_ref().map(|c| c.token),
+        source.info().fps,
+    );
 
     let mut published_any = false;
     // The consumer rate the pacer last saw; a change starts it over.
@@ -3274,11 +3319,20 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
         if paused != was_paused {
             was_paused = paused;
             stats.paused = paused;
-            if !paused {
+            if paused {
+                // Nothing is measured while paused, and what was in flight must not reach the controller after.
+                meter.reset(&shared.meter);
+            } else {
                 // Resumed: the writer leaves `Paused` with the first frame published from here on.
                 published_any = false;
             }
         }
+        facts.update(
+            Instant::now(),
+            || source.counters().0,
+            paused,
+            vcam_protocol::qpc_now(),
+        );
         if paused {
             writer.set_state(WriterState::Paused);
             match source.next(Duration::from_millis(40)) {
@@ -3408,6 +3462,25 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
             };
             // The decoder surface was copied by the pass above; give it back before the rest of the pipeline.
             drop(frame);
+            // The meter sees what the sensor delivers (converted, before any filter). A failure of it is not the
+            // frame's, unless the device is gone.
+            if let Err(e) = meter.frame(
+                renderer,
+                &rgba,
+                shared.metering.load(Ordering::Acquire),
+                facts.token().unwrap_or(0),
+                vcam_protocol::hns_to_qpc(capture_100ns),
+                cpu_started,
+                &shared.meter,
+            ) {
+                if e.is_device_lost() || renderer.gpu.removed_reason().is_some() {
+                    return Err(e);
+                }
+                meter.reset(&shared.meter);
+                if !std::mem::replace(&mut meter_failed, true) {
+                    eprintln!("[engine] meter: {e}");
+                }
+            }
             // The newest chain applies before this frame.
             let wanted = shared.chain_gen.load(Ordering::Acquire);
             if wanted != chain_gen {
@@ -4039,6 +4112,8 @@ mod tests {
         /// The next opens fail like the real factory's with these `(call, HRESULT)` of Media Foundation, in order
         /// (`Failure::from_capture_at` and `open_retrying_decoder` with the open's `first_open`).
         capture_errors: Mutex<VecDeque<(&'static str, u32)>>,
+        /// The picture of the next opens is one flat grey (an 8-bit coded level, NV12) instead of the bars.
+        flat: Mutex<Option<u8>>,
     }
 
     /// The symbolic link the fake camera has.
@@ -4169,7 +4244,13 @@ mod tests {
                 }
             };
             self.alive.fetch_add(1, Ordering::SeqCst);
-            let inner = SyntheticInput::new(synthetic)?;
+            let mut inner = SyntheticInput::new(synthetic)?;
+            if let (Some(level), PixelFormat::Nv12) = (*self.flat.lock().unwrap(), synthetic.format) {
+                let (w, h) = (synthetic.width, synthetic.height);
+                let (space, range) = synthetic.color.resolve(h);
+                let rgb = vec![level; w as usize * h as usize * 3];
+                inner.data = Arc::new(pattern::pack_nv12(&rgb, w, h, w as usize, h, space, range));
+            }
             let mut info = SourceInfo {
                 link: Some(FAKE_LINK.into()),
                 ..inner.info().clone()
@@ -4247,6 +4328,7 @@ mod tests {
                 real_users: AtomicBool::new(false),
                 targets: Mutex::new(Vec::new()),
                 capture_errors: Mutex::new(VecDeque::new()),
+                flat: Mutex::new(None),
             });
             let opener = Arc::new(crate::camera_controls::fake::FakeOpener {
                 camera: fake.controls.clone(),
@@ -7593,5 +7675,320 @@ mod tests {
             assert_eq!(serde_json::to_value(s).unwrap(), serde_json::json!(n));
             assert_eq!(s.name(), n);
         }
+    }
+
+    // ---- the meter (docs/AUTO-CONTROLS.md 2.4, 5.5) -------------------------------------------------------------
+
+    use crate::meter::MeterSample;
+
+    /// What the tap of a meter test saw, on the render thread: every frame's capture time in order, the frame (by
+    /// index) at which the meter first looked switched on, and every sample it took from the mailbox with the index of
+    /// the frame whose pass found it and the time.
+    #[derive(Default)]
+    struct MeterLog {
+        frames: Vec<u64>,
+        first_on: Option<usize>,
+        samples: Vec<(usize, Instant, MeterSample)>,
+    }
+
+    /// The tap is the mailbox's reader (it runs on the render thread right after the meter's pass of a frame), so a
+    /// sample is seen at the frame that delivered it, with nothing racing.
+    struct MeterTap {
+        shared: Arc<Shared>,
+        log: Arc<Mutex<MeterLog>>,
+    }
+
+    impl FrameTap for MeterTap {
+        fn on_frame(&mut self, _: &Renderer, _: &RgbaTexture, capture_qpc: u64) {
+            let mut log = self.log.lock().unwrap();
+            let idx = log.frames.len();
+            log.frames.push(capture_qpc);
+            if log.first_on.is_none() && self.shared.metering.load(Ordering::SeqCst) {
+                log.first_on = Some(idx);
+            }
+            if let Some(s) = self.shared.meter.take() {
+                log.samples.push((idx, Instant::now(), s));
+            }
+        }
+    }
+
+    /// A rig whose camera shows one flat grey (8-bit coded `level`, 320x180 at `fps`), running, with a [`MeterTap`].
+    fn grey_rig(name: &str, level: u8, fps: u32) -> (Rig, Arc<Mutex<MeterLog>>) {
+        let rig = Rig::new(name, fast());
+        *rig.fake.flat.lock().unwrap() = Some(level);
+        let log = Arc::new(Mutex::new(MeterLog::default()));
+        rig.engine.send(Msg::SetTap(Some(Box::new(MeterTap {
+            shared: rig.engine.shared.clone(),
+            log: log.clone(),
+        }))));
+        rig.engine.start(settings(bars(fps), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        (rig, log)
+    }
+
+    fn wait_log(rig: &Rig, log: &Arc<Mutex<MeterLog>>, what: &str, cond: impl Fn(&MeterLog) -> bool) {
+        rig.wait(what, Duration::from_secs(10), |_| cond(&log.lock().unwrap()));
+    }
+
+    fn frames_seen(log: &Arc<Mutex<MeterLog>>) -> usize {
+        log.lock().unwrap().frames.len()
+    }
+
+    /// The linear light of an 8-bit sRGB-coded grey.
+    fn linear_of(level: u8) -> f32 {
+        let c = f32::from(level) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    /// The mean linear colour of a sample, weighted by coverage.
+    fn mean_of(s: &MeterSample) -> [f32; 3] {
+        let mut sum = [0.0f32; 3];
+        let mut weight = 0.0f32;
+        for c in &s.stats.cells {
+            for k in 0..3 {
+                sum[k] += c[k] * c[3];
+            }
+            weight += c[3];
+        }
+        assert!(weight > 0.0, "no coverage");
+        sum.map(|v| v / weight)
+    }
+
+    fn assert_grey(s: &MeterSample, level: u8) {
+        assert_eq!(s.stats.cells.len(), 256);
+        let want = linear_of(level);
+        for (k, v) in mean_of(s).into_iter().enumerate() {
+            assert!(
+                (v - want).abs() <= 0.01,
+                "channel {k}: weighted linear mean {v}, the picture is {want} ({level}/255)"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sample_comes_within_three_frames_of_metering_on_and_measures_the_known_grey() {
+        let (rig, log) = grey_rig("meter-known.bin", 128, 60);
+        wait_log(&rig, &log, "30 frames", |l| l.frames.len() >= 30);
+        assert!(!rig.engine.metering());
+        // no sample without metering
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(log.lock().unwrap().samples.is_empty(), "samples while metering is off");
+        assert!(rig.engine.meter().take().is_none());
+
+        rig.engine.set_metering(true);
+        wait_log(&rig, &log, "a sample", |l| !l.samples.is_empty());
+        let l = log.lock().unwrap();
+        let (arrived, _, s) = &l.samples[0];
+        let on = l.first_on.expect("the tap saw metering on");
+        assert!(
+            *arrived - on <= 3,
+            "the sample was found by frame {arrived}, metering was on at frame {on}"
+        );
+        assert_grey(s, 128);
+        // `capture_qpc` is the capture time of a frame made after the switch and before the one that delivered it
+        let at = l.frames.iter().position(|q| *q == s.capture_qpc).expect("a frame's capture time");
+        assert!(at >= on.saturating_sub(1) && at < *arrived, "frame {at}, on at {on}, delivered at {arrived}");
+        // the token is the camera session's (the hub's), the same one the facts name
+        let facts = rig.engine.session_facts();
+        assert!(facts.token.is_some());
+        assert_eq!(Some(s.token), facts.token);
+    }
+
+    #[test]
+    fn at_60_fps_the_meter_makes_at_most_16_samples_a_second() {
+        let (rig, log) = grey_rig("meter-rate.bin", 90, 60);
+        rig.engine.set_metering(true);
+        wait_log(&rig, &log, "samples", |l| l.samples.len() >= 3);
+        let from = Instant::now();
+        let before = log.lock().unwrap().samples.len();
+        std::thread::sleep(Duration::from_secs(4));
+        let l = log.lock().unwrap();
+        let n = l.samples.iter().filter(|(_, t, _)| *t >= from).count();
+        assert!(l.samples.len() >= before);
+        // 15 a second when frames come at 60: no more than 16 a second, and not far fewer on a loaded machine
+        assert!(n <= 16 * 4, "{n} samples in 4 s");
+        assert!(n >= 30, "{n} samples in 4 s");
+        // each sample is of a different frame, in order
+        let q: Vec<u64> = l.samples.iter().map(|(_, _, s)| s.capture_qpc).collect();
+        assert!(q.windows(2).all(|w| w[1] > w[0]), "{q:?}");
+        // and at least three frames of capture time apart (66 ms of wall time, between frames that may be late)
+        let min = vcam_protocol::qpc_frequency() * 45 / 1000;
+        assert!(q.windows(2).all(|w| w[1] - w[0] >= min), "{q:?}");
+    }
+
+    #[test]
+    fn switching_metering_off_stops_the_samples_and_on_again_resumes_them() {
+        let (rig, log) = grey_rig("meter-onoff.bin", 160, 60);
+        rig.engine.set_metering(true);
+        wait_log(&rig, &log, "samples", |l| l.samples.len() >= 3);
+        rig.engine.set_metering(false);
+        // the render thread notices on its next frame and drops what was in flight
+        let seen = frames_seen(&log);
+        wait_log(&rig, &log, "5 frames", |l| l.frames.len() >= seen + 5);
+        let n = log.lock().unwrap().samples.len();
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(log.lock().unwrap().samples.len(), n, "samples with metering off");
+        assert!(rig.engine.meter().take().is_none());
+        rig.engine.set_metering(true);
+        wait_log(&rig, &log, "samples again", |l| l.samples.len() >= n + 2);
+        assert_grey(&log.lock().unwrap().samples.last().unwrap().2, 160);
+    }
+
+    #[test]
+    fn the_meter_sees_the_picture_before_the_filter_chain() {
+        let (rig, log) = grey_rig("meter-prechain.bin", 100, 60);
+        let _consumer = rig.consumer_with("meter-prechain.bin", Format::new(320, 180, 60, SUBTYPE_NV12));
+        // a chain that makes the picture far brighter than the camera's
+        rig.engine.set_chain(
+            crate::fx::parse_chain(&serde_json::json!([
+                { "id": "c", "kind": "color_filter", "enabled": true, "params": { "brightness": 0.6 } }
+            ]))
+            .unwrap(),
+        );
+        rig.engine.set_metering(true);
+        wait_log(&rig, &log, "samples", |l| l.samples.len() >= 3);
+        let out = |rig: &Rig| -> Option<u8> {
+            let (w, h, _, buf) = latest(&rig.file)?;
+            let rgb = nv12_to_rgb(&buf, w, h, w as usize, ColorSpace::Bt709, ColorRange::Limited);
+            Some(rgb[(w as usize * (h as usize / 2) + w as usize / 2) * 3])
+        };
+        rig.wait("the chain's picture", Duration::from_secs(10), |r| {
+            out(r).is_some_and(|v| v >= 140)
+        });
+        for (_, _, s) in &log.lock().unwrap().samples {
+            assert_grey(s, 100);
+        }
+    }
+
+    #[test]
+    fn the_facts_follow_the_session_and_a_resume_moves_the_resume_time() {
+        let (rig, log) = grey_rig("meter-facts.bin", 128, 60);
+        assert_eq!(rig.engine.session_facts().target_fps, 60.0);
+        rig.wait("the capture rate", Duration::from_secs(10), |r| {
+            let f = r.engine.session_facts();
+            f.capture_fps > 40.0 && f.capture_fps < 75.0
+        });
+        let f = rig.engine.session_facts();
+        assert!(f.token.is_some() && !f.paused && f.resumed_qpc == 0, "{f:?}");
+
+        // paused: the facts say so, nothing is measured, and what was in flight does not come after the resume
+        rig.engine.set_metering(true);
+        wait_log(&rig, &log, "samples", |l| l.samples.len() >= 2);
+        rig.engine.set_pause(true);
+        rig.wait("paused", Duration::from_secs(5), |r| r.engine.session_facts().paused);
+        let n = log.lock().unwrap().samples.len();
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(log.lock().unwrap().samples.len(), n, "samples while paused");
+        let resumed = vcam_protocol::qpc_now();
+        rig.engine.set_pause(false);
+        rig.wait("resumed", Duration::from_secs(5), |r| !r.engine.session_facts().paused);
+        let f = rig.engine.session_facts();
+        assert!(f.resumed_qpc >= resumed, "{} < {resumed}", f.resumed_qpc);
+        wait_log(&rig, &log, "samples after the resume", |l| l.samples.len() > n);
+        // every sample after the resume was captured after it
+        for (_, _, s) in log.lock().unwrap().samples.iter().skip(n) {
+            assert!(s.capture_qpc >= f.resumed_qpc, "{} < {}", s.capture_qpc, f.resumed_qpc);
+        }
+
+        // a stopped engine has no session
+        rig.engine.stop();
+        assert!(rig.engine.wait_stopped(Duration::from_secs(10)));
+        assert_eq!(rig.engine.session_facts(), crate::meter::SessionFacts::CLOSED);
+    }
+
+    /// The PERF.md method on the hardware adapter: 1080p60 synthetic NV12, an app reading the camera, no filters, the
+    /// engine's own mean GPU time per frame (`gpu_ms`, one mean per second) with the meter off and on in alternating
+    /// 20 s stretches (the window that straddles a switch is dropped). Run by hand under the `app-test.lock`:
+    /// `cargo test -p better-cam --lib meter_gpu_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a timing run on the hardware adapter"]
+    fn meter_gpu_cost_at_1080p60() {
+        let gpu = Arc::new(GpuDevice::new(AdapterKind::Hardware).expect("hardware adapter"));
+        let path = temp_file("meter-perf.bin");
+        let _ = std::fs::remove_file(&path);
+        let writer = Arc::new(Writer::create(&path).unwrap());
+        let engine = Engine::with_parts(gpu, writer).unwrap();
+        let _consumer = Consumer::start_with(&path, Format::new(1920, 1080, 60, SUBTYPE_NV12));
+        let spec = SourceSpec::Synthetic(SyntheticSpec {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            format: PixelFormat::Nv12,
+            color: ColorSettings::default(),
+        });
+        engine.start(settings(spec, false));
+        engine.wait_live(Duration::from_secs(20)).unwrap();
+        std::thread::sleep(Duration::from_secs(8));
+        let mut runs: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+        for round in 0..3 {
+            for on in [false, true] {
+                engine.set_metering(on);
+                let started = Instant::now();
+                let mut last = engine.stats().rendered;
+                let mut skipped = false;
+                while started.elapsed() < Duration::from_secs(21) {
+                    std::thread::sleep(Duration::from_millis(50));
+                    let s = engine.stats();
+                    if s.rendered != last {
+                        last = s.rendered;
+                        if std::mem::replace(&mut skipped, true) {
+                            runs[usize::from(on)].push(s.gpu_ms);
+                        }
+                    }
+                }
+                let v = &runs[usize::from(on)];
+                eprintln!(
+                    "round {round}, metering {on}: {} windows, last gpu {:.4} ms, fps {:.1}",
+                    v.len(),
+                    v.last().copied().unwrap_or(0.0),
+                    engine.stats().render_fps
+                );
+            }
+        }
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let median = |v: &[f64]| {
+            let mut s = v.to_vec();
+            s.sort_by(|a, b| a.total_cmp(b));
+            s[s.len() / 2]
+        };
+        let (off, on) = (mean(&runs[0]), mean(&runs[1]));
+        eprintln!(
+            "meter off: mean {off:.4} ms, median {:.4} ms over {} windows; meter on: mean {on:.4} ms, median {:.4} ms over {} windows; difference of the means {:+.4} ms, of the medians {:+.4} ms; a sample waits in the mailbox: {}",
+            median(&runs[0]),
+            runs[0].len(),
+            median(&runs[1]),
+            runs[1].len(),
+            on - off,
+            median(&runs[1]) - median(&runs[0]),
+            engine.meter().take().is_some()
+        );
+    }
+
+    #[test]
+    fn samples_resume_after_a_device_loss_with_the_new_session() {
+        let (rig, log) = grey_rig("meter-loss.bin", 128, 60);
+        rig.engine.set_metering(true);
+        wait_log(&rig, &log, "samples", |l| l.samples.len() >= 3);
+        let old = rig.engine.session_facts().token.expect("a session");
+        let n = log.lock().unwrap().samples.len();
+        rig.engine.inject_device_loss(1);
+        rig.wait("a new device", Duration::from_secs(10), |r| r.engine.gpu_generation() == 2);
+        rig.wait("live again", Duration::from_secs(10), |r| {
+            r.engine.state() == EngineState::Live && r.engine.session_facts().token.is_some_and(|t| t != old)
+        });
+        // metering is still on (nobody touched it) and the new session measures with the new device
+        assert!(rig.engine.metering());
+        let new = rig.engine.session_facts().token.unwrap();
+        wait_log(&rig, &log, "samples from the new session", |l| {
+            l.samples.iter().skip(n).any(|(_, _, s)| s.token == new)
+        });
+        let l = log.lock().unwrap();
+        let s = &l.samples.iter().skip(n).find(|(_, _, s)| s.token == new).unwrap().2;
+        assert_grey(s, 128);
+        assert_ne!(s.token, old);
     }
 }

@@ -10,6 +10,7 @@ pub mod ext;
 pub mod file_dialog;
 pub mod fx;
 pub mod gpu;
+pub mod meter;
 pub mod output_writer;
 pub mod preview;
 pub mod test_window;

@@ -119,10 +119,10 @@ pub const KEYS: &[&str] = &[
 ];
 
 const MAIN_HLSL: &str = include_str!("../gpu/shaders/auto_adjust.hlsl");
-const STATS_HLSL: &str = include_str!("../gpu/shaders/stats_downsample.hlsl");
+pub(crate) const STATS_HLSL: &str = include_str!("../gpu/shaders/stats_downsample.hlsl");
 
 /// Cells per side of the statistics image.
-const GRID: usize = 16;
+pub(crate) const GRID: usize = 16;
 const CELLS: usize = GRID * GRID;
 
 /// The exposure gain limits (linear): two stops either way.
@@ -268,7 +268,7 @@ pub struct Stats {
 
 impl Stats {
     /// Read the staging copy of the last stage: `R16G16B16A16_UNORM`, 16 x 16.
-    fn from_plane(plane: &MappedPlane<'_>) -> Stats {
+    pub(crate) fn from_plane(plane: &MappedPlane<'_>) -> Stats {
         let mut cells = Vec::with_capacity(CELLS);
         for y in 0..GRID {
             let row = plane.row(y);
@@ -836,12 +836,12 @@ pub fn stage_sizes(input: (u32, u32)) -> Vec<(u32, u32)> {
     }
 }
 
-struct Stage {
-    texture: ID3D11Texture2D,
-    rtv: ID3D11RenderTargetView,
-    srv: ID3D11ShaderResourceView,
-    size: (u32, u32),
-    constants: ConstantBuffer,
+pub(crate) struct Stage {
+    pub(crate) texture: ID3D11Texture2D,
+    pub(crate) rtv: ID3D11RenderTargetView,
+    pub(crate) srv: ID3D11ShaderResourceView,
+    pub(crate) size: (u32, u32),
+    pub(crate) constants: ConstantBuffer,
 }
 
 impl Stage {
@@ -886,13 +886,13 @@ impl Stage {
 }
 
 /// The downsample chain for one input size.
-struct StatsChain {
-    input: (u32, u32),
-    stages: Vec<Stage>,
+pub(crate) struct StatsChain {
+    pub(crate) input: (u32, u32),
+    pub(crate) stages: Vec<Stage>,
 }
 
 impl StatsChain {
-    fn new(r: &Renderer, input: (u32, u32)) -> GpuResult<StatsChain> {
+    pub(crate) fn new(r: &Renderer, input: (u32, u32)) -> GpuResult<StatsChain> {
         let mut stages = Vec::new();
         let mut src = input;
         for (n, dst) in stage_sizes(input).into_iter().enumerate() {
