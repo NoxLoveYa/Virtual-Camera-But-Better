@@ -65,4 +65,4 @@ Effects runtime is not part of Better Cam: the app downloads it from NVIDIA when
 
 ## Status
 
-Pre-release. The icons are still those of Better Mic, and the installer is unsigned.
+Pre-release. The installer is unsigned.
