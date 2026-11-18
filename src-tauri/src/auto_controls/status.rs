@@ -1,8 +1,110 @@
-//! Status texts (docs/AUTO-CONTROLS.md 4.2), made in Rust so tests can check them. A1: the exposure loop's texts.
-//! Phase A2 adds the white balance texts and the hand-back texts (`ignored`, `no_response`, `not_answering`,
-//! `hunting`, `conflict`).
+//! Status texts (docs/AUTO-CONTROLS.md 4.2), made in Rust so tests can check them: the exposure loop's (A1), the
+//! white balance loop's and the watchdog's hand-back texts (A2), the "not offered" reasons of 2.3 and the hints of
+//! 2.9.
+//!
+//! The buttons of 4.2 (`[Resume]`, `[Try again]`) are not part of a text: the card draws them from the state.
 
-use super::{CapReason, ExposureState};
+use super::watchdog::Fault;
+use super::{CapReason, ExposureState, HandBackKind, NoOffer, WhiteBalanceState};
+use crate::capture::controls::ControlKey;
+
+/// A colour temperature as text: `4650 K`.
+pub fn kelvin(k: i32) -> String {
+    format!("{k} K")
+}
+
+/// The text of a watchdog fault (4.2: `ignored`, `no_response`, `not_answering`, `hunting`, `conflict`; 2.9: too
+/// slow). `to` is where the control went; `None` for a conflict.
+pub fn fault_message(fault: Fault, key: ControlKey, to: Option<HandBackKind>) -> String {
+    let label = key.label();
+    let back = match to {
+        Some(HandBackKind::Camera) => "Back to Camera auto.",
+        Some(HandBackKind::Manual) => "Back to its earlier value.",
+        None => "",
+    };
+    match fault {
+        Fault::NotAnswering => {
+            let went = match to {
+                Some(HandBackKind::Manual) => "its earlier value",
+                _ => "Camera auto",
+            };
+            format!("The camera stopped answering. {label} went back to {went}.")
+        }
+        Fault::TooSlow => "This camera is too slow to adjust live.".to_string(),
+        Fault::Ignored => format!("The camera ignored Better Cam auto for {label}. {back}"),
+        Fault::NoResponse => {
+            format!("The picture does not change when Better Cam changes {label}. {back}")
+        }
+        Fault::Hunting => format!("{label} kept swinging. {back}"),
+        Fault::Conflict => format!("Another program keeps changing {label}. Better Cam auto paused."),
+    }
+}
+
+/// Why Better Cam auto is not offered (2.3), for the tooltip of the disabled mode.
+pub fn not_offered(key: ControlKey, why: NoOffer) -> String {
+    let what = match key {
+        ControlKey::WhiteBalance => "white balance",
+        _ => "exposure",
+    };
+    match why {
+        NoOffer::NoManual => format!("This camera has no manual {what}."),
+        NoOffer::UnknownUnits => format!("This camera reports {what} in units Better Cam does not know."),
+        NoOffer::Blocked => "This camera ignored Better Cam auto.".to_string(),
+    }
+}
+
+/// The hint under the exposure row of a camera without a usable gain (2.9).
+pub const WHOLE_STOPS_HINT: &str =
+    "No gain control: Better Cam auto works in whole stops. Add Auto Adjust for the fine trim.";
+
+/// The hint under the exposure row of a camera that can hold the frame rate itself (2.9).
+pub const LOW_LIGHT_HINT: &str =
+    "This camera can also hold the frame rate itself: Camera auto with Low light compensation off.";
+
+/// The note of 2.5.10, shown while the exposure is shorter than two periods of the mains light.
+pub const STRIPES_NOTE: &str = "Short exposures under mains light can show stripes.";
+
+/// Whether an exposure of `2^e` s is short enough to show stripes under `mains` Hz light (2.5.10).
+pub fn stripes(e: i32, mains: Option<u32>) -> bool {
+    mains.is_some_and(|hz| matches!(hz, 50 | 60) && f64::from(e) < (1.0 / (2.0 * f64::from(hz))).log2())
+}
+
+/// Everything the white balance texts read.
+pub struct WhiteBalanceFacts {
+    pub state: WhiteBalanceState,
+    pub kelvin: i32,
+    /// `true` when the limit is the warm one (`K_min`): the light is warmer than the camera can correct.
+    pub warm_limit: bool,
+    /// How long there has been no picture, in seconds.
+    pub no_picture_for: f64,
+    pub fault: Option<Fault>,
+    pub handed_back: Option<HandBackKind>,
+}
+
+/// The text of 4.2 for a white balance state, `None` when the state has none of its own.
+pub fn white_balance_message(f: &WhiteBalanceFacts) -> Option<String> {
+    if let Some(fault) = f.fault {
+        return Some(fault_message(fault, ControlKey::WhiteBalance, f.handed_back));
+    }
+    match f.state {
+        WhiteBalanceState::Starting | WhiteBalanceState::Adjusting => Some("Adjusting…".to_string()),
+        WhiteBalanceState::Holding => Some(format!("Holding · {}", kelvin(f.kelvin))),
+        WhiteBalanceState::AtLimit => Some(format!(
+            "White balance at its limit ({}): the light is {} than this camera can correct. Auto Adjust can finish it.",
+            kelvin(f.kelvin),
+            if f.warm_limit { "warmer" } else { "cooler" }
+        )),
+        WhiteBalanceState::NoPicture => (f.no_picture_for > super::watchdog::NO_PICTURE_TEXT_AFTER)
+            .then(|| "No picture to measure.".to_string()),
+        WhiteBalanceState::Paused => Some("Paused.".to_string()),
+        WhiteBalanceState::Closed => Some("Starts when the camera opens.".to_string()),
+        WhiteBalanceState::Conflict
+        | WhiteBalanceState::Ignored
+        | WhiteBalanceState::NoResponse
+        | WhiteBalanceState::NotAnswering
+        | WhiteBalanceState::Hunting => None,
+    }
+}
 
 /// An exposure of `2^e` seconds as text: `1/32 s`, `1/2 s`, `1 s`, `2 s`.
 pub fn exposure_time(e: i32) -> String {
@@ -27,10 +129,18 @@ pub struct ExposureFacts {
     pub target_fps: f64,
     /// The rate the camera dropped to when the learned cap was set.
     pub dropped_to: Option<f64>,
+    /// Why the loop stopped, and where the control went.
+    pub fault: Option<Fault>,
+    pub handed_back: Option<HandBackKind>,
+    /// How long there has been no picture, in seconds.
+    pub no_picture_for: f64,
 }
 
 /// The text of 4.2 for the state, `None` when the state has none of its own.
 pub fn exposure_message(f: &ExposureFacts) -> Option<String> {
+    if let Some(fault) = f.fault {
+        return Some(fault_message(fault, ControlKey::Exposure, f.handed_back));
+    }
     match f.state {
         ExposureState::Starting | ExposureState::Adjusting => Some("Adjusting…".to_string()),
         ExposureState::Holding => {
@@ -66,9 +176,11 @@ pub fn exposure_message(f: &ExposureFacts) -> Option<String> {
         }
         ExposureState::Paused => Some("Paused.".to_string()),
         ExposureState::Closed => Some("Starts when the camera opens.".to_string()),
-        // A2: the watchdog's texts. `no_picture` has none before 10 s.
-        ExposureState::NoPicture
-        | ExposureState::Conflict
+        // `no_picture` has no text before 10 s.
+        ExposureState::NoPicture => (f.no_picture_for > super::watchdog::NO_PICTURE_TEXT_AFTER)
+            .then(|| "No picture to measure.".to_string()),
+        // The watchdog's states carry their text in `fault`.
+        ExposureState::Conflict
         | ExposureState::Ignored
         | ExposureState::NoResponse
         | ExposureState::NotAnswering
@@ -102,7 +214,154 @@ mod tests {
             fps: 30.0,
             target_fps: 30.0,
             dropped_to: None,
+            fault: None,
+            handed_back: None,
+            no_picture_for: 0.0,
         }
+    }
+
+    #[test]
+    fn every_text_of_section_4_2() {
+        let t = |s| exposure_message(&facts(s));
+        assert_eq!(t(ExposureState::Starting).as_deref(), Some("Adjusting…"));
+        assert_eq!(t(ExposureState::Adjusting).as_deref(), Some("Adjusting…"));
+        assert_eq!(
+            t(ExposureState::LimitExposure).as_deref(),
+            Some("Exposure at the 30 fps limit and this camera has no gain. Add light or allow a longer exposure.")
+        );
+        assert_eq!(
+            t(ExposureState::NoSignal).as_deref(),
+            Some("Nothing to measure (lens covered?). Brightening slowly.")
+        );
+        assert_eq!(t(ExposureState::Paused).as_deref(), Some("Paused."));
+        assert_eq!(t(ExposureState::Closed).as_deref(), Some("Starts when the camera opens."));
+        // `no_picture` says nothing before 10 s, then one text.
+        let mut f = facts(ExposureState::NoPicture);
+        f.no_picture_for = 9.0;
+        assert_eq!(exposure_message(&f), None);
+        f.no_picture_for = 10.5;
+        assert_eq!(exposure_message(&f).as_deref(), Some("No picture to measure."));
+        assert_eq!(STRIPES_NOTE, "Short exposures under mains light can show stripes.");
+    }
+
+    #[test]
+    fn fault_texts_of_section_4_2() {
+        let x = ControlKey::Exposure;
+        let cam = Some(HandBackKind::Camera);
+        assert_eq!(
+            fault_message(Fault::Conflict, x, None),
+            "Another program keeps changing Exposure. Better Cam auto paused."
+        );
+        assert_eq!(
+            fault_message(Fault::Ignored, x, cam),
+            "The camera ignored Better Cam auto for Exposure. Back to Camera auto."
+        );
+        assert_eq!(
+            fault_message(Fault::NoResponse, x, cam),
+            "The picture does not change when Better Cam changes Exposure. Back to Camera auto."
+        );
+        assert_eq!(
+            fault_message(Fault::NotAnswering, x, cam),
+            "The camera stopped answering. Exposure went back to Camera auto."
+        );
+        assert_eq!(fault_message(Fault::Hunting, x, cam), "Exposure kept swinging. Back to Camera auto.");
+        assert_eq!(fault_message(Fault::TooSlow, x, cam), "This camera is too slow to adjust live.");
+        // A camera without Camera auto goes back to the earlier manual value.
+        let man = Some(HandBackKind::Manual);
+        assert_eq!(
+            fault_message(Fault::Hunting, ControlKey::WhiteBalance, man),
+            "White balance kept swinging. Back to its earlier value."
+        );
+        assert_eq!(
+            fault_message(Fault::NotAnswering, ControlKey::WhiteBalance, man),
+            "The camera stopped answering. White balance went back to its earlier value."
+        );
+        // The fault wins over the state.
+        let mut f = facts(ExposureState::NotAnswering);
+        f.fault = Some(Fault::NotAnswering);
+        f.handed_back = cam;
+        assert_eq!(
+            exposure_message(&f).as_deref(),
+            Some("The camera stopped answering. Exposure went back to Camera auto.")
+        );
+    }
+
+    fn wb(state: WhiteBalanceState) -> WhiteBalanceFacts {
+        WhiteBalanceFacts {
+            state,
+            kelvin: 4650,
+            warm_limit: true,
+            no_picture_for: 0.0,
+            fault: None,
+            handed_back: None,
+        }
+    }
+
+    #[test]
+    fn white_balance_texts_of_section_4_2() {
+        let t = |s| white_balance_message(&wb(s));
+        assert_eq!(t(WhiteBalanceState::Starting).as_deref(), Some("Adjusting…"));
+        assert_eq!(t(WhiteBalanceState::Adjusting).as_deref(), Some("Adjusting…"));
+        assert_eq!(t(WhiteBalanceState::Holding).as_deref(), Some("Holding · 4650 K"));
+        assert_eq!(t(WhiteBalanceState::Paused).as_deref(), Some("Paused."));
+        assert_eq!(t(WhiteBalanceState::Closed).as_deref(), Some("Starts when the camera opens."));
+        let mut f = wb(WhiteBalanceState::AtLimit);
+        f.kelvin = 2800;
+        assert_eq!(
+            white_balance_message(&f).as_deref(),
+            Some("White balance at its limit (2800 K): the light is warmer than this camera can correct. Auto Adjust can finish it.")
+        );
+        f.kelvin = 6500;
+        f.warm_limit = false;
+        assert_eq!(
+            white_balance_message(&f).as_deref(),
+            Some("White balance at its limit (6500 K): the light is cooler than this camera can correct. Auto Adjust can finish it.")
+        );
+        let mut f = wb(WhiteBalanceState::NoPicture);
+        f.no_picture_for = 12.0;
+        assert_eq!(white_balance_message(&f).as_deref(), Some("No picture to measure."));
+        f.no_picture_for = 3.0;
+        assert_eq!(white_balance_message(&f), None);
+        let mut f = wb(WhiteBalanceState::Ignored);
+        f.fault = Some(Fault::Ignored);
+        f.handed_back = Some(HandBackKind::Camera);
+        assert_eq!(
+            white_balance_message(&f).as_deref(),
+            Some("The camera ignored Better Cam auto for White balance. Back to Camera auto.")
+        );
+    }
+
+    #[test]
+    fn reasons_and_hints_of_section_2_3_and_2_9() {
+        let x = ControlKey::Exposure;
+        assert_eq!(not_offered(x, NoOffer::NoManual), "This camera has no manual exposure.");
+        assert_eq!(
+            not_offered(x, NoOffer::UnknownUnits),
+            "This camera reports exposure in units Better Cam does not know."
+        );
+        assert_eq!(not_offered(x, NoOffer::Blocked), "This camera ignored Better Cam auto.");
+        let w = ControlKey::WhiteBalance;
+        assert_eq!(not_offered(w, NoOffer::NoManual), "This camera has no manual white balance.");
+        assert_eq!(
+            not_offered(w, NoOffer::UnknownUnits),
+            "This camera reports white balance in units Better Cam does not know."
+        );
+        assert_eq!(
+            WHOLE_STOPS_HINT,
+            "No gain control: Better Cam auto works in whole stops. Add Auto Adjust for the fine trim."
+        );
+        assert_eq!(
+            LOW_LIGHT_HINT,
+            "This camera can also hold the frame rate itself: Camera auto with Low light compensation off."
+        );
+    }
+
+    #[test]
+    fn stripes_note_applies_to_short_exposures_under_mains() {
+        // 1/100 s is 2^-6.64: -7 and shorter. 1/120 s is 2^-6.9.
+        assert!(stripes(-7, Some(50)) && stripes(-7, Some(60)));
+        assert!(!stripes(-6, Some(50)) && !stripes(-6, Some(60)));
+        assert!(!stripes(-9, None) && !stripes(-9, Some(0)));
     }
 
     #[test]

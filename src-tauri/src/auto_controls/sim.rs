@@ -2,15 +2,21 @@
 //! `Stats` for the controller and executes its writes with realistic delays. Tests only.
 //!
 //! Scene: a 16x16 reflectance map (grey wall, face-like mid patch, two bright cells, dark corner), a scripted light
-//! `L(t)` (a linear factor) and optional mains flicker. Light needed is stated in stops: with `L = 2^(-need)` the
-//! picture is on target when `E + gs(G) = need` (the scale is calibrated numerically at construction for target 0.45).
+//! `L(t)` (a linear factor), a scripted light temperature `T(t)` (Kelvin) and optional mains flicker. Light needed is
+//! stated in stops: with `L = 2^(-need)` the picture is on target when `E + gs(G) = need` (the scale is calibrated
+//! numerically at construction for target 0.45).
 //!
-//! Not built yet (phase A2, with the faults it needs): white balance (`T(t)`, `K_set`), `ignore_writes`, `no_effect`,
-//! `fail`, `meddle`, the `slow` switch for every write.
+//! White balance (`SimCfg::wb`): the picture's blue-red signal is `c = α_true·(M_set − M_light)` in `ln(B/R)`, colours
+//! normalised to the luma of the grey, so the exposure meter does not see the white balance. A linear model in
+//! mired: the doc's three-point table is only a way to make such a signal; this is the signal.
+//!
+//! Faults (6.1) are public fields of [`Faults`], set by the test at any time: `ignore` (accepted, the read-back
+//! shows the old value), `no_effect` (the read-back shows the new value, the picture stays), `fail` (every write and
+//! read errors), `slow` (every write after the first takes this long), `meddles` (another program writes).
 
 use std::collections::VecDeque;
 
-use super::meter::{measure_exposure, srgb_decode, srgb_encode, GRID};
+use super::meter::{measure_exposure, srgb_decode, srgb_encode, warmth_target, GRID};
 use super::*;
 use crate::capture::controls::AccessPath;
 
@@ -20,6 +26,11 @@ pub type Light = Box<dyn Fn(f64) -> f64>;
 pub fn dim(need: f64) -> Light {
     let l = (-need).exp2();
     Box::new(move |_| l)
+}
+
+/// A constant light temperature.
+pub fn kelvin(k: f64) -> Light {
+    Box::new(move |_| k)
 }
 
 /// Gaussian noise from xorshift64*.
@@ -47,6 +58,26 @@ impl Rng {
     }
 }
 
+/// The camera has a manual white balance.
+#[derive(Clone, Copy, Debug)]
+pub struct WbSim {
+    /// `c` per mired between the setting and the light.
+    pub alpha_true: f64,
+    pub start_k: i32,
+    /// The camera has a Camera auto flag for white balance (where a hand-back goes).
+    pub can_auto: bool,
+}
+
+impl Default for WbSim {
+    fn default() -> Self {
+        WbSim {
+            alpha_true: 0.008,
+            start_k: 4600,
+            can_auto: true,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SimCfg {
     /// `F`.
@@ -61,7 +92,7 @@ pub struct SimCfg {
     pub rate_drop: bool,
     /// The camera never exceeds this rate, whatever the exposure.
     pub fps_cap: Option<f64>,
-    /// The first write to exposure after "open" takes 0.5 s.
+    /// The first write to exposure (and white balance) after "open" takes 0.5 s.
     pub slow_first_write: bool,
     pub flicker: Option<(f64, f64)>,
     /// Standard deviation of the per-frame light jitter in stops.
@@ -71,6 +102,9 @@ pub struct SimCfg {
     pub start_e: i32,
     pub start_g: i32,
     pub seed: u64,
+    pub wb: Option<WbSim>,
+    /// The camera has Camera auto for exposure.
+    pub exposure_auto: bool,
 }
 
 impl Default for SimCfg {
@@ -89,11 +123,39 @@ impl Default for SimCfg {
             start_e: -6,
             start_g: 0,
             seed: 7,
+            wb: None,
+            exposure_auto: true,
         }
     }
 }
 
+/// Another program's write.
+#[derive(Clone, Copy, Debug)]
+pub struct Meddle {
+    pub at: f64,
+    pub key: ControlKey,
+    pub value: i32,
+}
+
+/// The fault switches of 6.1.
+#[derive(Clone, Debug, Default)]
+pub struct Faults {
+    /// Writes to these controls are accepted and have no effect; the read-back shows the old value.
+    pub ignore: Vec<ControlKey>,
+    /// Writes to these controls are accepted and read back, but the picture does not change.
+    pub no_effect: Vec<ControlKey>,
+    /// Every write and read errors.
+    pub fail: bool,
+    /// Every write after the first takes this long (seconds).
+    pub slow: Option<f64>,
+    pub meddles: Vec<Meddle>,
+    /// A write that never returns.
+    pub hang: bool,
+}
+
 const GAIN_MAX: i32 = 100;
+pub const WB_MIN: i32 = 2800;
+pub const WB_MAX: i32 = 6500;
 const WRITE_S: f64 = 0.005;
 const FIRST_WRITE_S: f64 = 0.5;
 /// A write lands at the first frame starting this long after it returned.
@@ -101,6 +163,13 @@ const LAND_S: f64 = 0.1;
 /// A measurement is submitted at most this often (the engine's rate).
 const SUBMIT_EVERY: f64 = 0.066;
 const SUB: usize = 16;
+
+/// The channel multipliers of a picture whose blue over red is `e^c`, with the luma of the grey kept at 1.
+fn tint(c: f64) -> [f64; 3] {
+    let (r, b) = ((-0.5 * c).exp(), (0.5 * c).exp());
+    let n = 1.0 / (0.2126 * r + 0.7152 + 0.0722 * b);
+    [r * n, n, b * n]
+}
 
 /// The scene: reflectances, in-cell texture and the calibrated scale.
 struct Scene {
@@ -147,7 +216,7 @@ impl Scene {
         for _ in 0..40 {
             let mid = 0.5 * (lo + hi);
             scene.scale = mid.exp2();
-            let e = measure_exposure(&scene.render(0, 0, 1.0, None), 0.45).error;
+            let e = measure_exposure(&scene.render(0, 0, 1.0, 0.0, None), 0.45).error;
             if e > 0.0 {
                 lo = mid;
             } else {
@@ -173,10 +242,12 @@ impl Scene {
         }
     }
 
-    /// The statistics image of a frame exposed with `2^e` s, gain setting `g`, at light factor `l`.
-    fn render(&self, e: i32, g: i32, l: f64, mut rng: Option<&mut Rng>) -> Stats {
+    /// The statistics image of a frame exposed with `2^e` s, gain setting `g`, at light factor `l`, with the blue-red
+    /// signal `c`.
+    fn render(&self, e: i32, g: i32, l: f64, c: f64, mut rng: Option<&mut Rng>) -> Stats {
         let gain = self.gs(g).exp2();
         let base = self.scale * l * f64::from(e).exp2() * gain;
+        let colour = (c != 0.0).then(|| tint(c));
         let mut cells = Vec::with_capacity(GRID * GRID);
         for r in &self.refl {
             let mut sum = 0.0;
@@ -195,8 +266,16 @@ impl Scene {
                 };
                 sum += v;
             }
-            let m = (sum / SUB as f64) as f32;
-            cells.push([m, m, m, 1.0]);
+            let m = sum / SUB as f64;
+            cells.push(match colour {
+                None => [m as f32, m as f32, m as f32, 1.0],
+                Some(f) => [
+                    (m * f[0]).min(1.0) as f32,
+                    (m * f[1]).min(1.0) as f32,
+                    (m * f[2]).min(1.0) as f32,
+                    1.0,
+                ],
+            });
         }
         Stats { cells }
     }
@@ -208,6 +287,7 @@ struct Capture {
     e: i32,
     g: i32,
     light: f64,
+    c: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -215,6 +295,8 @@ struct Landing {
     at: f64,
     key: ControlKey,
     value: i32,
+    /// The picture changes with it (false for `no_effect`).
+    effective: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -243,21 +325,32 @@ pub struct Snap {
     pub clip: f64,
     pub e: i32,
     pub g: i32,
+    /// True white balance error `e_wb` of the landed state (noiseless); 0 without white balance.
+    pub wb_err: f64,
 }
 
 pub struct Sim {
     pub cfg: SimCfg,
+    pub faults: Faults,
     scene: Scene,
     light: Light,
+    temp: Light,
     rng: Rng,
     ms: u64,
     pub t: f64,
+    /// What the camera reports.
     dev_e: i32,
     dev_g: i32,
+    dev_k: i32,
+    /// What the picture is made with (differs from the report under `no_effect`).
+    eff_e: i32,
+    eff_g: i32,
+    eff_k: i32,
     landings: Vec<Landing>,
     queue: VecDeque<(ControlKey, i32)>,
     in_flight: Option<InFlight>,
     first_exposure_write: bool,
+    first_wb_write: bool,
     next_frame: f64,
     last_submit: f64,
     /// Delivery times of frames.
@@ -265,9 +358,18 @@ pub struct Sim {
     deliveries: VecDeque<(f64, Capture)>,
     pub paused: bool,
     pub resumed_at: f64,
+    /// Writes that went through.
     pub writes: Vec<WriteRec>,
+    /// Every write the camera received, failed ones too.
+    pub attempts: Vec<WriteRec>,
     /// Every `Write` action the controller returned, with the tick time.
     pub issued: Vec<(f64, ControlKey, i32)>,
+    pub handbacks: Vec<(f64, ControlKey, HandBack)>,
+    pub readbacks: usize,
+    /// The statuses that went with each `Emit`.
+    pub emitted: Vec<AutoStatus>,
+    /// The GPU stopped delivering measurements (W5).
+    pub no_samples: bool,
     pub history: Vec<Snap>,
     /// The highest exposure that was ever applied to a frame.
     pub max_e_applied: i32,
@@ -277,19 +379,27 @@ pub struct Sim {
 impl Sim {
     pub fn new(cfg: SimCfg, light: Light) -> Sim {
         let scene = Scene::new(cfg.s_true, cfg.bent);
+        let k0 = cfg.wb.map_or(4600, |w| w.start_k);
         Sim {
             rng: Rng::new(cfg.seed),
             dev_e: cfg.start_e,
             dev_g: cfg.start_g,
+            dev_k: k0,
+            eff_e: cfg.start_e,
+            eff_g: cfg.start_g,
+            eff_k: k0,
             max_e_applied: cfg.start_e,
             scene,
             light,
+            temp: kelvin(5000.0),
+            faults: Faults::default(),
             ms: 0,
             t: 0.0,
             landings: Vec::new(),
             queue: VecDeque::new(),
             in_flight: None,
             first_exposure_write: true,
+            first_wb_write: true,
             next_frame: 0.0,
             last_submit: f64::NEG_INFINITY,
             frames: Vec::new(),
@@ -297,31 +407,42 @@ impl Sim {
             paused: false,
             resumed_at: f64::NEG_INFINITY,
             writes: Vec::new(),
+            attempts: Vec::new(),
             issued: Vec::new(),
+            handbacks: Vec::new(),
+            readbacks: 0,
+            emitted: Vec::new(),
+            no_samples: false,
             history: Vec::new(),
             emits: 0,
             cfg,
         }
     }
 
-    /// The camera as `read_all` reports it (W4GS ranges). With `stale_exposure` the Auto flag is on and the value
-    /// is the stale one.
-    pub fn caps(&self) -> Vec<ControlInfo> {
-        let mut v = vec![ControlInfo {
-            key: ControlKey::Exposure,
-            min: -13,
-            max: -1,
-            step: 1,
-            default: -6,
-            value: self.cfg.stale_exposure.unwrap_or(self.dev_e),
-            can_auto: true,
-            can_manual: true,
-            auto: self.cfg.stale_exposure.is_some(),
-            path: AccessPath::Ks,
-        }];
-        if self.cfg.gain {
-            v.push(ControlInfo {
-                key: ControlKey::Gain,
+    /// The light's colour temperature over time (Kelvin).
+    pub fn with_temperature(mut self, temp: Light) -> Sim {
+        self.temp = temp;
+        self
+    }
+
+    /// The `ControlInfo` of one control as `read_all` reports it (W4GS ranges). With `stale_exposure` the Auto flag
+    /// is on and the value is the stale one.
+    fn info(&self, key: ControlKey) -> Option<ControlInfo> {
+        match key {
+            ControlKey::Exposure => Some(ControlInfo {
+                key,
+                min: -13,
+                max: -1,
+                step: 1,
+                default: -6,
+                value: self.cfg.stale_exposure.unwrap_or(self.dev_e),
+                can_auto: self.cfg.exposure_auto,
+                can_manual: true,
+                auto: self.cfg.stale_exposure.is_some(),
+                path: AccessPath::Ks,
+            }),
+            ControlKey::Gain if self.cfg.gain => Some(ControlInfo {
+                key,
                 min: 0,
                 max: GAIN_MAX,
                 step: 1,
@@ -331,20 +452,58 @@ impl Sim {
                 can_manual: true,
                 auto: false,
                 path: AccessPath::Ks,
-            });
+            }),
+            ControlKey::WhiteBalance => self.cfg.wb.map(|w| ControlInfo {
+                key,
+                min: WB_MIN,
+                max: WB_MAX,
+                step: 1,
+                default: 4600,
+                value: self.dev_k,
+                can_auto: w.can_auto,
+                can_manual: true,
+                auto: false,
+                path: AccessPath::Ks,
+            }),
+            _ => None,
         }
-        v
     }
 
+    pub fn caps(&self) -> Vec<ControlInfo> {
+        [ControlKey::Exposure, ControlKey::Gain, ControlKey::WhiteBalance]
+            .into_iter()
+            .filter_map(|k| self.info(k))
+            .collect()
+    }
+
+    /// What the camera reports for each driven control.
     pub fn device(&self) -> (i32, i32) {
         (self.dev_e, self.dev_g)
     }
 
-    fn oracle(&self, target: f64) -> meter::ExposureReading {
+    pub fn device_k(&self) -> i32 {
+        self.dev_k
+    }
+
+    /// The blue-red signal of a picture made with `k` under `t_light` Kelvin.
+    fn colour(&self, k: i32, t_light: f64) -> f64 {
+        self.cfg
+            .wb
+            .map_or(0.0, |w| w.alpha_true * (1e6 / f64::from(k) - 1e6 / t_light))
+    }
+
+    fn oracle(&self, target: f64, warmth: f64) -> (meter::ExposureReading, f64) {
+        let c = self.colour(self.eff_k, (self.temp)(self.t));
         let stats = self
             .scene
-            .render(self.dev_e, self.dev_g, (self.light)(self.t), None);
-        measure_exposure(&stats, target)
+            .render(self.eff_e, self.eff_g, (self.light)(self.t), c, None);
+        let wb = if self.cfg.wb.is_some() {
+            // Not `measure_white_balance` (its weights): the true `e_wb` is the signal minus the aim.
+            c - warmth_target(warmth)
+        } else {
+            0.0
+        };
+        (measure_exposure(&stats, target), wb)
     }
 
     /// The true stops of gain at a setting.
@@ -408,6 +567,7 @@ impl Sim {
         while self.ms < end {
             self.ms += 1;
             self.t = self.ms as f64 / 1000.0;
+            self.step_meddles();
             self.step_writes(ctrl);
             self.step_frames();
             self.step_deliveries(ctrl);
@@ -417,26 +577,62 @@ impl Sim {
         }
     }
 
+    /// Another program's writes land at the next frame.
+    fn step_meddles(&mut self) {
+        let t = self.t;
+        let (due, later): (Vec<Meddle>, Vec<Meddle>) = std::mem::take(&mut self.faults.meddles)
+            .into_iter()
+            .partition(|m| m.at <= t);
+        self.faults.meddles = later;
+        for m in due {
+            self.landings.push(Landing {
+                at: t,
+                key: m.key,
+                value: m.value,
+                effective: true,
+            });
+        }
+    }
+
     fn step_writes(&mut self, ctrl: &mut AutoController) {
         if let Some(w) = self.in_flight {
-            if self.t >= w.done {
+            if self.t >= w.done && !self.faults.hang {
                 self.in_flight = None;
-                self.writes.push(WriteRec {
+                let rec = WriteRec {
                     started: w.started,
                     done: w.done,
                     key: w.key,
                     value: w.value,
-                });
-                self.landings.push(Landing {
-                    at: w.done + LAND_S,
-                    key: w.key,
-                    value: w.value,
-                });
+                };
+                self.attempts.push(rec);
+                let reported = |s: &Sim| match w.key {
+                    ControlKey::Exposure => s.dev_e,
+                    ControlKey::Gain => s.dev_g,
+                    _ => s.dev_k,
+                };
+                let (ok, readback) = if self.faults.fail {
+                    (false, None)
+                } else if self.faults.ignore.contains(&w.key) {
+                    (true, Some(reported(self)))
+                } else {
+                    (true, Some(w.value))
+                };
+                if ok {
+                    self.writes.push(rec);
+                    if !self.faults.ignore.contains(&w.key) {
+                        self.landings.push(Landing {
+                            at: w.done + LAND_S,
+                            key: w.key,
+                            value: w.value,
+                            effective: !self.faults.no_effect.contains(&w.key),
+                        });
+                    }
+                }
                 ctrl.on_write_done(WriteDone {
                     key: w.key,
                     requested: w.value,
-                    readback: Some(w.value),
-                    ok: true,
+                    readback,
+                    ok,
                     started: w.started,
                     done: w.done,
                 });
@@ -444,13 +640,16 @@ impl Sim {
         }
         if self.in_flight.is_none() {
             if let Some((key, value)) = self.queue.pop_front() {
-                let slow = key == ControlKey::Exposure
-                    && self.first_exposure_write
-                    && self.cfg.slow_first_write;
-                if key == ControlKey::Exposure {
-                    self.first_exposure_write = false;
-                }
-                let d = if slow { FIRST_WRITE_S } else { WRITE_S };
+                let first = match key {
+                    ControlKey::Exposure => std::mem::replace(&mut self.first_exposure_write, false),
+                    ControlKey::WhiteBalance => std::mem::replace(&mut self.first_wb_write, false),
+                    _ => false,
+                };
+                let d = if first && self.cfg.slow_first_write {
+                    FIRST_WRITE_S
+                } else {
+                    self.faults.slow.unwrap_or(WRITE_S)
+                };
                 self.in_flight = Some(InFlight {
                     key,
                     value,
@@ -471,15 +670,31 @@ impl Sim {
             if self.landings[i].at <= start {
                 let l = self.landings.remove(i);
                 match l.key {
-                    ControlKey::Exposure => self.dev_e = l.value,
-                    _ => self.dev_g = l.value,
+                    ControlKey::Exposure => {
+                        self.dev_e = l.value;
+                        if l.effective {
+                            self.eff_e = l.value;
+                        }
+                    }
+                    ControlKey::Gain => {
+                        self.dev_g = l.value;
+                        if l.effective {
+                            self.eff_g = l.value;
+                        }
+                    }
+                    _ => {
+                        self.dev_k = l.value;
+                        if l.effective {
+                            self.eff_k = l.value;
+                        }
+                    }
                 }
             } else {
                 i += 1;
             }
         }
-        self.max_e_applied = self.max_e_applied.max(self.dev_e);
-        let tau = f64::from(self.dev_e).exp2();
+        self.max_e_applied = self.max_e_applied.max(self.eff_e);
+        let tau = f64::from(self.eff_e).exp2();
         let mut interval = (1.0 / self.cfg.fps).max(if self.cfg.rate_drop {
             tau / 0.8
         } else {
@@ -504,9 +719,10 @@ impl Sim {
                 start + 2.0 * interval,
                 Capture {
                     t: start,
-                    e: self.dev_e,
-                    g: self.dev_g,
+                    e: self.eff_e,
+                    g: self.eff_g,
                     light,
+                    c: self.colour(self.eff_k, (self.temp)(start)),
                 },
             ));
         }
@@ -515,10 +731,10 @@ impl Sim {
     fn step_deliveries(&mut self, ctrl: &mut AutoController) {
         while self.deliveries.front().is_some_and(|(at, _)| *at <= self.t) {
             let (_, c) = self.deliveries.pop_front().expect("checked");
-            if self.paused {
+            if self.paused || self.no_samples {
                 continue;
             }
-            let stats = self.scene.render(c.e, c.g, c.light, Some(&mut self.rng));
+            let stats = self.scene.render(c.e, c.g, c.light, c.c, Some(&mut self.rng));
             ctrl.on_sample(
                 &MeterSample {
                     token: 1,
@@ -539,22 +755,60 @@ impl Sim {
                     self.issued.push((self.t, key, value));
                     self.queue.push_back((key, value));
                 }
-                Action::Emit => self.emits += 1,
-                Action::ReadBack { .. } | Action::HandBack { .. } => {}
+                Action::ReadBack { key } => {
+                    self.readbacks += 1;
+                    if self.faults.fail {
+                        ctrl.on_read_failed(key, self.t);
+                    } else if let Some(info) = self.info(key) {
+                        ctrl.on_readback(&info, self.t);
+                    }
+                }
+                Action::HandBack { key, to } => self.handbacks.push((self.t, key, to)),
+                Action::Emit => {
+                    self.emits += 1;
+                    self.emitted.extend(ctrl.emitted().cloned());
+                }
             }
         }
-        let o = self.oracle(ctrl_target(ctrl));
+        let (o, wb_err) = self.oracle(ctrl.cfg.exposure.target, ctrl.cfg.white_balance.warmth);
         self.history.push(Snap {
             t: self.t,
             err: o.error,
             clip: o.clip,
-            e: self.dev_e,
-            g: self.dev_g,
+            e: self.eff_e,
+            g: self.eff_g,
+            wb_err,
         });
     }
 }
 
-/// The target the oracle measures against (the controller's own setting).
-fn ctrl_target(ctrl: &AutoController) -> f64 {
-    ctrl.cfg.exposure.target
+/// The controls W4GS reports (the table of 2.2): exposure -13..-1 (default -6), gain 0..100, white balance 2800..6500
+/// (default 4600), the rest as the table. Camera auto on exposure, white balance and focus.
+pub fn w4gs() -> Vec<ControlInfo> {
+    let c = |key, min, max, default, can_auto| ControlInfo {
+        key,
+        min,
+        max,
+        step: 1,
+        default,
+        value: default,
+        can_auto,
+        can_manual: true,
+        auto: false,
+        path: AccessPath::Ks,
+    };
+    vec![
+        c(ControlKey::Brightness, -64, 64, 0, false),
+        c(ControlKey::Contrast, 0, 64, 32, false),
+        c(ControlKey::Hue, -40, 40, 0, false),
+        c(ControlKey::Saturation, 0, 128, 64, false),
+        c(ControlKey::Sharpness, 0, 6, 3, false),
+        c(ControlKey::Gamma, 72, 500, 100, false),
+        c(ControlKey::WhiteBalance, 2800, 6500, 4600, true),
+        c(ControlKey::BacklightCompensation, 0, 2, 0, false),
+        c(ControlKey::Gain, 0, 100, 0, false),
+        c(ControlKey::PowerlineFrequency, 0, 2, 1, false),
+        c(ControlKey::Exposure, -13, -1, -6, true),
+        c(ControlKey::Focus, 1, 1023, 512, true),
+    ]
 }

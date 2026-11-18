@@ -93,6 +93,10 @@ holds; otherwise the mode is not listed and the reason is in the tooltip.
 
 `blocked` is set by the watchdog when a camera ignores writes (2.7) and stored per camera; "Try again" clears it.
 
+A2 note: "gain range under 0.5 stop" is read as a gain control with fewer than 6 steps (`(max − min) / step < 6`):
+with `S = 3` stops across the range, that is a finest step coarser than half a stop, too coarse to trim with. The
+units of a range say nothing about stops, so this is the one test the device facts allow.
+
 ### 2.4 The measurement
 
 **Where.** On the render thread, right after the input convert (YUV/RGB → RGBA8, colour space and range applied) and
@@ -129,9 +133,22 @@ near-black cells count less, near-white cells count a little):
 **White balance error.** Gray world on the cells Auto Adjust's white balance trusts (not near black, not near white,
 not strongly saturated; same smooth weights). `m` = weighted mean linear RGB of those cells.
 `conf_wb = smoothstep(0.02, 0.12, Σw / Σc)`. Signal `c = ln(m_B / m_R)` (the blue-red axis; colour temperature moves
-along it). Target `c* = −0.25 · warmth`, warmth in −1..+1 (+1 = warmer, B/R ≈ 0.78). Error `e_wb = c − c*`.
-If the Auto Adjust warmth work (built in parallel) defines another warmth scale, phase A2 adopts that scale so one
-"warmth +0.3" means the same in both places.
+along it). Target `c*(warmth)`, warmth in −1..+1 (+1 = warmer). Error `e_wb = c − c*`.
+
+**Warmth scale (A2, constant changed: old → new).** Old: `c* = −0.25 · warmth` (B/R ≈ 0.78 at +1). New: Auto Adjust's
+scale (`fx::auto_adjust::white_aim`, commit da34514, which merged first), so "warmth +0.3" is the same colour in the
+filter and on the device. The aim is the colour of a blackbody whose temperature is linear in **mired** from 5500 K at
+warmth 0 to 4000 K at +1 and 7000 K at −1, relative to 5500 K: `M(w) = 10⁶/5500 + |w| · (10⁶/K_end − 10⁶/5500)` with
+`K_end = 4000` (w > 0) or `7000` (w < 0); `aim = blackbody(10⁶/M) / blackbody(5500 K)`, normalised to luma 1. Then
+`c*(w) = ln(aim_B / aim_R)`. The device loop calls `white_aim(w, 0)` itself (`meter::warmth_target`), so the two cannot
+drift apart.
+
+| warmth | −1 | −0.5 | 0 | +0.3 | +0.5 | +1 |
+|---|---|---|---|---|---|---|
+| `c*` | +0.380 | +0.192 | 0 | −0.204 | −0.342 | −0.694 |
+| B/R | 1.46 | 1.21 | 1.00 | 0.82 | 0.71 | 0.50 |
+
+Why: one scale for the same word (owner decision). The old line was a placeholder, 2.5 times too gentle at +1.
 
 **Why the loop is closed and what that implies.** Unlike Auto Adjust (feed-forward on its own input), every write
 changes what the meter sees. Delay from write to measurement: USB write (2-7 ms; 200-700 ms for the first write to
@@ -295,6 +312,10 @@ keeps values across a reopen (measured on W4GS), so a reopen shows no flash.
   badly exposed picture. Exposure has priority.
 - Saturation: `K` at `K_min` or `K_max` and `|ê_wb| > B_out` for 3 s → `at_limit`.
 - Tint (green-magenta) has no device control; it stays with Auto Adjust.
+- **Learning `α` (A2 note, constant added).** The doc says "like `S`" but `S` learns from moves of at least 0.2 stop;
+  in `ln(B/R)` that is 0.14, which a 20 mired step (0.12 at the initial `α`) never reaches. The loop learns from
+  batches whose predicted change `|α·ΔM|` is at least **0.06** (10 mired at the initial `α`), once per batch, with
+  `conf_wb ≥ 0.8` before and after, and only when no exposure write came between the batch and its measurement.
 
 ### 2.7 Watchdog
 
@@ -314,6 +335,24 @@ to **Camera auto** if the camera has it (the safest picture), else to the `prior
 
 Saturation never hands back (2.5.9). The step bound (`step_max`, `ΔM_max`), the no-signal drift and the highlight
 guard (2.5.5) are the guarantees against black or white.
+
+**Notes from A2 (how the table is built; one constant changed).**
+
+- **W3 white balance threshold, 30 → 15 mired (constant changed).** Normal's `ΔM_max` is 20 mired and Slow's 10, so
+  "predicted change ≥ 30 mired" could only ever fire at Fast. 15 judges every Normal batch.
+- **W3 only judges what the meter can see.** A batch is judged when the decision that made it and the picture now
+  are confident (`conf ≥ 0.5`), unclipped (`clip < 0.05`) and inside the meter's range (`|ê| < 3.9`; at ±4 stops the
+  meter only says "at least"). Found by case 11: a lamp 10 stops too dark reads +4 before and after a one-stop step.
+  If the picture has not moved by 15 % yet, the loop waits (up to 3 s after the write) until 0.5 s of such samples
+  back it up; only then is it a strike. A batch that answered ends the strikes.
+- **W5** counts from the newest sample's arrival (or the loop's start / resume), not its capture time, so a long
+  exposure (late frames) is not "no picture".
+- **W6** replaces the decision of a tick once a second (the read-back runs alone); a re-take is a write of our value.
+  Two mismatches within 0.5 s (exposure and gain of the same meddling) are one event.
+- **Halts.** A fault ends the loop and keeps its status (state, text, `handed_back`) until the control's mode is
+  something other than the one it was handed to; a conflict keeps the mode (Better Cam auto) and waits for `resume`.
+  Hand-back targets: Camera auto where the camera has it (exposure, white balance), else the prior manual value
+  (the camera default if none was recorded); gain goes to its prior value (its Camera auto flag if that was on, 2.9).
 
 ### 2.8 Where it runs
 

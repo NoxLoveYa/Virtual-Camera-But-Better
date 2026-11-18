@@ -6,20 +6,35 @@
 //! [`Action`]s it returns. Time is `f64` seconds on one clock (`Instant` in the app, injected in tests); the runner
 //! converts QPC capture times.
 //!
-//! # Layout (what each phase adds)
-//! * `meter.rs` (A1): the exposure error from the 16x16 statistics image (2.4). A2 adds the white balance error.
-//! * `exposure.rs` (A1): the exposure + gain loop (2.5): limits, decision, allocation, gain learning, frame-rate
-//!   guard, saturation, engagement.
-//! * `status.rs` (A1 for the exposure texts, A2 adds white balance and hand-back texts): status text made in Rust.
-//! * `white_balance.rs` (A2, not yet): the white balance loop (2.6). It plugs in beside `exposure` in
-//!   [`AutoController`]: one more `Option<WhiteBalanceLoop>` field, ticked after the exposure loop, which has priority
-//!   (it must see `exposure.busy()`/`exposure.unsettled()` and the time of the last exposure batch).
-//! * `watchdog.rs` (A2, not yet): W1-W6 (2.7). It reads [`WriteDone`] results, read-backs and the tick, and returns
-//!   [`Action::HandBack`]. The hooks are in place: [`WriteDone::ok`] / `readback`, [`AutoController::on_readback`]
-//!   (a no-op now), [`ExposureState`] has the hand-back states, [`Learned::blocked`].
+//! # Layout
+//! * `meter.rs`: the exposure error and the white balance error from the 16x16 statistics image (2.4), and the warmth
+//!   scale (Auto Adjust's).
+//! * `exposure.rs`: the exposure + gain loop (2.5): limits, decision, allocation, gain learning, frame-rate guard,
+//!   saturation, engagement.
+//! * `white_balance.rs`: the white balance loop (2.6). It sits beside the exposure loop in [`AutoController`], which
+//!   ticks it second: exposure has priority (see [`exposure::ExposureView`]).
+//! * `watchdog.rs`: W1-W6 (2.7), one [`watchdog::Watchdog`] per loop. A loop that gets a [`watchdog::Fault`] stops,
+//!   keeps a [`watchdog::Halt`] and answers with [`Action::HandBack`] (or nothing, for a conflict).
+//! * `status.rs`: every status text of 4.2, the reasons of 2.3 and the hints of 2.9, made in Rust.
 //! * `sim.rs` (tests only): the simulated camera (6.1). `tests.rs`: the cases of 6.2.
 //!
 //! The runner (A4) lives in `runner.rs`; the hub and commands are not part of this module.
+//!
+//! # Contract with the runner (A4)
+//! * [`AutoController::tick`] every 100 ms; execute its actions in order. Every [`Action::Write`] gets exactly one
+//!   [`AutoController::on_write_done`] (also when it failed or timed out: a write that never reports back is a W1
+//!   fault after 3 s). `readback` is what a read right after the write showed.
+//! * [`Action::ReadBack`]: read the control and call [`AutoController::on_readback`] (or
+//!   [`AutoController::on_read_failed`]). Also feed the powerline frequency control the same way when it changes:
+//!   the stripes note reads it.
+//! * [`Action::HandBack`]: write the control's Camera auto flag or the manual value, then record the new mode and call
+//!   [`AutoController::set_modes`] with it. A hand-back status stays in [`AutoController::status`] until the mode
+//!   becomes something other than the one the control was handed to.
+//! * On [`Action::Emit`] send [`AutoController::emitted`] as `auto-status`. Its `learned` and `resume` are present when
+//!   they changed since the emit before: store them in the camera's record. ([`AutoController::status`] is the same
+//!   for polling; its `learned` is present until the next emit takes it.)
+//! * `Fault::Conflict` hands nothing back: the mode stays Better Cam auto, the loop waits for
+//!   [`AutoController::resume`]. A control whose camera ignores writes is `blocked` in [`Learned`]: store it.
 
 use std::collections::BTreeMap;
 
@@ -31,6 +46,8 @@ use crate::fx::auto_adjust::Stats;
 pub mod exposure;
 pub mod meter;
 pub mod status;
+pub mod watchdog;
+pub mod white_balance;
 
 #[cfg(test)]
 mod sim;
@@ -38,6 +55,7 @@ mod sim;
 mod tests;
 
 use exposure::{ExposureCaps, ExposureLoop};
+use white_balance::{WhiteBalanceCaps, WhiteBalanceLoop};
 
 // ---------------------------------------------------------------------------------------------------------------
 // Settings (5.1: the stored per-camera record)
@@ -112,7 +130,7 @@ impl Default for ExposureCfg {
     }
 }
 
-/// White balance loop settings (phase A2 uses them).
+/// White balance loop settings.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WhiteBalanceCfg {
@@ -161,13 +179,13 @@ pub struct Learned {
     /// `S`: stops across the whole gain range, `0.5..=6`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gain_stops: Option<f64>,
-    /// `alpha`: colour signal per mired, `0.002..=0.02` (A2).
+    /// `alpha`: colour signal per mired, `0.002..=0.02`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wb_alpha: Option<f64>,
     /// Capture fps (rounded, as text) to the longest exposure that held it.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub rate_caps: BTreeMap<String, i32>,
-    /// Controls whose Better Cam auto is blocked because the camera ignores writes (A2).
+    /// Controls whose Better Cam auto is blocked because the camera ignores writes (W2); "Try again" clears it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub blocked: Vec<ControlKey>,
 }
@@ -192,12 +210,24 @@ pub struct Resume {
     pub white_balance: Option<i32>,
 }
 
+/// What the controls were before Better Cam auto took them (2.5.11 step 1): where a hand-back puts them when the
+/// camera has no Camera auto (2.7). A missing value is the camera's default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Prior {
+    pub exposure: Option<i32>,
+    pub gain: Option<i32>,
+    /// Gain had its own Camera auto flag on (2.9): a hand-back switches it on again.
+    pub gain_auto: bool,
+    pub white_balance: Option<i32>,
+}
+
 /// The mode of each loop, and where it starts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Modes {
     pub exposure: Mode,
     pub white_balance: Mode,
     pub resume: Resume,
+    pub prior: Prior,
     /// The hub already wrote the seed values (`apply_on_open`): the loop starts from them without writing. When
     /// false the loop's first action is the seed write (exposure first, then gain; 2.5.11).
     pub seeded: bool,
@@ -253,15 +283,32 @@ pub enum HandBack {
     Manual(i32),
 }
 
+/// [`HandBack`] as the card shows it (5.4 `handed_back`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandBackKind {
+    Camera,
+    Manual,
+}
+
+impl From<HandBack> for HandBackKind {
+    fn from(h: HandBack) -> HandBackKind {
+        match h {
+            HandBack::CameraAuto => HandBackKind::Camera,
+            HandBack::Manual(_) => HandBackKind::Manual,
+        }
+    }
+}
+
 /// What the runner must do.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Action {
     /// Write the manual value. Write actions of one tick run in order; the runner reports each with
     /// [`AutoController::on_write_done`].
     Write { key: ControlKey, value: i32 },
-    /// Read the control and report with [`AutoController::on_readback`] (A2: W6).
+    /// Read the control and report with [`AutoController::on_readback`] (W6).
     ReadBack { key: ControlKey },
-    /// Stop the loop for `key` and give the control back (A2: watchdog).
+    /// Stop the loop for `key` and give the control back (watchdog). Gain is handed back with exposure.
     HandBack { key: ControlKey, to: HandBack },
     /// The status changed: emit `auto-status`.
     Emit,
@@ -270,7 +317,7 @@ pub enum Action {
 // ---------------------------------------------------------------------------------------------------------------
 // Status (5.4)
 
-/// The states of a loop as the card shows them (5.4). A1 produces the first nine; the rest are the watchdog's (A2).
+/// The states of the exposure loop as the card shows them (5.4). The last five are the watchdog's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExposureState {
@@ -312,32 +359,82 @@ pub struct ExposureStatus {
     pub target_fps: f64,
     /// The text of 4.2, made in Rust so tests can check it.
     pub message: Option<String>,
+    /// Where the controls went when the watchdog stopped the loop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handed_back: Option<HandBackKind>,
+    /// The stripes note (2.5.10), when it applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// The states of the white balance loop (5.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WhiteBalanceState {
+    Starting,
+    Adjusting,
+    Holding,
+    AtLimit,
+    NoPicture,
+    Paused,
+    Closed,
+    Conflict,
+    Ignored,
+    NoResponse,
+    NotAnswering,
+    Hunting,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct WhiteBalanceStatus {
+    pub state: WhiteBalanceState,
+    pub kelvin: i32,
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handed_back: Option<HandBackKind>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct AutoStatus {
     pub exposure: Option<ExposureStatus>,
+    pub white_balance: Option<WhiteBalanceStatus>,
     /// Present on entering `holding` (at most once per 10 s): the store persists it.
     pub resume: Option<Resume>,
-    // A2: `white_balance: Option<WhiteBalanceStatus>`.
+    /// Present when the learned values changed since the last emitted status: the store persists them.
+    pub learned: Option<Learned>,
 }
 
 /// Whether Better Cam auto is offered for a loop, and how (2.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Offer {
     Full,
-    /// Exposure in whole stops only (no usable gain).
+    /// Exposure in whole stops only (no usable gain, 2.9).
     Stops,
     No(NoOffer),
 }
 
+impl Offer {
+    pub fn offered(self) -> bool {
+        !matches!(self, Offer::No(_))
+    }
+
+    /// The reason text of a mode that is not offered (the tooltip of the disabled option).
+    pub fn why(self, key: ControlKey) -> Option<String> {
+        match self {
+            Offer::No(why) => Some(status::not_offered(key, why)),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoOffer {
+    /// The control is absent or does not take manual values.
     NoManual,
+    /// The range does not look like log2 seconds (exposure) or Kelvin (white balance).
     UnknownUnits,
+    /// The watchdog found that the camera ignores the writes; "Try again" clears it.
     Blocked,
-    /// Phase A2 has not built it yet.
-    NotBuilt,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -353,22 +450,63 @@ pub struct AutoController {
     cfg: AutoCfg,
     modes: Modes,
     learned: Learned,
+    /// The learned values the last emitted status carried.
+    learned_sent: Learned,
     session: Option<u64>,
     exposure: Option<ExposureLoop>,
+    white_balance: Option<WhiteBalanceLoop>,
+    /// Mains frequency from the powerline control, for the stripes note.
+    mains: Option<u32>,
     last_status: Option<AutoStatus>,
     last_emit: f64,
+}
+
+/// How much a status differs from the last emitted one.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Change {
+    Same,
+    /// Only numbers moved: emit at most twice a second.
+    Moved,
+    /// The state, a text or an end of the loop changed: emit now.
+    Visible,
+}
+
+/// The mains frequency a powerline control value means (Disabled 0, 50 Hz 1, 60 Hz 2, Auto 3).
+fn mains_of(value: i32) -> Option<u32> {
+    match value {
+        1 => Some(50),
+        2 => Some(60),
+        _ => None,
+    }
 }
 
 impl AutoController {
     /// `caps` is what the device reports now (`ControlInfo` of every control it has).
     pub fn new(caps: &[ControlInfo], cfg: AutoCfg, learned: Learned, modes: Modes) -> AutoController {
         let cfg = cfg.sanitized();
+        // A loop exists for a control that can run it (2.3 without `blocked`: "Try again" clears that).
+        let ex = Self::offer(caps, ControlKey::Exposure, &Learned::default());
+        let wb = Self::offer(caps, ControlKey::WhiteBalance, &Learned::default());
         let mut c = AutoController {
             cfg,
             modes,
+            learned_sent: learned.clone(),
             learned,
             session: None,
-            exposure: ExposureCaps::from_controls(caps).map(|caps| ExposureLoop::new(caps, cfg.exposure)),
+            exposure: ex
+                .offered()
+                .then(|| ExposureCaps::from_controls(caps))
+                .flatten()
+                .map(|caps| ExposureLoop::new(caps, cfg.exposure)),
+            white_balance: wb
+                .offered()
+                .then(|| WhiteBalanceCaps::from_controls(caps))
+                .flatten()
+                .map(|caps| WhiteBalanceLoop::new(caps, cfg.white_balance)),
+            mains: caps
+                .iter()
+                .find(|c| c.key == ControlKey::PowerlineFrequency)
+                .and_then(|c| mains_of(c.value)),
             last_status: None,
             last_emit: f64::NEG_INFINITY,
         };
@@ -376,24 +514,43 @@ impl AutoController {
         c
     }
 
-    /// 2.3, for the DTOs. A1 decides the exposure loop; the white balance loop is phase A2.
+    /// 2.3 and 2.9, for the DTOs: whether Better Cam auto is offered for each loop, and how.
     pub fn support(caps: &[ControlInfo], learned: &Learned) -> Support {
-        let exposure = if learned.blocked.contains(&ControlKey::Exposure) {
-            Offer::No(NoOffer::Blocked)
-        } else {
-            match caps.iter().find(|c| c.key == ControlKey::Exposure) {
-                None => Offer::No(NoOffer::NoManual),
-                Some(c) if !c.can_manual => Offer::No(NoOffer::NoManual),
-                Some(c) if c.min < -16 || c.max > 5 || c.step != 1 => Offer::No(NoOffer::UnknownUnits),
-                Some(_) => match ExposureCaps::from_controls(caps) {
-                    Some(c) if c.gain.is_some() => Offer::Full,
-                    _ => Offer::Stops,
-                },
-            }
-        };
         Support {
-            exposure,
-            white_balance: Offer::No(NoOffer::NotBuilt),
+            exposure: Self::offer(caps, ControlKey::Exposure, learned),
+            white_balance: Self::offer(caps, ControlKey::WhiteBalance, learned),
+        }
+    }
+
+    fn offer(caps: &[ControlInfo], key: ControlKey, learned: &Learned) -> Offer {
+        if learned.blocked.contains(&key) {
+            return Offer::No(NoOffer::Blocked);
+        }
+        let Some(c) = caps.iter().find(|c| c.key == key) else {
+            return Offer::No(NoOffer::NoManual);
+        };
+        if !c.can_manual {
+            return Offer::No(NoOffer::NoManual);
+        }
+        match key {
+            ControlKey::WhiteBalance => {
+                // Kelvin: `min >= 1500`, `max <= 12000`, `max - min >= 1000`.
+                if c.min < 1500 || c.max > 12_000 || c.max - c.min < 1000 {
+                    Offer::No(NoOffer::UnknownUnits)
+                } else {
+                    Offer::Full
+                }
+            }
+            _ => {
+                // log2 seconds: `min >= -16`, `max <= 5`, `step == 1`.
+                if c.min < -16 || c.max > 5 || c.step != 1 {
+                    Offer::No(NoOffer::UnknownUnits)
+                } else if ExposureCaps::from_controls(caps).is_some_and(|c| c.gain.is_some()) {
+                    Offer::Full
+                } else {
+                    Offer::Stops
+                }
+            }
         }
     }
 
@@ -401,6 +558,9 @@ impl AutoController {
         self.cfg = cfg.sanitized();
         if let Some(e) = &mut self.exposure {
             e.set_cfg(self.cfg.exposure);
+        }
+        if let Some(w) = &mut self.white_balance {
+            w.set_cfg(self.cfg.white_balance);
         }
     }
 
@@ -410,14 +570,40 @@ impl AutoController {
     }
 
     fn apply_modes(&mut self) {
+        let m = self.modes;
         if let Some(e) = &mut self.exposure {
-            e.set_engaged(self.modes.exposure == Mode::App, self.modes.resume, self.modes.seeded);
+            e.set_mode(m.exposure, m.resume, m.seeded, m.prior);
+        }
+        if let Some(w) = &mut self.white_balance {
+            w.set_mode(m.white_balance, m.resume, m.seeded, m.prior);
+        }
+    }
+
+    /// The user pressed "Resume" after a conflict, or "Try again" after the camera ignored Better Cam auto: the
+    /// loop forgets its halt and `blocked` is cleared. A loop that was handed back starts again when the mode is
+    /// set to Better Cam auto ([`AutoController::set_modes`]); a paused one (conflict) starts again now.
+    pub fn resume(&mut self, key: ControlKey) {
+        match key {
+            ControlKey::Exposure | ControlKey::Gain => {
+                self.learned.blocked.retain(|k| *k != ControlKey::Exposure);
+                if let Some(e) = &mut self.exposure {
+                    e.resume();
+                }
+            }
+            ControlKey::WhiteBalance => {
+                self.learned.blocked.retain(|k| *k != ControlKey::WhiteBalance);
+                if let Some(w) = &mut self.white_balance {
+                    w.resume();
+                }
+            }
+            _ => {}
         }
     }
 
     /// Whether any loop needs measurements (the runner sets `Shared.metering` from it).
     pub fn wants_meter(&self) -> bool {
         self.exposure.as_ref().is_some_and(ExposureLoop::engaged)
+            || self.white_balance.as_ref().is_some_and(WhiteBalanceLoop::engaged)
     }
 
     /// A measurement arrived. `capture_time` is the frame's capture time on the controller's clock.
@@ -428,17 +614,63 @@ impl AutoController {
         if let Some(e) = &mut self.exposure {
             e.on_sample(&s.stats, capture_time);
         }
-    }
-
-    pub fn on_write_done(&mut self, w: WriteDone) {
-        if let Some(e) = &mut self.exposure {
-            e.on_write_done(w);
+        if let Some(w) = &mut self.white_balance {
+            w.on_sample(&s.stats, capture_time);
         }
     }
 
-    /// The 1 Hz read-back of a driven control (W6, phase A2). Deliberately a no-op in A1: the device's reported
-    /// exposure is stale while Camera auto is on, so the loop never seeds from it (2.5.11).
-    pub fn on_readback(&mut self, _info: &ControlInfo, _now: f64) {}
+    pub fn on_write_done(&mut self, w: WriteDone) {
+        match w.key {
+            ControlKey::Exposure | ControlKey::Gain => {
+                if let Some(e) = &mut self.exposure {
+                    e.on_write_done(w);
+                }
+            }
+            ControlKey::WhiteBalance => {
+                if let Some(l) = &mut self.white_balance {
+                    l.on_write_done(w);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The answer to an [`Action::ReadBack`] (W6): a driven control that is not as we left it (Auto flag on, another
+    /// value) is taken back, three times a minute at most. The powerline control, when the runner reads it, feeds the
+    /// stripes note. The device's reported exposure is never used to seed a loop (2.5.11).
+    pub fn on_readback(&mut self, info: &ControlInfo, now: f64) {
+        match info.key {
+            ControlKey::Exposure | ControlKey::Gain => {
+                if let Some(e) = &mut self.exposure {
+                    e.on_readback(info, now);
+                }
+            }
+            ControlKey::WhiteBalance => {
+                if let Some(w) = &mut self.white_balance {
+                    w.on_readback(info, now);
+                }
+            }
+            ControlKey::PowerlineFrequency => self.mains = mains_of(info.value),
+            _ => {}
+        }
+    }
+
+    /// A read-back failed (W1: three failures in a row stop the loop).
+    pub fn on_read_failed(&mut self, key: ControlKey, now: f64) {
+        match key {
+            ControlKey::Exposure | ControlKey::Gain => {
+                if let Some(e) = &mut self.exposure {
+                    e.on_read_failed(now);
+                }
+            }
+            ControlKey::WhiteBalance => {
+                if let Some(w) = &mut self.white_balance {
+                    w.on_read_failed(now);
+                }
+            }
+            _ => {}
+        }
+    }
 
     pub fn tick(&mut self, now: f64, facts: &SessionFacts) -> Vec<Action> {
         if facts.token != self.session {
@@ -446,44 +678,98 @@ impl AutoController {
             if let Some(e) = &mut self.exposure {
                 e.reset_session();
             }
+            if let Some(w) = &mut self.white_balance {
+                w.reset_session();
+            }
         }
         let mut actions = Vec::new();
+        let wb_busy = self.white_balance.as_ref().is_some_and(WhiteBalanceLoop::busy);
         if let Some(e) = &mut self.exposure {
-            actions.extend(e.tick(now, facts, &mut self.learned));
+            actions.extend(e.tick(now, facts, &mut self.learned, wb_busy));
         }
-        // A2: white balance loop, then the watchdog.
+        let view = self.exposure.as_ref().map_or_else(exposure::ExposureView::idle, |e| e.view());
+        if let Some(w) = &mut self.white_balance {
+            actions.extend(w.tick(now, facts, &mut self.learned, &view));
+        }
         let status = self.status();
         if self.status_changed(now, &status) {
             self.last_status = Some(status);
             self.last_emit = now;
+            self.learned_sent = self.learned.clone();
             actions.push(Action::Emit);
         }
         actions
     }
 
-    /// Emit when the visible state changed; while only values move, at most twice a second.
+    /// How the visible state differs from the last emitted one.
     fn status_changed(&self, now: f64, status: &AutoStatus) -> bool {
         let Some(old) = &self.last_status else {
-            return status.exposure.is_some();
+            return status.exposure.is_some() || status.white_balance.is_some();
         };
-        let (Some(o), Some(n)) = (&old.exposure, &status.exposure) else {
-            return old.exposure.is_some() != status.exposure.is_some();
-        };
-        if o.state != n.state || o.message != n.message || status.resume != old.resume {
-            return true;
+        let mut change = Change::Same;
+        let mut up = |c: Change| change = change.max(c);
+        match (&old.exposure, &status.exposure) {
+            (None, None) => {}
+            (Some(o), Some(n)) => {
+                if o.state != n.state || o.message != n.message || o.handed_back != n.handed_back || o.note != n.note
+                {
+                    up(Change::Visible);
+                } else if o.exposure != n.exposure
+                    || o.gain != n.gain
+                    || o.cap != n.cap
+                    || o.max_gain != n.max_gain
+                {
+                    up(Change::Moved);
+                }
+            }
+            _ => up(Change::Visible),
         }
-        let moved = o.exposure != n.exposure || o.gain != n.gain || o.cap != n.cap || o.max_gain != n.max_gain;
-        moved && now - self.last_emit >= 0.5
+        match (&old.white_balance, &status.white_balance) {
+            (None, None) => {}
+            (Some(o), Some(n)) => {
+                if o.state != n.state || o.message != n.message || o.handed_back != n.handed_back {
+                    up(Change::Visible);
+                } else if o.kelvin != n.kelvin {
+                    up(Change::Moved);
+                }
+            }
+            _ => up(Change::Visible),
+        }
+        if status.resume != old.resume {
+            up(Change::Visible);
+        }
+        if status.learned.is_some() {
+            up(Change::Moved);
+        }
+        match change {
+            Change::Same => false,
+            Change::Moved => now - self.last_emit >= 0.5,
+            Change::Visible => true,
+        }
     }
 
     pub fn status(&self) -> AutoStatus {
-        match &self.exposure {
-            Some(e) => AutoStatus {
-                exposure: e.status(&self.learned),
-                resume: e.resume_report(),
-            },
-            None => AutoStatus::default(),
+        let exposure = self.exposure.as_ref().and_then(|e| e.status(&self.learned, self.mains));
+        let white_balance = self.white_balance.as_ref().and_then(|w| w.status(&self.learned));
+        let from_exposure = self.exposure.as_ref().and_then(ExposureLoop::resume_report);
+        let from_white_balance = self.white_balance.as_ref().and_then(WhiteBalanceLoop::resume_report);
+        let resume = (from_exposure.is_some() || from_white_balance.is_some()).then(|| Resume {
+            exposure: from_exposure.and_then(|r| r.exposure),
+            gain: from_exposure.and_then(|r| r.gain),
+            white_balance: from_white_balance.and_then(|r| r.white_balance),
+        });
+        AutoStatus {
+            exposure,
+            white_balance,
+            resume,
+            learned: (self.learned != self.learned_sent).then(|| self.learned.clone()),
         }
+    }
+
+    /// The status that went with the last [`Action::Emit`]: what the runner sends as `auto-status` and what the
+    /// store persists (`learned` and `resume` are in it when they changed since the emit before).
+    pub fn emitted(&self) -> Option<&AutoStatus> {
+        self.last_status.as_ref()
     }
 
     pub fn learned(&self) -> &Learned {

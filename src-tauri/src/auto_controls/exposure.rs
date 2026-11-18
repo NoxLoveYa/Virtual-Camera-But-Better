@@ -4,15 +4,19 @@
 //! longest time within the frame time (`E_rate`), gain fills the rest up to `Most gain`.
 //!
 //! The loop is pure: [`ExposureLoop::tick`] returns [`Action`]s; samples, write results and the clock come in as
-//! calls. See `mod.rs` for how the runner drives it.
+//! calls. See `mod.rs` for how the runner drives it. The watchdog (2.7, `watchdog.rs`) is part of the loop: a
+//! [`Fault`] ends it, [`Action::HandBack`] gives the controls back.
 
 use std::collections::VecDeque;
 
-use super::meter::{measure_exposure, ExposureReading};
-use super::status::{exposure_message, ExposureFacts};
+use super::meter::{measure_exposure, ExposureReading, SEARCH_STOPS};
+use super::status::{exposure_message, stripes, ExposureFacts, STRIPES_NOTE};
+use super::watchdog::{
+    Drift, Fault, Halt, Moved, Unit, Watchdog, NO_EFFECT_RATIO, NO_EFFECT_SPAN, NO_PICTURE_AFTER,
+};
 use super::{
-    Action, CapReason, ExposureCfg, ExposureState, ExposureStatus, Learned, Resume, SessionFacts, Speed,
-    WriteDone,
+    Action, CapReason, ExposureCfg, ExposureState, ExposureStatus, HandBack, Learned, Mode, Prior, Resume,
+    SessionFacts, Speed, WriteDone,
 };
 use crate::capture::controls::{ControlInfo, ControlKey};
 use crate::fx::auto_adjust::Stats;
@@ -66,6 +70,19 @@ const GUARD_LOW_FOR: f64 = 3.0;
 const GUARD_VERIFY: f64 = 3.0;
 /// The resume point is reported at most this often (2.5.11).
 const RESUME_EVERY: f64 = 10.0;
+/// W3 (2.7): a sample counts as "confident and unclipped" for judging a batch.
+const JUDGE_CONFIDENCE: f64 = 0.5;
+const JUDGE_CLIP: f64 = 0.05;
+/// W3: a batch the picture has not answered yet is not waited for longer than this after its write.
+const JUDGE_PATIENCE: f64 = 3.0;
+/// W3: a reading this close to the meter's limit (`SEARCH_STOPS`) only says "at least that far off": a move cannot be
+/// judged against it.
+const METER_EDGE: f64 = SEARCH_STOPS - 0.1;
+/// The white balance loop waits while the exposure loop is adjusting with more error than this (2.6).
+const UNSETTLED_STOPS: f64 = 1.0;
+/// 2.3 "gain range under 0.5 stop": the whole gain range (3 stops until learned) must have steps no coarser than half
+/// a stop, i.e. at least this many.
+const GAIN_MIN_STEPS: i32 = 6;
 
 /// The response presets of 2.5.4 (exposure columns).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -105,6 +122,9 @@ pub struct GainCaps {
     pub min: i32,
     pub max: i32,
     pub step: i32,
+    pub default: i32,
+    /// Gain has its own Camera auto flag (2.9).
+    pub can_auto: bool,
 }
 
 /// What the loop needs to know about the camera's exposure and gain controls.
@@ -113,27 +133,34 @@ pub struct ExposureCaps {
     pub e_min: i32,
     pub e_max: i32,
     pub e_default: i32,
+    /// The camera has Camera auto for exposure: where a hand-back goes (owner decision, section 8 question 5).
+    pub e_auto: bool,
     pub gain: Option<GainCaps>,
 }
 
 impl ExposureCaps {
-    /// `None` when the camera has no manual exposure. Gain is used only when it is manual and has a range.
+    /// `None` when the camera has no manual exposure. Gain is used only when it is manual and fine enough (2.3).
     pub fn from_controls(caps: &[ControlInfo]) -> Option<ExposureCaps> {
         let ex = caps
             .iter()
             .find(|c| c.key == ControlKey::Exposure && c.can_manual)?;
         let gain = caps
             .iter()
-            .find(|c| c.key == ControlKey::Gain && c.can_manual && c.max > c.min)
+            .find(|c| {
+                c.key == ControlKey::Gain && c.can_manual && (c.max - c.min) / c.step.max(1) >= GAIN_MIN_STEPS
+            })
             .map(|c| GainCaps {
                 min: c.min,
                 max: c.max,
                 step: c.step.max(1),
+                default: c.default.clamp(c.min, c.max),
+                can_auto: c.can_auto,
             });
         Some(ExposureCaps {
             e_min: ex.min.min(ex.max),
             e_max: ex.max.max(ex.min),
             e_default: ex.default,
+            e_auto: ex.can_auto,
             gain,
         })
     }
@@ -162,6 +189,31 @@ struct Limits {
     s: f64,
 }
 
+/// What the white balance loop needs to know about this loop (2.6: exposure has priority).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExposureView {
+    /// The loop is running.
+    pub engaged: bool,
+    /// A write is in flight.
+    pub busy: bool,
+    /// When the last write batch returned.
+    pub last_write: f64,
+    /// Adjusting with more than a stop of error.
+    pub unsettled: bool,
+}
+
+impl ExposureView {
+    /// No exposure loop: nothing to wait for.
+    pub fn idle() -> ExposureView {
+        ExposureView {
+            engaged: false,
+            busy: false,
+            last_write: f64::NEG_INFINITY,
+            unsettled: false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // State
 
@@ -178,6 +230,10 @@ struct Sample {
 struct Pending {
     key: ControlKey,
     prev: i32,
+    /// When the action was issued (W1: a write that never reports back).
+    issued_at: f64,
+    /// Part of the seed (a failed seed is written again).
+    seed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,6 +248,29 @@ struct Probe {
     e_before: f64,
     /// The change in stops the model predicted.
     dgs: f64,
+}
+
+/// The reading a decision acted on, for judging its batch (W3).
+#[derive(Clone, Copy, Debug)]
+struct Before {
+    e: f64,
+    /// Confident and unclipped then: the batch can be judged.
+    judgeable: bool,
+}
+
+/// A batch waiting to be judged (W3).
+#[derive(Clone, Copy, Debug)]
+struct Batch {
+    e_before: f64,
+    /// The change in stops the model predicted.
+    predicted: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Assess {
+    Go,
+    Wait,
+    Fault(Fault),
 }
 
 #[derive(Clone, Debug)]
@@ -217,7 +296,13 @@ struct Reading {
 pub struct ExposureLoop {
     caps: ExposureCaps,
     cfg: ExposureCfg,
-    engaged: bool,
+    /// The mode is Better Cam auto.
+    mode_app: bool,
+    /// The watchdog stopped the loop; kept until the mode changes (see `set_mode`) or the user resumes.
+    halt: Option<Halt>,
+    /// A fault raised but not yet acted on (the next tick hands back).
+    fault: Option<Fault>,
+    prior: Prior,
     resume: Resume,
     hub_seeded: bool,
     /// The seed is written (or assumed written).
@@ -228,6 +313,9 @@ pub struct ExposureLoop {
     capture_fps: f64,
     /// Samples captured before this are invalid (a resume).
     resumed_at: f64,
+    /// The last tick time, and when a sample last arrived (W5).
+    now: f64,
+    last_arrival: f64,
     /// The exposure and gain the camera has now, as far as the loop knows.
     e: i32,
     g: i32,
@@ -243,12 +331,20 @@ pub struct ExposureLoop {
     limit_since: Option<f64>,
     dark_since: Option<f64>,
     probe: Option<Probe>,
+    batch: Option<Batch>,
     guard: Guard,
     guard_spent: bool,
     /// The rate the camera dropped to when the cap was learned (for the status text).
     dropped_to: Option<f64>,
     last_resume_at: f64,
     resume_out: Option<Resume>,
+    /// The error of the last decision's reading; infinite before the first.
+    last_e: f64,
+    /// Seconds without a sample, when it is long enough to matter (W5).
+    no_picture: Option<f64>,
+    /// Values another program changed: written again (W6).
+    retakes: Vec<(ControlKey, i32)>,
+    watchdog: Watchdog,
 }
 
 impl ExposureLoop {
@@ -256,7 +352,10 @@ impl ExposureLoop {
         ExposureLoop {
             caps,
             cfg,
-            engaged: false,
+            mode_app: false,
+            halt: None,
+            fault: None,
+            prior: Prior::default(),
             resume: Resume::default(),
             hub_seeded: false,
             started: false,
@@ -265,6 +364,8 @@ impl ExposureLoop {
             f: 30.0,
             capture_fps: 0.0,
             resumed_at: f64::NEG_INFINITY,
+            now: f64::NEG_INFINITY,
+            last_arrival: f64::NEG_INFINITY,
             e: caps.e_default.clamp(caps.e_min, caps.e_max),
             g: caps.gain.map_or(0, |g| g.min),
             samples: VecDeque::new(),
@@ -278,22 +379,29 @@ impl ExposureLoop {
             limit_since: None,
             dark_since: None,
             probe: None,
+            batch: None,
             guard: Guard::Watching { low_since: None },
             guard_spent: false,
             dropped_to: None,
             last_resume_at: f64::NEG_INFINITY,
             resume_out: None,
+            last_e: f64::INFINITY,
+            no_picture: None,
+            retakes: Vec::new(),
+            watchdog: Watchdog::new(Unit::Stops),
         }
     }
 
+    /// The loop is running: Better Cam auto and not stopped by the watchdog.
     pub fn engaged(&self) -> bool {
-        self.engaged
+        self.mode_app && self.halt.is_none()
     }
 
     pub fn set_cfg(&mut self, cfg: ExposureCfg) {
         if (cfg.target - self.cfg.target).abs() > f64::EPSILON {
             // The error of the samples was measured against the old target.
             self.samples.clear();
+            self.batch = None;
         }
         if cfg.longest != self.cfg.longest || cfg.max_gain != self.cfg.max_gain {
             self.limit_since = None;
@@ -302,14 +410,31 @@ impl ExposureLoop {
         self.cfg = cfg;
     }
 
-    pub fn set_engaged(&mut self, on: bool, resume: Resume, seeded: bool) {
+    /// The mode the hub holds for exposure now. A halted loop keeps its status while the mode is the one the control
+    /// was handed to and forgets it when the mode is anything else (the user chose, or chose Better Cam auto again).
+    pub fn set_mode(&mut self, mode: Mode, resume: Resume, seeded: bool, prior: Prior) {
         self.resume = resume;
         self.hub_seeded = seeded;
-        if on && !self.engaged {
-            self.engaged = true;
+        self.prior = prior;
+        if self.halt.is_some_and(|h| h.left_in != mode) {
+            self.halt = None;
+        }
+        if mode == Mode::App {
+            if !self.mode_app {
+                self.mode_app = true;
+                self.reset_session();
+            }
+        } else {
+            self.mode_app = false;
+        }
+    }
+
+    /// "Resume" after a conflict, "Try again" after an ignored control: forget the halt. A paused (conflict) loop
+    /// starts again now, from the values it holds; a handed-back one starts with the next `set_mode(App)`.
+    pub fn resume(&mut self) {
+        self.halt = None;
+        if self.mode_app {
             self.reset_session();
-        } else if !on {
-            self.engaged = false;
         }
     }
 
@@ -318,6 +443,8 @@ impl ExposureLoop {
         self.started = false;
         self.samples.clear();
         self.pending.clear();
+        self.retakes.clear();
+        self.fault = None;
         self.t_done = f64::NEG_INFINITY;
         self.last_write_done = f64::NEG_INFINITY;
         self.band = Band::Adjusting;
@@ -327,10 +454,15 @@ impl ExposureLoop {
         self.limit_since = None;
         self.dark_since = None;
         self.probe = None;
+        self.batch = None;
         self.guard = Guard::Watching { low_since: None };
         self.guard_spent = false;
         self.dropped_to = None;
         self.resumed_at = f64::NEG_INFINITY;
+        self.last_arrival = f64::NEG_INFINITY;
+        self.last_e = f64::INFINITY;
+        self.no_picture = None;
+        self.watchdog.reset();
     }
 
     // -----------------------------------------------------------------------------------------------------------
@@ -443,13 +575,25 @@ impl ExposureLoop {
         (bottom, top)
     }
 
+    /// A requested value as the camera takes it: inside its range, on its step (W2 compares the read-back with it).
+    fn snap(&self, key: ControlKey, v: i32) -> i32 {
+        match (key, self.caps.gain) {
+            (ControlKey::Gain, Some(gc)) => {
+                let v = v.clamp(gc.min, gc.max);
+                gc.min + ((v - gc.min) as f64 / f64::from(gc.step)).round() as i32 * gc.step
+            }
+            _ => v.clamp(self.caps.e_min, self.caps.e_max),
+        }
+    }
+
     // -----------------------------------------------------------------------------------------------------------
     // Inputs
 
     pub fn on_sample(&mut self, stats: &Stats, capture_time: f64) {
-        if !self.engaged || self.paused || self.closed {
+        if !self.engaged() || self.paused || self.closed {
             return;
         }
+        self.last_arrival = self.now;
         let ExposureReading {
             error,
             confidence,
@@ -471,8 +615,12 @@ impl ExposureLoop {
             return;
         };
         let p = self.pending.remove(at);
+        let matched = w.readback.is_none_or(|r| r == self.snap(w.key, w.requested));
+        if let Some(f) = self.watchdog.write_done(&w, matched) {
+            self.raise(f);
+        }
         if w.ok {
-            // A watchdog (A2) compares `readback` with `requested`; the model believes the device.
+            // The model believes the device: a read-back that differs is what the camera has now (W2 counts it).
             let v = w.readback.unwrap_or(w.requested);
             match w.key {
                 ControlKey::Exposure => self.e = v,
@@ -486,22 +634,129 @@ impl ExposureLoop {
                 ControlKey::Gain => self.g = p.prev,
                 _ => {}
             }
+            if p.seed {
+                self.started = false;
+            }
         }
         self.t_done = self.t_done.max(w.done);
+    }
+
+    /// W6: the 1 Hz read-back of a driven control.
+    pub fn on_readback(&mut self, info: &ControlInfo, now: f64) {
+        if !self.engaged() || !self.started || self.closed || self.paused || !self.pending.is_empty() {
+            return;
+        }
+        let expected = match info.key {
+            ControlKey::Exposure => self.e,
+            ControlKey::Gain if self.caps.gain.is_some() => self.g,
+            _ => return,
+        };
+        self.watchdog.read_ok();
+        if !info.auto && info.value == expected {
+            return;
+        }
+        match self.watchdog.drift(now) {
+            Drift::Retake => {
+                if !self.retakes.iter().any(|(k, _)| *k == info.key) {
+                    self.retakes.push((info.key, expected));
+                }
+            }
+            Drift::Conflict => self.raise(Fault::Conflict),
+        }
+    }
+
+    /// W1: a read-back failed.
+    pub fn on_read_failed(&mut self, now: f64) {
+        if let Some(f) = self.watchdog.read_failed(now) {
+            self.raise(f);
+        }
+    }
+
+    fn raise(&mut self, f: Fault) {
+        if self.halt.is_none() && self.fault.is_none() {
+            self.fault = Some(f);
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------------------------
+    // The watchdog's hand-back (2.7)
+
+    /// Where exposure goes: Camera auto where the camera has it (owner decision), else the value it had before.
+    fn hand_back_exposure(&self) -> HandBack {
+        if self.caps.e_auto {
+            HandBack::CameraAuto
+        } else {
+            HandBack::Manual(
+                self.prior
+                    .exposure
+                    .unwrap_or(self.caps.e_default)
+                    .clamp(self.caps.e_min, self.caps.e_max),
+            )
+        }
+    }
+
+    /// Gain goes back to what it was (2.9: its Camera auto flag, if that was on).
+    fn hand_back_gain(&self, gc: GainCaps) -> HandBack {
+        if gc.can_auto && self.prior.gain_auto {
+            HandBack::CameraAuto
+        } else {
+            HandBack::Manual(self.prior.gain.unwrap_or(gc.default).clamp(gc.min, gc.max))
+        }
+    }
+
+    /// Act on a raised fault: stop, hand the controls back (not for a conflict) and remember why.
+    fn flush_fault(&mut self, learned: &mut Learned) -> Option<Vec<Action>> {
+        let fault = self.fault.take()?;
+        self.pending.clear();
+        self.retakes.clear();
+        self.batch = None;
+        self.probe = None;
+        self.resume = Resume {
+            exposure: Some(self.e),
+            gain: self.caps.gain.map(|_| self.g),
+            white_balance: self.resume.white_balance,
+        };
+        let mut actions = Vec::new();
+        let mut to = None;
+        if fault.hands_back() {
+            let e_to = self.hand_back_exposure();
+            actions.push(Action::HandBack {
+                key: ControlKey::Exposure,
+                to: e_to,
+            });
+            if let Some(gc) = self.caps.gain {
+                actions.push(Action::HandBack {
+                    key: ControlKey::Gain,
+                    to: self.hand_back_gain(gc),
+                });
+            }
+            to = Some(e_to);
+            self.mode_app = false;
+        }
+        if fault == Fault::Ignored && !learned.blocked.contains(&ControlKey::Exposure) {
+            learned.blocked.push(ControlKey::Exposure);
+        }
+        self.halt = Some(Halt::new(fault, to));
+        Some(actions)
     }
 
     // -----------------------------------------------------------------------------------------------------------
     // The tick
 
-    pub fn tick(&mut self, now: f64, facts: &SessionFacts, learned: &mut Learned) -> Vec<Action> {
+    pub fn tick(&mut self, now: f64, facts: &SessionFacts, learned: &mut Learned, other_busy: bool) -> Vec<Action> {
+        self.now = now;
         self.f = facts.target_fps.max(1.0);
         self.capture_fps = facts.capture_fps;
-        if !self.engaged {
+        if let Some(actions) = self.flush_fault(learned) {
+            return actions;
+        }
+        if !self.engaged() {
             return Vec::new();
         }
         self.closed = facts.token.is_none();
         if self.closed {
             self.started = false;
+            self.no_picture = None;
             return Vec::new();
         }
         if facts.paused {
@@ -509,28 +764,68 @@ impl ExposureLoop {
             self.no_signal_since = None;
             self.limit_since = None;
             self.dark_since = None;
+            self.no_picture = None;
             return Vec::new();
         }
         if self.paused {
             // Resumed: what was measured before says nothing about now.
             self.paused = false;
             self.samples.clear();
+            self.batch = None;
+            self.watchdog.touch(now);
         }
         self.resumed_at = facts.resumed_at;
         if !self.started {
+            if now < self.watchdog.retry_at() {
+                return Vec::new();
+            }
             let lim = self.limits(learned);
             return self.start(now, &lim);
         }
+        // W1: a write that never reports back.
+        let late = self.pending.iter().find_map(|p| Watchdog::too_long(now, p.issued_at));
+        if let Some(f) = late {
+            self.raise(f);
+            return self.flush_fault(learned).unwrap_or_default();
+        }
+        // W5: no sample for 2 s: hold, no writes.
+        let quiet = self.watchdog.quiet(now, self.last_arrival);
+        self.no_picture = (quiet >= NO_PICTURE_AFTER).then_some(quiet);
         self.guard_step(now, learned);
-        if !self.pending.is_empty() {
+        if !self.pending.is_empty() || now < self.watchdog.retry_at() || self.no_picture.is_some() || other_busy {
             return Vec::new();
         }
-        let pace = self.cfg.speed.exposure_pace();
+        // W6: values another program changed are taken back; once a second the driven controls are read.
+        if !self.retakes.is_empty() {
+            self.batch = None;
+            self.probe = None;
+            let writes = std::mem::take(&mut self.retakes);
+            return self.issue(writes, false);
+        }
+        if self.watchdog.readback_due(now, self.t_done) {
+            let mut reads = vec![Action::ReadBack {
+                key: ControlKey::Exposure,
+            }];
+            if self.caps.gain.is_some() {
+                reads.push(Action::ReadBack { key: ControlKey::Gain });
+            }
+            return reads;
+        }
+        let base = self.cfg.speed.exposure_pace();
+        let pace = Pace {
+            k: base.k * self.watchdog.k_scale(now),
+            step_max: base.step_max,
+            gap: self.watchdog.gap(base.gap),
+        };
         if now < self.t_done + pace.gap {
             return Vec::new();
         }
         let lim = self.limits(learned);
-        self.decide(now, &lim, &pace, learned)
+        let actions = self.decide(now, &lim, &pace, learned);
+        if self.fault.is_some() {
+            return self.flush_fault(learned).unwrap_or_default();
+        }
+        actions
     }
 
     /// 2.5.11: the seed. `E0 = min(E_cap, resume.exposure ?? device default)`, `G0 = resume.gain ?? G_min`. The
@@ -552,6 +847,7 @@ impl ExposureLoop {
         self.started = true;
         self.state = ExposureState::Starting;
         self.band = Band::Adjusting;
+        self.batch = None;
         if self.hub_seeded {
             self.e = e0;
             self.g = g0;
@@ -562,18 +858,23 @@ impl ExposureLoop {
         if self.caps.gain.is_some() {
             writes.push((ControlKey::Gain, g0));
         }
-        self.issue(writes)
+        self.issue(writes, true)
     }
 
     /// Record the writes as pending and believe them; the runner reports each result.
-    fn issue(&mut self, writes: Vec<(ControlKey, i32)>) -> Vec<Action> {
+    fn issue(&mut self, writes: Vec<(ControlKey, i32)>, seed: bool) -> Vec<Action> {
         let mut out = Vec::with_capacity(writes.len());
         for (key, value) in writes {
             let prev = match key {
                 ControlKey::Exposure => std::mem::replace(&mut self.e, value),
                 _ => std::mem::replace(&mut self.g, value),
             };
-            self.pending.push(Pending { key, prev });
+            self.pending.push(Pending {
+                key,
+                prev,
+                issued_at: self.now,
+                seed,
+            });
             out.push(Action::Write { key, value });
         }
         out
@@ -592,22 +893,44 @@ impl ExposureLoop {
         v
     }
 
-    /// Issue a plan; `None` when it changes nothing.
-    fn move_to(&mut self, e2: i32, g2: i32, lim: &Limits, probe: Option<Probe>) -> Option<Vec<Action>> {
+    /// Issue a plan; `None` when it changes nothing. `before` is the reading a decision acted on (W3 judges the
+    /// batch against it).
+    fn move_to(
+        &mut self,
+        e2: i32,
+        g2: i32,
+        lim: &Limits,
+        probe: Option<Probe>,
+        before: Option<Before>,
+    ) -> Option<Vec<Action>> {
         let plan = self.plan(e2, g2, lim.s);
         if plan.is_empty() {
             return None;
         }
+        let predicted: f64 = plan.iter().map(|p| p.2).sum();
+        // W4: a fourth reversal within 10 s damps; another while damped hands back.
+        if self.watchdog.moved(self.now, predicted) == Moved::Hunting {
+            self.raise(Fault::Hunting);
+            return Some(Vec::new());
+        }
         let gain_only = plan.len() == 1 && plan[0].0 == ControlKey::Gain;
         self.probe = probe.filter(|p| gain_only && p.dgs.abs() >= LEARN_MIN_STEP);
+        self.batch = before
+            .filter(|b| b.judgeable && predicted.abs() >= Unit::Stops.min_predicted())
+            .map(|b| Batch {
+                e_before: b.e,
+                predicted,
+            });
         self.state = ExposureState::Adjusting;
         self.band = Band::Adjusting;
-        Some(self.issue(plan.into_iter().map(|(k, v, _)| (k, v)).collect()))
+        Some(self.issue(plan.into_iter().map(|(k, v, _)| (k, v)).collect(), false))
     }
 
-    /// The valid samples: captured after the last write landed (`D_apply`) and after a resume (2.5.4).
+    /// The valid samples: captured after the last write landed (`D_apply`, longer for a slow camera) and after a
+    /// resume (2.5.4).
     fn valid(&self) -> Vec<Sample> {
-        let threshold = (self.t_done + D_APPLY_BASE + 1.0 / self.f).max(self.resumed_at);
+        let threshold =
+            (self.t_done + D_APPLY_BASE + 1.0 / self.f + self.watchdog.slow()).max(self.resumed_at);
         self.samples.iter().filter(|s| s.t >= threshold).copied().collect()
     }
 
@@ -636,6 +959,33 @@ impl ExposureLoop {
         })
     }
 
+    /// The error now as the white balance loop may look at it: the median of the last valid samples, or the last
+    /// decision's reading when there are none yet.
+    fn peek_error(&self) -> f64 {
+        let valid = self.valid();
+        if valid.is_empty() {
+            return self.last_e;
+        }
+        let mut v: Vec<f64> = valid.iter().rev().take(MEDIAN_SAMPLES).map(|s| s.e).collect();
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    }
+
+    /// What the white balance loop looks at (2.6).
+    pub fn view(&self) -> ExposureView {
+        let engaged = self.engaged();
+        ExposureView {
+            engaged,
+            busy: !self.pending.is_empty(),
+            last_write: self.t_done,
+            unsettled: engaged
+                && !self.paused
+                && !self.closed
+                && matches!(self.state, ExposureState::Starting | ExposureState::Adjusting)
+                && self.peek_error().abs() > UNSETTLED_STOPS,
+        }
+    }
+
     // -----------------------------------------------------------------------------------------------------------
     // The decision (2.5.5)
 
@@ -645,19 +995,35 @@ impl ExposureLoop {
         // needed and not bounded by `step_max`.
         if self.e > lim.e_cap {
             let (e2, g2) = self.allocate(self.x(s), lim);
-            return self.move_to(e2, g2, lim, None).unwrap_or_default();
+            return self.move_to(e2, g2, lim, None, None).unwrap_or_default();
         }
         let valid = self.valid();
         let Some(r) = Self::reading(&valid) else {
             return Vec::new();
         };
+        self.last_e = r.e;
         self.learn(&r, learned);
+        // W3: did the picture answer the last batch?
+        match self.assess(now, &valid, &r) {
+            Assess::Go => {}
+            Assess::Wait => return Vec::new(),
+            Assess::Fault(f) => {
+                self.raise(f);
+                return Vec::new();
+            }
+        }
         let s = learned.gain_stops.unwrap_or(S_INITIAL).clamp(S_MIN, S_MAX);
         let lim = &Limits {
             s,
             gs_cap: if lim.gain_usable { self.gs_with(lim.g_cap, s) } else { 0.0 },
             ..*lim
         };
+        let before = Before {
+            e: r.e,
+            judgeable: r.conf >= JUDGE_CONFIDENCE && r.clip < JUDGE_CLIP && r.e.abs() < METER_EDGE,
+        };
+        // W4: while damped the bands are wider.
+        let bands = self.watchdog.band_scale(now);
 
         // 1. No signal.
         let window = &valid[valid.len().saturating_sub(SIGMA_SAMPLES)..];
@@ -691,12 +1057,12 @@ impl ExposureLoop {
         // 3. Quantum.
         let up = r.e > 0.0;
         let Some(q) = self.quantum(up, lim) else {
-            self.saturated(now, lim, &r, up);
+            self.saturated(now, lim, &r, up, bands);
             return Vec::new();
         };
         // 4. Band.
-        let b_out = OUT_MIN.max(OUT_SIGMA * r.sigma).max(OUT_Q * q);
-        let b_in = IN_MIN.max(IN_SIGMA * r.sigma).max(IN_Q * q);
+        let b_out = OUT_MIN.max(OUT_SIGMA * r.sigma).max(OUT_Q * q) * bands;
+        let b_in = IN_MIN.max(IN_SIGMA * r.sigma).max(IN_Q * q) * bands;
         let threshold = if self.band == Band::Holding { b_out } else { b_in };
         if r.e.abs() <= threshold {
             if r.e.abs() <= b_in {
@@ -737,12 +1103,60 @@ impl ExposureLoop {
             e_before: r.e,
             dgs: self.gs_with(g2, s) - self.gs_with(self.g, s),
         });
-        match self.move_to(e2, g2, lim, probe) {
+        match self.move_to(e2, g2, lim, probe, Some(before)) {
             Some(actions) => actions,
             None => {
                 self.enter_holding(now);
                 Vec::new()
             }
+        }
+    }
+
+    /// W3: judge the last batch once the picture has had time to answer it.
+    ///
+    /// A batch is judged only when it predicted at least half a stop and both the decision that made it and the
+    /// picture now are confident and unclipped. If the picture has not moved by 15 % of the prediction, the loop
+    /// waits until 0.5 s of confident valid samples back that up (each such batch is a strike; three in a row hand
+    /// the control back). A picture that did answer ends the strikes.
+    fn assess(&mut self, now: f64, valid: &[Sample], r: &Reading) -> Assess {
+        let Some(b) = self.batch else {
+            return Assess::Go;
+        };
+        if r.conf < JUDGE_CONFIDENCE || r.clip >= JUDGE_CLIP || r.e.abs() >= METER_EDGE {
+            self.batch = None;
+            return Assess::Go;
+        }
+        if (b.e_before - r.e) / b.predicted >= NO_EFFECT_RATIO {
+            self.watchdog.responded();
+            self.batch = None;
+            return Assess::Go;
+        }
+        let good: Vec<&Sample> = valid
+            .iter()
+            .filter(|s| s.conf >= JUDGE_CONFIDENCE && s.clip < JUDGE_CLIP && s.e.abs() < METER_EDGE)
+            .collect();
+        let span = match (good.first(), good.last()) {
+            (Some(a), Some(z)) => z.t - a.t,
+            _ => 0.0,
+        };
+        if good.len() < 2 || span < NO_EFFECT_SPAN {
+            if now - self.t_done > JUDGE_PATIENCE {
+                self.batch = None;
+                return Assess::Go;
+            }
+            return Assess::Wait;
+        }
+        let mut tail: Vec<f64> = good.iter().rev().take(MEDIAN_SAMPLES).map(|s| s.e).collect();
+        tail.sort_by(f64::total_cmp);
+        let observed = tail[tail.len() / 2];
+        self.batch = None;
+        if (b.e_before - observed) / b.predicted >= NO_EFFECT_RATIO {
+            self.watchdog.responded();
+            return Assess::Go;
+        }
+        match self.watchdog.no_effect() {
+            Some(f) => Assess::Fault(f),
+            None => Assess::Go,
         }
     }
 
@@ -759,13 +1173,13 @@ impl ExposureLoop {
                 self.g,
             )
         };
-        self.move_to(e2, g2, lim, probe)
+        self.move_to(e2, g2, lim, probe, None)
     }
 
     /// Nothing has room in the direction the picture needs: saturation (2.5.9). Not a fault; the loop stays engaged.
-    fn saturated(&mut self, now: f64, lim: &Limits, r: &Reading, up: bool) {
-        let b_out = OUT_MIN.max(OUT_SIGMA * r.sigma);
-        let b_in = IN_MIN.max(IN_SIGMA * r.sigma);
+    fn saturated(&mut self, now: f64, lim: &Limits, r: &Reading, up: bool, bands: f64) {
+        let b_out = OUT_MIN.max(OUT_SIGMA * r.sigma) * bands;
+        let b_in = IN_MIN.max(IN_SIGMA * r.sigma) * bands;
         if r.e.abs() <= b_in {
             self.limit_since = None;
             self.dark_since = None;
@@ -882,27 +1296,33 @@ impl ExposureLoop {
     // Output
 
     pub fn resume_report(&self) -> Option<Resume> {
-        if self.state == ExposureState::Holding {
+        if self.engaged() && self.state == ExposureState::Holding {
             self.resume_out
         } else {
             None
         }
     }
 
-    pub fn status(&self, learned: &Learned) -> Option<ExposureStatus> {
-        if !self.engaged {
+    pub fn status(&self, learned: &Learned, mains: Option<u32>) -> Option<ExposureStatus> {
+        if !self.mode_app && self.halt.is_none() {
             return None;
         }
         let lim = self.limits(learned);
-        let state = if self.closed {
+        let halted = self.halt;
+        let state = if let Some(h) = halted {
+            fault_state(h.fault)
+        } else if self.closed {
             ExposureState::Closed
         } else if self.paused {
             ExposureState::Paused
+        } else if self.no_picture.is_some() {
+            ExposureState::NoPicture
         } else {
             self.state
         };
         let gain = self.caps.gain.map(|_| self.g);
         let max_gain = lim.gain_usable.then_some(lim.g_cap);
+        let handed_back = halted.and_then(|h| h.to).map(Into::into);
         let message = exposure_message(&ExposureFacts {
             state,
             exposure: self.e,
@@ -915,7 +1335,11 @@ impl ExposureLoop {
             fps: self.capture_fps,
             target_fps: self.f,
             dropped_to: self.dropped_to,
+            fault: halted.map(|h| h.fault),
+            handed_back,
+            no_picture_for: self.no_picture.unwrap_or(0.0),
         });
+        let running = halted.is_none() && !self.closed && !self.paused;
         Some(ExposureStatus {
             state,
             exposure: self.e,
@@ -926,6 +1350,19 @@ impl ExposureLoop {
             fps: self.capture_fps,
             target_fps: self.f,
             message,
+            handed_back,
+            note: (running && stripes(self.e, mains)).then(|| STRIPES_NOTE.to_string()),
         })
+    }
+}
+
+/// The state the card shows for a watchdog fault.
+fn fault_state(f: Fault) -> ExposureState {
+    match f {
+        Fault::NotAnswering | Fault::TooSlow => ExposureState::NotAnswering,
+        Fault::Ignored => ExposureState::Ignored,
+        Fault::NoResponse => ExposureState::NoResponse,
+        Fault::Hunting => ExposureState::Hunting,
+        Fault::Conflict => ExposureState::Conflict,
     }
 }

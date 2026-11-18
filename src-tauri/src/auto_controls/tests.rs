@@ -1,4 +1,6 @@
-//! The cases of docs/AUTO-CONTROLS.md 6.2 that phase A1 owns (1-14, 23, 24), against the simulated camera.
+//! The cases of docs/AUTO-CONTROLS.md 6.2 against the simulated camera: A1's (1-14, 23, 24) and A2's (15-22, the
+//! white balance loop and the watchdog), the `support()` outcomes and a few cases of the watchdog the table does not
+//! list (hunting, no picture, a hand-back to a manual value, a write that never returns).
 //!
 //! Times are simulated seconds. "Within the band" is judged by the oracle (`Sim::true_error`: the landed state of
 //! the camera under the scripted light, no noise), never by what the controller believes.
@@ -437,7 +439,13 @@ fn case_11_flashlight() {
     assert!(checked >= 8, "only {checked} decisions under a clipped picture");
     let at25 = sim.history.iter().find(|s| s.t >= 24.9).unwrap();
     assert!(at25.clip < 0.5 || (at25.e, at25.g) == (-13, 0), "{at25:?}");
-    assert!(settled_at(&sim, 25.0, 35.0, 0.33).is_some(), "no recovery");
+    assert!(
+        settled_at(&sim, 25.0, 35.0, 0.33).is_some(),
+        "no recovery: {:?} {:?} {:?}",
+        ctrl.status().exposure,
+        sim.handbacks,
+        sim.history.last()
+    );
 }
 
 #[test]
@@ -648,37 +656,832 @@ fn case_24_engagement_from_a_stale_read() {
     assert!(settled_at(&sim, 0.0, 10.0, 0.33).is_some_and(|t| t <= 4.0), "{:?}", sim.history.last());
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Phase A2: support, white balance (cases 15-17), the watchdog (cases 18-22)
+
+fn set(caps: &mut [ControlInfo], key: ControlKey) -> &mut ControlInfo {
+    caps.iter_mut().find(|c| c.key == key).expect("control in the set")
+}
+
+fn without(caps: &[ControlInfo], key: ControlKey) -> Vec<ControlInfo> {
+    caps.iter().filter(|c| c.key != key).cloned().collect()
+}
+
 #[test]
-fn support_of_exposure() {
-    let sim = Sim::new(SimCfg::default(), dim(-3.5));
-    let l = Learned::default();
-    assert_eq!(AutoController::support(&sim.caps(), &l).exposure, Offer::Full);
-    let no_gain = Sim::new(
+fn support_lists_every_outcome() {
+    use NoOffer::*;
+    use Offer::*;
+    let none = Learned::default();
+    let both = |caps: &[ControlInfo], l: &Learned| {
+        let s = AutoController::support(caps, l);
+        (s.exposure, s.white_balance)
+    };
+    let w4gs = w4gs();
+    // W4GS: exposure -13..-1 step 1, gain 0..100, white balance 2800..6500.
+    assert_eq!(both(&w4gs, &none), (Full, Full));
+    // The camera's own sim agrees.
+    let sim = Sim::new(
         SimCfg {
-            gain: false,
+            wb: Some(WbSim::default()),
             ..SimCfg::default()
         },
         dim(-3.5),
     );
-    assert_eq!(AutoController::support(&no_gain.caps(), &l).exposure, Offer::Stops);
-    let mut caps = sim.caps();
-    caps[0].min = 0;
-    caps[0].max = 10_000;
-    assert_eq!(
-        AutoController::support(&caps, &l).exposure,
-        Offer::No(NoOffer::UnknownUnits)
-    );
-    let mut caps = sim.caps();
-    caps[0].can_manual = false;
-    assert_eq!(AutoController::support(&caps, &l).exposure, Offer::No(NoOffer::NoManual));
-    let blocked = Learned {
+    assert_eq!(both(&sim.caps(), &none), (Full, Full));
+    // No gain control, or gain that is not manual, or gain too coarse to trim with: whole stops.
+    assert_eq!(both(&without(&w4gs, ControlKey::Gain), &none), (Stops, Full));
+    let mut caps = w4gs.clone();
+    set(&mut caps, ControlKey::Gain).can_manual = false;
+    assert_eq!(both(&caps, &none), (Stops, Full));
+    let mut caps = w4gs.clone();
+    set(&mut caps, ControlKey::Gain).max = 3;
+    assert_eq!(both(&caps, &none), (Stops, Full));
+    // Exposure in units that are not log2 seconds.
+    let mut caps = w4gs.clone();
+    let e = set(&mut caps, ControlKey::Exposure);
+    (e.min, e.max) = (0, 10_000);
+    assert_eq!(both(&caps, &none), (No(UnknownUnits), Full));
+    let mut caps = w4gs.clone();
+    set(&mut caps, ControlKey::Exposure).step = 10;
+    assert_eq!(both(&caps, &none).0, No(UnknownUnits));
+    // White balance in units that are not Kelvin.
+    let mut caps = w4gs.clone();
+    let w = set(&mut caps, ControlKey::WhiteBalance);
+    (w.min, w.max) = (0, 100);
+    assert_eq!(both(&caps, &none), (Full, No(UnknownUnits)));
+    let mut caps = w4gs.clone();
+    let w = set(&mut caps, ControlKey::WhiteBalance);
+    (w.min, w.max) = (4000, 4500);
+    assert_eq!(both(&caps, &none).1, No(UnknownUnits), "Kelvin but a range of 500");
+    // No manual values.
+    let mut caps = w4gs.clone();
+    set(&mut caps, ControlKey::Exposure).can_manual = false;
+    set(&mut caps, ControlKey::WhiteBalance).can_manual = false;
+    assert_eq!(both(&caps, &none), (No(NoManual), No(NoManual)));
+    // Absent.
+    let caps = without(&without(&w4gs, ControlKey::Exposure), ControlKey::WhiteBalance);
+    assert_eq!(both(&caps, &none), (No(NoManual), No(NoManual)));
+    // Blocked by the watchdog, each loop on its own.
+    let exposure_blocked = Learned {
         blocked: vec![ControlKey::Exposure],
         ..Learned::default()
     };
+    assert_eq!(both(&w4gs, &exposure_blocked), (No(Blocked), Full));
+    let wb_blocked = Learned {
+        blocked: vec![ControlKey::WhiteBalance],
+        ..Learned::default()
+    };
+    assert_eq!(both(&w4gs, &wb_blocked), (Full, No(Blocked)));
+    // The reasons the card shows.
+    let s = AutoController::support(&w4gs, &exposure_blocked);
     assert_eq!(
-        AutoController::support(&sim.caps(), &blocked).exposure,
+        s.exposure.why(ControlKey::Exposure).as_deref(),
+        Some("This camera ignored Better Cam auto.")
+    );
+    assert_eq!(s.white_balance.why(ControlKey::WhiteBalance), None);
+    assert!(Full.offered() && Stops.offered() && !No(Blocked).offered());
+}
+
+#[test]
+fn a_loop_is_not_built_for_a_control_that_is_not_offered() {
+    let mut caps = w4gs();
+    let w = set(&mut caps, ControlKey::WhiteBalance);
+    (w.min, w.max) = (0, 100);
+    let mut ctrl = AutoController::new(
+        &caps,
+        AutoCfg::default(),
+        Learned::default(),
+        Modes {
+            white_balance: Mode::App,
+            ..Modes::default()
+        },
+    );
+    assert!(!ctrl.wants_meter());
+    let facts = Sim::new(SimCfg::default(), dim(-3.5)).facts();
+    assert!(ctrl.tick(0.0, &facts).is_empty());
+    assert!(ctrl.status().white_balance.is_none());
+}
+
+// --- white balance ---
+
+fn wb_sim(alpha_true: f64, start_k: i32, temp: Light) -> Sim {
+    let cfg = SimCfg {
+        wb: Some(WbSim {
+            alpha_true,
+            start_k,
+            can_auto: true,
+        }),
+        start_e: -5,
+        start_g: 33,
+        // These runs start seeded: `apply_on_open` has made the first (slow, 200-700 ms) write already.
+        slow_first_write: false,
+        ..SimCfg::default()
+    };
+    Sim::new(cfg, dim(-4.0)).with_temperature(temp)
+}
+
+fn wb_modes(k: i32, seeded: bool) -> Modes {
+    Modes {
+        white_balance: Mode::App,
+        resume: Resume {
+            white_balance: Some(k),
+            ..Resume::default()
+        },
+        seeded,
+        ..Modes::default()
+    }
+}
+
+fn wb_ctrl(sim: &Sim, k: i32, seeded: bool) -> AutoController {
+    AutoController::new(&sim.caps(), AutoCfg::default(), Learned::default(), wb_modes(k, seeded))
+}
+
+fn wb_state(ctrl: &AutoController) -> WhiteBalanceState {
+    ctrl.status().white_balance.expect("engaged").state
+}
+
+fn wb_settled_at(sim: &Sim, from: f64, until: f64, band: f64) -> Option<f64> {
+    let mut at = None;
+    for s in sim.history.iter().filter(|s| s.t >= from && s.t <= until) {
+        if s.wb_err.abs() <= band {
+            at.get_or_insert(s.t);
+        } else {
+            at = None;
+        }
+    }
+    at
+}
+
+fn wb_writes(sim: &Sim) -> Vec<WriteRec> {
+    sim.writes.iter().filter(|w| w.key == ControlKey::WhiteBalance).copied().collect()
+}
+
+fn mired(k: i32) -> f64 {
+    1e6 / f64::from(k)
+}
+
+fn wb_step_check(alpha_true: f64, to: f64) -> AutoController {
+    // 6500 K light, matched; at t = 5 s the light turns to `to` Kelvin.
+    let temp: Light = Box::new(move |t| if t < 5.0 { 6500.0 } else { to });
+    let mut sim = wb_sim(alpha_true, 6500, temp);
+    let mut ctrl = wb_ctrl(&sim, 6500, true);
+    sim.run(&mut ctrl, 25.0);
+    assert!(wb_writes(&sim).iter().all(|w| w.started >= 5.0), "wrote before the light changed");
+    let at = wb_settled_at(&sim, 5.0, 25.0, 0.03)
+        .unwrap_or_else(|| panic!("α_true {alpha_true}: never settled: {:?}", sim.history.last()));
+    assert!(at - 5.0 <= 6.0, "α_true {alpha_true}: |e_wb| < 0.03 only after {} s", at - 5.0);
+    let writes = wb_writes(&sim);
+    let mut k = 6500;
+    let mut signs = Vec::new();
+    for w in &writes {
+        let dm = mired(w.value) - mired(k);
+        // ΔM_max 20 mired at Normal; a kelvin of rounding is 1.1 mired at 3000 K.
+        assert!(dm.abs() <= 20.0 + 1.2, "α_true {alpha_true}: a write moved {dm} mired");
+        signs.push(dm.signum());
+        k = w.value;
+    }
+    let reversals = signs.windows(2).filter(|s| s[0] != s[1]).count();
+    assert!(reversals <= 2, "α_true {alpha_true}: {reversals} reversals: {writes:?}");
+    assert_eq!(wb_state(&ctrl), WhiteBalanceState::Holding);
+    ctrl
+}
+
+#[test]
+fn case_15_white_balance_step() {
+    let ctrl = wb_step_check(0.008, 3000.0);
+    // The text of 4.2 with the Kelvin the loop holds.
+    let st = ctrl.status().white_balance.unwrap();
+    assert_eq!(st.message, Some(format!("Holding · {} K", st.kelvin)));
+    assert!((2900..=3100).contains(&st.kelvin), "{}", st.kelvin);
+    // Learned α within 30 % of the truth, for a camera half as sensitive and one 1.5 times as sensitive. At 0.012 a
+    // 3000 K light would be a cast of ln(B/R) = -2.15 (blue a tenth of red): every cell saturated, nothing neutral to
+    // trust, and the loop rightly holds (conf_wb < 0.3). That camera gets a 4000 K light.
+    for (alpha_true, to) in [(0.004, 3000.0), (0.012, 4000.0)] {
+        let ctrl = wb_step_check(alpha_true, to);
+        let a = ctrl.learned().wb_alpha.expect("nothing learned");
+        assert!((a - alpha_true).abs() <= 0.3 * alpha_true, "learned α {a} for a true {alpha_true}");
+    }
+}
+
+#[test]
+fn a_cast_with_nothing_neutral_to_trust_is_held() {
+    // The 3000 K light on a very sensitive camera: ln(B/R) = -2.15. The loop does not guess.
+    let temp: Light = Box::new(|t| if t < 5.0 { 6500.0 } else { 3000.0 });
+    let mut sim = wb_sim(0.012, 6500, temp);
+    let mut ctrl = wb_ctrl(&sim, 6500, true);
+    sim.run(&mut ctrl, 20.0);
+    assert!(wb_writes(&sim).is_empty(), "{:?}", wb_writes(&sim));
+    assert!(sim.handbacks.is_empty());
+}
+
+#[test]
+fn case_16_light_warmer_than_the_camera_can_correct() {
+    // A 2000 K lamp: the camera's warmest setting (2800 K) is still too cool for it.
+    let mut sim = wb_sim(0.008, 3500, kelvin(2000.0));
+    let mut ctrl = wb_ctrl(&sim, 3500, true);
+    let mut limit_at = None;
+    while sim.t < 14.0 {
+        sim.run(&mut ctrl, sim.t + 0.1);
+        if limit_at.is_none() && wb_state(&ctrl) == WhiteBalanceState::AtLimit {
+            limit_at = Some(sim.t);
+        }
+    }
+    let at = limit_at.expect("never at_limit");
+    assert!(at <= 8.0, "at_limit at {at}");
+    assert_eq!(sim.device_k(), 2800);
+    assert!(wb_writes(&sim).iter().all(|w| w.started < at), "writes after at_limit");
+    assert_eq!(wb_state(&ctrl), WhiteBalanceState::AtLimit);
+    assert_eq!(
+        ctrl.status().white_balance.unwrap().message.as_deref(),
+        Some("White balance at its limit (2800 K): the light is warmer than this camera can correct. Auto Adjust can finish it.")
+    );
+}
+
+#[test]
+fn case_16_light_cooler_than_the_camera_can_correct() {
+    let mut sim = wb_sim(0.008, 5500, kelvin(12_000.0));
+    let mut ctrl = wb_ctrl(&sim, 5500, true);
+    sim.run(&mut ctrl, 14.0);
+    assert_eq!(sim.device_k(), 6500);
+    assert_eq!(wb_state(&ctrl), WhiteBalanceState::AtLimit);
+    assert!(ctrl
+        .status()
+        .white_balance
+        .unwrap()
+        .message
+        .unwrap()
+        .contains("the light is cooler than this camera can correct"));
+}
+
+#[test]
+fn case_17_white_balance_waits_for_exposure() {
+    // One stop brighter and a 3500 K light at t = 8 s: exposure has to move twice; white balance must wait for it.
+    let base = (4.0f64).exp2();
+    let light: Light = Box::new(move |t| if t < 8.0 { base } else { base * 4.0 });
+    let temp: Light = Box::new(|t| if t < 8.0 { 6500.0 } else { 3500.0 });
+    let cfg = SimCfg {
+        wb: Some(WbSim::default()),
+        start_e: -5,
+        start_g: 33,
+        ..SimCfg::default()
+    };
+    let cfg = SimCfg {
+        wb: cfg.wb.map(|w| WbSim { start_k: 6500, ..w }),
+        ..cfg
+    };
+    let mut sim = Sim::new(cfg, light).with_temperature(temp);
+    let mut ctrl = AutoController::new(
+        &sim.caps(),
+        AutoCfg::default(),
+        Learned::default(),
+        Modes {
+            exposure: Mode::App,
+            white_balance: Mode::App,
+            resume: Resume {
+                exposure: Some(-5),
+                gain: Some(33),
+                white_balance: Some(6500),
+            },
+            seeded: true,
+            ..Modes::default()
+        },
+    );
+    sim.run(&mut ctrl, 30.0);
+    let wb = wb_writes(&sim);
+    assert!(wb.len() >= 5, "white balance never moved: {wb:?}");
+    let exposure: Vec<WriteRec> = sim
+        .writes
+        .iter()
+        .filter(|w| matches!(w.key, ControlKey::Exposure | ControlKey::Gain))
+        .copied()
+        .collect();
+    assert!(exposure.iter().any(|w| w.started >= 8.0), "exposure never moved");
+    for w in &wb {
+        // No white balance write within 0.3 s after an exposure batch, and none while one is in flight.
+        for x in &exposure {
+            assert!(
+                w.started < x.started || w.started >= x.done + 0.3 - 1e-9,
+                "white balance write at {} is {} s after the exposure write that returned at {}",
+                w.started,
+                w.started - x.done,
+                x.done
+            );
+        }
+        // None while the exposure is more than a stop off (judged by the true error 0.1 s before the write).
+        let before = sim.history.iter().rev().find(|s| s.t <= w.started - 0.1 + 1e-9).expect("history");
+        assert!(before.err.abs() <= 1.25, "white balance wrote at {} with the exposure {} stops off", w.started, before.err);
+    }
+    assert!(settled_at(&sim, 8.0, 30.0, 0.33).is_some_and(|t| t <= 20.0), "{:?}", sim.history.last());
+    assert!(wb_settled_at(&sim, 8.0, 30.0, 0.05).is_some_and(|t| t <= 25.0), "{:?}", sim.history.last());
+}
+
+#[test]
+fn white_balance_warmth_moves_the_target() {
+    // Warmth +0.5 asks for an orange picture: the loop settles where the signal is c*(+0.5), not zero.
+    let mut sim = wb_sim(0.008, 5000, kelvin(5000.0));
+    let mut ctrl = AutoController::new(
+        &sim.caps(),
+        AutoCfg {
+            white_balance: WhiteBalanceCfg {
+                warmth: 0.5,
+                ..WhiteBalanceCfg::default()
+            },
+            ..AutoCfg::default()
+        },
+        Learned::default(),
+        wb_modes(5000, true),
+    );
+    sim.run(&mut ctrl, 20.0);
+    assert!(wb_settled_at(&sim, 0.0, 20.0, 0.05).is_some(), "{:?}", sim.history.last());
+    // Warmer than the light: a higher Kelvin than the light's (lower mired).
+    assert!(sim.device_k() > 5000, "{}", sim.device_k());
+    // And as far as the aim says: c* = α (M_set - M_light).
+    let want = 1e6 / (1e6 / 5000.0 + meter::warmth_target(0.5) / 0.008);
+    assert!((f64::from(sim.device_k()) - want).abs() < 150.0, "{} vs {want}", sim.device_k());
+}
+
+#[test]
+fn white_balance_holds_on_a_picture_of_one_colour() {
+    // Saturated everywhere: nothing neutral to trust, so the loop must not move.
+    let mut sim = wb_sim(0.008, 5000, kelvin(6500.0));
+    let mut ctrl = wb_ctrl(&sim, 5000, true);
+    sim.run(&mut ctrl, 0.5);
+    let red = Stats {
+        cells: vec![[0.4, 0.02, 0.02, 1.0]; 256],
+    };
+    for i in 0..60 {
+        ctrl.on_sample(
+            &MeterSample {
+                token: 1,
+                capture_qpc: 0,
+                stats: red.clone(),
+            },
+            0.5 + f64::from(i) * 0.066,
+        );
+    }
+    let actions = ctrl.tick(2.0, &sim.facts());
+    assert!(
+        !actions.iter().any(|a| matches!(a, Action::Write { .. })),
+        "{actions:?}"
+    );
+}
+
+// --- the watchdog ---
+
+fn engage_both(sim: &Sim, resume: Resume, seeded: bool) -> AutoController {
+    AutoController::new(
+        &sim.caps(),
+        AutoCfg::default(),
+        Learned::default(),
+        Modes {
+            exposure: Mode::App,
+            resume,
+            seeded,
+            ..Modes::default()
+        },
+    )
+}
+
+fn handed_back(sim: &Sim, key: ControlKey) -> Vec<HandBack> {
+    sim.handbacks.iter().filter(|h| h.1 == key).map(|h| h.2).collect()
+}
+
+#[test]
+fn case_18_a_camera_that_ignores_writes() {
+    let cfg = SimCfg {
+        start_e: -9,
+        ..SimCfg::default()
+    };
+    let mut sim = Sim::new(cfg, dim(-3.5));
+    sim.faults.ignore = vec![ControlKey::Exposure];
+    let mut ctrl = engage_both(&sim, resume(-6, 0), false);
+    sim.run(&mut ctrl, 15.0);
+    let exposure_writes: Vec<_> = sim.attempts.iter().filter(|w| w.key == ControlKey::Exposure).collect();
+    assert_eq!(exposure_writes.len(), 3, "W2 after 3 writes: {exposure_writes:?}");
+    assert_eq!(handed_back(&sim, ControlKey::Exposure), vec![HandBack::CameraAuto]);
+    // Gain goes back to its prior value (the camera default without a recorded one).
+    assert_eq!(handed_back(&sim, ControlKey::Gain), vec![HandBack::Manual(0)]);
+    let at = sim.handbacks[0].0;
+    assert!(sim.attempts.iter().all(|w| w.started < at), "writes after the hand-back");
+    assert_eq!(ctrl.learned().blocked, vec![ControlKey::Exposure]);
+    assert!(!ctrl.wants_meter());
+    let st = ctrl.status().exposure.expect("the hand-back stays in the status");
+    assert_eq!(st.state, ExposureState::Ignored);
+    assert_eq!(st.handed_back, Some(HandBackKind::Camera));
+    assert_eq!(
+        st.message.as_deref(),
+        Some("The camera ignored Better Cam auto for Exposure. Back to Camera auto.")
+    );
+    // The card learns it from the emit, and the mode is no longer offered.
+    let last = sim.emitted.last().expect("emitted");
+    assert_eq!(last.exposure.as_ref().map(|e| e.state), Some(ExposureState::Ignored));
+    assert!(sim.emitted.iter().any(|s| s.learned.as_ref().is_some_and(|l| !l.blocked.is_empty())));
+    assert_eq!(
+        AutoController::support(&sim.caps(), ctrl.learned()).exposure,
         Offer::No(NoOffer::Blocked)
     );
+    // "Try again" clears `blocked`; choosing Better Cam auto again starts the loop.
+    ctrl.resume(ControlKey::Exposure);
+    assert!(ctrl.learned().blocked.is_empty());
+    ctrl.set_modes(Modes {
+        exposure: Mode::Camera,
+        ..Modes::default()
+    });
+    ctrl.set_modes(Modes {
+        exposure: Mode::App,
+        resume: resume(-6, 0),
+        ..Modes::default()
+    });
+    assert!(ctrl.wants_meter());
+    assert_eq!(ctrl.status().exposure.map(|e| e.state), Some(ExposureState::Starting));
+}
+
+#[test]
+fn a_hand_back_stays_until_the_mode_changes() {
+    let cfg = SimCfg {
+        start_e: -9,
+        ..SimCfg::default()
+    };
+    let mut sim = Sim::new(cfg, dim(-3.5));
+    sim.faults.ignore = vec![ControlKey::Exposure];
+    let mut ctrl = engage_both(&sim, resume(-6, 0), false);
+    sim.run(&mut ctrl, 15.0);
+    let ignored = |c: &AutoController| c.status().exposure.map(|e| e.state);
+    assert_eq!(ignored(&ctrl), Some(ExposureState::Ignored));
+    // The runner confirms the hand-back with the mode the control went to: the status stays.
+    ctrl.set_modes(Modes {
+        exposure: Mode::Camera,
+        ..Modes::default()
+    });
+    assert_eq!(ignored(&ctrl), Some(ExposureState::Ignored));
+    // The user picks Manual: it goes.
+    ctrl.set_modes(Modes {
+        exposure: Mode::Manual,
+        ..Modes::default()
+    });
+    assert_eq!(ignored(&ctrl), None);
+}
+
+#[test]
+fn case_19_a_picture_that_does_not_answer() {
+    // A camera without gain: every move is an exposure move of a whole stop; the picture ignores them.
+    let cfg = SimCfg {
+        gain: false,
+        start_e: -8,
+        ..SimCfg::default()
+    };
+    let mut sim = Sim::new(cfg, dim(-5.5));
+    sim.faults.no_effect = vec![ControlKey::Exposure];
+    let mut ctrl = engage_both(&sim, resume(-8, 0), true);
+    sim.run(&mut ctrl, 12.0);
+    assert_eq!(handed_back(&sim, ControlKey::Exposure), vec![HandBack::CameraAuto]);
+    let at = sim.handbacks[0].0;
+    assert!(at <= 5.0, "handed back at {at}");
+    assert!(sim.attempts.iter().all(|w| w.started < at), "writes after the hand-back: {:?}", sim.attempts);
+    assert_eq!(sim.attempts.len(), 3, "three batches: {:?}", sim.attempts);
+    assert!(ctrl.learned().blocked.is_empty(), "no_effect is not `ignored`");
+    let st = ctrl.status().exposure.unwrap();
+    assert_eq!(st.state, ExposureState::NoResponse);
+    assert_eq!(
+        st.message.as_deref(),
+        Some("The picture does not change when Better Cam changes Exposure. Back to Camera auto.")
+    );
+}
+
+#[test]
+fn case_19_with_gain_the_exposure_steps_are_still_caught() {
+    // Far from the cap the moves are gain first (the picture answers), then exposure steps (it does not): three of
+    // those in a row are caught. Near the cap the loop would fill with gain instead and the picture would answer.
+    let cfg = SimCfg {
+        start_e: -12,
+        start_g: 0,
+        ..SimCfg::default()
+    };
+    let mut sim = Sim::new(cfg, dim(-8.5));
+    sim.faults.no_effect = vec![ControlKey::Exposure];
+    let mut ctrl = engage_both(&sim, resume(-12, 0), true);
+    sim.run(&mut ctrl, 25.0);
+    assert_eq!(handed_back(&sim, ControlKey::Exposure), vec![HandBack::CameraAuto]);
+    assert_eq!(handed_back(&sim, ControlKey::Gain), vec![HandBack::Manual(0)]);
+    let at = sim.handbacks[0].0;
+    assert!(at <= 25.0 && sim.writes.iter().all(|w| w.started < at));
+    assert_eq!(ctrl.status().exposure.unwrap().state, ExposureState::NoResponse);
+}
+
+#[test]
+fn case_20_a_camera_that_errors() {
+    let mut sim = Sim::new(SimCfg::default(), dim(-3.5));
+    sim.faults.fail = true;
+    let mut ctrl = engage_both(&sim, resume(-6, 0), false);
+    sim.run(&mut ctrl, 10.0);
+    assert!(sim.attempts.len() <= 4, "{} write attempts: {:?}", sim.attempts.len(), sim.attempts);
+    assert!(sim.writes.is_empty());
+    assert_eq!(handed_back(&sim, ControlKey::Exposure), vec![HandBack::CameraAuto]);
+    let st = ctrl.status().exposure.unwrap();
+    assert_eq!(st.state, ExposureState::NotAnswering);
+    assert_eq!(
+        st.message.as_deref(),
+        Some("The camera stopped answering. Exposure went back to Camera auto.")
+    );
+    // The retry waits half a second after each failure.
+    let times: Vec<f64> = sim.issued.iter().map(|i| i.0).collect();
+    assert!(times.windows(2).all(|w| w[1] == w[0] || w[1] - w[0] >= 0.5), "{times:?}");
+    // An error is not "ignored".
+    assert!(ctrl.learned().blocked.is_empty());
+}
+
+#[test]
+fn a_write_that_never_returns_is_a_fault_after_3_seconds() {
+    let mut sim = Sim::new(SimCfg::default(), dim(-3.5));
+    sim.faults.hang = true;
+    let mut ctrl = engage_both(&sim, resume(-6, 0), false);
+    sim.run(&mut ctrl, 2.5);
+    assert!(sim.handbacks.is_empty());
+    sim.run(&mut ctrl, 5.0);
+    assert_eq!(handed_back(&sim, ControlKey::Exposure), vec![HandBack::CameraAuto]);
+    assert!(sim.handbacks[0].0 >= 3.0, "{:?}", sim.handbacks);
+    assert_eq!(ctrl.status().exposure.unwrap().state, ExposureState::NotAnswering);
+}
+
+#[test]
+fn case_21_another_program_keeps_changing_the_control() {
+    // Converged (E -5, one stop of gain); another program nudges the gain four times in 30 s: 0.2 stop, inside the
+    // band, so only the read-back notices.
+    let cfg = SimCfg {
+        start_e: -5,
+        start_g: 33,
+        ..SimCfg::default()
+    };
+    let mut sim = Sim::new(cfg, dim(-4.0));
+    sim.faults.meddles = [10.0, 20.0, 30.0, 40.0]
+        .into_iter()
+        .map(|at| Meddle {
+            at,
+            key: ControlKey::Gain,
+            value: 40,
+        })
+        .collect();
+    let mut ctrl = engage_both(&sim, resume(-5, 33), true);
+    sim.run(&mut ctrl, 70.0);
+    let retakes: Vec<_> = sim
+        .writes
+        .iter()
+        .filter(|w| w.key == ControlKey::Gain && w.value == 33)
+        .collect();
+    assert_eq!(retakes.len(), 3, "re-takes: {:?}", sim.writes);
+    for (w, at) in retakes.iter().zip([10.0, 20.0, 30.0]) {
+        assert!(w.started >= at && w.started < at + 1.6, "re-take at {} for a change at {at}", w.started);
+    }
+    // The fourth change: conflict, nothing handed back, nothing written until the user resumes.
+    assert!(sim.handbacks.is_empty());
+    assert!(sim.writes.iter().all(|w| w.started < 40.0), "{:?}", sim.writes);
+    let st = ctrl.status().exposure.unwrap();
+    assert_eq!(st.state, ExposureState::Conflict);
+    assert_eq!(
+        st.message.as_deref(),
+        Some("Another program keeps changing Exposure. Better Cam auto paused.")
+    );
+    assert_eq!(st.handed_back, None);
+    assert!(!ctrl.wants_meter());
+    assert_eq!(sim.device().1, 40, "the other program's value stays");
+    // "Resume": the loop starts again (from the values it holds).
+    ctrl.resume(ControlKey::Exposure);
+    assert!(ctrl.wants_meter());
+    assert_ne!(ctrl.status().exposure.map(|e| e.state), Some(ExposureState::Conflict));
+}
+
+#[test]
+fn case_22_slow_writes() {
+    let mut sim = Sim::new(SimCfg::default(), dim(-3.5));
+    sim.faults.slow = Some(0.3);
+    let mut ctrl = engage(&sim, resume(-6, 0), false);
+    sim.run(&mut ctrl, 14.0);
+    let at = settled_at(&sim, 0.0, 14.0, 0.33).expect("never settled");
+    assert!(at <= 6.0, "settled at {at}");
+    // Never more than one batch per two write times.
+    let mut starts: Vec<f64> = sim.issued.iter().map(|i| i.0).collect();
+    starts.dedup();
+    for w in starts.windows(2) {
+        assert!(w[1] - w[0] >= 0.6 - 1e-9, "batches {} s apart: {starts:?}", w[1] - w[0]);
+    }
+    // The camera is slow but works: not handed back.
+    assert!(sim.handbacks.is_empty());
+    assert_eq!(state(&ctrl), ExposureState::Holding);
+}
+
+#[test]
+fn a_camera_too_slow_for_a_live_loop_is_handed_back() {
+    let mut sim = Sim::new(SimCfg::default(), dim(-3.5));
+    sim.faults.slow = Some(1.2);
+    let mut ctrl = engage(&sim, resume(-6, 0), false);
+    sim.run(&mut ctrl, 30.0);
+    assert_eq!(handed_back(&sim, ControlKey::Exposure), vec![HandBack::CameraAuto]);
+    assert_eq!(
+        ctrl.status().exposure.unwrap().message.as_deref(),
+        Some("This camera is too slow to adjust live.")
+    );
+}
+
+#[test]
+fn hunting_damps_then_hands_back() {
+    // The light swings two stops every 1.2 s: the loop follows it, reverses, and is stopped.
+    let base = (3.5f64).exp2();
+    let light: Light = Box::new(move |t| if ((t / 1.2) as u32).is_multiple_of(2) { base } else { base * 4.0 });
+    let cfg = SimCfg {
+        start_e: -5,
+        start_g: 50,
+        ..SimCfg::default()
+    };
+    let mut sim = Sim::new(cfg, light);
+    let mut ctrl = engage(&sim, resume(-5, 50), true);
+    sim.run(&mut ctrl, 60.0);
+    assert_eq!(handed_back(&sim, ControlKey::Exposure), vec![HandBack::CameraAuto]);
+    let st = ctrl.status().exposure.unwrap();
+    assert_eq!(st.state, ExposureState::Hunting);
+    assert_eq!(st.message.as_deref(), Some("Exposure kept swinging. Back to Camera auto."));
+    // Damped first (30 s), handed back on the second round: not within the first 10 s window.
+    assert!(sim.handbacks[0].0 > 8.0, "{:?}", sim.handbacks);
+    assert!(sim.writes.iter().all(|w| w.started < sim.handbacks[0].0));
+}
+
+#[test]
+fn no_picture_holds_and_speaks_after_ten_seconds() {
+    let cfg = SimCfg {
+        start_e: -5,
+        start_g: 33,
+        ..SimCfg::default()
+    };
+    let mut sim = Sim::new(cfg, dim(-4.0));
+    let mut ctrl = engage(&sim, resume(-5, 33), true);
+    sim.run(&mut ctrl, 8.0);
+    assert_eq!(state(&ctrl), ExposureState::Holding);
+    sim.no_samples = true;
+    sim.run(&mut ctrl, 9.0);
+    assert_eq!(state(&ctrl), ExposureState::Holding, "less than 2 s of silence");
+    sim.run(&mut ctrl, 11.0);
+    let st = ctrl.status().exposure.unwrap();
+    assert_eq!((st.state, st.message), (ExposureState::NoPicture, None));
+    sim.run(&mut ctrl, 20.0);
+    let st = ctrl.status().exposure.unwrap();
+    assert_eq!(st.state, ExposureState::NoPicture);
+    assert_eq!(st.message.as_deref(), Some("No picture to measure."));
+    assert!(sim.writes.is_empty(), "wrote without a picture: {:?}", sim.writes);
+    // The picture comes back: the loop goes on, nothing was handed back.
+    sim.no_samples = false;
+    sim.run(&mut ctrl, 24.0);
+    assert_eq!(state(&ctrl), ExposureState::Holding);
+    assert!(sim.handbacks.is_empty());
+}
+
+// --- where a hand-back goes ---
+
+#[test]
+fn a_camera_without_camera_auto_goes_back_to_the_prior_value() {
+    let cfg = SimCfg {
+        exposure_auto: false,
+        wb: Some(WbSim {
+            can_auto: false,
+            ..WbSim::default()
+        }),
+        ..SimCfg::default()
+    };
+    let mut sim = Sim::new(cfg, dim(-3.5));
+    sim.faults.fail = true;
+    let modes = Modes {
+        exposure: Mode::App,
+        white_balance: Mode::App,
+        prior: Prior {
+            exposure: Some(-7),
+            gain: Some(12),
+            gain_auto: false,
+            white_balance: Some(5200),
+        },
+        ..Modes::default()
+    };
+    let mut ctrl = AutoController::new(&sim.caps(), AutoCfg::default(), Learned::default(), modes);
+    sim.run(&mut ctrl, 10.0);
+    assert_eq!(handed_back(&sim, ControlKey::Exposure), vec![HandBack::Manual(-7)]);
+    assert_eq!(handed_back(&sim, ControlKey::Gain), vec![HandBack::Manual(12)]);
+    assert_eq!(handed_back(&sim, ControlKey::WhiteBalance), vec![HandBack::Manual(5200)]);
+    let st = ctrl.status().exposure.unwrap();
+    assert_eq!(st.handed_back, Some(HandBackKind::Manual));
+    assert_eq!(
+        st.message.as_deref(),
+        Some("The camera stopped answering. Exposure went back to its earlier value.")
+    );
+    let wb = ctrl.status().white_balance.unwrap();
+    assert_eq!((wb.state, wb.handed_back), (WhiteBalanceState::NotAnswering, Some(HandBackKind::Manual)));
+}
+
+#[test]
+fn white_balance_is_handed_back_on_its_own() {
+    // Exposure keeps running; only the white balance write is ignored.
+    let temp: Light = Box::new(|t| if t < 2.0 { 5000.0 } else { 3500.0 });
+    let mut sim = wb_sim(0.008, 5000, temp);
+    sim.faults.ignore = vec![ControlKey::WhiteBalance];
+    let mut ctrl = AutoController::new(
+        &sim.caps(),
+        AutoCfg::default(),
+        Learned::default(),
+        Modes {
+            exposure: Mode::App,
+            white_balance: Mode::App,
+            resume: Resume {
+                exposure: Some(-5),
+                gain: Some(33),
+                white_balance: Some(5000),
+            },
+            seeded: true,
+            ..Modes::default()
+        },
+    );
+    sim.run(&mut ctrl, 20.0);
+    assert_eq!(handed_back(&sim, ControlKey::WhiteBalance), vec![HandBack::CameraAuto]);
+    assert!(handed_back(&sim, ControlKey::Exposure).is_empty());
+    assert_eq!(ctrl.learned().blocked, vec![ControlKey::WhiteBalance]);
+    assert_eq!(wb_state(&ctrl), WhiteBalanceState::Ignored);
+    assert_eq!(
+        ctrl.status().white_balance.unwrap().message.as_deref(),
+        Some("The camera ignored Better Cam auto for White balance. Back to Camera auto.")
+    );
+    assert!(ctrl.status().exposure.is_some_and(|e| e.state == ExposureState::Holding));
+    assert!(ctrl.wants_meter(), "exposure still needs the meter");
+    assert_eq!(
+        AutoController::support(&sim.caps(), ctrl.learned()).white_balance,
+        Offer::No(NoOffer::Blocked)
+    );
+}
+
+#[test]
+fn a_white_balance_that_does_not_answer_is_handed_back() {
+    let temp: Light = Box::new(|t| if t < 2.0 { 5000.0 } else { 3500.0 });
+    let mut sim = wb_sim(0.008, 5000, temp);
+    sim.faults.no_effect = vec![ControlKey::WhiteBalance];
+    let mut ctrl = wb_ctrl(&sim, 5000, true);
+    sim.run(&mut ctrl, 20.0);
+    assert_eq!(handed_back(&sim, ControlKey::WhiteBalance), vec![HandBack::CameraAuto]);
+    assert!(ctrl.learned().blocked.is_empty());
+    assert_eq!(
+        ctrl.status().white_balance.unwrap().message.as_deref(),
+        Some("The picture does not change when Better Cam changes White balance. Back to Camera auto.")
+    );
+    assert!(sim.writes.iter().all(|w| w.started < sim.handbacks[0].0));
+}
+
+// --- the stripes note and `learned` in the status ---
+
+#[test]
+fn stripes_note_follows_the_exposure_and_the_powerline_control() {
+    let sim = Sim::new(SimCfg::default(), dim(-3.5));
+    let mut ctrl = engage(&sim, resume(-6, 0), true);
+    ctrl.tick(0.0, &sim.facts());
+    assert_eq!(ctrl.status().exposure.unwrap().note, None, "powerline unknown");
+    let mut line = w4gs().into_iter().find(|c| c.key == ControlKey::PowerlineFrequency).unwrap();
+    line.value = 1; // 50 Hz
+    ctrl.on_readback(&line, 0.1);
+    // E = -6 is 1/64 s = 15.6 ms: longer than 10 ms, the period of 100 Hz light. The note starts at -7.
+    assert_eq!(ctrl.status().exposure.unwrap().note, None);
+    let sim = Sim::new(
+        SimCfg {
+            start_e: -9,
+            ..SimCfg::default()
+        },
+        dim(-3.5),
+    );
+    let mut ctrl = engage(&sim, resume(-9, 0), true);
+    ctrl.on_readback(&line, 0.0);
+    ctrl.tick(0.0, &sim.facts());
+    assert_eq!(
+        ctrl.status().exposure.unwrap().note.as_deref(),
+        Some("Short exposures under mains light can show stripes.")
+    );
+    line.value = 3; // Auto: no frequency known
+    ctrl.on_readback(&line, 0.2);
+    assert_eq!(ctrl.status().exposure.unwrap().note, None);
+}
+
+#[test]
+fn learned_values_ride_the_status_that_follows_their_change() {
+    // The gain curve is learned while the light alternates (as in case 6): some emitted status carries it, the next
+    // does not, and the last carried value is what the controller holds.
+    let cfg = SimCfg {
+        s_true: 5.0,
+        start_e: -5,
+        ..SimCfg::default()
+    };
+    let light: Light = Box::new(|t| {
+        let need: f64 = if ((t / 5.0) as u32).is_multiple_of(2) { -4.0 } else { -4.8 };
+        (-need).exp2()
+    });
+    let mut sim = Sim::new(cfg, light);
+    let mut ctrl = engage(&sim, resume(-5, 0), true);
+    sim.run(&mut ctrl, 30.0);
+    let carried: Vec<&Learned> = sim.emitted.iter().filter_map(|s| s.learned.as_ref()).collect();
+    assert!(!carried.is_empty(), "no status carried the learned values");
+    assert!(carried.windows(2).all(|w| w[0] != w[1]), "an unchanged value was sent again");
+    let last = carried.last().unwrap();
+    assert!(last.gain_stops.is_some());
+    assert_eq!(ctrl.status().learned, None, "nothing changed since the last emit");
 }
 
 #[test]
