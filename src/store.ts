@@ -1,7 +1,8 @@
 import { create } from "zustand";
 import { api, type EngineState, type NvidiaGpu, type NvidiaInstallProgress, type NvidiaStatus, type Stats, type VcamStatus } from "./api";
 import { FILTERS, defaultChain, makeFilter, type FilterCfg, type FilterKind, type ParamValue } from "./filters/schema";
-import { normalizeChain, signature } from "./filters/chain";
+import { normalizeChain, presetChain, signature } from "./filters/chain";
+import { presetNameFor, stemOf } from "./ui/fileDrop";
 import {
   DEFAULT_OUTPUT,
   DEFAULT_SOURCE,
@@ -219,7 +220,12 @@ interface State extends Saved {
   dismissNotice: () => void;
   undoChain: () => void;
 
-  addFilter: (kind: FilterKind) => void;
+  /** A toast without an Undo (a dropped file Better Cam cannot use, a preset that failed to import). */
+  notify: (text: string) => void;
+  /** Adds a sentence to the toast on screen, or shows it alone when there is none (the note on a drop of several files). */
+  addNotice: (text: string) => void;
+  /** Adds a filter at gap `at` of the chain (default: the end) with some of its params set (a dropped file's path). */
+  addFilter: (kind: FilterKind, at?: number | null, params?: Record<string, ParamValue>) => void;
   removeFilter: (id: string) => void;
   moveFilter: (from: number, to: number) => void;
   toggleFilter: (id: string) => void;
@@ -232,6 +238,11 @@ interface State extends Saved {
   savePreset: (name: string) => Promise<void>;
   saveActivePreset: () => Promise<void>;
   loadPreset: (name: string) => Promise<void>;
+  /**
+   * Imports a preset file from anywhere (a drop): saves it as a preset under its file name ("Name 2" on a clash) and
+   * loads it, with Undo for the chain. The file stays. A failure is a toast.
+   */
+  importPreset: (path: string) => Promise<void>;
   deletePreset: (name: string) => Promise<void>;
   resetChain: () => void;
 }
@@ -891,10 +902,17 @@ export const useStore = create<State>((set, get) => {
       say("Undone");
     },
 
-    addFilter: (kind) => {
+    notify: (text) => say(text),
+    addNotice: (text) =>
+      set((s) => (s.notice ? { notice: `${s.notice} ${text}`, noticeSeq: s.noticeSeq + 1 } : { notice: text, undo: null, noticeSeq: s.noticeSeq + 1 })),
+
+    addFilter: (kind, at, params) => {
       const prev = snapshot();
-      setChain([...prev.chain, makeFilter(kind)]);
-      say(`Added ${FILTERS[kind].label} as step ${prev.chain.length + 1}`, prev);
+      const made = makeFilter(kind);
+      const filter = params ? { ...made, params: { ...made.params, ...params } } : made;
+      const index = at == null ? prev.chain.length : Math.max(0, Math.min(prev.chain.length, at));
+      setChain([...prev.chain.slice(0, index), filter, ...prev.chain.slice(index)]);
+      say(`Added ${FILTERS[kind].label} as step ${index + 1}`, prev);
     },
     removeFilter: (id) => {
       const prev = snapshot();
@@ -949,6 +967,20 @@ export const useStore = create<State>((set, get) => {
         say(`Loaded “${name}”`, signature(prev.chain) === signature(chain) ? null : prev);
       } catch (e) {
         fail(e);
+      }
+    },
+    importPreset: async (path) => {
+      try {
+        const chain = presetChain(await api.readPresetFile(path));
+        await get().refreshPresets();
+        const name = presetNameFor(stemOf(path), get().presets);
+        await api.savePreset(name, chain);
+        await get().refreshPresets();
+        const prev = snapshot();
+        replaceChain(chain, name, signature(chain));
+        say(`Imported “${name}”`, prev);
+      } catch (e) {
+        say(e instanceof Error ? e.message : String(e));
       }
     },
     deletePreset: async (name) => {

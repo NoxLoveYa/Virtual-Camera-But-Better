@@ -1,5 +1,6 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
+import { registerField } from "../ui/fileDrop";
 
 interface Props {
   /** The full path, or "" for none. */
@@ -23,13 +24,32 @@ export function splitPath(path: string): { dir: string; stem: string; ext: strin
  * A file the filter reads: the path (read-only; when it does not fit the folder shortens first, then the file name
  * loses the end of its stem but keeps the extension; the full path is the tooltip), a "Browse…" button for the native
  * file dialog and, once a file is set, a clear button. Both buttons are plain buttons: Tab, Enter and Space work, and
- * focus returns to Browse after the dialog closes and after Clear.
+ * focus returns to Browse after the dialog closes and after Clear. A file dropped from Explorer onto the field sets it
+ * (the window's drop listener finds the field by `data-drop="path"`, see `ui/useFileDrop.ts`); while a fitting file is
+ * over it the path text is replaced by "Drop to use this file" in an accent border.
  */
 export function PathField({ value, kind, onChange, label }: Props) {
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
+  const [over, setOver] = useState(false);
   const browseRef = useRef<HTMLButtonElement>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const change = useRef(onChange);
+  change.current = onChange;
   const { dir, stem, ext } = splitPath(value);
+
+  useEffect(
+    () =>
+      registerField(rootRef.current!, {
+        kind,
+        drop: (path) => {
+          setFailure(null);
+          change.current(path);
+        },
+        setOver,
+      }),
+    [kind],
+  );
 
   const browse = async () => {
     setBusy(true);
@@ -47,10 +67,12 @@ export function PathField({ value, kind, onChange, label }: Props) {
   };
 
   return (
-    <div className="pathfield" role="group" aria-label={label}>
+    <div ref={rootRef} className={`pathfield${over ? " drop-over" : ""}`} role="group" aria-label={label} data-drop="path" data-kind={kind}>
       <div className="pf-line">
         <div className={`pf-text${value ? "" : " empty"}`} title={value || undefined}>
-          {value ? (
+          {over ? (
+            <span className="pf-drop">Drop to use this file</span>
+          ) : value ? (
             <>
               <span className="pf-dir">{dir}</span>
               <span className="pf-stem">{stem}</span>

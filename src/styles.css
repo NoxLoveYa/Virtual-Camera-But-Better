@@ -594,6 +594,27 @@ body.reordering, body.reordering * { cursor: grabbing !important; user-select: n
 .reorder-lift svg { flex: none; color: var(--accent); }
 .reorder-lift .lift-title { font-size: 13px; font-weight: 600; letter-spacing: -0.005em; }
 
+/* Files dragged in from Explorer (ui/useFileDrop.ts): a 1px accent outline round the window content while a usable file
+   is over it, a quiet pill above the footer, the chain's drop line, the path field's own highlight, and the "Use as" box. */
+body.file-drag::after { content: ""; position: fixed; inset: 0; z-index: 40; border: 1px solid var(--accent); pointer-events: none; }
+.drop-hint {
+  /* At the left, so a toast that is still up (centred, same height) does not sit under it. */
+  position: absolute; bottom: calc(100% + 12px); left: 24px; z-index: 15; max-width: calc(100vw - 48px);
+  padding: 6px 14px; color: var(--accent); font-size: 12px; white-space: nowrap; pointer-events: none;
+  background: var(--pop); backdrop-filter: var(--blur);
+  border: 1px solid rgba(46, 230, 214, 0.45); border-radius: var(--r);
+}
+.pathfield.drop-over .pf-text { border-color: var(--accent); background: var(--accent-soft); box-shadow: var(--glow-soft); }
+.pf-drop { color: var(--accent); }
+.drop-chooser {
+  position: fixed; z-index: 50; display: flex; flex-direction: column; gap: 2px; width: 200px; padding: 4px;
+  background: var(--pop); backdrop-filter: var(--blur);
+  border: 1px solid var(--line-strong); border-radius: var(--r);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45), 0 0 18px -10px rgba(46, 230, 214, 0.3);
+}
+.drop-chooser .label { padding: 6px 10px 4px; }
+.drop-chooser .pm-item:focus-visible { color: var(--text); background: rgba(255, 255, 255, 0.07); }
+
 .reorder-live { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 
 @media (prefers-reduced-motion: no-preference) {

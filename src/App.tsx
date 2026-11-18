@@ -2,8 +2,10 @@ import { useEffect, useRef } from "react";
 import { useStore } from "./store";
 import { finalIndex } from "./ui/chainDrag";
 import { useChainDrag } from "./ui/useChainDrag";
+import { useFileDrop } from "./ui/useFileDrop";
 import { AddFilter } from "./components/AddFilter";
 import { ControlsCard } from "./components/ControlsCard";
+import { DropChooser } from "./components/DropChooser";
 import { EngineBanner } from "./components/EngineBanner";
 import { FilterCard } from "./components/FilterCard";
 import { Icon } from "./components/Icon";
@@ -25,6 +27,7 @@ export default function App() {
   const vcamBanner = useStore((s) => s.vcam?.state === "missing" || s.vcam?.state === "outdated");
   const { setAllCollapsed } = useStore.getState();
   const reorder = useChainDrag();
+  const fileDrop = useFileDrop();
   const init = useRef(false);
 
   useEffect(() => {
@@ -64,7 +67,7 @@ export default function App() {
             </div>
           )}
 
-          <div className="chain-block" ref={reorder.blockRef}>
+          <div className="chain-block" ref={reorder.blockRef} data-drop="chain">
             <span className="label chain-label">Filter chain · applied top to bottom</span>
 
             <ol className="chain" ref={reorder.chainRef}>
@@ -81,9 +84,11 @@ export default function App() {
                 aria-hidden
               />
             )}
+            {fileDrop.lineTop !== null && <div className="drop-line file-line" style={{ top: fileDrop.lineTop }} aria-hidden />}
           </div>
         </div>
       </div>
+      {fileDrop.chooser && <DropChooser chooser={fileDrop.chooser} onChoose={fileDrop.choose} />}
       {reorder.lift && (
         <div className="reorder-lift" ref={reorder.liftRef} style={{ left: reorder.lift.left, width: Math.min(reorder.lift.width, 300) }} aria-hidden>
           <Icon name="grip" />
@@ -96,6 +101,7 @@ export default function App() {
       </div>
       <footer className="footer">
         <Toast />
+        {fileDrop.hint && <div className="drop-hint">{fileDrop.hint}</div>}
         <Stats />
       </footer>
       <NvidiaPrompt />

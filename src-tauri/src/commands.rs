@@ -337,6 +337,33 @@ pub fn delete_preset(app: AppHandle, name: String) -> Result<(), String> {
     std::fs::remove_file(preset_path(&app, &name)?).map_err(|e| e.to_string())
 }
 
+/// A preset file may be at most this big. Real ones are a few KiB; the cap keeps a wrong file (a video dropped on the
+/// window, say) from being read into memory.
+const PRESET_FILE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// What `read_preset_file` returns for the file at `path`: the file's chain in the object format (see
+/// `preset_from_file`). Only reads; every failure is a sentence for the user.
+fn read_preset_at(path: &std::path::Path) -> Result<serde_json::Value, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("could not read this file: {e}"))?;
+    if !meta.is_file() {
+        return Err("this is not a file".into());
+    }
+    if meta.len() > PRESET_FILE_MAX_BYTES {
+        return Err("this file is too big to be a Better Cam preset (the limit is 1 MiB)".into());
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("could not read this file: {e}"))?;
+    // Notepad and PowerShell save UTF-8 with a byte order mark, which JSON parsers refuse.
+    let json = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+    let content = serde_json::from_slice(json).map_err(|_| "this file is not a Better Cam preset (it is not valid JSON)")?;
+    preset_from_file(content)
+}
+
+/// Reads a preset file from anywhere (a file dropped on the window) so the page can import it; nothing is written.
+#[tauri::command]
+pub fn read_preset_file(path: String) -> Result<serde_json::Value, String> {
+    read_preset_at(std::path::Path::new(&path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,5 +396,80 @@ mod tests {
         assert_eq!(preset_from_file(with_camera).unwrap(), want);
         assert!(preset_from_file(json!({ "app": "better-cam" })).is_err());
         assert!(preset_from_file(json!("text")).is_err());
+    }
+
+    /// A scratch folder that goes away with the test.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> TempDir {
+            let dir = std::env::temp_dir().join(format!("better-cam-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn read_preset_file_reads_the_object_and_the_bare_array() {
+        let dir = TempDir::new("read-preset");
+        let entry = json!({ "kind": "color_filter", "enabled": true, "params": {} });
+        let want = json!({ "app": "better-cam", "version": 1, "chain": [entry.clone()] });
+
+        let object = dir.0.join("object.json");
+        std::fs::write(&object, serde_json::to_string(&want).unwrap()).unwrap();
+        assert_eq!(read_preset_at(&object).unwrap(), want);
+
+        let bare = dir.0.join("bare.json");
+        std::fs::write(&bare, serde_json::to_string(&json!([entry])).unwrap()).unwrap();
+        assert_eq!(read_preset_at(&bare).unwrap(), want);
+
+        // A file saved by Notepad or PowerShell starts with a UTF-8 byte order mark.
+        let with_bom = dir.0.join("bom.json");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(serde_json::to_string(&want).unwrap().as_bytes());
+        std::fs::write(&with_bom, bytes).unwrap();
+        assert_eq!(read_preset_at(&with_bom).unwrap(), want);
+    }
+
+    #[test]
+    fn read_preset_file_refuses_what_is_not_a_preset() {
+        let dir = TempDir::new("read-preset-bad");
+
+        let bad = dir.0.join("bad.json");
+        std::fs::write(&bad, "{ not json").unwrap();
+        assert!(read_preset_at(&bad).unwrap_err().contains("not valid JSON"));
+
+        let no_chain = dir.0.join("no-chain.json");
+        std::fs::write(&no_chain, r#"{ "app": "better-cam" }"#).unwrap();
+        assert!(read_preset_at(&no_chain).unwrap_err().contains("no \"chain\""));
+
+        let text = dir.0.join("text.json");
+        std::fs::write(&text, r#""just text""#).unwrap();
+        assert!(read_preset_at(&text).is_err());
+
+        assert!(read_preset_at(&dir.0.join("missing.json")).unwrap_err().contains("could not read"));
+        // A folder is not a file.
+        assert_eq!(read_preset_at(&dir.0).unwrap_err(), "this is not a file");
+    }
+
+    #[test]
+    fn read_preset_file_caps_the_size() {
+        let dir = TempDir::new("read-preset-big");
+        let path = dir.0.join("big.json");
+        // Valid JSON, one byte over the limit: the size is checked before the content is read.
+        let padding = " ".repeat(PRESET_FILE_MAX_BYTES as usize - 1);
+        std::fs::write(&path, format!("[]{padding}")).unwrap();
+        assert!(read_preset_at(&path).unwrap_err().contains("too big"));
+        // Exactly at the limit is still read.
+        let padding = " ".repeat(PRESET_FILE_MAX_BYTES as usize - 2);
+        std::fs::write(&path, format!("[]{padding}")).unwrap();
+        assert_eq!(read_preset_at(&path).unwrap(), preset_object(vec![]));
     }
 }

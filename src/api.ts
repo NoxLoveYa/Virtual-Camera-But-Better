@@ -151,6 +151,11 @@ export const api = {
   /** The chain of the preset file (the object, or the old bare array), normalized, with fresh ids. */
   loadPreset: (name: string) => invoke<unknown>("load_preset", { name }).then(presetChain),
   deletePreset: (name: string) => invoke<void>("delete_preset", { name }),
+  /**
+   * The preset file at `path` (a file dropped on the window; the object format, or the old bare array wrapped in it),
+   * still raw: run it through `presetChain`. Only reads; rejects with a sentence (over 1 MiB, not JSON, not a preset).
+   */
+  readPresetFile: (path: string) => invoke<unknown>("read_preset_file", { path }),
   onEngineState: (cb: (s: EngineState) => void) => listen<EngineState>("engine-state", (e) => cb(e.payload)),
   onEngineError: (cb: (msg: string) => void) => listen<string>("engine-error", (e) => cb(e.payload)),
   /** The pause flag of the engine; the window follows it (a restored engine reports the pause it was given). */

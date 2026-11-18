@@ -190,6 +190,7 @@ fn main() {
             commands::save_preset,
             commands::load_preset,
             commands::delete_preset,
+            commands::read_preset_file,
             commands::open_camera_settings,
             commands::vcam_status,
             commands::vcam_install,
