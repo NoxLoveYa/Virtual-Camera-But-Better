@@ -64,3 +64,21 @@
     ${EndIf}
   ${EndIf}
 !macroend
+
+!macro NSIS_HOOK_POSTUNINSTALL
+  ; Tauri's uninstaller removes its install-location key (HKLM\SOFTWARE\NoxLoveYa\Better Cam, the publisher is
+  ; bundle.publisher) only when the "delete app data" box is ticked, and a silent uninstall never ticks it: the key
+  ; was left behind, with the folder it points to gone. Only that key and the publisher key above it, when empty,
+  ; are removed. The publisher must never be "BetterCam": registry names are not case sensitive, and that key holds the
+  ; virtual camera's own record (HKLM\SOFTWARE\BetterCam\Vcam), which only the helper may delete. An update installs
+  ; again right after and keeps both keys.
+  ;
+  ; The autostart plugin also writes an enabled/disabled marker for the Run value (Task Manager's Startup tab reads it,
+  ; HKCU\...\Explorer\StartupApproved\Run), and Tauri removes only the Run value. A marker that stays could keep a
+  ; later install's autostart switched off (if the user had disabled it there), so it goes too.
+  ${If} $UpdateMode <> 1
+    DeleteRegKey SHCTX "${MANUPRODUCTKEY}"
+    DeleteRegKey /ifempty SHCTX "${MANUKEY}"
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" "${PRODUCTNAME}"
+  ${EndIf}
+!macroend
