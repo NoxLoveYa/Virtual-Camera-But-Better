@@ -175,8 +175,8 @@ pub fn is_decoder_failure(hr: HRESULT) -> bool {
 }
 
 /// An error that a second try cannot change: an invalid argument, an operation or interface the object does not
-/// have, a format Media Foundation does not support. The engine stops at once with the named error instead of
-/// retrying it for 30 seconds.
+/// have, a format Media Foundation does not support. On the first open of a Start the engine stops at once with the
+/// named error instead of retrying it for 30 seconds; on a retry after the camera worked it is an error like others.
 pub fn is_deterministic_failure(hr: HRESULT) -> bool {
     const E_INVALIDARG: u32 = 0x8007_0057;
     const E_NOTIMPL: u32 = 0x8000_4001;

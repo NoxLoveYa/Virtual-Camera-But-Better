@@ -156,6 +156,13 @@ pub enum Failure {
 
 impl Failure {
     pub fn from_capture(e: &CaptureError) -> Failure {
+        Failure::from_capture_at(e, true)
+    }
+
+    /// [`Failure::from_capture`] for an open that is (`first_open`) or is not the first of a Start. An error that a
+    /// second try cannot change stops the engine at once on the first open only: a camera that worked and fails with
+    /// such a code after a reconnect is retried like any other error (for `Timings::error_cap`).
+    pub fn from_capture_at(e: &CaptureError, first_open: bool) -> Failure {
         // A lost GPU device first: the decoder and the media type share it, so with it gone any call can fail with
         // any code, and a failure to set the media type is not a format problem (it would trigger the device-default
         // fallback and the user's saved format would be replaced).
@@ -180,7 +187,7 @@ impl Failure {
                 } else if what.starts_with("SetCurrentMediaType") {
                     // The camera refused the type that was picked from its own list.
                     Failure::Format(e.to_string())
-                } else if crate::capture::is_deterministic_failure(hr) {
+                } else if first_open && crate::capture::is_deterministic_failure(hr) {
                     // A second try cannot change it: stop at once and name the error.
                     Failure::Fatal(e.to_string())
                 } else {
@@ -601,6 +608,8 @@ pub struct Timings {
     /// After a device loss the last frame stays on the file for this long; a recovery that takes longer shows the
     /// "starting" slate (plan 4.9: 1 s).
     pub gpu_slate_delay: Duration,
+    /// A GPU device rebuild that takes longer than this counts as a failed rebuild; its helper thread is left behind.
+    pub gpu_rebuild_timeout: Duration,
 }
 
 impl Default for Timings {
@@ -614,6 +623,7 @@ impl Default for Timings {
             stable_after: Duration::from_secs(10),
             gpu_failure_window: Duration::from_secs(30),
             gpu_slate_delay: Duration::from_secs(1),
+            gpu_rebuild_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -817,6 +827,7 @@ impl Engine {
         let control = {
             let c = Control {
                 rx,
+                backlog: VecDeque::new(),
                 events_rx,
                 events_tx,
                 shared: shared.clone(),
@@ -1138,6 +1149,8 @@ enum OpenMode {
 
 struct Control {
     rx: Receiver<Msg>,
+    /// Messages read from `rx` while a GPU device was rebuilt, handled before any later one.
+    backlog: VecDeque<Msg>,
     events_rx: Receiver<SessionEvent>,
     events_tx: Sender<SessionEvent>,
     shared: Arc<Shared>,
@@ -1196,13 +1209,16 @@ impl Control {
         #[cfg(test)]
         let gate_owner = self.shared.clone();
         loop {
-            let mut next = match self.rx.recv_timeout(self.timings.tick) {
-                Ok(m) => Some(m),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => {
-                    self.shutdown();
-                    return;
-                }
+            let mut next = match self.backlog.pop_front() {
+                Some(m) => Some(m),
+                None => match self.rx.recv_timeout(self.timings.tick) {
+                    Ok(m) => Some(m),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        self.shutdown();
+                        return;
+                    }
+                },
             };
             #[cfg(test)]
             let _gate = lock(&gate_owner.control_gate);
@@ -1212,7 +1228,7 @@ impl Control {
                     return;
                 }
                 self.handle(m);
-                next = self.rx.try_recv().ok();
+                next = self.backlog.pop_front().or_else(|| self.rx.try_recv().ok());
             }
             self.poll_session();
             self.poll_hotplug();
@@ -1500,8 +1516,11 @@ impl Control {
             }
         }
         // The GPU device was lost: a new one first (a failure counts as another loss and is handled there).
-        if self.gpu_dirty && !self.rebuild_gpu() {
-            return;
+        if self.gpu_dirty {
+            // A Stop or Shutdown that came in meanwhile is handled before the camera is opened.
+            if !self.rebuild_gpu() || self.stop_queued() {
+                return;
+            }
         }
         let Some(cfg) = &self.cfg else {
             return;
@@ -1674,7 +1693,9 @@ impl Control {
     ///
     /// The device is built on a helper thread (it takes 0.6-0.8 s on WARP and may take longer after a driver reset)
     /// while this thread keeps the file's heartbeat going: the virtual camera shows "Better Cam is not running"
-    /// after a second without one. Messages that arrive meanwhile wait in the queue.
+    /// after a second without one. Messages that arrive meanwhile wait in the queue ([`Control::backlog`]); a Stop or
+    /// a Shutdown among them ends the wait (`false`, nothing counted). A rebuild that takes longer than
+    /// `Timings::gpu_rebuild_timeout` is a failed one; its helper thread is left to finish by itself.
     fn rebuild_gpu(&mut self) -> bool {
         let started = Instant::now();
         let kind = self.renderer.gpu.kind;
@@ -1709,7 +1730,19 @@ impl Control {
             Ok(_) => loop {
                 match result.recv_timeout(self.timings.tick) {
                     Ok(built) => break built,
-                    Err(RecvTimeoutError::Timeout) => self.beat(),
+                    Err(RecvTimeoutError::Timeout) => {
+                        self.beat();
+                        if self.stop_queued() {
+                            eprintln!("[engine] GPU device rebuild abandoned: the engine is stopping");
+                            return false;
+                        }
+                        if started.elapsed() >= self.timings.gpu_rebuild_timeout {
+                            break Err(format!(
+                                "it took longer than {:.1} seconds",
+                                self.timings.gpu_rebuild_timeout.as_secs_f32()
+                            ));
+                        }
+                    }
                     Err(RecvTimeoutError::Disconnected) => {
                         break Err("the rebuild thread ended without a result".to_string())
                     }
@@ -1750,6 +1783,15 @@ impl Control {
                 false
             }
         }
+    }
+
+    /// Move the messages that wait in the queue to [`Control::backlog`]; `true` when a Stop or a Shutdown is among
+    /// them (so the engine must not open a camera first).
+    fn stop_queued(&mut self) -> bool {
+        while let Ok(m) = self.rx.try_recv() {
+            self.backlog.push_back(m);
+        }
+        self.backlog.iter().any(|m| matches!(m, Msg::Stop | Msg::Shutdown))
     }
 
     /// Keep the advertised media types current while no camera is open, so a consumer that attaches then (and wakes
@@ -2204,7 +2246,7 @@ impl SourceFactory for DefaultFactory {
         }
         Ok(match spec {
             SourceSpec::Camera(c) => {
-                Box::new(open_retrying_decoder(c, |c| open_camera(c, gpu))?)
+                Box::new(open_retrying_decoder(c, first_open, |c| open_camera(c, gpu, first_open))?)
             }
             SourceSpec::Configured(cap) => {
                 let (mut camera, fallback) = open_with_fallback(cap, |cap| {
@@ -2212,7 +2254,7 @@ impl SourceFactory for DefaultFactory {
                     // A camera that cannot deliver a picture in the format it lists is as good as one that lacks it,
                     // but only the first time this source is opened: one that did open and then timed out after a
                     // reconnect is slow, not lacking the format, and is retried in the same format.
-                    open_retrying_decoder(&c, |c| open_camera(c, gpu))
+                    open_retrying_decoder(&c, first_open, |c| open_camera(c, gpu, first_open))
                         .map_err(|f| no_picture_as_format_problem(f, cap, first_open))
                 })?;
                 camera.info.fallback = finish_fallback(fallback, &camera.info);
@@ -2311,9 +2353,12 @@ fn describe_source(i: &SourceInfo) -> String {
 
 /// Open a camera; when the video decoder fails at the open or at the first frame, open it once more with hardware
 /// decoding off (plan 4.9), before anything else is given up: the next step, if the decoder fails again, is the format
-/// fallback ([`open_with_fallback`]), so a decoder that cannot run the saved format counts as lacking it.
+/// fallback ([`open_with_fallback`]), so a decoder that cannot run the saved format counts as lacking it. But only
+/// on the `first_open` of a Start: a camera that worked and then fails in the decoder after a reconnect is not
+/// lacking the format; the failure is returned as a decoder retry (like any other generic failure, for a while).
 fn open_retrying_decoder<T>(
     spec: &CameraSpec,
+    first_open: bool,
     mut open: impl FnMut(&CameraSpec) -> Result<T, Failure>,
 ) -> Result<T, Failure> {
     match open(spec) {
@@ -2324,14 +2369,14 @@ fn open_retrying_decoder<T>(
                 ..spec.clone()
             };
             match open(&software) {
-                Err(Failure::Retry(RetryKind::Decoder, again)) => Err(Failure::Format(format!(
+                Err(Failure::Retry(RetryKind::Decoder, again)) if first_open => Err(Failure::Format(format!(
                     "the video decoder cannot decode this format, also with hardware decoding off ({again})"
                 ))),
                 other => other,
             }
         }
         // Hardware decoding was off already: nothing left to try for this format.
-        Err(Failure::Retry(RetryKind::Decoder, why)) => Err(Failure::Format(format!(
+        Err(Failure::Retry(RetryKind::Decoder, why)) if first_open => Err(Failure::Format(format!(
             "the video decoder cannot decode this format ({why})"
         ))),
         other => other,
@@ -2432,13 +2477,13 @@ impl Source for CameraInput {
     }
 }
 
-fn open_camera(spec: &CameraSpec, gpu: &Arc<GpuDevice>) -> Result<CameraInput, Failure> {
+fn open_camera(spec: &CameraSpec, gpu: &Arc<GpuDevice>, first_open: bool) -> Result<CameraInput, Failure> {
     let mut opts = OpenOptions::new(&spec.link, spec.request);
     opts.hw_decode = spec.hw_decode;
     opts.gpu = Some(gpu.clone());
     // A queue of one is the latest-frame mailbox: a newer frame replaces the one the render thread has not taken.
     opts.queue_len = 1;
-    let reader = CaptureReader::open(opts).map_err(|e| Failure::from_capture(&e))?;
+    let reader = CaptureReader::open(opts).map_err(|e| Failure::from_capture_at(&e, first_open))?;
     // A camera that offers no controls simply has none to show.
     let controls = match DeviceControls::from_reader(&reader) {
         Ok(c) => Some(Arc::new(c)),
@@ -3572,6 +3617,7 @@ mod tests {
             stable_after: Duration::from_millis(600),
             gpu_failure_window: Duration::from_secs(5),
             gpu_slate_delay: Duration::from_secs(1),
+            gpu_rebuild_timeout: Duration::from_secs(10),
         }
     }
 
@@ -3620,6 +3666,9 @@ mod tests {
         real_users: AtomicBool,
         /// The target link of every `camera_users` call.
         targets: Mutex<Vec<Option<String>>>,
+        /// The next opens fail like the real factory's with these `(call, HRESULT)` of Media Foundation, in order
+        /// (`Failure::from_capture_at` and `open_retrying_decoder` with the open's `first_open`).
+        capture_errors: Mutex<VecDeque<(&'static str, u32)>>,
     }
 
     /// The symbolic link the fake camera has.
@@ -3697,6 +3746,18 @@ mod tests {
             }
             if let Some(f) = self.failures.lock().unwrap().pop_front() {
                 return Err(f);
+            }
+            if let Some((what, code)) = self.capture_errors.lock().unwrap().pop_front() {
+                let spec = CameraSpec {
+                    link: FAKE_LINK.into(),
+                    request: FormatRequest { format: PixelFormat::Mjpeg, size: None, fps: None },
+                    hw_decode: true,
+                };
+                let failed = open_retrying_decoder(&spec, first_open, |_| -> Result<(), Failure> {
+                    let error = windows::core::Error::from(HRESULT(code as i32));
+                    Err(Failure::from_capture_at(&CaptureError::Api { what, error }, first_open))
+                });
+                return Err(failed.unwrap_err());
             }
             if self.gone.load(Ordering::SeqCst) {
                 return Err(Failure::Retry(
@@ -3815,6 +3876,7 @@ mod tests {
                 users: Mutex::new(Vec::new()),
                 real_users: AtomicBool::new(false),
                 targets: Mutex::new(Vec::new()),
+                capture_errors: Mutex::new(VecDeque::new()),
             });
             let opener = Arc::new(crate::camera_controls::fake::FakeOpener {
                 camera: fake.controls.clone(),
@@ -5931,6 +5993,57 @@ mod tests {
         assert!(worst < 500, "the heartbeat was {worst} ms old");
     }
 
+    /// A device rebuild that never returns is a failed rebuild after `gpu_rebuild_timeout`; three stop the engine.
+    #[test]
+    fn a_gpu_rebuild_that_never_returns_stops_the_engine_with_an_error() {
+        let mut t = fast();
+        t.gpu_rebuild_timeout = Duration::from_millis(300);
+        let rig = Rig::new("rf-rebuild-hang.bin", t);
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        *rig.engine.shared.rebuild_delay.lock().unwrap() = Duration::from_secs(3600);
+        let t0 = Instant::now();
+        rig.engine.inject_device_loss(1);
+        assert!(rig.engine.wait_stopped(Duration::from_secs(10)), "{:?}", rig.states());
+        let err = rig.engine.last_error().unwrap();
+        assert!(err.contains("could not be rebuilt") && err.contains("took longer"), "{err}");
+        assert!(t0.elapsed() < Duration::from_secs(8), "{:?}", t0.elapsed());
+        assert_eq!(rig.engine.gpu_generation(), 1, "no device was ever built");
+        assert_eq!(rig.alive(), 0);
+    }
+
+    /// A Stop or a Shutdown sent while the device is being rebuilt is read within a tick, not after the rebuild.
+    #[test]
+    fn a_stop_or_shutdown_during_a_gpu_rebuild_is_honoured_at_once() {
+        let rebuilding = |name: &str| {
+            let rig = Rig::new(name, fast());
+            rig.engine.start(settings(bars(30), false));
+            rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+            *rig.engine.shared.rebuild_delay.lock().unwrap() = Duration::from_secs(3600);
+            rig.engine.inject_device_loss(1);
+            rig.wait("the rebuild", Duration::from_secs(10), |r| {
+                r.engine.state() == EngineState::Standby && r.engine.reason().as_deref() == Some("reopening")
+            });
+            std::thread::sleep(Duration::from_millis(150));
+            rig
+        };
+        // Stop: the engine stops without opening a camera
+        let rig = rebuilding("rf-rebuild-stop.bin");
+        let opens = rig.opens();
+        let t0 = Instant::now();
+        rig.engine.stop();
+        assert!(rig.engine.wait_stopped(Duration::from_secs(3)), "{:?}", rig.states());
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        assert_eq!(rig.opens(), opens, "no camera was opened for the engine that was told to stop");
+        assert!(rig.engine.last_error().is_none());
+        drop(rig);
+        // Shutdown: the control thread ends
+        let rig = rebuilding("rf-rebuild-shutdown.bin");
+        let t0 = Instant::now();
+        rig.engine.close();
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+    }
+
     /// The real lookup (registry and the camera service's log) on the control thread, at every retry: the file's
     /// heartbeat does not stall.
     #[test]
@@ -6269,7 +6382,7 @@ mod tests {
         };
         // hardware first, software works
         let mut seen = Vec::new();
-        let r = open_retrying_decoder(&spec(true), |s| {
+        let r = open_retrying_decoder(&spec(true), true, |s| {
             seen.push(s.hw_decode);
             if s.hw_decode { Err(decoder()) } else { Ok(7) }
         });
@@ -6277,7 +6390,7 @@ mod tests {
         assert_eq!(seen, vec![true, false]);
         // both fail: a format problem, which the fallback to the device default takes up
         let mut calls = 0;
-        let r: Result<u8, Failure> = open_retrying_decoder(&spec(true), |_| {
+        let r: Result<u8, Failure> = open_retrying_decoder(&spec(true), true, |_| {
             calls += 1;
             Err(decoder())
         });
@@ -6285,7 +6398,7 @@ mod tests {
         assert_eq!(calls, 2, "once more, not more");
         // software from the start: nothing to retry with, and nothing else to blame
         let mut calls = 0;
-        let r: Result<u8, Failure> = open_retrying_decoder(&spec(false), |_| {
+        let r: Result<u8, Failure> = open_retrying_decoder(&spec(false), true, |_| {
             calls += 1;
             Err(decoder())
         });
@@ -6293,11 +6406,81 @@ mod tests {
         assert_eq!(calls, 1);
         // other failures are not the decoder's
         let mut calls = 0;
-        let r: Result<u8, Failure> = open_retrying_decoder(&spec(true), |_| {
+        let r: Result<u8, Failure> = open_retrying_decoder(&spec(true), true, |_| {
             calls += 1;
             Err(Failure::in_use(None))
         });
         assert!(matches!(r, Err(Failure::Retry(RetryKind::InUse, _))) && calls == 1);
+    }
+
+    /// A decoder that fails twice is a format problem on the first open of a Start only: after a reconnect it is a
+    /// decoder retry (no device-default fallback, no format stop).
+    #[test]
+    fn a_decoder_failure_on_a_reconnect_is_retried_not_a_format_problem() {
+        use windows::core::Error;
+        let decoder = || {
+            Failure::from_capture(&CaptureError::Api {
+                what: "first ReadSample",
+                error: Error::from(HRESULT(0xC00D_6D60_u32 as i32)),
+            })
+        };
+        let spec = |hw| CameraSpec {
+            link: FAKE_LINK.into(),
+            request: FormatRequest { format: PixelFormat::Mjpeg, size: None, fps: None },
+            hw_decode: hw,
+        };
+        for hw in [true, false] {
+            let mut calls = 0;
+            let r: Result<u8, Failure> = open_retrying_decoder(&spec(hw), false, |_| {
+                calls += 1;
+                Err(decoder())
+            });
+            assert!(matches!(r, Err(Failure::Retry(RetryKind::Decoder, _))), "hw {hw}: {r:?}");
+            assert_eq!(calls, if hw { 2 } else { 1 }, "the software retry is still made");
+        }
+        // through the engine: the first open stops with a format error ...
+        let rig = Rig::new("rf-decoder-first.bin", fast());
+        rig.fake.capture_errors.lock().unwrap().push_back(("first ReadSample", 0xC00D_6D60));
+        rig.engine.start(settings(bars(30), false));
+        let err = rig.engine.wait_live(Duration::from_secs(5)).unwrap_err();
+        assert!(err.contains("decoder cannot decode"), "{err}");
+        assert!(rig.engine.wait_stopped(Duration::from_secs(5)));
+        drop(rig);
+        // ... a reconnect waits and comes back
+        let rig = Rig::new("rf-decoder-again.bin", fast());
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.fake.capture_errors.lock().unwrap().push_back(("first ReadSample", 0xC00D_6D60));
+        rig.fake.capture_errors.lock().unwrap().push_back(("first ReadSample", 0xC00D_6D60));
+        rig.fake.stream_error_once.store(true, Ordering::SeqCst);
+        rig.wait("a failed retry", Duration::from_secs(10), |r| r.fake.capture_errors.lock().unwrap().is_empty());
+        rig.wait_state(EngineState::Live, Duration::from_secs(10));
+        assert!(rig.engine.last_error().is_none());
+        assert!(rig.states().iter().all(|(s, _)| *s != EngineState::Stopped), "{:?}", rig.states());
+        let firsts = rig.fake.first_opens.lock().unwrap().clone();
+        assert!(firsts.len() >= 4 && firsts[0] && firsts[1..].iter().all(|f| !f), "{firsts:?}");
+    }
+
+    /// A deterministic error code stops the engine at once on the first open of a Start; while a camera that worked is
+    /// waited for it is an error like others (retried for `error_cap`).
+    #[test]
+    fn a_deterministic_error_code_during_a_reconnect_does_not_stop_the_engine() {
+        use windows::core::Error;
+        let api = |code: u32| CaptureError::Api { what: "MFCreateSourceReaderFromMediaSource", error: Error::from(HRESULT(code as i32)) };
+        for code in [0x8007_0057_u32, 0x8000_4001, 0x8000_4002, 0x8007_0032, 0xC00D_3E98, 0xC00D_36B4] {
+            assert!(matches!(Failure::from_capture_at(&api(code), true), Failure::Fatal(_)), "{code:#x}");
+            assert!(matches!(Failure::from_capture_at(&api(code), false), Failure::Retry(RetryKind::Error, _)), "{code:#x}");
+        }
+        let rig = Rig::new("rf-deterministic-again.bin", fast());
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.fake.capture_errors.lock().unwrap().push_back(("MFCreateSourceReaderFromMediaSource", 0x8007_0057));
+        rig.fake.capture_errors.lock().unwrap().push_back(("MFCreateSourceReaderFromMediaSource", 0x8007_0057));
+        rig.fake.stream_error_once.store(true, Ordering::SeqCst);
+        rig.wait("a failed retry", Duration::from_secs(10), |r| r.fake.capture_errors.lock().unwrap().is_empty());
+        rig.wait_state(EngineState::Live, Duration::from_secs(10));
+        assert!(rig.engine.last_error().is_none());
+        assert!(rig.states().iter().all(|(s, _)| *s != EngineState::Stopped), "{:?}", rig.states());
     }
 
     /// L4: only a refusal ("access denied") of the open is Windows' privacy setting, and only while a switch is off.

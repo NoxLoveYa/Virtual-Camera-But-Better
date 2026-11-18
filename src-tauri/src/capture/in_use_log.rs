@@ -24,8 +24,10 @@
 //! started before the oldest record is not seen, and the answer is then "no name" (the banner says "another app").
 //!
 //! The reading is bounded: newest first, at most [`MAX_EVENTS`] records from the last [`MAX_AGE_MS`], and it
-//! returns what it has when [`BUDGET`] is spent. Every failure is an empty list.
+//! returns what it has when [`BUDGET`] is spent. The analysis is bounded too: linear in the number of records, and
+//! it returns what it knows when [`ANALYSIS_BUDGET`] is spent. Every failure is an empty list.
 
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use windows::core::{w, HSTRING, PCWSTR};
@@ -39,8 +41,7 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-use super::{links_match, normalize_link};
-use crate::config::arrival_matches;
+use super::{normalize_link, parse_vid_pid};
 
 /// The environment variable that replaces the event log with the lines of a text file (debug builds only, like
 /// `BETTER_CAM_TEST_WINDOW`), re-read at every lookup, so a test can add and remove events while the app runs. Lines
@@ -57,8 +58,10 @@ pub const TEST_LOG_ENV: &str = "BETTER_CAM_TEST_CAMERA_LOG";
 pub const MAX_EVENTS: usize = 2000;
 /// How far back the log is read, in milliseconds.
 pub const MAX_AGE_MS: u64 = 4 * 60 * 60 * 1000;
-/// The time one lookup may take before it returns what it has.
+/// The time reading the log may take before it returns what it has.
 pub const BUDGET: Duration = Duration::from_millis(50);
+/// The time the analysis of what was read ([`holders`]) may take, from the end of the reading.
+pub const ANALYSIS_BUDGET: Duration = Duration::from_millis(20);
 
 /// 100 ns units (FILETIME) in a millisecond.
 const MS: u64 = 10_000;
@@ -85,7 +88,16 @@ pub struct LogEvent {
     pub pid: u32,
     /// The camera's symbolic link as the event spells it.
     pub link: String,
+    /// [`normalize_link`] of `link`, made once when the event is built (links compare equal by this).
+    pub norm: String,
     pub kind: Kind,
+}
+
+impl LogEvent {
+    pub fn new(time: u64, pid: u32, link: String, kind: Kind) -> LogEvent {
+        let norm = normalize_link(&link);
+        LogEvent { time, pid, link, norm, kind }
+    }
 }
 
 /// What Windows says about a process id now.
@@ -118,85 +130,160 @@ fn is_service_host(name: &str) -> bool {
 }
 
 /// A stream that started and has not been seen to stop.
-struct Open {
+struct Open<'a> {
+    /// Position among the events by time (the order of ties).
+    seq: usize,
     time: u64,
     service: u32,
-    link: String,
+    /// The camera's link, normalised.
+    norm: &'a str,
+}
+
+/// The deadline of the analysis: `expired` is asked every [`Budget::EVERY`] steps, and once it said yes it stays yes.
+struct Budget<'a> {
+    expired: &'a dyn Fn() -> bool,
+    steps: u32,
+    over: bool,
+}
+
+impl<'a> Budget<'a> {
+    const EVERY: u32 = 16;
+
+    fn new(expired: &'a dyn Fn() -> bool) -> Budget<'a> {
+        Budget { expired, steps: 0, over: false }
+    }
+
+    /// One step of work done; `true` when the time is up.
+    fn over(&mut self) -> bool {
+        if !self.over {
+            self.steps += 1;
+            self.over = self.steps % Self::EVERY == 0 && (self.expired)();
+        }
+        self.over
+    }
+}
+
+/// What the process table says about a process id, asked once per id.
+struct Procs<'a> {
+    proc_of: &'a dyn Fn(u32) -> Proc,
+    seen: HashMap<u32, Proc>,
+}
+
+impl Procs<'_> {
+    fn get(&mut self, pid: u32) -> Proc {
+        let proc_of = self.proc_of;
+        self.seen.entry(pid).or_insert_with(|| proc_of(pid)).clone()
+    }
 }
 
 /// The programs that stream the camera `target` (the symbolic link Better Cam wants; `None`: the first camera, which
 /// is not known here) according to `events` (any order). `own_pid` is Better Cam's process; `proc_of` tells what a
-/// process id is now. See the module comment for the rule.
-pub fn holders(events: &[LogEvent], target: Option<&str>, own_pid: u32, proc_of: &dyn Fn(u32) -> Proc) -> Holders {
+/// process id is now (asked once per id). `expired` says the time is up: what is known by then is returned (the
+/// streams are matched first, and with the time up before that is done nothing is known; after that each stream is
+/// judged on its own, most recent first). The work is linear in the number of events. See the module comment for the
+/// rule.
+pub fn holders(
+    events: &[LogEvent],
+    target: Option<&str>,
+    own_pid: u32,
+    proc_of: &dyn Fn(u32) -> Proc,
+    expired: &dyn Fn() -> bool,
+) -> Holders {
+    if expired() {
+        return Holders::default();
+    }
+    let mut budget = Budget::new(expired);
     let target = target.filter(|t| !t.is_empty());
-    let physical: Vec<&LogEvent> = events.iter().filter(|e| is_physical(&e.link)).collect();
+    let physical = events.iter().filter(|e| is_physical(&e.norm));
     // The target's own link first; the same model on another port only when the link itself never shows up.
     let mut ev: Vec<&LogEvent> = match target {
         Some(t) => {
-            let exact: Vec<&LogEvent> = physical.iter().copied().filter(|e| links_match(&e.link, t)).collect();
+            let wanted = normalize_link(t);
+            let exact: Vec<&LogEvent> = physical.clone().filter(|e| e.norm == wanted).collect();
             if exact.is_empty() {
-                physical.iter().copied().filter(|e| arrival_matches(Some(t), &e.link)).collect()
+                let vid_pid = parse_vid_pid(t);
+                physical
+                    .filter(|e| vid_pid.is_some() && parse_vid_pid(&e.link) == vid_pid)
+                    .collect()
             } else {
                 exact
             }
         }
-        None => physical,
+        None => physical.collect(),
     };
     ev.sort_by_key(|e| e.time);
 
     // The streams that started and were not stopped later (a stream id is a pointer: a new start replaces an old one).
-    let mut open: Vec<(u64, Open)> = Vec::new();
-    for e in &ev {
+    let mut started: HashMap<(u64, &str), Open> = HashMap::new();
+    let mut opens: HashMap<&str, Vec<&LogEvent>> = HashMap::new();
+    for (seq, e) in ev.iter().enumerate() {
+        if budget.over() {
+            return Holders::default();
+        }
         match e.kind {
             Kind::StreamStart(id) => {
-                open.retain(|(i, o)| !(*i == id && links_match(&o.link, &e.link)));
-                open.push((id, Open { time: e.time, service: e.pid, link: e.link.clone() }));
+                started.insert((id, e.norm.as_str()), Open { seq, time: e.time, service: e.pid, norm: &e.norm });
             }
-            Kind::StreamStop(id) => open.retain(|(i, o)| !(*i == id && links_match(&o.link, &e.link))),
-            Kind::Opened => {}
+            Kind::StreamStop(id) => {
+                started.remove(&(id, e.norm.as_str()));
+            }
+            Kind::Opened => opens.entry(e.norm.as_str()).or_default().push(e),
         }
     }
     // A stream whose service host is gone (the service restarted) is gone with it.
-    open.retain(|(_, o)| {
-        o.service == 0
-            || match proc_of(o.service) {
+    let mut procs = Procs { proc_of, seen: HashMap::new() };
+    let mut open: Vec<Open> = Vec::new();
+    for o in started.into_values() {
+        if budget.over() {
+            return Holders::default();
+        }
+        let alive = o.service == 0
+            || match procs.get(o.service) {
                 Proc::Gone => false,
                 Proc::Running { start, .. } => start < o.time,
                 Proc::Unknown => true,
-            }
-    });
-    open.sort_by_key(|(_, o)| std::cmp::Reverse(o.time));
+            };
+        if alive {
+            open.push(o);
+        }
+    }
+    open.sort_by_key(|o| (std::cmp::Reverse(o.time), o.seq));
 
-    let mut links: Vec<String> = open.iter().map(|(_, o)| normalize_link(&o.link)).collect();
-    links.sort();
-    links.dedup();
     // Without a target, streams on several cameras cannot be told apart.
-    let mut maybe = target.is_none() && links.len() > 1;
+    let cameras: HashSet<&str> = open.iter().map(|o| o.norm).collect();
+    let mut maybe = target.is_none() && cameras.len() > 1;
 
     let mut named: Vec<(u64, String)> = Vec::new();
-    for (_, stream) in &open {
-        // The clients that opened this camera before the stream: those just before it, else the latest one.
-        let mut opened: Vec<&&LogEvent> = ev
-            .iter()
-            .filter(|e| e.kind == Kind::Opened && e.time <= stream.time && links_match(&e.link, &stream.link))
-            .collect();
-        opened.sort_by_key(|e| std::cmp::Reverse(e.time));
+    'streams: for stream in &open {
+        if budget.over() {
+            break;
+        }
+        // The clients that opened this camera before the stream (`before`, oldest first): those just before it, else
+        // the latest one.
+        let Some(all) = opens.get(stream.norm) else { continue };
+        let before = &all[..all.partition_point(|e| e.time <= stream.time)];
+        let Some(newest) = before.last().map(|e| e.time) else { continue };
         // A failed try of Better Cam's own (the camera is held by a program that bypasses the camera service) also
         // starts a stream that nothing ever stops: it is ours when our open is the newest one before it.
-        if opened.first().is_some_and(|e| e.pid == own_pid) {
+        if before[before.partition_point(|e| e.time < newest)].pid == own_pid {
             continue;
         }
-        let near: Vec<&&LogEvent> = opened.iter().copied().filter(|e| stream.time - e.time <= OPEN_WINDOW).collect();
+        let near = &before[before.partition_point(|e| stream.time - e.time > OPEN_WINDOW)..];
         // Just before the stream, else the latest open before it (a client that opened the camera and streamed later).
-        let candidates: Vec<&&LogEvent> = if near.is_empty() { opened.iter().copied().take(1).collect() } else { near.clone() };
+        let mut candidates: Vec<&LogEvent> =
+            if near.is_empty() { vec![before[before.partition_point(|e| e.time < newest)]] } else { near.to_vec() };
+        candidates.sort_by_key(|e| std::cmp::Reverse(e.time));
         // Only a process that can be the client counts, once, by its newest open: not Better Cam (which is the one
         // asking), not the service host, not one that ended or whose id was reused after the open.
         let mut eligible: Vec<(u32, String)> = Vec::new();
         for c in candidates {
+            if budget.over() {
+                break 'streams; // this stream is not judged half way
+            }
             if c.pid == own_pid || eligible.iter().any(|(p, _)| *p == c.pid) {
                 continue;
             }
-            let Proc::Running { start, name } = proc_of(c.pid) else { continue };
+            let Proc::Running { start, name } = procs.get(c.pid) else { continue };
             if start >= c.time || is_service_host(&name) {
                 continue;
             }
@@ -280,7 +367,7 @@ pub fn parse_test_log(text: &str, now: u64) -> Vec<LogEvent> {
         let ev = match what {
             "open" => {
                 let (Some(pid), Some(link)) = (f.next().and_then(|p| p.parse().ok()), f.next()) else { continue };
-                LogEvent { time, pid, link: link.to_string(), kind: Kind::Opened }
+                LogEvent::new(time, pid, link.to_string(), Kind::Opened)
             }
             "start" | "stop" => {
                 let (Some(pid), Some(id), Some(link)) =
@@ -289,7 +376,7 @@ pub fn parse_test_log(text: &str, now: u64) -> Vec<LogEvent> {
                     continue;
                 };
                 let kind = if what == "start" { Kind::StreamStart(id) } else { Kind::StreamStop(id) };
-                LogEvent { time, pid, link: link.to_string(), kind }
+                LogEvent::new(time, pid, link.to_string(), kind)
             }
             _ => continue,
         };
@@ -327,11 +414,12 @@ const VALUE_PATHS: [PCWSTR; 9] = [
     w!("Event/EventData/Data[@Name='WatchdogOperation']"),
 ];
 
-/// An `EVT_VARIANT` as a number, `None` for a missing value or a type that is not a number.
+/// An `EVT_VARIANT` as a number, `None` for a missing value or a type that is not a scalar number (the type is
+/// compared whole: an array of numbers has the array flag, 0x80, on top of the element type).
 fn number(v: &EVT_VARIANT) -> Option<u64> {
     // SAFETY: the union member read is the one the type tag says is set.
     unsafe {
-        match v.Type & 0x7f {
+        match v.Type {
             4 => Some(u64::from(v.Anonymous.ByteVal)),
             6 => Some(u64::from(v.Anonymous.UInt16Val)),
             7 | 20 => Some(u64::from(v.Anonymous.Int32Val as u32)),
@@ -343,11 +431,11 @@ fn number(v: &EVT_VARIANT) -> Option<u64> {
     }
 }
 
-/// An `EVT_VARIANT` as a string, `None` for a missing value or another type.
+/// An `EVT_VARIANT` as a string, `None` for a missing value or another type (an array of strings included).
 fn text(v: &EVT_VARIANT) -> Option<String> {
     // SAFETY: a string variant points at a NUL-terminated UTF-16 string inside the render buffer, which is alive.
     unsafe {
-        if v.Type & 0x7f != 1 || v.Anonymous.StringVal.is_null() {
+        if v.Type != 1 || v.Anonymous.StringVal.is_null() {
             return None;
         }
         v.Anonymous.StringVal.to_string().ok()
@@ -382,7 +470,7 @@ fn event_of(values: &[EVT_VARIANT]) -> Option<LogEvent> {
         }
         _ => return None,
     };
-    Some(LogEvent { time, pid, link, kind })
+    Some(LogEvent::new(time, pid, link, kind))
 }
 
 /// Closes an event log handle on drop.
@@ -456,7 +544,8 @@ pub fn lookup(target: Option<&str>) -> Holders {
         Some(path) => parse_test_log(&std::fs::read_to_string(path).unwrap_or_default(), now_filetime()),
         None => read_events(Instant::now() + BUDGET),
     };
-    holders(&events, target, std::process::id(), &process_info)
+    let deadline = Instant::now() + ANALYSIS_BUDGET;
+    holders(&events, target, std::process::id(), &process_info, &|| Instant::now() >= deadline)
 }
 
 #[cfg(test)]
@@ -478,13 +567,13 @@ mod tests {
         T + ms * MS
     }
     fn open(ms: u64, pid: u32, link: &str) -> LogEvent {
-        LogEvent { time: t(ms), pid, link: link.into(), kind: Kind::Opened }
+        LogEvent::new(t(ms), pid, link.into(), Kind::Opened)
     }
     fn start(ms: u64, id: u64, link: &str) -> LogEvent {
-        LogEvent { time: t(ms), pid: SVC, link: link.into(), kind: Kind::StreamStart(id) }
+        LogEvent::new(t(ms), SVC, link.into(), Kind::StreamStart(id))
     }
     fn stop(ms: u64, id: u64, link: &str) -> LogEvent {
-        LogEvent { time: t(ms), pid: SVC, link: link.into(), kind: Kind::StreamStop(id) }
+        LogEvent::new(t(ms), SVC, link.into(), Kind::StreamStop(id))
     }
 
     /// A process table: pid -> (start in ms on the test clock, name). Pids not in it are gone; pid 666 cannot be opened.
@@ -508,7 +597,7 @@ mod tests {
     }
 
     fn run(events: &[LogEvent], target: Option<&str>, table: &Table) -> (Vec<String>, bool) {
-        let h = holders(events, target, OWN, &|p| table.of(p));
+        let h = holders(events, target, OWN, &|p| table.of(p), &|| false);
         (h.names.into_iter().map(|(_, n)| n).collect(), h.maybe)
     }
     fn s(v: &[&str]) -> Vec<String> {
@@ -703,6 +792,252 @@ mod tests {
         assert_eq!(run(&[], None, &table), (vec![], false));
     }
 
+    // ---- the analysis is linear, bounded, and the same as the plain rule
+
+    /// The rule as it was first written, quadratic and allocating: what [`holders`] must still answer.
+    fn reference(events: &[LogEvent], target: Option<&str>, own_pid: u32, proc_of: &dyn Fn(u32) -> Proc) -> Holders {
+        use crate::capture::links_match;
+        use crate::config::arrival_matches;
+        struct OpenOld {
+            time: u64,
+            service: u32,
+            link: String,
+        }
+        let target = target.filter(|t| !t.is_empty());
+        let physical: Vec<&LogEvent> = events.iter().filter(|e| is_physical(&e.link)).collect();
+        let mut ev: Vec<&LogEvent> = match target {
+            Some(t) => {
+                let exact: Vec<&LogEvent> = physical.iter().copied().filter(|e| links_match(&e.link, t)).collect();
+                if exact.is_empty() {
+                    physical.iter().copied().filter(|e| arrival_matches(Some(t), &e.link)).collect()
+                } else {
+                    exact
+                }
+            }
+            None => physical,
+        };
+        ev.sort_by_key(|e| e.time);
+        let mut open: Vec<(u64, OpenOld)> = Vec::new();
+        for e in &ev {
+            match e.kind {
+                Kind::StreamStart(id) => {
+                    open.retain(|(i, o)| !(*i == id && links_match(&o.link, &e.link)));
+                    open.push((id, OpenOld { time: e.time, service: e.pid, link: e.link.clone() }));
+                }
+                Kind::StreamStop(id) => open.retain(|(i, o)| !(*i == id && links_match(&o.link, &e.link))),
+                Kind::Opened => {}
+            }
+        }
+        open.retain(|(_, o)| {
+            o.service == 0
+                || match proc_of(o.service) {
+                    Proc::Gone => false,
+                    Proc::Running { start, .. } => start < o.time,
+                    Proc::Unknown => true,
+                }
+        });
+        open.sort_by_key(|(_, o)| std::cmp::Reverse(o.time));
+        let mut links: Vec<String> = open.iter().map(|(_, o)| normalize_link(&o.link)).collect();
+        links.sort();
+        links.dedup();
+        let mut maybe = target.is_none() && links.len() > 1;
+        let mut named: Vec<(u64, String)> = Vec::new();
+        for (_, stream) in &open {
+            let mut opened: Vec<&&LogEvent> = ev
+                .iter()
+                .filter(|e| e.kind == Kind::Opened && e.time <= stream.time && links_match(&e.link, &stream.link))
+                .collect();
+            opened.sort_by_key(|e| std::cmp::Reverse(e.time));
+            if opened.first().is_some_and(|e| e.pid == own_pid) {
+                continue;
+            }
+            let near: Vec<&&LogEvent> = opened.iter().copied().filter(|e| stream.time - e.time <= OPEN_WINDOW).collect();
+            let candidates: Vec<&&LogEvent> =
+                if near.is_empty() { opened.iter().copied().take(1).collect() } else { near.clone() };
+            let mut eligible: Vec<(u32, String)> = Vec::new();
+            for c in candidates {
+                if c.pid == own_pid || eligible.iter().any(|(p, _)| *p == c.pid) {
+                    continue;
+                }
+                let Proc::Running { start, name } = proc_of(c.pid) else { continue };
+                if start >= c.time || is_service_host(&name) {
+                    continue;
+                }
+                eligible.push((c.pid, name));
+            }
+            maybe |= !eligible.is_empty() && (near.is_empty() || eligible.len() > 1);
+            for (_, name) in eligible {
+                if !named.iter().any(|(_, n)| n.eq_ignore_ascii_case(&name)) {
+                    named.push((stream.time, name));
+                }
+            }
+        }
+        if named.is_empty() {
+            maybe = false;
+        }
+        Holders { names: named, maybe }
+    }
+
+    /// A deterministic pseudo-random number generator (no dependency, the same logs on every run).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self, n: u64) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    #[test]
+    fn the_analysis_gives_the_same_answer_as_the_plain_rule_on_many_logs() {
+        const MOVED: &str = r"\\?\usb#vid_0c45&pid_636d&mi_00#9&aaaaaaaa&0&0001#{e5323777-f976-4f5b-9b55-b94699c46e44}\global";
+        const MOVED_AGAIN: &str = r"\\?\usb#vid_0c45&pid_636d&mi_00#9&bbbbbbbb&0&0002#{e5323777-f976-4f5b-9b55-b94699c46e44}\global";
+        let links = [CAM, CAM_UPPER, OTHER, MOVED, VCAM];
+        let table = Table::new(&[
+            (500, 0, "a.exe"),
+            (501, 0, "B.exe"),
+            (502, 0, "b.exe"),
+            (503, 5000, "late.exe"),
+            (504, 0, "svchost.exe"),
+            (777, 0, "svchost.exe"),
+        ]);
+        let mut named_somewhere = 0;
+        for seed in 0..400u64 {
+            let mut rng = Lcg(seed + 1);
+            let mut events = Vec::new();
+            for _ in 0..(20 + rng.next(120)) {
+                let ms = rng.next(400) * 50; // coarse: equal times happen
+                let link = links[rng.next(links.len() as u64) as usize];
+                let id = rng.next(4) + 1;
+                events.push(match rng.next(10) {
+                    0..=3 => open(ms, [OWN, 500, 501, 502, 503, 504, 505][rng.next(7) as usize], link),
+                    4..=6 => {
+                        let mut e = start(ms, id, link);
+                        e.pid = [SVC, SVC, SVC, 4242, 666, 0][rng.next(6) as usize];
+                        e
+                    }
+                    _ => stop(ms, id, link),
+                });
+            }
+            for target in [None, Some(CAM), Some(OTHER), Some(MOVED_AGAIN), Some("")] {
+                let want = reference(&events, target, OWN, &|p| table.of(p));
+                let got = holders(&events, target, OWN, &|p| table.of(p), &|| false);
+                assert_eq!(got, want, "seed {seed} target {target:?}");
+                named_somewhere += usize::from(!got.names.is_empty());
+            }
+        }
+        assert!(named_somewhere > 100, "the logs must name programs often enough to mean something: {named_somewhere}");
+    }
+
+    /// 2,000 events, most of them streams of Better Cam's own failed tries that nothing stops.
+    fn flooded_log() -> (Vec<LogEvent>, Table) {
+        let table = Table::new(&[(500, 0, "Discord.exe")]);
+        let mut events = vec![open(100, 500, CAM), start(150, 1, CAM)];
+        for i in 0..999u64 {
+            events.push(open(10_000 + i * 3_000, OWN, CAM));
+            events.push(start(10_050 + i * 3_000, 100 + i, CAM));
+        }
+        assert_eq!(events.len(), 2000);
+        (events, table)
+    }
+
+    #[test]
+    fn two_thousand_events_with_many_open_streams_cost_a_linear_amount_of_work() {
+        let (events, table) = flooded_log();
+        let (lookups, checks) = (std::cell::Cell::new(0u32), std::cell::Cell::new(0u32));
+        let got = holders(
+            &events,
+            Some(CAM),
+            OWN,
+            &|p| {
+                lookups.set(lookups.get() + 1);
+                table.of(p)
+            },
+            &|| {
+                checks.set(checks.get() + 1);
+                false
+            },
+        );
+        assert_eq!(got, reference(&events, Some(CAM), OWN, &|p| table.of(p)));
+        assert_eq!(got.names.len(), 1);
+        assert_eq!(got.names[0].1, "Discord.exe");
+        // one process lookup per process id (the service host, Discord), not one per stream
+        assert!(lookups.get() <= 2, "{} process lookups", lookups.get());
+        // the clock is read a few times per sixteen steps of work, and the steps are a few per event
+        assert!(checks.get() <= 2000 / 4, "{} clock reads", checks.get());
+    }
+
+    #[test]
+    fn the_analysis_returns_what_it_knows_when_the_time_is_up() {
+        // 400 clients, each opened the camera and started a stream: 400 names, most recent first
+        let rows: Vec<(u32, u64, &'static str)> = (0..400u32)
+            .map(|i| (1000 + i, 0, Box::leak(format!("app{i}.exe").into_boxed_str()) as &'static str))
+            .collect();
+        let table = Table::new(&rows);
+        let mut events = Vec::new();
+        for i in 0..400u32 {
+            let ms = 1000 + u64::from(i) * 10_000;
+            events.push(open(ms, 1000 + i, CAM));
+            events.push(start(ms + 100, 10 + u64::from(i), CAM));
+        }
+        let count = std::cell::Cell::new(0u32);
+        let run_with = |limit: u32| {
+            count.set(0);
+            holders(&events, Some(CAM), OWN, &|p| table.of(p), &|| {
+                count.set(count.get() + 1);
+                count.get() > limit
+            })
+        };
+        let full = run_with(u32::MAX);
+        let full_checks = count.get();
+        assert_eq!(full.names.len(), 400);
+        // out of time before the streams are matched: nothing is known
+        assert_eq!(run_with(0), Holders::default());
+        assert_eq!(run_with(2), Holders::default());
+        // out of time while the streams are judged: the most recent ones are named, and no more checks follow
+        let partial = run_with(full_checks - 10);
+        assert!(!partial.names.is_empty() && partial.names.len() < 400, "{}", partial.names.len());
+        assert_eq!(partial.names[..], full.names[..partial.names.len()]);
+        assert!(count.get() <= full_checks - 9, "the clock is not read once the time is up");
+    }
+
+    // ---- the variants of the event log
+
+    /// An `EVT_VARIANT` with the given type tag whose 64-bit payload is `bits`.
+    fn variant(ty: u32, bits: u64) -> EVT_VARIANT {
+        // SAFETY: the variant is plain data (a union of integers and pointers); all zero is a valid value.
+        let mut v: EVT_VARIANT = unsafe { std::mem::zeroed() };
+        v.Type = ty;
+        v.Anonymous.UInt64Val = bits;
+        v
+    }
+
+    #[test]
+    fn a_number_is_read_only_from_a_scalar_variant_of_a_number_type() {
+        // 8 is a UInt32, 10 a UInt64, 17 a FILETIME, 4 a byte
+        assert_eq!(number(&variant(8, 42)), Some(42));
+        assert_eq!(number(&variant(10, 1 << 40)), Some(1 << 40));
+        assert_eq!(number(&variant(17, 99)), Some(99));
+        assert_eq!(number(&variant(4, 7)), Some(7));
+        // the same types as arrays (flag 0x80) hold a pointer, not a number
+        for ty in [8u32, 10, 17, 4, 6, 7, 9, 20, 21] {
+            assert_eq!(number(&variant(ty | 0x80, 42)), None, "type {ty} as an array");
+        }
+        // a null value (type 0), a string and a boolean are no numbers
+        for ty in [0u32, 1, 13] {
+            assert_eq!(number(&variant(ty, 42)), None, "type {ty}");
+        }
+    }
+
+    #[test]
+    fn a_string_is_read_only_from_a_scalar_string_variant() {
+        let wide: Vec<u16> = "camera\\link".encode_utf16().chain(std::iter::once(0)).collect();
+        let bits = wide.as_ptr() as usize as u64;
+        assert_eq!(text(&variant(1, bits)).as_deref(), Some("camera\\link"));
+        assert_eq!(text(&variant(1 | 0x80, bits)), None, "an array of strings is a pointer to pointers");
+        assert_eq!(text(&variant(8, bits)), None, "a number");
+        assert_eq!(text(&variant(1, 0)), None, "a null pointer");
+    }
+
     #[test]
     fn the_test_file_has_the_events_in_it() {
         let text = "# a comment\n\nopen 300 500 \\\\?\\usb#x#{g}\\global\nstart 200 900 7 \\\\?\\usb#x#{g}\\global\n\
@@ -750,7 +1085,7 @@ mod tests {
             times.push(t0.elapsed());
         }
         times.sort();
-        let held = holders(&last, None, std::process::id(), &process_info);
+        let held = holders(&last, None, std::process::id(), &process_info, &|| false);
         eprintln!(
             "camera log: {} events; median {:?}, worst {:?}; holders now: {:?}",
             last.len(),

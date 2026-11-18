@@ -14,6 +14,8 @@ import {
   effectiveSource,
   findCamera,
   forgetControls,
+  afterVcamRemoval,
+  inUseAfterStart,
   inUseAfterState,
   inUseDeviceDefault,
   inUseFromFallback,
@@ -381,6 +383,8 @@ export const useStore = create<State>((set, get) => {
       persist();
       return true;
     } catch (e) {
+      // A rejected Start runs nothing: no "using the device default" panel for it.
+      set({ inUse: inUseAfterStart(inUse, false) });
       fail(e);
       return false;
     }
@@ -579,12 +583,15 @@ export const useStore = create<State>((set, get) => {
 
     removeVcam: async () => {
       if (get().vcamBusy) return;
-      // The backend shuts the engine down before it asks for administrator rights; the window follows at once.
-      set({ vcamBusy: "remove", engine: STOPPED, paused: false, inUse: null, wasRunning: false });
+      // The backend shuts the engine down before it asks for administrator rights; the window follows at once. It
+      // brings the engine back with the same state when the removal is declined or fails, so the pause, the fallback
+      // and `wasRunning` are cleared only once the removal happened.
+      set({ vcamBusy: "remove", engine: STOPPED });
       useStats.setState({ stats: null });
-      persist();
+      let removed = false;
       try {
         const result = await api.vcamUninstall();
+        removed = true;
         say(
           result === "pending_restart"
             ? "Virtual camera removed. A file it used is deleted when Windows restarts."
@@ -593,7 +600,8 @@ export const useStore = create<State>((set, get) => {
       } catch (e) {
         say(String(e));
       } finally {
-        set((s) => ({ vcamBusy: null, vcamEpoch: s.vcamEpoch + 1 }));
+        set((s) => ({ vcamBusy: null, vcamEpoch: s.vcamEpoch + 1, ...afterVcamRemoval(removed, s) }));
+        if (removed) persist();
         await get().refreshVcam();
       }
     },

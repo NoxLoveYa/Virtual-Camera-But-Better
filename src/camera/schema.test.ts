@@ -1,6 +1,7 @@
 /**
  * Checks of the pure logic behind the saved-versus-running format, the pause and the edits made during a virtual camera
- * change (P15 review). There is no browser or test runner in the project: bundle and run it with
+ * change (P15 review). There is no browser or test runner in the project: `npm run test:schema` bundles and runs it
+ * (esbuild comes with vite), or by hand:
  *
  *   npx esbuild src/camera/schema.test.ts --bundle --platform=node --format=esm --outfile=%TEMP%/schema-test.mjs
  *   node %TEMP%/schema-test.mjs
@@ -9,6 +10,8 @@
  */
 import {
   DEFAULT_SOURCE,
+  afterVcamRemoval,
+  inUseAfterStart,
   cameraUsers,
   describeSaved,
   inUseText,
@@ -84,6 +87,19 @@ same(inUseAfterState(fb, { state: "stopped", reason: null }), null, "stop clears
 same(inUseAfterState(fb, { state: "stopped", reason: "error" }), null, "error clears the fallback");
 same(inUseAfterState(fb, { state: "stopped", reason: "vcam-change" }), fb, "vcam-change keeps the fallback");
 same(inUseAfterState(fb, { state: "live" }), fb, "live keeps the fallback");
+
+// a removal of the virtual camera that did not happen (declined, failed) leaves the running state as it is: the backend
+// brings the engine back with it. One that happened ends the pause, the fallback and the start at the next launch.
+const state = { paused: true, inUse: fb, wasRunning: true };
+same(afterVcamRemoval(false, state), state, "a removal that did not happen keeps the state");
+same(afterVcamRemoval(true, state), { paused: false, inUse: null, wasRunning: false }, "a removal that happened clears it");
+same(afterVcamRemoval(false, { paused: false, inUse: null, wasRunning: false }), { paused: false, inUse: null, wasRunning: false }, "nothing to keep");
+
+// a Start the backend rejected leaves no "using the device default" panel behind
+const wanted = inUseDeviceDefault(saved);
+same(inUseAfterStart(wanted, true), wanted, "an accepted Start keeps the running format");
+same(inUseAfterStart(wanted, false), null, "a rejected Start runs nothing");
+same(inUseAfterStart(null, false), null, "a normal Start has none");
 
 // L5: the device default as the running format keeps the saved size and rate, which is what the engine is sent
 const dflt = inUseDeviceDefault(saved);

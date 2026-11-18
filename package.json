@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test:schema": "esbuild src/camera/schema.test.ts --bundle --platform=node --format=esm --log-level=warning --outfile=node_modules/.cache/schema-test.mjs && node node_modules/.cache/schema-test.mjs",
     "tauri": "tauri",
     "schema:export": "node scripts/export-schema.mjs",
     "vcam:build": "cargo build -p vcam-source --release",

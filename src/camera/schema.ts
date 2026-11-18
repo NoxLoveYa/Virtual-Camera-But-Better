@@ -347,6 +347,25 @@ export const pausedAfterState = (paused: boolean, e: { state: string; reason?: s
 export const inUseAfterState = (inUse: InUse | null, e: { state: string; reason?: string | null }): InUse | null =>
   e.state === "stopped" && e.reason !== "vcam-change" ? null : inUse;
 
+/** The running format a Start announced, kept only when the backend accepted the Start (a rejected one runs nothing). */
+export const inUseAfterStart = (requested: InUse | null, accepted: boolean): InUse | null => (accepted ? requested : null);
+
+/** The state that goes with a running engine: what a removal of the virtual camera clears when it happened. */
+export interface RunningState {
+  paused: boolean;
+  inUse: InUse | null;
+  wasRunning: boolean;
+}
+
+/**
+ * The running state after the virtual camera was removed (`removed`: the uninstall call succeeded) or not. The backend
+ * shuts the engine down before it asks for administrator rights and brings it back with the same state when the
+ * removal is declined or fails, so only a removal that happened ends the pause, the fallback and the flag that starts
+ * the camera at the next launch; otherwise they stay as they were.
+ */
+export const afterVcamRemoval = (removed: boolean, s: RunningState): RunningState =>
+  removed ? { paused: false, inUse: null, wasRunning: false } : { paused: s.paused, inUse: s.inUse, wasRunning: s.wasRunning };
+
 /**
  * Who holds the camera, in words (`engine-state.apps`): `Discord.exe`, `Discord.exe and chrome.exe`,
  * `Discord.exe, chrome.exe and 2 more`; `another app` when the engine could name none.
