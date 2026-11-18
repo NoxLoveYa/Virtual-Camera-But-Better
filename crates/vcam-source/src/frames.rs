@@ -18,8 +18,12 @@
 //! One copy per frame: the pixels go from the slot of the shared file straight into the buffer a [`FrameSink`]
 //! hands out (in the stream: the buffer of the sample that is about to be posted), and only then is the slot's
 //! sequence number checked. A copy the check rejects is never delivered. The source keeps no frame of its own: a
-//! repeat copies the slot of the last frame again (or, when the writer has reused it for something else of the
-//! right size, that); when no slot holds a frame of the negotiated size any more it shows the "starting" slate.
+//! repeat copies the slot of the last frame again. A slot that holds a newer frame than the last one shown is never
+//! a repeat: the live path takes it (a frame captured too soon after the last one is skipped only until the repeat
+//! deadline, 1.5 frame durations after the last live frame, so a stalled camera cannot leave the stream with
+//! nothing to show). Only a slot that cannot be read (a writer that died in the middle of it) or holds another
+//! size sends a repeat to the newest slot. When no slot holds a frame of the negotiated size any more it shows the
+//! "starting" slate.
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -293,6 +297,8 @@ enum Status {
 enum ReadResult {
     New(u64),
     Nothing,
+    /// The sink has no buffer right now: nothing was read.
+    NoBuffer,
     /// The slot descriptor was stable but invalid.
     Invalid,
 }
@@ -301,8 +307,11 @@ enum ReadResult {
 enum RepeatResult {
     /// The frame is in the sink.
     Copied,
-    /// The copy was torn, or there was no buffer to copy into: try again at the next poll.
+    /// The copy was torn, or a newer frame took the place of the one to repeat (the live path takes that one, as it
+    /// is not decimated this late): try again at the next poll.
     Retry,
+    /// The sink has no buffer right now: nothing was read.
+    NoBuffer,
     /// No slot holds a frame of the negotiated size any more.
     Lost,
     /// The slot descriptor was stable but invalid.
@@ -542,6 +551,12 @@ impl FrameSource {
         self.period * 3 / 4
     }
 
+    /// When the sink has no buffer: a sink that cannot make a sample (memory) has not got one a millisecond later
+    /// either, and each try can allocate, so the next try is a quarter period away.
+    fn no_buffer_wait(&self, now: u64) -> Wait {
+        Wait::Until(now.saturating_add(self.period / 4))
+    }
+
     fn leave_live(&mut self) {
         self.have_frame = false;
         self.last_id = None;
@@ -563,7 +578,7 @@ impl FrameSource {
         }
         let l = Layout::of(&self.fmt);
         let Some(mut dst) = dest(sink, &l) else {
-            return Poll::Wait(Wait::Soon);
+            return Poll::Wait(self.no_buffer_wait(now));
         };
         if self.slate_kind != Some(kind) {
             let s = decoded_slate(kind);
@@ -589,17 +604,33 @@ impl FrameSource {
         }
     }
 
-    fn try_read(&mut self, v: &ValidHeader, now: u64, sink: &mut dyn FrameSink) -> ReadResult {
+    /// Take the newest frame if it is new. With `decimate` a frame captured less than [`min_capture_gap`] after the
+    /// last one emitted is skipped (a faster writer is halved); without it the newest frame goes out whatever its
+    /// capture time (the repeat deadline has passed: see [`FrameSource::poll_inner`]).
+    ///
+    /// [`min_capture_gap`]: FrameSource::min_capture_gap
+    fn try_read(
+        &mut self,
+        v: &ValidHeader,
+        now: u64,
+        decimate: bool,
+        sink: &mut dyn FrameSink,
+    ) -> ReadResult {
         let Some(map) = &self.map else {
             return ReadResult::Nothing;
         };
         let l = Layout::of(&self.fmt);
         let subtype = self.fmt.pixel.protocol_subtype();
         let last_id = self.last_id;
-        let last_capture = self.last_capture;
+        let last_capture = self.last_capture.filter(|_| decimate);
         let min_gap = self.min_capture_gap();
         let freq = self.freq;
         let pid = v.writer_pid;
+        // The buffer is asked for before the read, not inside it: making a sample can allocate and log, and the
+        // read must stay short.
+        let Some(mut dst) = dest(&mut *sink, &l) else {
+            return ReadResult::NoBuffer;
+        };
         // The slot is copied straight into the sink's buffer and the sequence check follows: a read it rejects
         // leaves a mixed frame in a buffer that no sample has been made of, and that the next copy overwrites.
         let r = map.shared().read_latest(v, |m, data| {
@@ -610,15 +641,13 @@ impl FrameSource {
                 return Disposition::Skip;
             }
             // a faster writer is decimated by capture time: skip a frame captured too soon after the last one
+            // (`last_capture` is `None` once the repeat deadline has passed: see `poll_inner`)
             if let Some(c) = last_capture {
                 let cq = clamp_capture(m.capture_qpc, now, freq);
                 if cq >= c && cq - c < min_gap {
                     return Disposition::Skip;
                 }
             }
-            let Some(mut dst) = dest(&mut *sink, &l) else {
-                return Disposition::Skip;
-            };
             #[cfg(test)]
             COPY_HOOK.with(|h| {
                 if let Some(f) = h.borrow_mut().as_mut() {
@@ -644,24 +673,33 @@ impl FrameSource {
         }
     }
 
-    /// Copy the last frame again: the slot of `last_id` while it still holds a frame of the negotiated size (the
-    /// writer reuses a slot only for a newer frame, so that is then the newest we can show), else the newest slot.
+    /// Copy the last frame again: the slot of `last_id` while it still holds that very frame. A slot that holds a
+    /// newer frame (the writer reused it) is `Retry`: that frame is the live path's, which takes it past the repeat
+    /// deadline whatever its capture time. A slot that cannot be read (a writer that died in the middle of it, or
+    /// another size in it) falls back to the newest slot, the best picture left.
     fn try_repeat(&mut self, v: &ValidHeader, sink: &mut dyn FrameSink) -> RepeatResult {
-        let (Some(map), Some((slot, _, _))) = (&self.map, self.last_id) else {
+        let (Some(map), Some((slot, _, last_seq))) = (&self.map, self.last_id) else {
             return RepeatResult::Lost;
         };
         let l = Layout::of(&self.fmt);
         let subtype = self.fmt.pixel.protocol_subtype();
         let pid = v.writer_pid;
-        let no_buffer = std::cell::Cell::new(false);
+        // asked for before the reads, not inside them (see `try_read`)
+        let Some(mut dst) = dest(&mut *sink, &l) else {
+            return RepeatResult::NoBuffer;
+        };
+        // the pass over the slot of the last frame takes only that frame; a slot that holds a newer one is left to
+        // the live path (a newer frame is not a repeat)
+        let exact = std::cell::Cell::new(true);
+        let moved = std::cell::Cell::new(false);
         let mut copy = |m: &vcam_protocol::SlotMeta, data: &SlotData<'_>| {
             if m.width as usize != l.w || m.height as usize != l.h || m.subtype != subtype {
                 return Disposition::Skip;
             }
-            let Some(mut dst) = dest(&mut *sink, &l) else {
-                no_buffer.set(true);
+            if exact.get() && m.seq != last_seq {
+                moved.set(true);
                 return Disposition::Skip;
-            };
+            }
             #[cfg(test)]
             COPY_HOOK.with(|h| {
                 if let Some(f) = h.borrow_mut().as_mut() {
@@ -673,7 +711,15 @@ impl FrameSource {
         };
         let shared = map.shared();
         let mut r = shared.read_slot(slot as usize, v, &mut copy);
-        if matches!(r, Ok(Read::Skipped(_)) | Ok(Read::NoFrame)) && !no_buffer.get() {
+        // the slot is gone (another size in it, nothing in it) or the writer is in the middle of it (a writer that
+        // died there leaves it odd for good): the newest slot is the best picture left
+        if !moved.get()
+            && matches!(
+                r,
+                Ok(Read::Skipped(_)) | Ok(Read::NoFrame) | Err(ReadError::Torn)
+            )
+        {
+            exact.set(false);
             r = shared.read_latest(v, &mut copy);
         }
         match r {
@@ -682,8 +728,7 @@ impl FrameSource {
                 self.last_id = Some((m.index, pid, m.seq));
                 RepeatResult::Copied
             }
-            // no sample to copy into right now: the same as a torn copy, ask again
-            Ok(_) if no_buffer.get() => RepeatResult::Retry,
+            Ok(_) if moved.get() => RepeatResult::Retry,
             Err(ReadError::Torn) => RepeatResult::Retry,
             Ok(_) => RepeatResult::Lost,
             Err(ReadError::Invalid(e)) => {
@@ -736,8 +781,14 @@ impl FrameSource {
                 .min(now.saturating_add(period)),
             None => 0,
         };
+        // Decimation holds only until the repeat deadline. Past it the newest frame goes out as a live frame
+        // whatever its capture time: a stalled camera that left two decimated frames after the last one shown would
+        // otherwise be skipped for good (the writer alternates between two slots, so the slot of the last frame holds
+        // a newer one and cannot be repeated), and the stream would deliver nothing while the app keeps the
+        // heartbeat alive. The sample time is then that frame's own capture time (`next_timestamp` keeps it rising).
+        let decimate = now < self.last_new_seen.saturating_add(period * 3 / 2);
         if now >= next_ok {
-            match self.try_read(&v, now, &mut *sink) {
+            match self.try_read(&v, now, decimate, &mut *sink) {
                 ReadResult::New(capture_qpc) => {
                     self.have_frame = true;
                     self.last_capture = Some(capture_qpc);
@@ -754,6 +805,8 @@ impl FrameSource {
                     self.not_running = true;
                     return self.slate_poll(SlateKind::NotRunning, now, sink);
                 }
+                // nothing can be copied into: a repeat or a slate would find no buffer either
+                ReadResult::NoBuffer => return Poll::Wait(self.no_buffer_wait(now)),
                 ReadResult::Nothing => {}
             }
         }
@@ -770,6 +823,7 @@ impl FrameSource {
                         });
                     }
                     RepeatResult::Retry => {}
+                    RepeatResult::NoBuffer => return Poll::Wait(self.no_buffer_wait(now)),
                     RepeatResult::Invalid => {
                         self.not_running = true;
                         return self.slate_poll(SlateKind::NotRunning, now, sink);
@@ -1088,8 +1142,8 @@ mod tests {
         let e = next_ready(&mut src, Duration::from_secs(1));
         assert_eq!(e.kind, Kind::Slate(SlateKind::Starting));
         publish_pattern(&w, fw, fh, 5);
-        let e = next_ready(&mut src, Duration::from_secs(1));
-        assert_eq!(e.kind, Kind::Live);
+        let live = next_ready(&mut src, Duration::from_secs(1));
+        assert_eq!(live.kind, Kind::Live);
         let a = pattern::analyse(
             |r| &src.data()[r as usize * fw as usize..(r as usize + 1) * fw as usize],
             SUBTYPE_NV12,
@@ -1098,14 +1152,16 @@ mod tests {
         );
         assert_eq!(a.slot(), Some(5 % pattern::slots(fw)));
         assert!(a.board_ok);
-        // no new frame: repeat the last one after about 1.5 frame durations, counted
-        let t0 = Instant::now();
+        // no new frame: repeat the last one after about 1.5 frame durations, counted. Measured between the two
+        // decisions in QPC: the wall clock after `next_ready` also holds the time the test thread was not running
         let e = next_ready(&mut src, Duration::from_secs(1));
         assert_eq!(e.kind, Kind::Repeat);
+        let period = vcam_protocol::qpc_frequency() / 30;
         assert!(
-            t0.elapsed() >= Duration::from_millis(30),
-            "repeated after only {:?}",
-            t0.elapsed()
+            e.at - live.at >= period * 3 / 2,
+            "repeated after only {} of {} ticks",
+            e.at - live.at,
+            period * 3 / 2
         );
         assert_eq!(src.repeated(), 1);
         let a = pattern::analyse(
@@ -1972,16 +2028,20 @@ mod tests {
             next_ready(&mut src, Duration::from_secs(1)).kind,
             Kind::Live
         );
-        // the "writer" scribbles over the slot of the last frame while the repeat copies it, and finishes
-        // another frame there (seq changes): the sequence check rejects every copy
-        let w2 = w.clone();
+        let shown = Stuck::of(&src);
+        // the "writer" scribbles over the slot of the last frame while the repeat copies it and is in the middle of
+        // writing it (seq odd) from then on: the sequence check rejects the copy, and the retry finds the slot
+        // odd. The slot is the only one there is, so the fallback to the newest slot is torn too.
+        let copies = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let (w2, c2) = (w.clone(), copies.clone());
         COPY_HOOK.with(|h| {
             *h.borrow_mut() = Some(Box::new(move || {
+                c2.set(c2.get() + 1);
                 let sh = w2.shared();
                 let slot = sh.header().latest_slot as usize;
                 let meta = sh.slot_meta(slot);
                 sh.poke_bytes(meta.data_offset as usize, &vec![0xEE; (fw * fh) as usize]);
-                sh.poke64(slot_off(slot) + off::SLOT_SEQ, meta.seq + 2);
+                sh.poke64(slot_off(slot) + off::SLOT_SEQ, meta.seq + 1);
             }))
         });
         let began = Instant::now();
@@ -1993,12 +2053,20 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         COPY_HOOK.with(|h| *h.borrow_mut() = None);
-        // the slot now holds a settled frame (all 0xEE luma): it is shown whole
-        w.heartbeat();
+        assert_eq!(copies.get(), 1, "the repeat never copied the slot");
+        // the writer finishes the frame it was writing: a settled frame (all 0xEE luma) other than the one that
+        // was shown. It is a newer frame, not a repeat, and the repeat deadline is long past, so the live path
+        // shows it whole, as itself
+        shown.settle_as_another_frame(&w);
         let e = next_ready(&mut src, Duration::from_secs(1));
-        assert!(matches!(e.kind, Kind::Repeat | Kind::Live), "{:?}", e.kind);
-        let luma = &src.data()[..(fw * fh) as usize];
-        assert!(luma.iter().all(|&b| b == 0xEE), "a mix of two frames");
+        assert_eq!(e.kind, Kind::Live);
+        assert!(src.data()[..(fw * fh) as usize].iter().all(|&b| b == 0xEE));
+        // and the next frame the writer sends goes through whole
+        std::thread::sleep(Duration::from_millis(40));
+        publish_pattern(&w, fw, fh, 6);
+        let e = next_ready(&mut src, Duration::from_secs(1));
+        assert_eq!(e.kind, Kind::Live);
+        assert!(src.data() == pattern_frame(6, fw, fh).as_slice());
     }
 
     #[test]
@@ -2028,6 +2096,278 @@ mod tests {
         assert_eq!(src.sink.refuse, 0, "the four refusals were not met");
         assert_eq!(src.repeated(), 1);
         assert!(src.data() == pattern_frame(3, fw, fh).as_slice());
+    }
+
+    #[test]
+    fn a_sink_without_a_buffer_is_asked_again_a_quarter_period_later_not_a_millisecond_later() {
+        let (fw, fh) = (320u32, 180u32);
+        let quarter = vcam_protocol::qpc_frequency() / 30 / 4;
+        // a slate that finds no buffer
+        let path = temp_path("no-buffer-wait-none.bin");
+        let _ = std::fs::remove_file(&path);
+        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        src.start();
+        src.sink.refuse = 1;
+        let now = qpc_now();
+        assert_eq!(
+            src.poll(now),
+            Poll::Wait(Wait::Until(now + quarter)),
+            "slate"
+        );
+        // a live frame that finds none
+        let path = temp_path("no-buffer-wait.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        publish_pattern(&w, fw, fh, 3);
+        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        src.start();
+        src.sink.refuse = 1;
+        let now = qpc_now();
+        assert_eq!(
+            src.poll(now),
+            Poll::Wait(Wait::Until(now + quarter)),
+            "live"
+        );
+        // and the frame is still there for the next try
+        let e = next_ready(&mut src, Duration::from_secs(1));
+        assert_eq!(e.kind, Kind::Live);
+    }
+
+    /// The reader's slot of the last shown frame, and a way to put the writer's mess in it.
+    struct Stuck {
+        slot: usize,
+        seq: u64,
+    }
+
+    impl Stuck {
+        fn of(src: &Rig) -> Stuck {
+            let (slot, _, seq) = src.last_id.expect("a frame was shown");
+            Stuck {
+                slot: slot as usize,
+                seq,
+            }
+        }
+
+        /// A writer that is in the middle of a write to the slot (its `seq` is odd).
+        fn odd(&self, w: &Writer) {
+            use vcam_protocol::{off, slot_off};
+            w.shared()
+                .poke64(slot_off(self.slot) + off::SLOT_SEQ, self.seq + 1);
+        }
+
+        /// The write is over.
+        fn even(&self, w: &Writer) {
+            use vcam_protocol::{off, slot_off};
+            w.shared()
+                .poke64(slot_off(self.slot) + off::SLOT_SEQ, self.seq);
+        }
+
+        /// The write that was under way ends with a settled frame other than the one that was shown.
+        fn settle_as_another_frame(&self, w: &Writer) {
+            use vcam_protocol::{off, slot_off};
+            w.shared()
+                .poke64(slot_off(self.slot) + off::SLOT_SEQ, self.seq + 2);
+        }
+    }
+
+    /// One `try_repeat` at the current time, called directly (what `poll` does only past the repeat deadline).
+    fn repeat_now(src: &mut Rig) -> RepeatResult {
+        let v = match src.status(qpc_now()) {
+            Status::Live(v) => v,
+            _ => panic!("setup: not live"),
+        };
+        let Rig { src: s, sink, .. } = src;
+        s.try_repeat(&v, sink)
+    }
+
+    #[test]
+    fn a_repeat_whose_slot_is_stuck_mid_write_falls_back_to_the_newest_slot() {
+        let path = temp_path("repeat-stuck-newest.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        let (fw, fh) = (320u32, 180u32);
+        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        src.start();
+        publish_pattern(&w, fw, fh, 5);
+        assert_eq!(
+            next_ready(&mut src, Duration::from_secs(1)).kind,
+            Kind::Live
+        );
+        let stuck = Stuck::of(&src);
+        // two slots: the next frame goes to the other one, whole
+        publish_pattern(&w, fw, fh, 6);
+        assert_ne!(w.shared().header().latest_slot as usize, stuck.slot);
+        // the writer died in the middle of a write into the slot of the frame that was shown last
+        stuck.odd(&w);
+        w.heartbeat();
+        // the slot of the last frame is torn (not "moved": nothing newer is in it), so the repeat takes the newest
+        // slot, which is whole: the best picture left. Without the fallback this is a retry for ever.
+        let r = repeat_now(&mut src);
+        assert!(matches!(r, RepeatResult::Copied), "no fallback");
+        assert!(
+            src.data() == pattern_frame(6, fw, fh).as_slice(),
+            "the repeat is not the newest frame"
+        );
+        // what was shown is what the slot holds: not a new frame when it comes round again
+        assert_ne!(src.last_id.map(|(s, _, _)| s as usize), Some(stuck.slot));
+    }
+
+    #[test]
+    fn a_last_slot_stuck_mid_write_does_not_starve_the_stream() {
+        let path = temp_path("repeat-stuck-live.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        let (fw, fh) = (320u32, 180u32);
+        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        src.start();
+        publish_pattern(&w, fw, fh, 5);
+        assert_eq!(
+            next_ready(&mut src, Duration::from_secs(1)).kind,
+            Kind::Live
+        );
+        let stuck = Stuck::of(&src);
+        // the next frame comes right behind (too soon after the last one to be taken at once), and the writer dies
+        // in the middle of a write into the slot of the frame that was shown last
+        publish_pattern(&w, fw, fh, 6);
+        stuck.odd(&w);
+        w.heartbeat();
+        // once the repeat deadline has passed the newest frame is the next live frame
+        let e = next_ready(&mut src, Duration::from_secs(1));
+        assert_eq!(e.kind, Kind::Live);
+        assert!(src.data() == pattern_frame(6, fw, fh).as_slice());
+    }
+
+    #[test]
+    fn frames_decimated_behind_the_last_one_are_shown_when_the_camera_stalls() {
+        let path = temp_path("decimated-stall.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        let (fw, fh) = (320u32, 180u32);
+        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        src.start();
+        publish_pattern(&w, fw, fh, 5);
+        let first = next_ready(&mut src, Duration::from_secs(1));
+        assert_eq!(first.kind, Kind::Live);
+        // two frames right behind the shown one (a writer at 60+ fps, or a burst), both captured inside the gap:
+        // the writer alternates between two slots, so the second one reuses the slot of frame 5. Then the camera
+        // stalls: only the heartbeat goes on, as the app does on a capture timeout.
+        let shown = Stuck::of(&src);
+        publish_pattern(&w, fw, fh, 6);
+        publish_pattern(&w, fw, fh, 7);
+        assert_ne!(
+            w.shared().slot_meta(shown.slot).seq,
+            shown.seq,
+            "setup: the slot of frame 5 was not reused"
+        );
+        let period = vcam_protocol::qpc_frequency() / 30;
+        let t0 = Instant::now();
+        let e = loop {
+            w.heartbeat();
+            match src.poll(qpc_now()) {
+                Poll::Ready(e) => {
+                    src.finish_emit(e, qpc_now());
+                    break e;
+                }
+                Poll::Wait(_) => {
+                    assert!(t0.elapsed() < Duration::from_secs(1), "the stream starved");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        };
+        // the newest frame, as a live frame, about two periods after the last one (the bound has room for a busy
+        // test machine; a starved stream never gets here)
+        assert_eq!(e.kind, Kind::Live);
+        assert!(src.data() == pattern_frame(7, fw, fh).as_slice());
+        assert!(
+            e.at - first.at <= period * 3,
+            "shown {} ticks after the last frame (period {period})",
+            e.at - first.at
+        );
+        assert!(e.at - first.at >= period * 3 / 2, "decimation ended early");
+        // its own capture time, and a sample time that rises
+        assert!(e.capture_qpc > first.capture_qpc);
+        let ts_first = crate::stream::next_timestamp(first.sample_qpc(), 0);
+        assert!(crate::stream::next_timestamp(e.sample_qpc(), ts_first) > ts_first);
+        // and the stall goes on: a repeat of that frame, not a hang
+        let e = next_ready(&mut src, Duration::from_secs(1));
+        assert_eq!(e.kind, Kind::Repeat);
+        assert!(src.data() == pattern_frame(7, fw, fh).as_slice());
+    }
+
+    #[test]
+    fn a_repeat_whose_slot_stays_mid_write_delivers_nothing_and_goes_on_when_it_settles() {
+        let path = temp_path("repeat-stuck-odd.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        let (fw, fh) = (320u32, 180u32);
+        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        src.start();
+        publish_pattern(&w, fw, fh, 5);
+        assert_eq!(
+            next_ready(&mut src, Duration::from_secs(1)).kind,
+            Kind::Live
+        );
+        let stuck = Stuck::of(&src);
+        let good = src.data().to_vec();
+        // the only slot there is stays odd: no frame, no slate, no crash
+        stuck.odd(&w);
+        let began = Instant::now();
+        while began.elapsed() < Duration::from_millis(250) {
+            w.heartbeat();
+            if let Poll::Ready(e) = src.poll(qpc_now()) {
+                panic!(
+                    "{:?} was delivered from a slot that is being written",
+                    e.kind
+                );
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        stuck.even(&w);
+        w.heartbeat();
+        let e = next_ready(&mut src, Duration::from_secs(1));
+        assert_eq!(e.kind, Kind::Repeat);
+        assert!(src.data() == good.as_slice());
+    }
+
+    #[test]
+    fn a_slot_that_holds_a_newer_frame_than_the_last_shown_is_not_a_repeat() {
+        let path = temp_path("repeat-newer.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        let (fw, fh) = (320u32, 180u32);
+        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        src.start();
+        publish_pattern(&w, fw, fh, 5);
+        assert_eq!(
+            next_ready(&mut src, Duration::from_secs(1)).kind,
+            Kind::Live
+        );
+        let shown = Stuck::of(&src);
+        // two frames right behind (too soon after the last one to be live frames); the poll in between moves the
+        // reader's mark off the slot of frame 5, so the writer reuses it for frame 7
+        publish_pattern(&w, fw, fh, 6);
+        assert!(matches!(src.poll(qpc_now()), Poll::Wait(_)));
+        publish_pattern(&w, fw, fh, 7);
+        assert_ne!(
+            w.shared().slot_meta(shown.slot).seq,
+            shown.seq,
+            "setup: the slot of frame 5 was not reused"
+        );
+        let before = src.sink.buf.clone();
+        let r = repeat_now(&mut src);
+        assert!(
+            matches!(r, RepeatResult::Retry),
+            "a newer frame went out as a repeat"
+        );
+        assert!(src.sink.buf == before, "the buffer was written");
+        // (the live path shows that frame once the repeat deadline has passed: see
+        // `frames_decimated_behind_the_last_one_are_shown_when_the_camera_stalls`)
     }
 
     #[test]

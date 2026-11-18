@@ -26,15 +26,16 @@ use windows::Win32::Media::MediaFoundation::{
     MFCreateTrackedSample, MFSampleExtension_CleanPoint, MFSampleExtension_Token,
     MF_E_INVALIDMEDIATYPE,
 };
-use windows_core::{implement, Error, IUnknown, Interface, Ref, Result};
+use windows_core::{implement, Error, IUnknown, Interface, Ref, Result, GUID};
 
 use crate::frames::{FrameBuf, FrameSink};
 use crate::guard::{guard, LockExt};
 use crate::mediatype::FrameFormat;
 
-/// Samples the pool makes at most. A stream needs about two in flight: one being copied into, one the consumer is
-/// still reading. At 4K NV12 (12.4 MB a sample) this bounds the pool to 75 MB, and only when the consumer keeps
-/// every sample.
+/// Samples the pool makes at most. A stream needs up to three in flight: `dest()` runs on every live poll, so the
+/// sample for the next frame is already locked and pending through the inter-frame gap; the consumer holds the last
+/// frame posted, and the one before it until the next arrives and its callback has brought it back. At 4K NV12
+/// (12.4 MB a sample) the cap bounds the pool to 75 MB, and only when the consumer keeps every sample.
 pub const POOL_MAX: usize = 6;
 
 /// What the pool did: samples taken from the free list, pooled samples made (each one allocates a buffer), and
@@ -45,6 +46,9 @@ pub struct PoolStats {
     pub created: u64,
     pub plain: u64,
 }
+
+/// Attribute of a pooled sample that the pool gave up (see `SamplePool::retire`).
+const RETIRED: GUID = GUID::from_u128(0x6b0f_5f1a_7a31_4c6e_9d52_b3c0_0000_0001);
 
 /// A sample that the free list owns. Media Foundation samples are free-threaded; windows-rs does not say so.
 struct Idle(IMFSample);
@@ -64,6 +68,21 @@ struct Recycler {
     inner: Arc<PoolInner>,
 }
 
+impl Recycler {
+    /// The callback is code of this DLL that a consumer's sample can still point at after the stream ended, so it
+    /// counts as a live object: the DLL is not unloaded under it.
+    fn new(inner: Arc<PoolInner>) -> Recycler {
+        crate::object_created();
+        Recycler { inner }
+    }
+}
+
+impl Drop for Recycler {
+    fn drop(&mut self) {
+        crate::object_dropped();
+    }
+}
+
 impl IMFAsyncCallback_Impl for Recycler_Impl {
     fn GetParameters(&self, _flags: *mut u32, _queue: *mut u32) -> Result<()> {
         // the defaults: no flags, the standard work queue
@@ -74,6 +93,18 @@ impl IMFAsyncCallback_Impl for Recycler_Impl {
         guard("Pool::Invoke", || {
             let result = result.ok()?;
             let sample: IMFSample = unsafe { result.GetObject()? }.cast()?;
+            if unsafe { sample.GetUINT32(&RETIRED) }.is_ok() {
+                // the pool gave this one up: it is let go here and freed
+                self.inner.owned.fetch_sub(1, Ordering::AcqRel);
+                return Ok(());
+            }
+            // What a consumer or Frame Server set on the sample is not for the next frame: attributes (and with
+            // them foreign objects and the token, which would otherwise live until the sample is reused or the pool
+            // ends) and flags go now.
+            unsafe {
+                let _ = sample.DeleteAllItems();
+                let _ = sample.SetSampleFlags(0);
+            }
             // closed is set and the list emptied under this lock: a sample comes back before that (and is emptied
             // out) or after it (and is let go here)
             let mut free = self.inner.free.lock_safe();
@@ -106,10 +137,7 @@ impl SamplePool {
             closed: AtomicBool::new(false),
             owned: AtomicUsize::new(0),
         });
-        let recycler: IMFAsyncCallback = Recycler {
-            inner: inner.clone(),
-        }
-        .into();
+        let recycler: IMFAsyncCallback = Recycler::new(inner.clone()).into();
         SamplePool {
             inner,
             recycler,
@@ -126,10 +154,12 @@ impl SamplePool {
         loop {
             let idle = self.inner.free.lock_safe().pop();
             let Some(Idle(s)) = idle else { break };
-            if self.arm(&s).is_ok() {
+            if Self::still_ours(&s) && self.arm(&s).is_ok() {
                 self.stats.reused += 1;
                 return Ok(s);
             }
+            // a sample that was changed while it was out is not used again, and not kept: it is freed here (it is
+            // not armed, so nothing brings it back)
             self.inner.owned.fetch_sub(1, Ordering::AcqRel);
         }
         if self.inner.owned.load(Ordering::Acquire) < self.max {
@@ -157,6 +187,30 @@ impl SamplePool {
     fn arm(&self, sample: &IMFSample) -> Result<()> {
         let tracked: IMFTrackedSample = sample.cast()?;
         unsafe { tracked.SetAllocator(&self.recycler, None) }
+    }
+
+    /// A sample from the free list still has the one 2D buffer it was made with (a consumer can have added or
+    /// swapped buffers).
+    fn still_ours(sample: &IMFSample) -> bool {
+        unsafe {
+            sample.GetBufferCount().is_ok_and(|n| n == 1)
+                && sample
+                    .GetBufferByIndex(0)
+                    .is_ok_and(|b| b.cast::<IMF2DBuffer2>().is_ok())
+        }
+    }
+
+    /// `sample` came from [`sample`](Self::sample) and cannot be used (its buffer cannot be locked, say): if it is
+    /// a pooled one, it leaves the pool. It is marked, and `Recycler::Invoke` frees it instead of keeping it when
+    /// it is let go. (The callback of a tracked sample cannot be taken off again.)
+    ///
+    /// `SetUINT32` can fail only when memory runs out. The sample then stays unmarked, comes back to the free list
+    /// once, fails `Locked::new` again on its next use and is retired again: at worst one more plain sample, never
+    /// a stall. That is accepted rather than tracked.
+    fn retire(&self, sample: &IMFSample) {
+        if sample.cast::<IMFTrackedSample>().is_ok() {
+            let _ = unsafe { sample.SetUINT32(&RETIRED, 1) };
+        }
     }
 
     /// A new pooled sample, armed.
@@ -316,12 +370,9 @@ impl Locked {
             self.sample.SetSampleTime(ts)?;
             self.sample.SetSampleDuration(fmt.frame_duration())?;
             self.sample.SetUINT32(&MFSampleExtension_CleanPoint, 1)?;
-            match token {
-                Some(t) => self.sample.SetUnknown(&MFSampleExtension_Token, &t)?,
-                // a pooled sample still has the previous frame's token
-                None => {
-                    let _ = self.sample.DeleteItem(&MFSampleExtension_Token);
-                }
+            // (a pooled sample comes back without the previous frame's token: `Recycler::Invoke` cleared it)
+            if let Some(t) = token {
+                self.sample.SetUnknown(&MFSampleExtension_Token, &t)?;
             }
         }
         Ok(self.sample.clone())
@@ -366,10 +417,13 @@ impl SampleSink {
 
     fn lock_next(&mut self) -> Result<Locked> {
         let s = self.pool.sample()?;
-        match Locked::new(s, &self.fmt) {
+        match Locked::new(s.clone(), &self.fmt) {
             Ok(l) => Ok(l),
             Err(e) => {
-                // a sample of a shape we cannot write: do not depend on the pool for this frame
+                // a sample of a shape we cannot write (a pooled one stays out of the pool, or it would fail every
+                // frame): do not depend on the pool for this frame
+                self.pool.retire(&s);
+                drop(s);
                 crate::log::log_sampled(crate::log::slot::POOL_FALLBACK, 600, || {
                     format!("sample pool: sample not usable ({e}), plain sample instead")
                 });
@@ -528,6 +582,37 @@ mod tests {
         assert_eq!(buffers.len(), 2);
     }
 
+    /// The pump's rhythm with a consumer that keeps the last sample until the next one arrives: `dest()` asks for
+    /// the buffer on a live poll, the sample stays locked and pending through the inter-frame gap, then the frame is
+    /// copied in, finished and posted, and the consumer lets go of the one before. Nothing waits for the callback
+    /// that brings a sample back.
+    #[test]
+    fn a_pending_sample_through_the_gap_and_a_consumer_holding_the_last_one_need_three_pooled_samples(
+    ) {
+        mf();
+        let f = fmt(PixelFormat::Nv12, 1280, 720);
+        let mut sink = SampleSink::new(f);
+        let mut previous: Option<IMFSample> = None;
+        for n in 0..120u32 {
+            // the poll that finds no frame yet: the buffer is taken and held
+            let b = sink.buffer().expect("a buffer");
+            std::thread::sleep(Duration::from_millis(2));
+            // the frame comes
+            b.data[0] = n as u8;
+            let s = sink.finish(i64::from(n), None).unwrap();
+            assert_eq!(address(&s).1, n as u8, "the frame is in the sample");
+            // it reaches the consumer, which then lets the last one go
+            drop(previous.replace(s));
+        }
+        let st = sink.stats();
+        assert_eq!(st.plain, 0, "a plain sample was made: {st:?}");
+        assert!(
+            (2..=3).contains(&st.created),
+            "pool samples made: {st:?}, wanted at most 3"
+        );
+        assert!(st.reused >= 117, "{st:?}");
+    }
+
     #[test]
     fn samples_carry_their_time_length_and_the_token_of_their_own_frame_only() {
         mf();
@@ -643,6 +728,141 @@ mod tests {
         until("the pool was released", || !watch.alive());
     }
 
+    /// Let `s` go and wait until the pool has it back.
+    fn give_back(pool: &SamplePool, s: IMFSample) {
+        let want = pool.inner.free.lock_safe().len() + 1;
+        drop(s);
+        until("the sample came back", || {
+            pool.inner.free.lock_safe().len() == want
+        });
+    }
+
+    #[test]
+    fn a_sample_comes_back_without_what_the_consumer_set_on_it() {
+        mf();
+        let f = fmt(PixelFormat::Nv12, 640, 360);
+        let mut pool = SamplePool::new(f);
+        let key = windows_core::GUID::from_u128(0x6b0f_5f1a_0000_4000_8000_0000_0000_0001);
+        let obj_key = windows_core::GUID::from_u128(0x6b0f_5f1a_0000_4000_8000_0000_0000_0002);
+        let foreign: IUnknown = {
+            let mut a: Option<IMFAttributes> = None;
+            unsafe { MFCreateAttributes(&mut a, 0).unwrap() };
+            a.unwrap().cast().unwrap()
+        };
+        let s = pool.sample().unwrap();
+        unsafe {
+            s.SetGUID(&key, &key).unwrap();
+            s.SetUnknown(&obj_key, &foreign).unwrap();
+            s.SetUnknown(&MFSampleExtension_Token, &foreign).unwrap();
+            s.SetSampleFlags(7).unwrap();
+            assert_eq!(s.GetSampleFlags().unwrap(), 7);
+        }
+        give_back(&pool, s);
+        let s = pool.sample().unwrap();
+        assert_eq!(pool.stats().reused, 1);
+        unsafe {
+            assert!(s.GetGUID(&key).is_err(), "an attribute was kept");
+            assert!(s.GetUnknown::<IUnknown>(&obj_key).is_err());
+            assert!(s.GetUnknown::<IUnknown>(&MFSampleExtension_Token).is_err());
+            assert_eq!(s.GetSampleFlags().unwrap(), 0, "the flags were kept");
+            assert_eq!(s.GetCount().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn a_sample_that_was_made_and_never_posted_goes_back_to_the_pool_clean() {
+        mf();
+        let f = fmt(PixelFormat::Nv12, 640, 360);
+        let mut sink = SampleSink::new(f);
+        let token: IUnknown = {
+            let mut a: Option<IMFAttributes> = None;
+            unsafe { MFCreateAttributes(&mut a, 0).unwrap() };
+            a.unwrap().cast().unwrap()
+        };
+        for n in 0..10u8 {
+            // the pump stopped between "sample ready" and "posted": the sample is dropped
+            let b = sink.buffer().unwrap();
+            b.data[0] = n;
+            let s = sink.finish(i64::from(n), Some(token.clone())).unwrap();
+            give_back(&sink.pool, s);
+        }
+        let st = sink.stats();
+        assert_eq!((st.created, st.reused, st.plain), (1, 9, 0), "{st:?}");
+        let s = sink.pool.sample().unwrap();
+        unsafe {
+            assert!(s.GetUnknown::<IUnknown>(&MFSampleExtension_Token).is_err());
+        }
+    }
+
+    #[test]
+    fn a_pooled_sample_that_came_back_with_another_buffer_is_not_kept() {
+        mf();
+        let f = fmt(PixelFormat::Nv12, 640, 360);
+        let mut pool = SamplePool::new(f);
+        // a second buffer
+        let s = pool.sample().unwrap();
+        unsafe { s.AddBuffer(&pool.new_buffer().unwrap()).unwrap() };
+        give_back(&pool, s);
+        let s = pool.sample().unwrap();
+        let st = pool.stats();
+        assert_eq!((st.created, st.reused, st.plain), (2, 0, 0), "{st:?}");
+        assert_eq!(pool.inner.owned.load(Ordering::Acquire), 1);
+        assert!(pool.inner.free.lock_safe().is_empty());
+        unsafe { assert_eq!(s.GetBufferCount().unwrap(), 1) };
+        // a buffer that is not a 2D buffer
+        unsafe {
+            s.RemoveAllBuffers().unwrap();
+            s.AddBuffer(
+                &windows::Win32::Media::MediaFoundation::MFCreateMemoryBuffer(4096).unwrap(),
+            )
+            .unwrap();
+        }
+        give_back(&pool, s);
+        let s = pool.sample().unwrap();
+        let st = pool.stats();
+        assert_eq!((st.created, st.reused, st.plain), (3, 0, 0), "{st:?}");
+        assert_eq!(pool.inner.owned.load(Ordering::Acquire), 1);
+        // and an untouched one is kept
+        give_back(&pool, s);
+        let _s = pool.sample().unwrap();
+        assert_eq!(pool.stats().reused, 1);
+    }
+
+    #[test]
+    fn a_pooled_sample_with_a_buffer_that_cannot_hold_a_frame_leaves_the_pool_and_the_frame_goes_out_plain(
+    ) {
+        mf();
+        let f = fmt(PixelFormat::Nv12, 640, 360);
+        let mut sink = SampleSink::new(f);
+        let s = take(&mut sink, 1);
+        // a consumer swapped the buffer for another 2D one, too small for a frame: one 2D buffer, so it passes the
+        // checks of the free list and fails when it is locked for a frame
+        unsafe {
+            s.RemoveAllBuffers().unwrap();
+            s.AddBuffer(
+                &MFCreate2DMediaBuffer(32, 32, PixelFormat::Nv12.buffer_fourcc(), false).unwrap(),
+            )
+            .unwrap();
+        }
+        give_back(&sink.pool, s);
+        // the frame still gets a sample, and the pool no longer counts the bad one
+        let s2 = take(&mut sink, 2);
+        let st = sink.stats();
+        assert_eq!((st.created, st.plain, st.reused), (1, 1, 1), "{st:?}");
+        until("the pool let the bad sample go", || {
+            sink.pool.inner.owned.load(Ordering::Acquire) == 0
+        });
+        assert_eq!(address(&s2).1, 2);
+        drop(s2);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            sink.pool.inner.free.lock_safe().is_empty(),
+            "the retired sample came back"
+        );
+        // the next frame makes a new pooled sample
+        let _s3 = take(&mut sink, 3);
+        assert_eq!(sink.stats().created, 2);
+    }
     #[test]
     fn a_sink_with_a_locked_sample_that_is_never_finished_gives_it_back() {
         mf();
