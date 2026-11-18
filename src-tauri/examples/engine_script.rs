@@ -20,7 +20,10 @@
 //!   last command and print how long it took (`FAIL` past `max`, or when it never comes).
 //! * `stats_report` `{label}`: count the `stats` events since the last report and print the rate and the last one.
 //! * `engine_stats` `{label, seconds}`: the engine's own counters over a window (rates, GPU, readback and CPU-side
-//!   time, frame counts, latency, the DLL's header counters); the window is printed as `PERF_WINDOW_START/END`.
+//!   time, the longest pass of the render loop, frame counts including the frames skipped for want of a consumer or
+//!   for its rate, latency, the DLL's header counters); the window is printed as `PERF_WINDOW_START/END`.
+//! * `prefill_latency` `{samples}`: make the render thread's whole-run latency statistics hold `samples` more
+//!   samples (an hour of frames), to see what keeping them costs without waiting an hour.
 //! * `consume` `{seconds, size, format?, label, dump?, background?, light?, fps?}`: open the Better Cam camera as an
 //!   app does, read frames, and say how many were video, which slate showed when, and how many pictures were
 //!   distinct. `dump` saves one video frame as PNG. NV12 frames are also measured on the colour bars (the widest
@@ -974,8 +977,8 @@ fn run() -> Result<(), String> {
                 let (s0, h0) = (engine.stats(), engine.writer().shared().header());
                 println!("PERF_WINDOW_START {label} t={:.3}", log.t());
                 let begin = Instant::now();
-                // capture fps, render fps, publish fps, gpu, readback, cpu
-                let mut v: Vec<[f64; 6]> = Vec::new();
+                // capture fps, render fps, publish fps, gpu, readback, cpu, worst pass of the render loop
+                let mut v: Vec<[f64; 8]> = Vec::new();
                 while begin.elapsed().as_secs_f64() < seconds {
                     std::thread::sleep(Duration::from_millis(500));
                     let s = engine.stats();
@@ -987,6 +990,8 @@ fn run() -> Result<(), String> {
                             s.gpu_ms,
                             s.readback_ms,
                             s.cpu_ms,
+                            s.worst_frame_ms,
+                            s.stats_ms,
                         ]);
                     }
                 }
@@ -995,14 +1000,17 @@ fn run() -> Result<(), String> {
                 let mean = |i: usize| v.iter().map(|x| x[i]).sum::<f64>() / v.len().max(1) as f64;
                 let max = |i: usize| v.iter().map(|x| x[i]).fold(0.0f64, f64::max);
                 println!(
-                    "RESULT {label}: fps capture {:.2} render {:.2} publish {:.2} | gpu_ms mean {:.3} max {:.3} | readback_ms mean {:.3} max {:.3} | cpu_ms mean {:.3} max {:.3} | samples {}",
-                    mean(0), mean(1), mean(2), mean(3), max(3), mean(4), max(4), mean(5), max(5), v.len()
+                    "RESULT {label}: fps capture {:.2} render {:.2} publish {:.2} | gpu_ms mean {:.3} max {:.3} | readback_ms mean {:.3} max {:.3} | cpu_ms mean {:.3} max {:.3} | worst render pass ms (longest of the windows) {:.3} | closing a statistics window ms mean {:.3} max {:.3} | samples {}",
+                    mean(0), mean(1), mean(2), mean(3), max(3), mean(4), max(4), mean(5), max(5), max(6), mean(7), max(7), v.len()
                 );
                 println!(
-                    "  counters over the window: captured +{} rendered +{} published +{} | dropped_mailbox +{} dropped_output +{} errors +{} | dll delivered +{} repeated +{}",
+                    "  counters over the window: captured +{} rendered +{} published +{} skipped_no_consumer +{} skipped_rate +{} late_publishes (gap over 1.5 periods) +{} | dropped_mailbox +{} dropped_output +{} errors +{} | dll delivered +{} repeated +{}",
                     s1.captured - s0.captured,
                     s1.rendered - s0.rendered,
                     s1.published - s0.published,
+                    s1.skipped_no_consumer - s0.skipped_no_consumer,
+                    s1.skipped_rate - s0.skipped_rate,
+                    s1.late_publishes - s0.late_publishes,
                     s1.dropped_mailbox - s0.dropped_mailbox,
                     s1.dropped_output - s0.dropped_output,
                     s1.errors - s0.errors,
@@ -1018,6 +1026,12 @@ fn run() -> Result<(), String> {
                     s1.captured, s1.rendered, s1.published, s1.dropped_mailbox, s1.dropped_output,
                     h1.delivered, h1.repeated
                 );
+            }
+            "prefill_latency" => {
+                // What an hour of frames leaves in the render thread's whole-run latency statistics, at once.
+                let samples = secs(step, "samples", 200_000.0) as u64;
+                svc.engine()?.prefill_latency(samples);
+                println!("prefill_latency: {samples} samples queued for the render thread");
             }
             "consume" => {
                 let seconds = secs(step, "seconds", 3.0);

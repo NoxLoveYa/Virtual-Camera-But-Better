@@ -234,7 +234,7 @@ struct Attached {
     token: u64,
     link: String,
     device: Arc<dyn CameraControls>,
-    /// The last values read or written, for [`ControlsHub::poll`].
+    /// The last values read or written: what the window was last told, for [`ControlsHub::poll`].
     last: Vec<ControlInfo>,
 }
 
@@ -272,6 +272,8 @@ pub struct ControlsHub {
     next_token: AtomicU64,
     /// Calls that are running on a device now; an idle lease is kept while there are any.
     calls: AtomicUsize,
+    /// The next poll returns the list although nothing moved ([`ControlsHub::request_resend`]).
+    resend: AtomicBool,
     lease_idle: Duration,
     opener: Arc<dyn ControlsOpener>,
 }
@@ -301,6 +303,7 @@ impl ControlsHub {
             gate: Mutex::new(()),
             next_token: AtomicU64::new(1),
             calls: AtomicUsize::new(0),
+            resend: AtomicBool::new(false),
             lease_idle: LEASE_IDLE,
             opener,
         }
@@ -385,11 +388,23 @@ impl ControlsHub {
         }
     }
 
-    fn update_last(&self, token: u64, info: &ControlInfo) {
-        if let Some(a) = lock(&self.attached).as_mut().filter(|a| a.token == token) {
-            match a.last.iter_mut().find(|i| i.key == info.key) {
-                Some(slot) => *slot = info.clone(),
-                None => a.last.push(info.clone()),
+    /// Note `info` as the newest reading of its control. `true` when that differs from what was noted before.
+    fn update_last(&self, token: u64, info: &ControlInfo) -> bool {
+        let mut g = lock(&self.attached);
+        let Some(a) = g.as_mut().filter(|a| a.token == token) else {
+            return false;
+        };
+        match a.last.iter_mut().find(|i| i.key == info.key) {
+            Some(slot) => {
+                let changed = *slot != *info;
+                if changed {
+                    *slot = info.clone();
+                }
+                changed
+            }
+            None => {
+                a.last.push(info.clone());
+                true
             }
         }
     }
@@ -607,9 +622,17 @@ impl ControlsHub {
 
     // ---- the poller
 
-    /// Re-read the engine camera's controls that are on Auto; `None` when no camera is open or nothing is on Auto.
-    /// The payload is the whole list, as `controls-changed` carries it. One control at a time, so a write that comes
-    /// in waits for one read, not for all.
+    /// Ask for the next [`poll`](Self::poll) to return the list even when no control moved (the window is visible
+    /// again after a time in which it was sent nothing).
+    pub fn request_resend(&self) {
+        self.resend.store(true, Ordering::Release);
+    }
+
+    /// Re-read the engine camera's controls that are on Auto. Returns the whole list, as `controls-changed` carries
+    /// it, when a control that was read differs from what the window was last told (`last`: the last full read, the
+    /// last write, the last poll that came back), or when a [`resend`](Self::request_resend) is due. `None` when
+    /// nothing changed, no camera is open or nothing is on Auto. One control at a time, so a write that comes in
+    /// waits for one read, not for all.
     pub fn poll(&self) -> Option<Vec<ControlInfoDto>> {
         let (token, device, auto_keys) = {
             let g = lock(&self.attached);
@@ -617,16 +640,17 @@ impl ControlsHub {
             let keys: Vec<ControlKey> = a.last.iter().filter(|i| i.auto).map(|i| i.key).collect();
             (a.token, a.device.clone(), keys)
         };
-        if auto_keys.is_empty() {
-            return None;
-        }
+        let mut send = self.resend.swap(false, Ordering::AcqRel);
         for key in auto_keys {
             if let Ok(Some(info)) = device.read(key) {
-                self.update_last(token, &info);
+                send |= self.update_last(token, &info);
             }
         }
+        if !send {
+            return None;
+        }
         let g = lock(&self.attached);
-        let a = g.as_ref().filter(|a| a.token == token)?;
+        let a = g.as_ref().filter(|a| a.token == token && !a.last.is_empty())?;
         Some(dtos(&a.last))
     }
 }
@@ -1121,8 +1145,13 @@ mod tests {
         // the poller sees what is on Auto after a full read
         assert!(hub.poll().is_none(), "nothing read yet");
         hub.get(LINK).unwrap();
+        // nothing moved since the full read, which the window got: nothing to send
+        assert!(hub.poll().is_none(), "an unchanged poll sends nothing");
+        // a window that was away asks for the list once, changed or not
+        hub.request_resend();
         let polled = hub.poll().expect("exposure and focus are on Auto");
         assert_eq!(polled.len(), 4);
+        assert!(hub.poll().is_none(), "the resend is one-off");
         // the device moves the lens: the poll sees it
         lock(&cam.state)
             .iter_mut()
@@ -1138,6 +1167,7 @@ mod tests {
                 .value,
             321
         );
+        assert!(hub.poll().is_none(), "the move was sent once");
         // nothing on Auto: nothing to poll
         hub.set(LINK, "focus", 321, false).unwrap();
         hub.set(LINK, "exposure", -5, false).unwrap();

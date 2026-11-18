@@ -366,6 +366,43 @@ impl Shared {
         // `evicted` (an MF sample, possibly a locked buffer) is released here, outside the queue lock.
     }
 
+    /// The consumer's side: wait up to `timeout` for a frame. `newest` takes the last one queued and drops the older
+    /// ones (counted); otherwise the oldest comes first.
+    fn recv(&self, timeout: Duration, newest: bool) -> Result<Frame, RecvError> {
+        let deadline = Instant::now() + timeout;
+        let mut st = lock(&self.state);
+        loop {
+            let taken = if newest {
+                st.frames.pop_back()
+            } else {
+                st.frames.pop_front()
+            };
+            if let Some(f) = taken {
+                // Only the newest-first path has anything left to drop: for the oldest-first one the rest waits.
+                let older: Vec<Frame> = if newest { st.frames.drain(..).collect() } else { Vec::new() };
+                drop(st);
+                if !older.is_empty() {
+                    self.dropped.fetch_add(older.len() as u64, Ordering::Relaxed);
+                }
+                // Released outside the queue lock, like an evicted frame in `push`.
+                drop(older);
+                return Ok(f);
+            }
+            if let Some(reason) = st.stop {
+                return Err(RecvError::Stopped(reason));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(RecvError::Timeout);
+            }
+            st = self
+                .cv
+                .wait_timeout(st, deadline - now)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
     fn request_read(&self) -> windows::core::Result<()> {
         let reader = lock(&self.reader).as_ref().map(|r| r.0.clone());
         match reader {
@@ -756,28 +793,17 @@ impl CaptureReader {
         }
     }
 
-    /// Wait for the next frame. Queued frames are delivered before a stop is reported.
+    /// Wait for the next frame, the oldest one queued. Queued frames are delivered before a stop is reported.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<Frame, RecvError> {
-        let deadline = Instant::now() + timeout;
-        let mut st = lock(&self.shared.state);
-        loop {
-            if let Some(f) = st.frames.pop_front() {
-                return Ok(f);
-            }
-            if let Some(reason) = st.stop {
-                return Err(RecvError::Stopped(reason));
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(RecvError::Timeout);
-            }
-            st = self
-                .shared
-                .cv
-                .wait_timeout(st, deadline - now)
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
-        }
+        self.shared.recv(timeout, false)
+    }
+
+    /// Wait for a frame and take the newest one queued: the older ones are dropped and counted in
+    /// [`ReaderStats::dropped`], like the ones the queue drops itself. A consumer that renders slower than the camera
+    /// delivers (so the queue is full whenever it comes back) gets the picture of now, not one that is a queue's
+    /// length old. Queued frames are delivered before a stop is reported.
+    pub fn recv_newest(&self, timeout: Duration) -> Result<Frame, RecvError> {
+        self.shared.recv(timeout, true)
     }
 
     /// The next frame if one is queued (`RecvError::Timeout` when empty).
@@ -1006,6 +1032,46 @@ mod tests {
         let st = lock(&sh.state);
         let seqs: Vec<u64> = st.frames.iter().map(|f| f.sequence).collect();
         assert_eq!(seqs, vec![3, 4], "the newest frames survive");
+    }
+
+    #[test]
+    fn a_slow_consumer_gets_the_newest_frame_not_one_a_queue_old() {
+        // The camera is faster than the consumer: the queue is full whenever it comes back.
+        for capacity in [1usize, 3, 5] {
+            let sh = shared(capacity);
+            for i in 0..8 {
+                sh.push(cpu_frame(&sh, i));
+            }
+            let f = sh.recv(Duration::ZERO, true).expect("a frame");
+            assert_eq!(f.sequence, 7, "capacity {capacity}: the newest frame, not the oldest in the queue");
+            assert!(
+                matches!(sh.recv(Duration::ZERO, true), Err(RecvError::Timeout)),
+                "nothing older is left to hand over"
+            );
+            // Every frame that was not handed over is counted: 8 produced, 1 taken.
+            assert_eq!(sh.dropped.load(Ordering::Relaxed), 7, "capacity {capacity}");
+        }
+        // The oldest-first path (the default `recv_timeout`) is what made frames old: with a queue of 3 it hands over
+        // the frame that is two behind.
+        let sh = shared(3);
+        for i in 0..8 {
+            sh.push(cpu_frame(&sh, i));
+        }
+        assert_eq!(sh.recv(Duration::ZERO, false).unwrap().sequence, 5);
+    }
+
+    #[test]
+    fn the_newest_frame_goes_before_a_stop_is_reported() {
+        let sh = shared(3);
+        sh.push(cpu_frame(&sh, 0));
+        sh.push(cpu_frame(&sh, 1));
+        sh.finish(StopReason::EndOfStream);
+        assert_eq!(sh.recv(Duration::ZERO, true).unwrap().sequence, 1);
+        assert!(matches!(
+            sh.recv(Duration::ZERO, true),
+            Err(RecvError::Stopped(StopReason::EndOfStream))
+        ));
+        assert_eq!(sh.dropped.load(Ordering::Relaxed), 1);
     }
 
     #[test]

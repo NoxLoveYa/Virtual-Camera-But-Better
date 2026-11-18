@@ -8,7 +8,9 @@
 
 use std::sync::Arc;
 
-use vcam_protocol::{SlotFormat, Writer, SUBTYPE_NV12, SUBTYPE_RGB32};
+use vcam_protocol::{Format, SlotFormat, Writer, SUBTYPE_NV12, SUBTYPE_RGB32};
+use windows::core::BOOL;
+use windows::Win32::Graphics::Direct3D11::{ID3D11Query, D3D11_QUERY_DESC, D3D11_QUERY_EVENT};
 
 use crate::gpu::output::{EncodeFormat, Encoder};
 use crate::gpu::readback::{MappedPlane, ReadbackRing};
@@ -34,7 +36,13 @@ impl Target {
 /// The frame the writer should render: the negotiated format while a consumer is attached, else `configured` as
 /// NV12.
 pub fn target_for(writer: &Writer, configured: (u32, u32)) -> Target {
-    match writer.negotiated() {
+    target_from(writer.negotiated(), configured)
+}
+
+/// [`target_for`] for a format that was read already (the render loop reads the consumer once a frame and uses the
+/// answer for the size, the format and the decision to publish at all).
+pub fn target_from(negotiated: Option<Format>, configured: (u32, u32)) -> Target {
+    match negotiated {
         Some(f) => Target {
             width: f.width,
             height: f.height,
@@ -76,16 +84,85 @@ pub struct Published {
     pub copy_ms: f64,
 }
 
+/// How many frames the CPU may run ahead of the GPU on frames that are not read back.
+const FENCE_DEPTH: usize = 2;
+
+/// A frame that is read back makes the render thread wait for the GPU, which is what keeps the CPU from queuing work
+/// faster than the GPU does it. A frame that is not read back (no app reads the virtual camera, or the frame would be
+/// dropped by it) waits for nothing, so an event query per frame stands in: before frame N is queued, frame
+/// N - [`FENCE_DEPTH`] must be done. With a GPU that keeps up (the normal case) the query is long done and this costs
+/// two calls.
+struct Fence {
+    queries: Vec<ID3D11Query>,
+    issued: Vec<bool>,
+    next: usize,
+}
+
+impl Fence {
+    fn new(renderer: &Renderer) -> Option<Fence> {
+        let desc = D3D11_QUERY_DESC {
+            Query: D3D11_QUERY_EVENT,
+            MiscFlags: 0,
+        };
+        let mut queries = Vec::with_capacity(FENCE_DEPTH);
+        for _ in 0..FENCE_DEPTH {
+            let mut q = None;
+            // SAFETY: plain call; `desc` and the out pointer are locals.
+            unsafe { renderer.gpu.device.CreateQuery(&desc, Some(&mut q)).ok()? };
+            queries.push(q?);
+        }
+        Some(Fence {
+            issued: vec![false; queries.len()],
+            queries,
+            next: 0,
+        })
+    }
+
+    fn done(&self, renderer: &Renderer, i: usize) -> bool {
+        let mut done = BOOL(0);
+        // SAFETY: the data pointer is a local `BOOL`, the size of an event query's data. Flushing is allowed: the
+        // frame this waits for may still be in the command buffer.
+        let r = unsafe {
+            renderer.gpu.context.GetData(
+                &self.queries[i],
+                Some(&mut done as *mut _ as *mut core::ffi::c_void),
+                std::mem::size_of::<BOOL>() as u32,
+                0,
+            )
+        };
+        // S_FALSE (not ready) leaves `done` false. An error (a lost device) ends the wait: the loop notices it.
+        r.is_err() || done.as_bool()
+    }
+
+    /// Wait (at most 100 ms) until the frame queued [`FENCE_DEPTH`] calls ago is done, then queue this one's marker.
+    fn pace(&mut self, renderer: &Renderer) {
+        let i = self.next;
+        if self.issued[i] {
+            let started = std::time::Instant::now();
+            while !self.done(renderer, i) && started.elapsed() < std::time::Duration::from_millis(100) {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        }
+        // SAFETY: plain call on the render thread's context.
+        unsafe { renderer.gpu.context.End(&self.queries[i]) };
+        self.issued[i] = true;
+        self.next = (i + 1) % self.queries.len();
+    }
+}
+
 /// Encoder, readback ring and `frames.bin` publisher.
 pub struct OutputWriter {
     writer: Arc<Writer>,
     encoder: Encoder,
     ring: Option<(Target, ReadbackRing<FrameTag>)>,
     renderer: Arc<Renderer>,
+    fence: Option<Fence>,
     /// Frames the ring dropped because it was full.
     pub dropped: u64,
     /// Frames `Writer::publish` refused.
     pub rejected: u64,
+    /// Frames that were rendered and not encoded, read back or published ([`OutputWriter::skip`]).
+    pub skipped: u64,
 }
 
 impl OutputWriter {
@@ -94,10 +171,22 @@ impl OutputWriter {
             writer,
             encoder: Encoder::new(renderer.clone())?,
             ring: None,
+            fence: Fence::new(&renderer),
             renderer,
             dropped: 0,
             rejected: 0,
+            skipped: 0,
         })
+    }
+
+    /// A frame that goes nowhere: no encode, no readback, no publish. Hands the frame's commands to the GPU and keeps
+    /// the CPU at most [`FENCE_DEPTH`] frames ahead of it ([`Fence`]).
+    pub fn skip(&mut self) {
+        self.skipped += 1;
+        self.renderer.flush();
+        if let Some(f) = self.fence.as_mut() {
+            f.pace(&self.renderer);
+        }
     }
 
     pub fn writer(&self) -> &Arc<Writer> {

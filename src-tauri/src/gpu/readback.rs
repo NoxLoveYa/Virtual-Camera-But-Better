@@ -1,9 +1,9 @@
-//! Readback (plan 4.2 stage 5): a ring of 3 staging textures per plane.
+//! Readback (plan 4.2 stage 5): a ring of up to 3 staging textures per plane.
 //!
-//! [`ReadbackRing::submit`] copies the encoded planes into the next staging slot and returns at once;
+//! [`ReadbackRing::submit`] copies the encoded planes into a free staging slot and returns at once;
 //! [`ReadbackRing::poll`] maps the oldest pending slot. A caller that maps one frame later (frame N+1 maps frame N)
 //! never waits for the GPU, because the copy finished long before. When all three slots are busy the oldest frame is
-//! dropped, so the ring never holds more than 3 frames of latency.
+//! dropped, so the ring never holds more than 3 frames of latency. Slots are made when a frame first needs them.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -68,51 +68,59 @@ impl<'a> MappedPlane<'a> {
 }
 
 /// Staging ring for frames made of one or more planes. `T` travels with each frame (capture time, sizes).
+///
+/// The staging textures are made on first use: a caller that maps each frame right after it submits it (the engine's
+/// default policy) never has more than one frame pending and so only ever owns one slot, which at 4K saves two
+/// 12.4 MB staging textures that would be committed and never touched.
 pub struct ReadbackRing<T> {
     gpu: Arc<GpuDevice>,
     planes: Vec<PlaneDesc>,
+    /// Staging textures made so far (at most [`Self::SLOTS`]); a pending frame is in the slot its index names.
     slots: Vec<Vec<ID3D11Texture2D>>,
     pending: VecDeque<(usize, T)>,
-    next: usize,
     /// Frames dropped because the ring was full.
     pub dropped: u64,
 }
 
 impl<T> ReadbackRing<T> {
-    /// Slots in the ring.
+    /// Most slots the ring grows to.
     pub const SLOTS: usize = 3;
 
     pub fn new(gpu: Arc<GpuDevice>, planes: &[PlaneDesc]) -> GpuResult<ReadbackRing<T>> {
-        let mut slots = Vec::new();
-        for _ in 0..Self::SLOTS {
-            let mut set = Vec::new();
-            for p in planes {
-                set.push(gpu.create_texture(&D3D11_TEXTURE2D_DESC {
-                    Width: p.width,
-                    Height: p.height,
-                    MipLevels: 1,
-                    ArraySize: 1,
-                    Format: p.format,
-                    SampleDesc: DXGI_SAMPLE_DESC {
-                        Count: 1,
-                        Quality: 0,
-                    },
-                    Usage: D3D11_USAGE_STAGING,
-                    BindFlags: 0,
-                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-                    MiscFlags: 0,
-                })?);
-            }
-            slots.push(set);
-        }
         Ok(ReadbackRing {
             gpu,
             planes: planes.to_vec(),
-            slots,
+            slots: Vec::with_capacity(Self::SLOTS),
             pending: VecDeque::new(),
-            next: 0,
             dropped: 0,
         })
+    }
+
+    /// Slots that have staging textures now (the ring makes them when a frame needs one).
+    pub fn allocated(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn make_slot(&self) -> GpuResult<Vec<ID3D11Texture2D>> {
+        let mut set = Vec::with_capacity(self.planes.len());
+        for p in &self.planes {
+            set.push(self.gpu.create_texture(&D3D11_TEXTURE2D_DESC {
+                Width: p.width,
+                Height: p.height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: p.format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            })?);
+        }
+        Ok(set)
     }
 
     pub fn planes(&self) -> &[PlaneDesc] {
@@ -139,14 +147,26 @@ impl<T> ReadbackRing<T> {
                 sources.len()
             )));
         }
-        let evicted = if self.pending.len() >= Self::SLOTS {
+        // A full ring drops its oldest frame and reuses that frame's slot; otherwise the lowest slot that holds no
+        // pending frame is used (made now if it does not exist yet), so a caller that maps every frame before it
+        // submits the next one only ever has slot 0.
+        let (evicted, slot) = if self.pending.len() >= Self::SLOTS {
             self.dropped += 1;
-            self.pending.pop_front().map(|(_, t)| t)
+            match self.pending.pop_front() {
+                Some((slot, t)) => (Some(t), slot),
+                None => (None, 0),
+            }
         } else {
-            None
+            let free = (0..Self::SLOTS)
+                .find(|i| self.pending.iter().all(|(s, _)| s != i))
+                .expect("fewer pending frames than slots");
+            (None, free)
         };
-        let slot = self.next;
-        self.next = (self.next + 1) % Self::SLOTS;
+        if slot >= self.slots.len() {
+            // `free` is at most `slots.len()`: a slot is made only when every earlier one holds a pending frame.
+            let set = self.make_slot()?;
+            self.slots.push(set);
+        }
         // SAFETY: plain calls; source and staging textures have the same format and size.
         unsafe {
             for (staging, src) in self.slots[slot].iter().zip(sources) {
@@ -226,6 +246,72 @@ impl<T> ReadbackRing<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu::AdapterKind;
+    use windows::Win32::Graphics::Direct3D11::D3D11_USAGE_DEFAULT;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+
+    fn plane() -> PlaneDesc {
+        PlaneDesc {
+            format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            width: 64,
+            height: 32,
+            bytes_per_texel: 4,
+        }
+    }
+
+    fn source(gpu: &GpuDevice) -> ID3D11Texture2D {
+        let p = plane();
+        gpu.create_texture(&D3D11_TEXTURE2D_DESC {
+            Width: p.width,
+            Height: p.height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: p.format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: 0,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        })
+        .expect("source texture")
+    }
+
+    #[test]
+    fn a_ring_that_maps_each_frame_at_once_owns_one_slot_and_grows_only_with_pending_frames() {
+        let gpu = Arc::new(GpuDevice::new(AdapterKind::Warp).expect("WARP"));
+        let src = source(&gpu);
+        let mut ring: ReadbackRing<u32> = ReadbackRing::new(gpu.clone(), &[plane()]).unwrap();
+        assert_eq!(ring.allocated(), 0, "nothing is made before the first frame");
+
+        // The engine's default policy: submit, map, submit, map ...
+        for n in 0..20u32 {
+            assert!(ring.submit(&[&src], n).unwrap().is_none());
+            let tag = ring.poll(true, |_, tag| tag).unwrap().expect("pending frame");
+            assert_eq!(tag, n);
+        }
+        assert_eq!(ring.allocated(), 1, "one frame in flight needs one slot");
+
+        // One frame behind (the next-frame policy) needs two, and a burst of three fills the ring.
+        ring.submit(&[&src], 100).unwrap();
+        ring.submit(&[&src], 101).unwrap();
+        assert_eq!(ring.allocated(), 2);
+        assert_eq!(ring.poll(true, |_, t| t).unwrap(), Some(100));
+        ring.submit(&[&src], 102).unwrap();
+        ring.submit(&[&src], 103).unwrap();
+        assert_eq!(ring.allocated(), 3);
+        // Full: the oldest frame is dropped, its slot is reused and nothing new is made.
+        assert_eq!(ring.submit(&[&src], 104).unwrap(), Some(101));
+        assert_eq!(ring.allocated(), ReadbackRing::<u32>::SLOTS);
+        assert_eq!(ring.dropped, 1);
+        let mut got = Vec::new();
+        while let Some(t) = ring.poll(true, |_, t| t).unwrap() {
+            got.push(t);
+        }
+        assert_eq!(got, [102, 103, 104], "the frames come out in order");
+    }
 
     #[test]
     fn copy_to_skips_the_padding_of_odd_pitches() {

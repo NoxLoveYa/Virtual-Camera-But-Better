@@ -16,7 +16,8 @@
 //! * `Standby`: engine ready, camera closed or being opened. Writer `Starting` ("Starting camera...") unless paused.
 //!   Reasons: `opening` (a camera is being opened), `reopening` (a capture setting changed while live; the last frame
 //!   stays on the file), `idle` (`deactivate_when_not_showing`: nobody watches).
-//! * `Live`: the camera is open and frames flow. The first published frame sets the writer to `Live`.
+//! * `Live`: the camera is open and frames flow. The first published frame sets the writer to `Live`; with no app
+//!   reading the virtual camera nothing is published and the first frame that is rendered does it (see below).
 //! * `Reconnecting`: the camera is lost or in use. A retry every `retry_interval`, and at once when the same device
 //!   arrives. Any other failure is fatal: `Stopped` with `engine-error`.
 //!
@@ -30,7 +31,13 @@
 //! Order: the control thread sets the writer's slate (`Paused`, `Starting`) before it changes `Engine::state` and
 //! before the event for the new state goes out (`Control::enter_slate`), so an observer of the state or the event
 //! never finds the old slate in the file. `Live` is the other way round on purpose: the state says the camera is
-//! open, and the writer leaves `Starting` only when the first frame is published.
+//! open, and the writer leaves `Starting` only when the first frame is published (or, with nobody reading the
+//! camera, rendered).
+//!
+//! Frames nobody takes cost nothing past the filter chain: with no app reading the virtual camera a frame is
+//! rendered for the preview and not encoded, read back or published (the heartbeat goes on, and the first frame after
+//! an app attaches is published at once); for an app that reads at a lower rate than the camera, the frames the
+//! virtual camera would drop are not published either ([`Pacer`]).
 //!
 //! With `deactivate_when_not_showing` the camera is open only while a consumer is attached or the window is visible;
 //! after `standby_delay` (5 s) with neither a `Live` or `Reconnecting` engine goes to `Standby` and closes the camera.
@@ -43,7 +50,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use vcam_protocol::{qpc_to_hns, Writer, WriterState};
+use vcam_protocol::{qpc_to_hns, Format, Writer, WriterState};
 use windows::core::HRESULT;
 use windows::Win32::Media::MediaFoundation::{MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX};
 
@@ -70,7 +77,7 @@ use crate::gpu::pattern;
 use crate::fx::assets::{AssetClient, Assets};
 use crate::fx::{Chain, FilterCfg, FilterError, FilterStatus};
 use crate::gpu::{AdapterKind, GpuDevice, GpuError, GpuTimer, Renderer, RgbaTexture};
-use crate::output_writer::{FrameTag, OutputWriter, Published};
+use crate::output_writer::{target_from, FrameTag, OutputWriter, Published};
 
 // ---------------------------------------------------------------------------------------------------------------
 // Public types
@@ -434,6 +441,14 @@ pub struct EngineStats {
     pub readback_ms: f64,
     /// Encode and submit on the CPU side, mean of the last second.
     pub cpu_ms: f64,
+    /// The longest pass of the render loop in the last second (taking a frame to the end of its pass, the statistics
+    /// work included), milliseconds: what a stall on the render thread looks like. 0 while paused.
+    pub worst_frame_ms: f64,
+    /// What closing the last one-second window cost the render thread (the latency percentiles), milliseconds.
+    pub stats_ms: f64,
+    /// Publishes that came more than 1.5 frame periods after the one before: the virtual camera repeats a frame for
+    /// each, whatever the frames are stamped (a stall of the render thread, a slow GPU, a busy machine).
+    pub late_publishes: u64,
     pub captured: u64,
     pub rendered: u64,
     pub published: u64,
@@ -449,9 +464,17 @@ pub struct EngineStats {
     /// Arrival in the capture callback to published (the part this process controls).
     pub pipeline_p50_ms: f64,
     pub pipeline_p95_ms: f64,
-    /// The same percentiles over the whole run.
+    /// The same percentiles over the whole run (a histogram with 0.05 ms bins, the maximum exact).
+    pub total_latency_p50_ms: f64,
     pub total_latency_p95_ms: f64,
+    pub total_latency_max_ms: f64,
     pub total_pipeline_p95_ms: f64,
+    /// Frames rendered but not encoded, read back or published because no app was reading the virtual camera (they
+    /// still feed the preview).
+    pub skipped_no_consumer: u64,
+    /// Frames rendered but not published because the consumer reads at a lower rate than the camera and the
+    /// virtual camera would have dropped them ([`Pacer`]).
+    pub skipped_rate: u64,
     pub output_width: u32,
     pub output_height: u32,
     pub output_format: &'static str,
@@ -535,7 +558,8 @@ pub struct OutputStatsEvent {
     pub fps: f64,
 }
 
-/// The `stats` event payload (plan 5.6), 4 Hz.
+/// The `stats` event payload (plan 5.6). Sent while the window is visible and when a number changed: about once a
+/// second while live (the figures are refreshed once a second), and once after a state change.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct StatsEvent {
     pub capture: CaptureStatsEvent,
@@ -559,7 +583,8 @@ pub enum EngineEvent {
     Stats(StatsEvent),
     /// A camera arrived or left.
     DevicesChanged,
-    /// The camera's controls (`controls-changed`): about once a second while one is on Auto, and after a re-apply.
+    /// The camera's controls (`controls-changed`): when a control that is on Auto moved, once when the window becomes
+    /// visible, and after a re-apply. Not while the window is hidden.
     Controls(Vec<ControlInfoDto>),
     /// A filter failed to render and is bypassed (`filter-error`, plan 5.6). Sent once per failure, not per frame.
     /// The asset service (`fx::assets`) uses the same event for a file that could not be loaded
@@ -595,7 +620,8 @@ pub struct Timings {
     pub retry_interval: Duration,
     /// How often the control thread looks at consumers, timers and messages.
     pub tick: Duration,
-    /// Between `stats` events.
+    /// Between looks at the numbers for a `stats` event (one goes out only when they changed, see
+    /// [`Control::emit_stats`]).
     pub stats_interval: Duration,
     /// Failures that may be permanent (a stream error, a camera that opens but sends nothing) are retried for this
     /// long, counted from the first one; then the engine stops with an error. A camera that is in use, unplugged
@@ -650,6 +676,10 @@ struct Shared {
     flip: AtomicBool,
     color: Mutex<ColorSettings>,
     paused: AtomicBool,
+    /// The app window is visible (a copy of the control thread's flag for the controls poller).
+    window_visible: AtomicBool,
+    /// Latency samples the render thread adds to its statistics on its next pass ([`Engine::prefill_latency`]).
+    prefill_latency: AtomicU64,
     tap: Mutex<Option<Box<dyn FrameTap>>>,
     /// The newest chain and its version: the render thread applies it when the version changed.
     chain: Mutex<Arc<Vec<FilterCfg>>>,
@@ -794,6 +824,8 @@ impl Engine {
             flip: AtomicBool::new(false),
             color: Mutex::new(ColorSettings::default()),
             paused: AtomicBool::new(false),
+            window_visible: AtomicBool::new(false),
+            prefill_latency: AtomicU64::new(0),
             tap: Mutex::new(None),
             chain: Mutex::new(Arc::new(Vec::new())),
             chain_gen: AtomicU64::new(0),
@@ -848,6 +880,7 @@ impl Engine {
                 emitted: None,
                 last_heartbeat: Instant::now(),
                 last_stats: Instant::now(),
+                last_stats_sent: None,
                 hotplug: None,
                 error_streak: None,
                 opened_at: None,
@@ -918,6 +951,13 @@ impl Engine {
     /// `Msg::SetChain`: the render thread applies it before the next frame; no reopen, no restart.
     pub fn set_chain(&self, chain: Vec<FilterCfg>) {
         self.send(Msg::SetChain(chain));
+    }
+
+    /// Measurement hook for the examples: the running render thread adds `samples` made-up latencies (1 to 6 ms) to its
+    /// whole-run statistics on its next pass, as an hour of frames would have, so that a stall in how those are kept
+    /// shows in [`EngineStats::worst_frame_ms`] without waiting for it.
+    pub fn prefill_latency(&self, samples: u64) {
+        self.shared.prefill_latency.store(samples, Ordering::Release);
     }
 
     /// `Msg::SetWindowVisible`.
@@ -1174,7 +1214,11 @@ struct Control {
     retrying: bool,
     emitted: Option<StateEvent>,
     last_heartbeat: Instant,
+    /// When the numbers were last looked at for a `stats` event ([`Timings::stats_interval`]).
     last_stats: Instant,
+    /// The last `stats` event that went out: the next one is sent only when it differs, and only while the window
+    /// is visible.
+    last_stats_sent: Option<StatsEvent>,
     hotplug: Option<(HotplugWatcher, Receiver<HotplugEvent>)>,
     /// Since when the camera has been failing for a reason that may be permanent ([`RetryKind::is_generic`]).
     error_streak: Option<Instant>,
@@ -1267,7 +1311,7 @@ impl Control {
             }
             Msg::SetFlip(f) => self.shared.flip.store(f, Ordering::Relaxed),
             Msg::SetPause(on) => self.set_pause(on),
-            Msg::SetWindowVisible(v) => self.window_visible = v,
+            Msg::SetWindowVisible(v) => self.set_window_visible(v),
             Msg::SetTap(t) => *lock(&self.shared.tap) = t,
             Msg::SetChain(c) => {
                 *lock(&self.shared.chain) = Arc::new(c);
@@ -1336,6 +1380,17 @@ impl Control {
             chain: lock(&self.shared.chain).as_ref().clone(),
             record: self.shared.hub.record(),
         })
+    }
+
+    fn set_window_visible(&mut self, visible: bool) {
+        let was = std::mem::replace(&mut self.window_visible, visible);
+        self.shared.window_visible.store(visible, Ordering::Release);
+        if visible && !was {
+            // The window heard nothing while it was hidden: it gets the numbers as they are now, once. (The controls
+            // poller sees the flag and does the same for the device controls.)
+            self.last_stats_sent = None;
+            self.emit_stats();
+        }
     }
 
     /// Report the pause flag when it differs from what was reported last.
@@ -1963,11 +2018,27 @@ impl Control {
         }
     }
 
-    fn emit_stats(&self) {
+    /// Send a `stats` event when the window is visible and the numbers differ from the last event that went out. The
+    /// figures are refreshed once a second by the render thread, and a state change flips them to zero or back, so
+    /// that is about one event a second while live and one after a state change; the DLL's `repeated` and the
+    /// `consumers` flag are looked at on every call.
+    fn emit_stats(&mut self) {
+        if !self.window_visible {
+            return;
+        }
+        let event = self.stats_event();
+        if self.last_stats_sent.as_ref() == Some(&event) {
+            return;
+        }
+        self.last_stats_sent = Some(event.clone());
+        emit(&self.shared, EngineEvent::Stats(event));
+    }
+
+    fn stats_event(&self) -> StatsEvent {
         let s = lock(&self.shared.stats).clone();
         let live = self.phase == EngineState::Live;
         let header = self.writer.shared().header();
-        let event = StatsEvent {
+        StatsEvent {
             capture: CaptureStatsEvent {
                 width: if live { s.capture_width } else { 0 },
                 height: if live { s.capture_height } else { 0 },
@@ -1986,7 +2057,13 @@ impl Control {
             output: OutputStatsEvent {
                 width: if live { s.output_width } else { 0 },
                 height: if live { s.output_height } else { 0 },
-                fps: if live { s.publish_fps } else { 0.0 },
+                // What the apps get; with none attached nothing is published, and the picture the preview shows comes
+                // at the render rate.
+                fps: match (live, s.consumer) {
+                    (false, _) => 0.0,
+                    (true, true) => s.publish_fps,
+                    (true, false) => s.render_fps,
+                },
             },
             gpu_ms: if live { s.gpu_ms } else { 0.0 },
             dropped: if live {
@@ -1997,8 +2074,7 @@ impl Control {
             repeated: header.repeated,
             latency_p95_ms: if live { s.latency_p95_ms } else { 0.0 },
             consumers: self.writer.consumer_active() as u32,
-        };
-        emit(&self.shared, EngineEvent::Stats(event));
+        }
     }
 }
 
@@ -2094,7 +2170,10 @@ struct SynthFrame {
     height: u32,
     format: PixelFormat,
     color: ColorSettings,
+    /// The time the frame was planned for ([`Schedule`]).
     timestamp_100ns: i64,
+    /// When the thread made it (never before `timestamp_100ns`).
+    arrival_100ns: i64,
 }
 
 impl InFrame {
@@ -2112,7 +2191,7 @@ impl InFrame {
                 };
                 (ts, f.arrival_100ns)
             }
-            InFrame::Synthetic(s) => (s.timestamp_100ns, s.timestamp_100ns),
+            InFrame::Synthetic(s) => (s.timestamp_100ns, s.arrival_100ns),
         }
     }
 
@@ -2437,7 +2516,6 @@ struct CameraInput {
     controls: Option<Arc<DeviceControls>>,
     reader: CaptureReader,
     info: SourceInfo,
-    drained: u64,
 }
 
 /// The picture size of a camera stream: the native size, never more than the coded size the reader delivers.
@@ -2451,15 +2529,9 @@ impl Source for CameraInput {
     }
 
     fn next(&mut self, timeout: Duration) -> SourceEvent {
-        match self.reader.recv_timeout(timeout) {
-            Ok(mut f) => {
-                // Latest-frame mailbox: keep only the newest.
-                while let Ok(newer) = self.reader.try_recv() {
-                    self.drained += 1;
-                    f = newer;
-                }
-                SourceEvent::Frame(InFrame::Camera(f, (self.info.width, self.info.height)))
-            }
+        // Latest-frame mailbox: the newest frame, whatever the queue's length; the older ones are counted as dropped.
+        match self.reader.recv_newest(timeout) {
+            Ok(f) => SourceEvent::Frame(InFrame::Camera(f, (self.info.width, self.info.height))),
             Err(RecvError::Timeout) => SourceEvent::Timeout,
             Err(RecvError::Stopped(r)) => SourceEvent::Stopped(Failure::from_stop(r)),
         }
@@ -2467,7 +2539,7 @@ impl Source for CameraInput {
 
     fn counters(&self) -> (u64, u64) {
         let s = self.reader.stats();
-        (s.produced, s.dropped + self.drained)
+        (s.produced, s.dropped)
     }
 
     fn controls(&self) -> Option<Arc<dyn CameraControls>> {
@@ -2537,7 +2609,6 @@ fn open_camera(spec: &CameraSpec, gpu: &Arc<GpuDevice>, first_open: bool) -> Res
         },
         controls,
         reader,
-        drained: 0,
     })
 }
 
@@ -2579,12 +2650,46 @@ fn read_color(reader: &CaptureReader) -> ColorSettings {
     }
 }
 
+/// When the synthetic source's frames are due, and the capture time each one carries.
+///
+/// A frame is stamped with the time it was *planned* for, not the time the thread woke up to make it: a late wake-up
+/// (the machine was busy for 8 ms) otherwise leaves one stamp late and the next one on time, 8 ms closer together,
+/// and the virtual camera drops a frame that is captured less than 0.75 of its period after the one before and
+/// repeats a frame a period later. A real camera stamps frames at exposure time, which is the planned time too.
+struct Schedule {
+    /// The plan and the clock reading (100 ns, the capture layer's clock) it is counted from.
+    origin: Instant,
+    origin_100ns: i64,
+    next_at: Instant,
+    period: Duration,
+}
+
+impl Schedule {
+    fn new(fps: u32, now: Instant, now_100ns: i64) -> Schedule {
+        Schedule {
+            origin: now,
+            origin_100ns: now_100ns,
+            next_at: now,
+            period: Duration::from_secs_f64(1.0 / fps as f64),
+        }
+    }
+
+    /// Hand out the next planned frame, made at `now` (not before `next_at`, unless the caller is late): its capture
+    /// stamp in 100 ns units. The frame after it is due one period after this one was *planned*; a caller that is
+    /// more than a period late has missed slots, which are not made up: the plan restarts from `now`.
+    fn take(&mut self, now: Instant) -> i64 {
+        let planned = self.next_at;
+        self.next_at = (planned + self.period).max(now);
+        self.origin_100ns + (planned.saturating_duration_since(self.origin).as_nanos() / 100) as i64
+    }
+}
+
 struct SyntheticInput {
     spec: SyntheticSpec,
     info: SourceInfo,
     data: Arc<Vec<u8>>,
     stride: usize,
-    next_at: Instant,
+    schedule: Schedule,
     made: u64,
 }
 
@@ -2641,7 +2746,7 @@ impl SyntheticInput {
             spec,
             data: Arc::new(data),
             stride,
-            next_at: Instant::now(),
+            schedule: Schedule::new(spec.fps, Instant::now(), qpc_now_100ns()),
             made: 0,
         })
     }
@@ -2654,15 +2759,15 @@ impl Source for SyntheticInput {
 
     fn next(&mut self, timeout: Duration) -> SourceEvent {
         let now = Instant::now();
-        if self.next_at > now + timeout {
+        let next_at = self.schedule.next_at;
+        if next_at > now + timeout {
             std::thread::sleep(timeout);
             return SourceEvent::Timeout;
         }
-        if self.next_at > now {
-            std::thread::sleep(self.next_at - now);
+        if next_at > now {
+            std::thread::sleep(next_at - now);
         }
-        let period = Duration::from_secs_f64(1.0 / self.spec.fps as f64);
-        self.next_at = (self.next_at + period).max(Instant::now());
+        let timestamp_100ns = self.schedule.take(Instant::now());
         self.made += 1;
         SourceEvent::Frame(InFrame::Synthetic(SynthFrame {
             data: self.data.clone(),
@@ -2671,7 +2776,8 @@ impl Source for SyntheticInput {
             height: self.spec.height,
             format: self.spec.format,
             color: self.spec.color,
-            timestamp_100ns: qpc_now_100ns(),
+            timestamp_100ns,
+            arrival_100ns: qpc_now_100ns(),
         }))
     }
 
@@ -2753,8 +2859,10 @@ fn attach_controls(shared: &Arc<Shared>, source: &dyn Source) -> Option<Controls
     })
 }
 
-/// The engine's background thread for the controls: every second the controls that are on Auto are read again and
-/// sent as `controls-changed` (so sliders follow the device), and a lease that has been idle for a while is closed.
+/// The engine's background thread for the controls: while the window is visible, every second the controls that are on
+/// Auto are read again and, when one moved, sent as `controls-changed` (so sliders follow the device); a hidden window
+/// costs no device reads and no events, and gets the list once when it is visible again. A lease that has been idle
+/// for a while is closed.
 fn spawn_poller(shared: Arc<Shared>) -> std::io::Result<(Arc<AtomicBool>, JoinHandle<()>)> {
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
@@ -2763,10 +2871,20 @@ fn spawn_poller(shared: Arc<Shared>) -> std::io::Result<(Arc<AtomicBool>, JoinHa
         .spawn(move || {
             ensure_com();
             let mut last_poll = Instant::now();
+            let mut was_visible = false;
             while !flag.load(Ordering::Acquire) {
                 std::thread::sleep(Duration::from_millis(100));
                 shared.hub.expire_lease();
-                if last_poll.elapsed() >= Duration::from_secs(1) {
+                let visible = shared.window_visible.load(Ordering::Acquire);
+                let mut due = last_poll.elapsed() >= Duration::from_secs(1);
+                if visible && !was_visible {
+                    // The window is back and has not heard of the controls for a while: it gets them at once, changed
+                    // or not.
+                    shared.hub.request_resend();
+                    due = true;
+                }
+                was_visible = visible;
+                if visible && due {
                     last_poll = Instant::now();
                     if let Some(infos) = shared.hub.poll() {
                         emit(&shared, EngineEvent::Controls(infos));
@@ -2780,42 +2898,103 @@ fn spawn_poller(shared: Arc<Shared>) -> std::io::Result<(Arc<AtomicBool>, JoinHa
 // ---------------------------------------------------------------------------------------------------------------
 // Statistics
 
-/// Latency samples: a sliding window and the whole run.
-#[derive(Default)]
+/// Latency samples: a sliding window of the last [`WINDOW`] and a histogram of the whole run.
+///
+/// The histogram has [`TOTAL_BINS`] bins of [`BIN_MS`] up to [`TOTAL_RANGE_MS`] and one overflow bin, and the exact
+/// maximum. A sample costs one increment and the numbers are read by scanning the bins (about 20 000, two or three
+/// times a second), so neither depends on how long the run is, nothing is allocated after [`LatencyTrack::new`], and
+/// the figures never freeze: the old store (every sample, sorted on each read, capped at 200 000) took 0.9 ms on the
+/// render thread after ten minutes at 60 fps and 5.6 ms at the cap, reached after 55 minutes. A percentile is
+/// the middle of its bin, so it is within half a bin (0.025 ms) of the sorted value; the maximum is exact.
 struct LatencyTrack {
     window: VecDeque<f32>,
-    total: Vec<f32>,
+    /// Samples per bin; the last one counts everything at or above [`TOTAL_RANGE_MS`].
+    bins: Box<[u32]>,
+    count: u64,
+    max: f64,
 }
 
 const WINDOW: usize = 240;
-const TOTAL_CAP: usize = 200_000;
+const BIN_MS: f64 = 0.05;
+const TOTAL_RANGE_MS: f64 = 1000.0;
+const TOTAL_BINS: usize = (TOTAL_RANGE_MS / BIN_MS) as usize;
+
+impl Default for LatencyTrack {
+    fn default() -> Self {
+        LatencyTrack::new()
+    }
+}
 
 impl LatencyTrack {
+    fn new() -> LatencyTrack {
+        LatencyTrack {
+            window: VecDeque::with_capacity(WINDOW),
+            bins: vec![0; TOTAL_BINS + 1].into_boxed_slice(),
+            count: 0,
+            max: 0.0,
+        }
+    }
+
     fn push(&mut self, ms: f64) {
         if self.window.len() == WINDOW {
             self.window.pop_front();
         }
         self.window.push_back(ms as f32);
-        if self.total.len() < TOTAL_CAP {
-            self.total.push(ms as f32);
-        }
+        // A negative latency (a camera clock ahead of ours) counts as 0.
+        let ms = ms.max(0.0);
+        let bin = ((ms / BIN_MS) as usize).min(TOTAL_BINS);
+        self.bins[bin] = self.bins[bin].saturating_add(1);
+        self.count += 1;
+        self.max = self.max.max(ms);
     }
 
     /// `(p50, p95, max)` of the window.
     fn window_stats(&self) -> (f64, f64, f64) {
-        let mut v: Vec<f32> = self.window.iter().copied().collect();
-        v.sort_by(|a, b| a.total_cmp(b));
+        let n = self.window.len();
+        let mut v = [0f32; WINDOW];
+        for (slot, s) in v.iter_mut().zip(&self.window) {
+            *slot = *s;
+        }
+        let v = &mut v[..n];
+        v.sort_unstable_by(|a, b| a.total_cmp(b));
         (
-            percentile(&v, 0.5),
-            percentile(&v, 0.95),
+            percentile(v, 0.5),
+            percentile(v, 0.95),
             v.last().copied().unwrap_or(0.0) as f64,
         )
     }
 
+    /// The `q` quantile of every sample so far (same rank rule as [`percentile`]), in milliseconds.
+    fn total_quantile(&self, q: f64) -> f64 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        // 1-based rank of the sample `percentile` would pick from the sorted run.
+        let rank = ((self.count - 1) as f64 * q).ceil() as u64 + 1;
+        let mut seen = 0u64;
+        for (i, n) in self.bins.iter().enumerate() {
+            seen += *n as u64;
+            if seen >= rank {
+                if i == TOTAL_BINS {
+                    return self.max;
+                }
+                // The middle of the bin, but never past the largest sample.
+                return ((i as f64 + 0.5) * BIN_MS).min(self.max);
+            }
+        }
+        self.max
+    }
+
+    fn total_p50(&self) -> f64 {
+        self.total_quantile(0.5)
+    }
+
     fn total_p95(&self) -> f64 {
-        let mut v = self.total.clone();
-        v.sort_by(|a, b| a.total_cmp(b));
-        percentile(&v, 0.95)
+        self.total_quantile(0.95)
+    }
+
+    fn total_max(&self) -> f64 {
+        self.max
     }
 }
 
@@ -2827,10 +3006,88 @@ fn percentile(sorted: &[f32], q: f64) -> f64 {
     sorted[i.min(sorted.len() - 1)] as f64
 }
 
+/// Why a rendered frame is not encoded, read back and published.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Skip {
+    /// No app reads the virtual camera.
+    NoConsumer,
+    /// The app reads at a lower rate and the virtual camera would drop the frame ([`Pacer`]).
+    Rate,
+}
+
+/// A frame period in 100 ns units for a rate of `fps_num / fps_den`; `None` when the rate is 0 or unknown.
+fn period_100ns(fps_num: u32, fps_den: u32) -> Option<i64> {
+    (fps_num > 0 && fps_den > 0).then(|| 10_000_000 * fps_den as i64 / fps_num as i64)
+}
+
+/// Decimation for a consumer that reads at a lower rate than the camera delivers (a 30 fps app on a 60 fps camera).
+///
+/// The virtual camera takes a frame only when it was captured at least 3/4 of its period after the last frame it took
+/// ([`dll_min_gap`]; `crates/vcam-source/src/frames.rs`, `min_capture_gap`) and drops the others unseen, so
+/// encoding, reading back and publishing them is work for nothing. The engine follows the same rule on the capture
+/// times, but looser, so that nothing the virtual camera would have taken is ever held back:
+///
+/// * [`Pacer::base`] is the capture time of the last frame the virtual camera would have taken from what was published:
+///   the engine runs the virtual camera's rule itself on the frames it publishes.
+/// * A frame is published unless it was captured less than 7/10 of the consumer's period after `base`
+///   ([`engine_min_gap`]). Between 7/10 and 3/4 it is published although the virtual camera will drop it (it does not
+///   move `base`); from 3/4 on, the virtual camera takes it and `base` moves to it.
+///
+/// By induction `base` is always the virtual camera's own last taken frame, so the frames it takes from the published
+/// sequence are exactly the frames it takes from the whole sequence (see the test
+/// `the_pacer_never_holds_back_a_frame_the_virtual_camera_takes`). A time that goes backwards is taken (the virtual
+/// camera takes it too). The first frame, and the first after the consumer changed or went away ([`Pacer::reset`]),
+/// is always published.
+#[derive(Default)]
+struct Pacer {
+    base: Option<i64>,
+}
+
+/// The smallest capture-time distance between two frames the virtual camera takes, for a consumer period `period`: 3/4
+/// of it, in the same integer arithmetic as the virtual camera's `min_capture_gap`.
+fn dll_min_gap(period: i64) -> i64 {
+    period * 3 / 4
+}
+
+/// What the engine holds back: a frame captured less than 7/10 of the consumer's period after [`Pacer::base`].
+fn engine_min_gap(period: i64) -> i64 {
+    period * 7 / 10
+}
+
+impl Pacer {
+    fn reset(&mut self) {
+        self.base = None;
+    }
+
+    /// Whether the frame captured at `capture` (100 ns) is worth publishing for a consumer whose frame period is
+    /// `period` (100 ns).
+    fn admit(&mut self, capture: i64, period: i64) -> bool {
+        let Some(base) = self.base else {
+            self.base = Some(capture);
+            return true;
+        };
+        let gap = capture - base;
+        if gap < 0 {
+            self.base = Some(capture);
+            return true;
+        }
+        if gap < engine_min_gap(period) {
+            return false;
+        }
+        if gap >= dll_min_gap(period) {
+            self.base = Some(capture);
+        }
+        true
+    }
+}
+
 /// Counters for the one-second window.
 struct Window {
     started: Instant,
     captured_at_start: u64,
+    /// The longest a pass of the render loop took in this window, from taking the frame to the end of the pass
+    /// (the pass that closes a window and does its statistics counts in the next one), milliseconds.
+    worst_ms: f64,
     rendered: u64,
     published: u64,
     gpu_sum: f64,
@@ -2845,6 +3102,7 @@ impl Window {
         Window {
             started: Instant::now(),
             captured_at_start: captured,
+            worst_ms: 0.0,
             rendered: 0,
             published: 0,
             gpu_sum: 0.0,
@@ -2959,10 +3217,14 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
     let mut timer = GpuTimer::new(&renderer.gpu.device).ok();
 
     let mut published_any = false;
+    // The consumer rate the pacer last saw; a change starts it over.
+    let mut pacer = Pacer::default();
+    let mut paced_for: Option<Format> = None;
+    let mut gaps = Gaps::default();
     let mut was_paused = false;
     let mut window = Window::new(0);
-    let mut latency = LatencyTrack::default();
-    let mut pipeline = LatencyTrack::default();
+    let mut latency = LatencyTrack::new();
+    let mut pipeline = LatencyTrack::new();
     let mut stats = EngineStats {
         source: format!("{description}; color {}", describe_color(&color, src_h)),
         capture_width: capture_info.0,
@@ -2977,7 +3239,8 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
     let mut first_error: Option<String> = None;
     // A stream that stops because the GPU device went (the decoder shares it) is a device loss, not a camera error.
     let gpu_check = |f: Failure| device_check(renderer, f);
-    // The first published frame is the only thing that sets the writer `Live` (see `Shared::live_gen`).
+    // The first published frame (or, with nobody reading the camera, the first rendered one) is the only thing that
+    // sets the writer `Live` (see `Shared::live_gen`).
     let go_live = || {
         let mut live = lock(&shared.live_gen);
         *live = ctx.gen;
@@ -3052,6 +3315,7 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                     &mut latency,
                     &mut pipeline,
                     &mut window,
+                    &mut gaps,
                 );
             }
         }
@@ -3083,6 +3347,41 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
         let (capture_100ns, arrival_100ns) = frame.times();
         let cpu_started = Instant::now();
 
+        // Who reads the virtual camera, read once for the whole frame: the format to encode, and whether the frame
+        // goes to the file at all. A frame nobody takes is still rendered (the preview shows it) but not encoded,
+        // read back or published: with no app reading the camera there is nothing to publish to, and an app that
+        // reads at a lower rate than the camera would have the virtual camera drop it unseen ([`Pacer`]).
+        let negotiated = writer.negotiated();
+        let watched = negotiated.is_some() || writer.consumer_active();
+        let target = target_from(negotiated, (ow, oh));
+        let mut skip = None;
+        if !watched {
+            pacer.reset();
+            paced_for = None;
+            skip = Some(Skip::NoConsumer);
+        } else {
+            if paced_for != negotiated {
+                // A new consumer or format: its first frame is published at once.
+                pacer.reset();
+                paced_for = negotiated;
+            }
+            let lower = negotiated.and_then(|f| {
+                let theirs = period_100ns(f.fps_num, f.fps_den)?;
+                let ours = source.info().fps;
+                (ours > 0.0 && theirs as f64 > 10_000_000.0 / ours * 1.05).then_some(theirs)
+            });
+            // What a gap between two publishes may be before the virtual camera repeats: 1.5 periods of the slower
+            // of camera and consumer.
+            let slower = lower.unwrap_or_else(|| (10_000_000.0 / source.info().fps.max(1.0)) as i64);
+            gaps.limit = slower * 3 / 2;
+            match lower {
+                Some(period) if !pacer.admit(capture_100ns, period) => skip = Some(Skip::Rate),
+                Some(_) => {}
+                None => pacer.reset(),
+            }
+        }
+        let mut submitted = false;
+
         // Everything from here to the readback submit is one frame of GPU work.
         let timing = timer
             .as_mut()
@@ -3103,7 +3402,6 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                     windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED,
                 )));
             }
-            let target = output.target((ow, oh));
             let rgba = {
                 let src = frame.source_frame(color)?;
                 converter.convert(&src, shared.flip.load(Ordering::Relaxed))?
@@ -3133,15 +3431,18 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
             if let Some(tap) = lock(&shared.tap).as_mut() {
                 tap.on_frame(renderer, &fitted, capture_qpc);
             }
-            output.submit(
-                &fitted,
-                target,
-                FrameTag {
-                    capture_qpc,
-                    capture_100ns,
-                    arrival_100ns,
-                },
-            )?;
+            if skip.is_none() {
+                output.submit(
+                    &fitted,
+                    target,
+                    FrameTag {
+                        capture_qpc,
+                        capture_100ns,
+                        arrival_100ns,
+                    },
+                )?;
+                submitted = true;
+            }
             stats.output_width = target.width;
             stats.output_height = target.height;
             stats.output_format = target.format_name();
@@ -3169,6 +3470,23 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                 window.rendered += 1;
                 window.cpu_sum += cpu_started.elapsed().as_secs_f64() * 1000.0;
                 window.cpu_n += 1;
+                match skip {
+                    Some(Skip::NoConsumer) => {
+                        stats.skipped_no_consumer += 1;
+                        // Nobody reads the file, so nothing is published, and the writer still goes `Live` with the
+                        // first frame the engine renders: the camera is open and frames flow, and the first one
+                        // after an app attaches is published at once.
+                        if !published_any {
+                            published_any = true;
+                            go_live();
+                        }
+                    }
+                    Some(Skip::Rate) => stats.skipped_rate += 1,
+                    None => {}
+                }
+                if skip.is_some() {
+                    output.skip();
+                }
             }
             Err(e) => {
                 if e.is_device_lost() || renderer.gpu.removed_reason().is_some() {
@@ -3200,6 +3518,7 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                         &mut latency,
                         &mut pipeline,
                         &mut window,
+                        &mut gaps,
                     );
                 }
                 Ok(None) => {}
@@ -3223,6 +3542,7 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                         &mut latency,
                         &mut pipeline,
                         &mut window,
+                        &mut gaps,
                     );
                 }
             }
@@ -3234,12 +3554,20 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                 hr_text(hr)
             )));
         }
-        last_heartbeat = Instant::now();
+        // A publish beats the file's heartbeat itself; a frame that was not published (nobody reads the file, or the
+        // frame would be dropped) leaves it to this, so the virtual camera never sees a stale heartbeat.
+        if submitted {
+            last_heartbeat = Instant::now();
+        } else if last_heartbeat.elapsed() >= Duration::from_millis(100) {
+            writer.heartbeat();
+            last_heartbeat = Instant::now();
+        }
         // A pause that arrived while this frame was in flight must not be undone by its first publish.
         if shared.paused.load(Ordering::Acquire) {
             writer.set_state(WriterState::Paused);
         }
         stats.dropped_output = output.dropped + output.rejected;
+        stats.late_publishes = gaps.late;
         maybe_publish_stats(
             shared,
             &mut stats,
@@ -3253,6 +3581,15 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
             &mut timer,
             renderer,
         );
+        window.worst_ms = window.worst_ms.max(cpu_started.elapsed().as_secs_f64() * 1000.0);
+        // Measurement hook ([`Engine::prefill_latency`]), after the pass was timed.
+        let n = shared.prefill_latency.swap(0, Ordering::AcqRel);
+        for i in 0..n {
+            // Scattered over 1 to 6 ms (a repeating pattern would sort faster than real latencies do).
+            let ms = 1.0 + (i.wrapping_mul(2_654_435_761) >> 8) as f64 % 5000.0 * 0.001;
+            latency.push(ms);
+            pipeline.push(ms);
+        }
     };
 
     // Drain what is still in flight so the last frame is not lost, then release the camera (drop of `source`).
@@ -3283,6 +3620,28 @@ fn describe_color(c: &ColorSettings, height: u32) -> String {
     )
 }
 
+/// How long after the previous publish a publish is too late for the virtual camera, which repeats the last picture
+/// when no new one comes within 1.5 frame periods, whatever the frames are stamped.
+#[derive(Default)]
+struct Gaps {
+    last: Option<i64>,
+    /// 1.5 periods of the slower of the camera and the consumer, 100 ns; 0 until known.
+    limit: i64,
+    /// Publishes that came later than `limit` after the one before.
+    late: u64,
+}
+
+impl Gaps {
+    fn note(&mut self, at: i64) {
+        if let Some(last) = self.last {
+            if self.limit > 0 && at - last > self.limit {
+                self.late += 1;
+            }
+        }
+        self.last = Some(at);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn note_published(
     p: &Published,
@@ -3292,6 +3651,7 @@ fn note_published(
     latency: &mut LatencyTrack,
     pipeline: &mut LatencyTrack,
     window: &mut Window,
+    gaps: &mut Gaps,
 ) {
     if !*published_any {
         *published_any = true;
@@ -3300,6 +3660,7 @@ fn note_published(
     *published += 1;
     window.published += 1;
     let done = qpc_to_hns(p.publish_qpc);
+    gaps.note(done);
     latency.push((done - p.tag.capture_100ns) as f64 / 10_000.0);
     pipeline.push((done - p.tag.arrival_100ns) as f64 / 10_000.0);
 }
@@ -3328,6 +3689,7 @@ fn maybe_publish_stats(
     if elapsed < 1.0 {
         return;
     }
+    let closing = Instant::now();
     let (captured, dropped) = source.counters();
     stats.capture_fps = captured.saturating_sub(window.captured_at_start) as f64 / elapsed;
     stats.render_fps = window.rendered as f64 / elapsed;
@@ -3347,6 +3709,7 @@ fn maybe_publish_stats(
     } else {
         0.0
     };
+    stats.worst_frame_ms = window.worst_ms;
     stats.captured = captured;
     stats.rendered = rendered;
     stats.published = published;
@@ -3359,9 +3722,13 @@ fn maybe_publish_stats(
     let (q50, q95, _) = pipeline.window_stats();
     stats.pipeline_p50_ms = q50;
     stats.pipeline_p95_ms = q95;
+    stats.total_latency_p50_ms = latency.total_p50();
     stats.total_latency_p95_ms = latency.total_p95();
+    stats.total_latency_max_ms = latency.total_max();
     stats.total_pipeline_p95_ms = pipeline.total_p95();
     stats.consumer = output.writer().consumer_active();
+    // What closing this window cost the render thread (the percentiles above); the next window reports it.
+    stats.stats_ms = closing.elapsed().as_secs_f64() * 1000.0;
     store_stats(shared, stats);
     *window = Window::new(captured);
 }
@@ -3417,6 +3784,8 @@ mod tests {
         let writer = Arc::new(Writer::create(&path).unwrap());
         let engine = Engine::with_parts(gpu, writer).unwrap();
         let reader = MappedFile::open(&path, Access::ReadWrite).unwrap();
+        // An app reads the virtual camera (nothing is published for nobody), at the configured size as NV12.
+        let consumer = Consumer::start_with(&path, Format::new(640, 360, 30, SUBTYPE_NV12));
 
         engine.start(Settings {
             source: SourceSpec::Synthetic(SyntheticSpec {
@@ -3450,7 +3819,7 @@ mod tests {
         let adv = reader.shared().header();
         assert_eq!(adv.advertised[0], Format::new(640, 360, 30, SUBTYPE_NV12));
 
-        // No consumer: the configured size as NV12, equal to the source bars.
+        // The configured size as NV12, equal to the source bars.
         let (w, h, subtype, buf) = latest(&reader).expect("a published frame");
         assert_eq!((w, h, subtype), (640, 360, SUBTYPE_NV12));
         let got = nv12_to_rgb(
@@ -3463,15 +3832,13 @@ mod tests {
         );
         assert!(max_diff(&got, &smpte_bars(w, h), 3, |_| false) <= 3);
 
-        // A consumer asks for 320x180 RGB32: the engine follows the next frame.
-        let raw = MappedFile::open(&path, Access::ReadWrite).unwrap();
-        raw.shared()
+        // The consumer asks for 320x180 RGB32: the engine follows the next frame.
+        consumer
+            .file
+            .shared()
             .set_negotiated(&Format::new(320, 180, 30, SUBTYPE_RGB32));
-        raw.shared().set_consumer_active(true);
         let deadline = Instant::now() + Duration::from_secs(10);
         let frame = loop {
-            raw.shared()
-                .set_consumer_heartbeat(vcam_protocol::qpc_now());
             if let Some(f) = latest(&reader).filter(|f| f.2 == SUBTYPE_RGB32) {
                 break f;
             }
@@ -3503,6 +3870,7 @@ mod tests {
         };
         assert!(max_diff(&got, &want, 3, near) <= 3);
 
+        drop(consumer);
         engine.send(Msg::Stop);
         assert!(engine.wait_stopped(Duration::from_secs(10)));
         // Stopped shows the "paused" slate; only a shutdown closes the file.
@@ -3522,6 +3890,8 @@ mod tests {
     #[test]
     fn set_chain_applies_live_and_survives_a_stop() {
         let rig = Rig::new("sm-chain.bin", fast());
+        // The frames are looked at in the file, which only gets frames while an app reads the camera.
+        let _consumer = rig.consumer("sm-chain.bin");
         let chain = |sat: Option<f64>| match sat {
             Some(s) => crate::fx::parse_chain(&serde_json::json!([
                 { "id": "c", "kind": "color_filter", "enabled": true, "params": { "saturation": s } },
@@ -3972,6 +4342,11 @@ mod tests {
         fn consumer(&self, path_name: &str) -> Consumer {
             Consumer::start(&temp_file(path_name))
         }
+
+        /// The same with the format the app negotiated.
+        fn consumer_with(&self, path_name: &str, format: Format) -> Consumer {
+            Consumer::start_with(&temp_file(path_name), format)
+        }
     }
 
     struct Consumer {
@@ -3981,11 +4356,16 @@ mod tests {
     }
 
     impl Consumer {
+        /// An app that asked for 320x180 NV12 at 30 fps (the size of the fake camera's picture).
         fn start(path: &std::path::Path) -> Consumer {
+            Consumer::start_with(path, Format::new(320, 180, 30, SUBTYPE_NV12))
+        }
+
+        /// An app that negotiated `format`.
+        fn start_with(path: &std::path::Path, format: Format) -> Consumer {
             let file = Arc::new(MappedFile::open(path, Access::ReadWrite).unwrap());
             let stop = Arc::new(AtomicBool::new(false));
-            file.shared()
-                .set_negotiated(&Format::new(320, 180, 30, SUBTYPE_NV12));
+            file.shared().set_negotiated(&format);
             file.shared().set_consumer_active(true);
             let (f, s) = (file.clone(), stop.clone());
             let join = std::thread::spawn(move || {
@@ -4931,14 +5311,37 @@ mod tests {
     }
 
     #[test]
-    fn stats_events_come_four_times_a_second_with_every_field() {
+    fn stats_events_come_when_the_numbers_change_and_only_while_the_window_is_visible() {
         let rig = Rig::new("sm-stats.bin", fast());
         rig.engine.start(settings(bars(30), false));
         rig.engine.wait_live(Duration::from_secs(20)).unwrap();
-        // let a one-second statistics window complete
+        // let a one-second statistics window complete (no app reads the camera yet: frames are rendered for the
+        // preview and not published)
         rig.wait("a full window", Duration::from_secs(10), |r| {
-            r.engine.stats().publish_fps > 0.0
+            r.engine.stats().render_fps > 0.0
         });
+        let all_stats = |rig: &Rig| -> Vec<StatsEvent> {
+            rig.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(_, e)| match e {
+                    EngineEvent::Stats(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        // A hidden window hears nothing, however the numbers move.
+        std::thread::sleep(Duration::from_millis(1600));
+        assert!(all_stats(&rig).is_empty(), "stats events while the window is hidden");
+
+        // It is shown: one event at once, with everything in it.
+        rig.engine.set_window_visible(true);
+        rig.wait("the first event", Duration::from_secs(2), |r| !all_stats(r).is_empty());
+        let first = all_stats(&rig)[0].clone();
+        assert_eq!((first.capture.width, first.output.width), (320, 320));
+        // With no app attached the output rate is the rate of the picture the preview gets.
+        assert!((3.0..=36.0).contains(&first.output.fps), "{first:?}");
         let mark = Instant::now();
         let stats_since = |t: Instant, rig: &Rig| -> Vec<StatsEvent> {
             rig.events
@@ -4959,21 +5362,21 @@ mod tests {
             let t = Instant::now();
             loop {
                 let s = rig.engine.stats();
-                if s.published > after {
+                if s.rendered > after {
                     return (s, Instant::now());
                 }
                 assert!(t.elapsed() < Duration::from_secs(10), "no stats window");
                 std::thread::sleep(Duration::from_millis(2));
             }
         };
-        let (a, ta) = next_window(&rig, rig.engine.stats().published);
-        let (b, tb) = next_window(&rig, a.published);
-        // the 4 Hz count is taken over exactly two seconds of the events' own timestamps: a test thread that
+        let (a, ta) = next_window(&rig, rig.engine.stats().rendered);
+        let (b, tb) = next_window(&rig, a.rendered);
+        // the count is taken over exactly three seconds of the events' own timestamps: a test thread that
         // oversleeps on a busy machine does not add events
-        if let Some(rest) = (mark + Duration::from_secs(2)).checked_duration_since(Instant::now()) {
+        if let Some(rest) = (mark + Duration::from_secs(3)).checked_duration_since(Instant::now()) {
             std::thread::sleep(rest);
         }
-        let end = mark + Duration::from_secs(2);
+        let end = mark + Duration::from_secs(3);
         let none: Vec<StatsEvent> = rig
             .events
             .lock()
@@ -4985,11 +5388,16 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // 4 per second: 8 in two seconds, give or take the timer
+        // The figures change once a second: about three events in three seconds (it was 12 at 4 Hz), and no event
+        // repeats the one before it.
         assert!(
-            (7..=9).contains(&none.len()),
-            "{} stats events in 2 s",
+            (2..=5).contains(&none.len()),
+            "{} stats events in 3 s",
             none.len()
+        );
+        assert!(
+            none.windows(2).all(|w| w[0] != w[1]),
+            "an event that carries nothing new: {none:?}"
         );
         // The frame rates are per window over its real elapsed time, so they follow what the machine managed (13 fps
         // for a 30 fps source was seen with every core busy): compare them with the counters and the test's own
@@ -4997,7 +5405,7 @@ mod tests {
         let secs = tb.duration_since(ta).as_secs_f64();
         for (name, reported, frames) in [
             ("capture", b.capture_fps, b.captured - a.captured),
-            ("publish", b.publish_fps, b.published - a.published),
+            ("render", b.render_fps, b.rendered - a.rendered),
         ] {
             let measured = frames as f64 / secs;
             assert!(
@@ -5013,7 +5421,6 @@ mod tests {
         assert!((3.0..=36.0).contains(&s.capture.fps), "{s:?}");
         assert_eq!((s.output.width, s.output.height), (320, 180));
         assert!((3.0..=36.0).contains(&s.output.fps), "{s:?}");
-        assert!(s.latency_p95_ms > 0.0, "{s:?}");
         assert_eq!(s.consumers, 0);
         // every key of plan 5.6 is in the JSON
         let json = serde_json::to_value(s).unwrap();
@@ -5040,6 +5447,10 @@ mod tests {
         let t = Instant::now();
         rig.wait("consumers = 1", Duration::from_secs(5), |r| {
             stats_since(t, r).last().is_some_and(|s| s.consumers == 1)
+        });
+        // frames are published now, so the latency of the file is a number
+        rig.wait("a latency", Duration::from_secs(5), |r| {
+            stats_since(t, r).last().is_some_and(|s| s.latency_p95_ms > 0.0 && s.output.fps > 0.0)
         });
         consumer.detach();
         let t = Instant::now();
@@ -5072,6 +5483,572 @@ mod tests {
             (0, 0, 0)
         );
         let _ = rig.started;
+    }
+
+    // ---- performance faults of the audit: latency statistics, frames nobody takes, stamps, events ----------------
+
+    mod count_allocs {
+        //! Counts the allocations of the calling thread, so a test can say that a call allocates nothing.
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static ALLOCS: Cell<u64> = const { Cell::new(0) };
+        }
+
+        pub struct Counting;
+
+        fn count() {
+            let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
+        }
+
+        // SAFETY: every call goes to the system allocator unchanged.
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                count();
+                unsafe { System.alloc(layout) }
+            }
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                count();
+                unsafe { System.alloc_zeroed(layout) }
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                count();
+                unsafe { System.realloc(ptr, layout, new_size) }
+            }
+        }
+
+        /// Allocations this thread has made so far.
+        pub fn allocations() -> u64 {
+            ALLOCS.with(|c| c.get())
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING: count_allocs::Counting = count_allocs::Counting;
+
+    /// A deterministic stream of numbers in `[0, 1)`.
+    fn unit_stream(seed: u64) -> impl FnMut() -> f64 {
+        let mut x = seed;
+        move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    #[test]
+    fn the_latency_histogram_matches_a_sorted_run_and_a_push_allocates_nothing() {
+        const N: usize = 3_000_000;
+        let mut track = LatencyTrack::new();
+        let mut reference: Vec<f32> = Vec::with_capacity(N);
+        let mut next = unit_stream(0x9E37_79B9_7F4A_7C15);
+        let mut largest = 0.0f64;
+        let before = count_allocs::allocations();
+        for i in 0..N {
+            // About 2 ms, a tail up to 40 ms, a spike past the histogram's range once in a while.
+            let u = next();
+            let ms = if i % 100_000 == 99_999 {
+                1500.0 + 500.0 * u
+            } else {
+                1.0 + 2.0 * u + 40.0 * u.powi(8)
+            };
+            track.push(ms);
+            reference.push(ms as f32);
+            largest = largest.max(ms);
+        }
+        assert_eq!(
+            count_allocs::allocations() - before,
+            0,
+            "pushing {N} samples allocated"
+        );
+        reference.sort_by(|a, b| a.total_cmp(b));
+        // The old store stopped taking samples at 200 000; these are all 3 million.
+        for q in [0.5, 0.9, 0.95, 0.99, 0.999] {
+            let want = percentile(&reference, q);
+            let got = track.total_quantile(q);
+            assert!(
+                (got - want).abs() <= BIN_MS,
+                "q {q}: histogram {got:.4} ms, sorted {want:.4} ms (a bin is {BIN_MS} ms)"
+            );
+        }
+        assert_eq!(track.total_max(), largest, "the maximum is exact");
+        assert!(track.total_max() >= 1500.0, "the overflow bin keeps the exact maximum");
+        // a read is a scan of the bins: far from the sort of millions of samples
+        let t = Instant::now();
+        for _ in 0..200 {
+            std::hint::black_box(track.total_p95());
+        }
+        assert!(
+            t.elapsed() < Duration::from_millis(250),
+            "200 reads took {:?}",
+            t.elapsed()
+        );
+        let mut empty = LatencyTrack::new();
+        assert_eq!((empty.total_p95(), empty.total_max()), (0.0, 0.0));
+        empty.push(-3.0);
+        assert_eq!(empty.total_p95(), 0.0, "a negative latency counts as 0");
+    }
+
+    #[test]
+    fn reading_the_whole_run_percentile_after_200000_samples_is_not_a_sort() {
+        let mut track = LatencyTrack::new();
+        let mut kept: Vec<f32> = Vec::new();
+        let mut next = unit_stream(7);
+        for _ in 0..200_000 {
+            let ms = 1.0 + 5.0 * next();
+            track.push(ms);
+            kept.push(ms as f32);
+        }
+        // What the render thread did every second until now, twice: clone and sort the capped history.
+        let old = || {
+            let mut v = kept.clone();
+            v.sort_by(|a, b| a.total_cmp(b));
+            percentile(&v, 0.95)
+        };
+        let best = |f: &dyn Fn() -> f64| {
+            (0..20)
+                .map(|_| {
+                    let t = Instant::now();
+                    std::hint::black_box(f());
+                    t.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        let (was, is) = (best(&old), best(&|| track.total_p95()));
+        eprintln!("whole-run p95 over 200 000 samples: sorted {was:?}, histogram {is:?}");
+        assert!(is * 20 < was, "the read takes {is:?}, the sort took {was:?}");
+        assert!((track.total_p95() - old()).abs() <= BIN_MS);
+        // The scan ends where the percentile is; the worst case is a long tail (one sample at 900 ms).
+        track.push(900.0);
+        let worst = best(&|| track.total_quantile(1.0));
+        eprintln!("whole-run maximum rank with a sample at 900 ms: histogram {worst:?}");
+        assert!(worst * 20 < was, "the longest scan takes {worst:?}, the sort took {was:?}");
+    }
+
+    #[test]
+    fn the_latency_window_is_the_last_240_samples() {
+        let mut t = LatencyTrack::new();
+        for i in 0..1000 {
+            t.push(i as f64);
+        }
+        let (p50, p95, max) = t.window_stats();
+        // samples 760..=999
+        assert_eq!(max, 999.0);
+        assert_eq!(p50, percentile(&(760..1000).map(|i| i as f32).collect::<Vec<_>>(), 0.5));
+        assert!(p95 > 980.0 && p95 <= 999.0, "{p95}");
+    }
+
+    /// The virtual camera's choice of frames, as `crates/vcam-source/src/frames.rs` makes it (`try_read` and
+    /// `min_capture_gap`) on the capture times of what it finds in the file: a frame is taken unless it was captured
+    /// less than 3/4 of a period after the last frame it took.
+    fn dll_takes(captures: &[i64], period: i64) -> Vec<i64> {
+        let mut taken: Vec<i64> = Vec::new();
+        for &c in captures {
+            let skip = taken.last().is_some_and(|&last| c >= last && c - last < period * 3 / 4);
+            if !skip {
+                taken.push(c);
+            }
+        }
+        taken
+    }
+
+    #[test]
+    fn the_pacer_never_holds_back_a_frame_the_virtual_camera_takes() {
+        let mut next = unit_stream(0xDEAD_BEEF_1234_5678);
+        let mut saved = 0usize;
+        let mut total = 0usize;
+        for camera_fps in [120u32, 60, 50, 48, 40, 30, 29, 25, 15] {
+            for consumer_fps in [60u32, 30, 25, 24, 20, 15, 10] {
+                for jitter in [0.0, 0.1, 0.3, 0.6] {
+                    for _ in 0..8 {
+                        // a camera with jitter (never going back, apart from a rare glitch), 900 frames
+                        let cam_period = 10_000_000.0 / camera_fps as f64;
+                        let mut t = 1_000_000_000.0f64;
+                        let mut captures = Vec::new();
+                        for k in 0..900 {
+                            t += cam_period;
+                            let mut c = t + (next() - 0.5) * 2.0 * jitter * cam_period;
+                            if k % 250 == 249 {
+                                c -= 3.0 * cam_period; // a clock that steps back
+                            }
+                            captures.push(c as i64);
+                        }
+                        let period = 10_000_000 / consumer_fps as i64;
+                        let mut pacer = Pacer::default();
+                        let published: Vec<i64> = captures
+                            .iter()
+                            .copied()
+                            .filter(|&c| pacer.admit(c, period))
+                            .collect();
+                        assert_eq!(
+                            dll_takes(&published, period),
+                            dll_takes(&captures, period),
+                            "camera {camera_fps}, consumer {consumer_fps}, jitter {jitter}: the virtual camera takes \
+                             other frames from what was published than from what the camera made"
+                        );
+                        total += captures.len();
+                        saved += captures.len() - published.len();
+                    }
+                }
+            }
+        }
+        assert!(saved * 5 > total, "the pacer saves nothing: {saved} of {total}");
+
+        // 60 fps against a 30 fps consumer with a steady clock: exactly every other frame
+        let period = 10_000_000 / 30;
+        let mut pacer = Pacer::default();
+        let kept: Vec<usize> = (0..12)
+            .filter(|k| pacer.admit(5_000 + *k as i64 * 10_000_000 / 60, period))
+            .collect();
+        assert_eq!(kept, [0, 2, 4, 6, 8, 10]);
+        // The first frame goes out at once, and so does the first after a reset.
+        let mut pacer = Pacer::default();
+        assert!(pacer.admit(100, period));
+        assert!(!pacer.admit(100 + period / 2, period));
+        pacer.reset();
+        assert!(pacer.admit(100 + period / 2, period));
+        // The engine's rule is looser than the virtual camera's: nothing it takes is held back, and a frame in
+        // between goes out although it is dropped there (it does not count as the last one taken).
+        assert!(engine_min_gap(period) < dll_min_gap(period));
+        let mut pacer = Pacer::default();
+        assert!(pacer.admit(0, period));
+        let between = (engine_min_gap(period) + dll_min_gap(period)) / 2;
+        assert!(pacer.admit(between, period), "between the two rules: published");
+        assert_eq!(pacer.base, Some(0), "but the virtual camera drops it");
+        assert!(pacer.admit(dll_min_gap(period), period), "the next one at 3/4 of the period is taken");
+    }
+
+    #[test]
+    fn a_publish_more_than_one_and_a_half_periods_after_the_last_counts_as_late() {
+        // 60 fps: the virtual camera repeats a frame when none came within 250 000 (100 ns).
+        let mut gaps = Gaps { limit: 250_000, ..Gaps::default() };
+        for at in [0, 166_666, 333_332, 333_332 + 260_000, 333_332 + 260_000 + 166_666] {
+            gaps.note(at);
+        }
+        assert_eq!(gaps.late, 1, "one gap of 260 000");
+        // until the limit is known nothing is late
+        let mut unknown = Gaps::default();
+        unknown.note(0);
+        unknown.note(10_000_000);
+        assert_eq!(unknown.late, 0);
+    }
+
+    #[test]
+    fn a_late_wake_up_does_not_move_the_stamps_of_the_synthetic_source() {
+        let t0 = Instant::now();
+        let origin = 5_000_000_000i64;
+        let period = Duration::from_secs_f64(1.0 / 60.0);
+        let period_100ns = 10_000_000.0 / 60.0;
+        let mut plan = Schedule::new(60, t0, origin);
+        let (mut stamps, mut wakes) = (Vec::new(), Vec::new());
+        for k in 0..12 {
+            // The thread wakes on time, except for frame 4, which it makes 12 ms late (a quarter period is 4 ms).
+            let due = plan.next_at;
+            let wake = if k == 4 { due + Duration::from_millis(12) } else { due };
+            stamps.push(plan.take(wake));
+            wakes.push(origin + (wake - t0).as_nanos() as i64 / 100);
+        }
+        for w in stamps.windows(2) {
+            let gap = (w[1] - w[0]) as f64;
+            assert!(
+                (gap - period_100ns).abs() <= 1.0,
+                "stamped {gap} apart, a period is {period_100ns:.1}: {stamps:?}"
+            );
+        }
+        // What stamping with the wake-up made of it: one frame looks too early to the virtual camera (it takes
+        // frames at least 3/4 of a period after the last).
+        let worst = wakes.windows(2).map(|w| w[1] - w[0]).min().unwrap() as f64;
+        assert!(worst < period_100ns * 0.75, "the wake-up stamps would have been fine too: {worst}");
+        assert_eq!(plan.next_at, t0 + period * 12, "the plan did not slip");
+
+        // More than a period late: the missed slots are not made up, and no stamp is ever early or from the future.
+        let mut plan = Schedule::new(60, t0, origin);
+        let mut last = None;
+        for k in 0..10u32 {
+            let due = plan.next_at;
+            let wake = if k == 3 { due + Duration::from_millis(40) } else { due };
+            let stamp = plan.take(wake);
+            if let Some(l) = last {
+                assert!(
+                    (stamp - l) as f64 >= period_100ns - 1.0,
+                    "frame {k} is stamped {} after the one before",
+                    stamp - l
+                );
+            }
+            assert!(stamp <= origin + (wake - t0).as_nanos() as i64 / 100, "stamped from the future");
+            last = Some(stamp);
+        }
+    }
+
+    #[test]
+    fn the_synthetic_source_stamps_the_planned_time_not_the_wake_up() {
+        let mut s = SyntheticInput::new(SyntheticSpec {
+            width: 64,
+            height: 36,
+            fps: 100,
+            format: PixelFormat::Nv12,
+            color: ColorSettings::default(),
+        })
+        .unwrap();
+        let mut stamps = Vec::new();
+        for k in 0..30 {
+            if k == 10 {
+                // the render thread is held up for 4 ms: a late wake-up of the source's own thread
+                std::thread::sleep(Duration::from_millis(4));
+            }
+            let SourceEvent::Frame(f) = s.next(Duration::from_millis(100)) else {
+                panic!("a frame is due");
+            };
+            let (capture, arrival) = f.times();
+            assert!(arrival >= capture, "arrived before it was planned: {arrival} < {capture}");
+            stamps.push(capture);
+        }
+        for w in stamps.windows(2) {
+            let gap = w[1] - w[0];
+            assert!((99_999..=100_001).contains(&gap), "stamps {gap} apart at 100 fps: {stamps:?}");
+        }
+    }
+
+    /// The newest statistics snapshot that satisfies `cond`.
+    fn wait_stats(rig: &Rig, what: &str, cond: impl Fn(&EngineStats) -> bool) -> EngineStats {
+        let t = Instant::now();
+        loop {
+            let s = rig.engine.stats();
+            if cond(&s) {
+                return s;
+            }
+            assert!(
+                t.elapsed() < Duration::from_secs(30),
+                "timed out waiting for {what}: {s:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Counts the frames the preview would get.
+    struct CountingTap(Arc<std::sync::atomic::AtomicU64>);
+
+    impl FrameTap for CountingTap {
+        fn on_frame(&mut self, _: &Renderer, _: &RgbaTexture, _: u64) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn frames_in_file(rig: &Rig) -> u64 {
+        rig.file.shared().header().writer_frames
+    }
+
+    #[test]
+    fn a_consumer_at_half_the_camera_rate_gets_every_other_frame() {
+        let rig = Rig::new("pub-60-30.bin", fast());
+        let _consumer = rig.consumer_with("pub-60-30.bin", Format::new(320, 180, 30, SUBTYPE_NV12));
+        rig.engine.start(settings(bars(60), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        let s = wait_stats(&rig, "150 frames", |s| s.rendered >= 150);
+        // the counters of one snapshot add up: every rendered frame was published or skipped for its rate
+        assert_eq!(s.rendered, s.published + s.skipped_rate + s.skipped_no_consumer, "{s:?}");
+        assert_eq!(s.skipped_no_consumer, 0);
+        assert!(
+            s.published * 100 >= s.rendered * 40 && s.published * 100 <= s.rendered * 70,
+            "{} of {} frames published for a consumer at half the rate",
+            s.published,
+            s.rendered
+        );
+        assert!(frames_in_file(&rig) >= s.published);
+    }
+
+    #[test]
+    fn a_consumer_at_the_camera_rate_or_above_it_gets_every_frame() {
+        for (camera, consumer, name) in [(60, 60, "pub-60-60.bin"), (30, 60, "pub-30-60.bin"), (30, 30, "pub-30-30.bin")] {
+            let rig = Rig::new(name, fast());
+            let _consumer = rig.consumer_with(name, Format::new(320, 180, consumer, SUBTYPE_NV12));
+            rig.engine.start(settings(bars(camera), false));
+            rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+            let s = wait_stats(&rig, "90 frames", |s| s.rendered >= 90);
+            assert_eq!(s.skipped_rate, 0, "camera {camera}, consumer {consumer}: {s:?}");
+            assert_eq!(s.skipped_no_consumer, 0);
+            assert_eq!(s.published, s.rendered, "camera {camera}, consumer {consumer}: {s:?}");
+        }
+    }
+
+    #[test]
+    fn without_an_app_reading_the_camera_frames_are_rendered_but_not_published() {
+        let rig = Rig::new("pub-none.bin", fast());
+        let seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        rig.engine.send(Msg::SetTap(Some(Box::new(CountingTap(seen.clone())))));
+        rig.engine.start(settings(bars(30), false));
+        // Live is reached without a published frame: the state, and the writer too (it was `Starting`).
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("the writer is live", Duration::from_secs(10), |r| r.writer_state() == LIVE);
+        let s = wait_stats(&rig, "60 frames", |s| s.rendered >= 60);
+        assert_eq!(s.published, 0, "{s:?}");
+        assert_eq!(s.skipped_no_consumer, s.rendered, "{s:?}");
+        assert_eq!(s.readback_ms, 0.0);
+        assert_eq!(frames_in_file(&rig), 0, "nothing was written to the file");
+        assert_eq!(rig.engine.state(), EngineState::Live);
+        // the preview still gets every frame
+        assert!(seen.load(Ordering::SeqCst) >= s.rendered, "{} frames reached the tap", seen.load(Ordering::SeqCst));
+        // and the heartbeat goes on: the virtual camera would not show "not running"
+        std::thread::sleep(Duration::from_millis(1200));
+        let h = rig.file.shared().header();
+        let age = vcam_protocol::qpc_now().saturating_sub(h.writer_heartbeat);
+        assert!(age < vcam_protocol::qpc_frequency() / 4, "the heartbeat is {age} ticks old");
+        assert_eq!(h.writer_state, LIVE);
+    }
+
+    #[test]
+    fn the_first_frame_after_an_app_attaches_goes_out_at_once_and_leaving_stops_it() {
+        let rig = Rig::new("pub-attach.bin", fast());
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        wait_stats(&rig, "30 frames", |s| s.rendered >= 30);
+        assert_eq!(frames_in_file(&rig), 0);
+
+        let t = Instant::now();
+        let mut consumer = rig.consumer("pub-attach.bin");
+        rig.wait("the first frame", Duration::from_secs(5), |r| frames_in_file(r) > 0);
+        let took = t.elapsed();
+        // one camera frame is 33 ms; the margin is for a busy machine, not for a frame that waits for a window
+        assert!(took < Duration::from_millis(250), "the first frame came {took:?} after the app attached");
+        assert_eq!(rig.writer_state(), LIVE);
+        rig.wait("frames keep coming", Duration::from_secs(5), |r| frames_in_file(r) >= 10);
+
+        // the app goes: no more frames
+        consumer.detach();
+        std::thread::sleep(Duration::from_millis(200));
+        let at = frames_in_file(&rig);
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(frames_in_file(&rig), at, "frames were written for nobody");
+        assert_eq!(rig.writer_state(), LIVE);
+
+        // and one more attaches: again at once
+        let t = Instant::now();
+        let _again = rig.consumer("pub-attach.bin");
+        rig.wait("a frame for the second app", Duration::from_secs(5), |r| frames_in_file(r) > at);
+        assert!(t.elapsed() < Duration::from_millis(250), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn a_consumer_that_changes_its_rate_gets_a_frame_at_once() {
+        let rig = Rig::new("pub-rate-change.bin", fast());
+        let consumer = rig.consumer_with("pub-rate-change.bin", Format::new(320, 180, 30, SUBTYPE_NV12));
+        rig.engine.start(settings(bars(60), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        wait_stats(&rig, "frames", |s| s.published >= 10);
+        // the app negotiates 15 fps now: the pacer starts over and the next frame is published
+        let before = frames_in_file(&rig);
+        consumer.file.shared().set_negotiated(&Format::new(320, 180, 15, SUBTYPE_NV12));
+        rig.wait("a frame", Duration::from_secs(2), |r| frames_in_file(r) > before);
+        let s = wait_stats(&rig, "more frames", |s| s.rendered >= 240);
+        assert_eq!(s.rendered, s.published + s.skipped_rate, "{s:?}");
+        assert!(s.skipped_rate > s.published, "a quarter of the rate keeps about one frame in four: {s:?}");
+    }
+
+    #[test]
+    fn the_controls_are_read_and_sent_only_while_the_window_is_visible_and_only_when_they_changed() {
+        let rig = Rig::new("ctl-poll.bin", fast());
+        let lists = |r: &Rig| -> Vec<Vec<crate::camera_controls::ControlInfoDto>> {
+            r.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(_, e)| match e {
+                    EngineEvent::Controls(c) => Some(c.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let focus_of = |l: &Vec<crate::camera_controls::ControlInfoDto>| {
+            l.iter().find(|i| i.key == crate::capture::controls::ControlKey::Focus).unwrap().value
+        };
+        let lens = |value: i32| {
+            lock(&rig.fake.controls.state)
+                .iter_mut()
+                .find(|i| i.key == crate::capture::controls::ControlKey::Focus)
+                .unwrap()
+                .value = value;
+        };
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        // the list that the re-apply after the open sends
+        rig.wait("the list after the open", Duration::from_secs(5), |r| !lists(r).is_empty());
+        let n = lists(&rig).len();
+
+        // hidden: the lens moves, nothing is read, nothing is sent
+        lens(321);
+        std::thread::sleep(Duration::from_millis(2500));
+        assert_eq!(lists(&rig).len(), n, "controls were sent to a hidden window");
+
+        // shown: the list at once, with where the lens is now
+        rig.engine.set_window_visible(true);
+        rig.wait("the list for the window that is back", Duration::from_secs(3), |r| lists(r).len() == n + 1);
+        assert_eq!(focus_of(lists(&rig).last().unwrap()), 321);
+
+        // nothing moves: nothing is sent, however many polls there are
+        std::thread::sleep(Duration::from_millis(2500));
+        assert_eq!(lists(&rig).len(), n + 1, "an unchanged list was sent again");
+
+        // the lens moves while the window is visible: one list
+        lens(400);
+        rig.wait("the list with the new lens", Duration::from_secs(3), |r| lists(r).len() == n + 2);
+        assert_eq!(focus_of(lists(&rig).last().unwrap()), 400);
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(lists(&rig).len(), n + 2);
+
+        // hidden again: it moves, nothing is sent; shown: the list once
+        rig.engine.set_window_visible(false);
+        std::thread::sleep(Duration::from_millis(300));
+        lens(500);
+        std::thread::sleep(Duration::from_millis(2200));
+        assert_eq!(lists(&rig).len(), n + 2);
+        rig.engine.set_window_visible(true);
+        rig.wait("the list again", Duration::from_secs(3), |r| lists(r).len() == n + 3);
+        assert_eq!(focus_of(lists(&rig).last().unwrap()), 500);
+    }
+
+    #[test]
+    fn a_stats_event_follows_a_state_change_once_and_a_returning_window_gets_one() {
+        let rig = Rig::new("stats-state.bin", fast());
+        let stats = |r: &Rig| -> Vec<StatsEvent> {
+            r.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(_, e)| match e {
+                    EngineEvent::Stats(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        rig.engine.set_window_visible(true);
+        // stopped, visible: the window gets the (zero) numbers once when it is shown, and nothing after
+        rig.wait("the first event", Duration::from_secs(2), |r| stats(r).len() == 1);
+        std::thread::sleep(Duration::from_millis(800));
+        assert_eq!(stats(&rig).len(), 1, "events while stopped");
+        assert_eq!(stats(&rig)[0].capture.width, 0);
+
+        // live: the numbers come, each different from the one before
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("live numbers", Duration::from_secs(5), |r| stats(r).iter().any(|s| s.capture.width == 320));
+        let live = stats(&rig);
+        assert!(live.windows(2).all(|w| w[0] != w[1]), "{live:?}");
+
+        // hidden: silence; shown again: the numbers as they are, once at once
+        rig.engine.set_window_visible(false);
+        std::thread::sleep(Duration::from_millis(100));
+        let n = stats(&rig).len();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(stats(&rig).len(), n, "events to a hidden window");
+        rig.engine.set_window_visible(true);
+        rig.wait("an event for the returning window", Duration::from_millis(800), |r| stats(r).len() == n + 1);
+        assert_eq!(stats(&rig).last().unwrap().capture.width, 320);
     }
 
     #[test]
@@ -5433,6 +6410,8 @@ mod tests {
     #[test]
     fn a_lost_gpu_device_is_rebuilt_and_the_engine_is_live_again() {
         let rig = Rig::new("p15-gpu.bin", fast());
+        // The frames are looked at in the file, which only gets frames while an app reads the camera.
+        let _consumer = rig.consumer("p15-gpu.bin");
         // The chain must be rebuilt on the new device too: grey frames before and after.
         rig.engine.set_chain(
             crate::fx::parse_chain(&serde_json::json!([
