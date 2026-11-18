@@ -263,11 +263,17 @@ const CATALOGUE = {
   // Auto Adjust (P16): Better Cam's own filter, no OBS counterpart.
   auto_adjust: {
     label: "Auto Adjust",
-    hint: "Automatic exposure and white balance in software",
+    hint: "Automatic exposure, white balance, contrast and saturation in software",
     params: [
       { type: "bool", key: "exposure", label: "Auto exposure", def: true },
-      { type: "bool", key: "white_balance", label: "Auto white balance", def: true },
       { type: "slider", key: "target", label: "Target brightness", min: 0.2, max: 0.8, step: 0.01, def: 0.45, showIf: { key: "exposure", in: [true] } },
+      { type: "bool", key: "contrast", label: "Auto contrast", def: false },
+      { type: "slider", key: "target_contrast", label: "Target contrast", min: 0.1, max: 0.9, step: 0.01, def: 0.4, showIf: { key: "contrast", in: [true] }, hint: "Spread of dark to bright: 0.1 flat, 0.9 punchy" },
+      { type: "bool", key: "saturation", label: "Auto saturation", def: false },
+      { type: "slider", key: "target_saturation", label: "Target saturation", min: 0.05, max: 0.5, step: 0.01, def: 0.2, showIf: { key: "saturation", in: [true] }, hint: "Colour strength: 0.05 gray, 0.5 vivid" },
+      { type: "bool", key: "white_balance", label: "Auto white balance", def: true },
+      { type: "slider", key: "temperature", label: "Warmth", min: -1, max: 1, step: 0.01, def: 0, showIf: { key: "white_balance", in: [true] }, hint: "Aim for an orange (up) or blue (down) cast" },
+      { type: "slider", key: "tint", label: "Tint", min: -1, max: 1, step: 0.01, def: 0, showIf: { key: "white_balance", in: [true] }, hint: "Aim toward magenta (up) or green (down)" },
       { type: "slider", key: "strength", label: "Strength", min: 0, max: 1, step: 0.01, def: 1 },
       { type: "slider", key: "speed", label: "Adaptation speed", min: 0.05, max: 1, step: 0.01, def: 0.3 },
     ],

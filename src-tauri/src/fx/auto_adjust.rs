@@ -1,7 +1,8 @@
 //! Auto Adjust (`auto_adjust`, plan 6.4, P16): Better Cam's own software "auto mode". It has no OBS counterpart.
 //!
-//! It measures the picture on the GPU and corrects brightness (auto exposure) and colour cast (auto white balance)
-//! in a shader, smoothly over time, for cameras whose built-in auto is poor.
+//! It measures the picture on the GPU and corrects brightness (auto exposure), colour cast (auto white balance),
+//! contrast and saturation toward targets the user sets, in a shader, smoothly over time, for cameras whose built-in
+//! auto is poor.
 //!
 //! # Measuring
 //! Each frame the filter's *input* shrinks on the GPU through a chain of passes ([`stats_downsample.hlsl`], at most 8
@@ -32,6 +33,45 @@
 //! saturated (a smooth weight in each, so no cell flips the result by crossing a threshold). The gains make the mean of
 //! those cells grey, `g_c = Y / m_c`, normalised to keep the luma of the mean, and each is limited to `0.5 ..= 2`: a
 //! scene that really is one colour is corrected only part of the way. A small dead band holds the gains too.
+//!
+//! # Warmth and tint
+//! `temperature` ("Warmth") and `tint` move where the white balance aims. Gray world wants the mean of the usable
+//! cells to be neutral; with an aim colour `t` (linear RGB with the luma 1, see [`white_aim`]) it wants the mean to
+//! have the colour of `t` instead: `g_c = Y t_c / m_c`, then the same limits and luma normalisation. `0 / 0` is the
+//! aim `[1, 1, 1]` and the old behaviour to the bit. Warmth is a colour temperature of the light the neutral surface
+//! seems to be lit by, linear in mireds from 5500 K (0) to 4000 K (+1, warmer: a neutral ends orange, about
+//! R : G : B = 1.25 : 0.96 : 0.63) or 7000 K (-1, cooler: it ends blue), blackbody colours in linear sRGB relative to
+//! 5500 K. Tint multiplies red and blue by `e^d` and green by `e^-2d` with `d = 0.045 tint`, so +1 leaves green 13 %
+//! below red and blue (magenta) and -1 13 % above (green). Both aims are multiplied and renormalised to luma 1. With
+//! `white_balance` off they do nothing.
+//!
+//! # Contrast
+//! Order of the stages (the shader and every prediction here use it): exposure, white balance, contrast, saturation.
+//! The *contrast* of the picture is the spread of the brightness of its cells between the 10th and 90th percentile,
+//! the weighted percentiles of the 256 cell brightnesses after the exposure and white balance gains (weights as for
+//! the exposure: centre weight times coverage). The scale is the brightness scale of `target`: 0 is a flat gray
+//! picture, 0.5 a normal well lit scene, 0.8 is what cells spread evenly over black to white give. (The cells are
+//! 16 x 16 means, so they fall short of the extremes of single pixels.) The slider is `target_contrast`.
+//!
+//! The correction is a soft S-curve around a pivot (`auto_adjust.hlsl`) with the slope `k` at the pivot, `k` between
+//! `0.5` and `2`; 0 and 1 stay put and nothing clips. The shader applies it to each encoded channel, so the prediction
+//! does the same to each cell and reads the brightness of the result (for gray cells that is the curve of the
+//! brightness). The pivot is the one for which the mean brightness of the cells does not change, found by regula
+//! falsi (for a picture that is symmetrical around its mean it is the mean). The spread after the curve is measured
+//! on the predicted cells and `k` comes by bisection, with a dead band of `0.008` on the spread. A flat picture
+//! (spread below 0.02) or a black or white one has nothing to measure and holds the gain.
+//!
+//! The prediction works on cell means: detail inside a cell (hard edges, texture) makes the real effect of the curve
+//! weaker than predicted (about two thirds of it on a picture of flat areas with hard edges, measured live), so
+//! such a picture settles somewhat short of the target. The loop does not look at its own output, by design.
+//!//! # Saturation
+//! The colourfulness of a cell is `max(R, G, B) - min(R, G, B)` of its encoded colour after the stages before
+//! (so the contrast curve is included); the colourfulness of the picture is the weighted mean over the cells that are
+//! neither near black nor near white. 0 is gray, 0.2 a normal scene, 0.5 very vivid. The shader scales the
+//! distance of the encoded colour from its luma by the gain `s`, which scales the colourfulness by exactly `s` (up to
+//! clipping), so the wanted gain is `target / measured`, limited to `0.5 ..= 2`, with a dead band of 4 % around the
+//! target. Below a colourfulness of 0.02 nothing is held to be measured: the gain stays where it is (it cannot
+//! make colour out of gray anyway: a gray pixel does not move).
 //!
 //! # Time
 //! The filter keeps the gains as logarithms and moves them toward the wanted values with a first-order low-pass
@@ -64,7 +104,19 @@ mod tests;
 pub const KIND: &str = "auto_adjust";
 
 /// The settings the filter reads.
-pub const KEYS: &[&str] = &["exposure", "white_balance", "target", "strength", "speed"];
+pub const KEYS: &[&str] = &[
+    "exposure",
+    "white_balance",
+    "target",
+    "temperature",
+    "tint",
+    "contrast",
+    "target_contrast",
+    "saturation",
+    "target_saturation",
+    "strength",
+    "speed",
+];
 
 const MAIN_HLSL: &str = include_str!("../gpu/shaders/auto_adjust.hlsl");
 const STATS_HLSL: &str = include_str!("../gpu/shaders/stats_downsample.hlsl");
@@ -83,6 +135,25 @@ const MAX_WB: f64 = 2.0;
 const EXPOSURE_BAND: f32 = 0.012;
 /// Dead band of the white balance loop, in natural-log units of the gain (0.8 %).
 const WB_BAND: f64 = 0.008;
+/// The contrast curve's slope at its pivot: from half to double.
+const MIN_CONTRAST: f64 = 0.5;
+const MAX_CONTRAST: f64 = 2.0;
+/// Dead band of the contrast loop, in units of the spread (the brightness scale).
+const CONTRAST_BAND: f32 = 0.008;
+/// The saturation gain limits.
+const MIN_SAT: f64 = 0.5;
+const MAX_SAT: f64 = 2.0;
+/// Dead band of the saturation loop, in natural-log units of the gain (4 %).
+const SAT_BAND: f64 = 0.04;
+/// The colour temperature of the neutral aim (warmth 0) and of the two ends of the warmth slider, in kelvin.
+const REF_KELVIN: f64 = 5500.0;
+const WARM_KELVIN: f64 = 4000.0;
+const COOL_KELVIN: f64 = 7000.0;
+/// Tint 1 multiplies red and blue by `e^TINT_SCALE` and green by `e^-2 TINT_SCALE`.
+const TINT_SCALE: f32 = 0.045;
+/// The default targets (the values of `schema.ts`).
+const DEF_TARGET_CONTRAST: f32 = 0.4;
+const DEF_TARGET_SATURATION: f32 = 0.2;
 /// `tau = TAU_SCALE / speed` seconds.
 const TAU_SCALE: f64 = 0.15;
 /// The longest step of the smoothing: a stalled frame does not make a jump.
@@ -105,6 +176,12 @@ struct Settings {
     exposure: bool,
     white_balance: bool,
     target: f32,
+    temperature: f32,
+    tint: f32,
+    contrast: bool,
+    target_contrast: f32,
+    saturation: bool,
+    target_saturation: f32,
     strength: f32,
     speed: f32,
 }
@@ -114,6 +191,12 @@ fn settings(p: &Params) -> Settings {
         exposure: pb(p, "exposure", true),
         white_balance: pb(p, "white_balance", true),
         target: pf(p, "target", 0.45, 0.2, 0.8),
+        temperature: pf(p, "temperature", 0.0, -1.0, 1.0),
+        tint: pf(p, "tint", 0.0, -1.0, 1.0),
+        contrast: pb(p, "contrast", false),
+        target_contrast: pf(p, "target_contrast", DEF_TARGET_CONTRAST, 0.1, 0.9),
+        saturation: pb(p, "saturation", false),
+        target_saturation: pf(p, "target_saturation", DEF_TARGET_SATURATION, 0.05, 0.5),
         strength: pf(p, "strength", 1.0, 0.0, 1.0),
         speed: pf(p, "speed", 0.3, 0.05, 1.0),
     }
@@ -265,9 +348,61 @@ pub fn exposure_target(stats: &Stats, target: f32, ln_cur: f64) -> f64 {
     ln_cur + confidence * (want - ln_cur)
 }
 
+/// The linear sRGB colour of a blackbody of `kelvin` with the luminance 1 (Kim et al.'s cubic spline of the Planckian
+/// locus, 1667 K to 25000 K).
+fn blackbody_rgb(kelvin: f64) -> [f64; 3] {
+    let t = kelvin.clamp(1667.0, 25000.0);
+    let (t2, t3) = (t * t, t * t * t);
+    let x = if t <= 4000.0 {
+        -0.266_123_9e9 / t3 - 0.234_358_9e6 / t2 + 0.877_695_6e3 / t + 0.179_910
+    } else {
+        -3.025_846_9e9 / t3 + 2.107_037_9e6 / t2 + 0.222_634_7e3 / t + 0.240_390
+    };
+    let y = if t <= 2222.0 {
+        -1.106_381_4 * x * x * x - 1.348_110_20 * x * x + 2.185_558_32 * x - 0.202_196_83
+    } else if t <= 4000.0 {
+        -0.954_947_6 * x * x * x - 1.374_185_93 * x * x + 2.091_370_15 * x - 0.167_488_67
+    } else {
+        3.081_758_0 * x * x * x - 5.873_386_70 * x * x + 3.751_129_97 * x - 0.370_014_83
+    };
+    let (cx, cz) = (x / y, (1.0 - x - y) / y);
+    [
+        3.2406 * cx - 1.5372 - 0.4986 * cz,
+        -0.9689 * cx + 1.8758 + 0.0415 * cz,
+        0.0557 * cx - 0.2040 + 1.0570 * cz,
+    ]
+}
+
+/// The colour (linear RGB with the luma 1) the white balance makes a neutral surface, for the settings `temperature`
+/// ("Warmth") and `tint`, both `-1 ..= 1`. `0, 0` is exactly `[1, 1, 1]`: gray.
+///
+/// Warmth is a blackbody colour temperature, linear in mireds, from 5500 K at 0 to 4000 K at +1 and 7000 K at -1; the
+/// aim is the colour of that blackbody relative to 5500 K, so +1 gives about `[1.25, 0.96, 0.63]` (orange) and -1 about
+/// `[0.87, 1.01, 1.28]` (blue). Tint scales red and blue by `e^d` and green by `e^-2d`, `d = 0.045 tint` (+1: magenta,
+/// -1: green). The two are multiplied and the result is normalised to luma 1.
+pub fn white_aim(temperature: f32, tint: f32) -> [f32; 3] {
+    if temperature == 0.0 && tint == 0.0 {
+        return [1.0; 3];
+    }
+    let mut aim = [1.0f64; 3];
+    if temperature != 0.0 {
+        let t = f64::from(temperature.clamp(-1.0, 1.0));
+        let end = if t > 0.0 { WARM_KELVIN } else { COOL_KELVIN };
+        let (m0, m1) = (1e6 / REF_KELVIN, 1e6 / end);
+        let kelvin = 1e6 / (m0 + t.abs() * (m1 - m0));
+        let (c, r) = (blackbody_rgb(kelvin), blackbody_rgb(REF_KELVIN));
+        aim = [c[0] / r[0], c[1] / r[1], c[2] / r[2]];
+    }
+    let d = f64::from(TINT_SCALE * tint.clamp(-1.0, 1.0));
+    aim = [aim[0] * d.exp(), aim[1] * (-2.0 * d).exp(), aim[2] * d.exp()];
+    let y = 0.2126 * aim[0] + 0.7152 * aim[1] + 0.0722 * aim[2];
+    aim.map(|c| (c / y) as f32)
+}
+
 /// The wanted white balance gains (natural logarithms, red green blue) for the measured `stats`, given the gains
-/// `ln_cur` held now. A picture with nothing usable to measure gives `ln_cur`.
-pub fn white_balance_target(stats: &Stats, ln_cur: [f64; 3]) -> [f64; 3] {
+/// `ln_cur` held now and the colour `aim` a neutral surface should get (see [`white_aim`]; `[1; 3]` is gray). A
+/// picture with nothing usable to measure gives `ln_cur`.
+pub fn white_balance_target(stats: &Stats, ln_cur: [f64; 3], aim: [f32; 3]) -> [f64; 3] {
     let mut total = 0.0f32;
     let mut weight_sum = 0.0f32;
     let mut sum = [0.0f32; 3];
@@ -301,10 +436,11 @@ pub fn white_balance_target(stats: &Stats, ln_cur: [f64; 3]) -> [f64; 3] {
     if mean.iter().any(|m| *m < 1e-5) {
         return ln_cur;
     }
-    // Gray world: every channel of the mean to the luma of the mean, limited, then normalised to keep that luma.
+    // Gray world: every channel of the mean to the luma of the mean times the aim, limited, then normalised to keep
+    // that luma.
     let y = luma(mean);
     let limit = |g: f32| g.clamp(MIN_WB as f32, MAX_WB as f32);
-    let raw = [0, 1, 2].map(|k| limit(y / mean[k]));
+    let raw = [0, 1, 2].map(|k| limit(y * aim[k] / mean[k]));
     let keep = y / luma([raw[0] * mean[0], raw[1] * mean[1], raw[2] * mean[2]]);
     let mut out = ln_cur;
     for k in 0..3 {
@@ -314,6 +450,321 @@ pub fn white_balance_target(stats: &Stats, ln_cur: [f64; 3]) -> [f64; 3] {
         out[k] = ln_cur[k] + confidence * past_band;
     }
     out
+}
+
+/// The contrast curve of `auto_adjust.hlsl` on one encoded value `x`: 0, 1 and `m` stay, the slope at `m` is `k`.
+/// Each side of `m` is stretched to `u` in `[-1, 1]` and bent by `k u + (1 - k) u |u|`.
+pub fn contrast_curve(x: f32, k: f32, m: f32) -> f32 {
+    let (u, room) = if x < m {
+        ((x - m) / m, m)
+    } else {
+        ((x - m) / (1.0 - m), 1.0 - m)
+    };
+    let a = u.abs();
+    m + u * (a + k * (1.0 - a)) * room
+}
+
+/// A cell as the shader leaves it after the exposure and white balance gains, before contrast and saturation.
+struct Tone {
+    /// The encoded colour.
+    coded: [f32; 3],
+    /// Its brightness (encoded luma of the linear colour).
+    b: f32,
+    /// Centre weight times coverage.
+    w: f32,
+}
+
+/// The cells of `stats` as the exposure and white balance gains (natural logarithms) leave them. Clear cells are
+/// left out.
+fn tone_cells(stats: &Stats, ln_exposure: f64, ln_wb: [f64; 3]) -> Vec<Tone> {
+    let g = ln_exposure.exp() as f32;
+    let wb = ln_wb.map(|l| l.exp() as f32);
+    stats
+        .cells
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c[3] >= 0.02)
+        .map(|(i, c)| {
+            let lin = [0, 1, 2].map(|k| shape(c[k] * wb[k], g));
+            Tone {
+                coded: lin.map(srgb_encode),
+                b: srgb_encode(luma(lin)),
+                w: centre_weight(i) * c[3],
+            }
+        })
+        .collect()
+}
+
+/// The weighted `q` quantile (`0..=1`) of the values in `sorted` (value, weight; ascending): each value sits at the
+/// middle of its share of the weight and the quantile is interpolated between neighbours.
+fn weighted_quantile(sorted: &[(f32, f32)], total: f32, q: f32) -> f32 {
+    let target = q * total;
+    let mut before = 0.0f32;
+    let mut prev: Option<(f32, f32)> = None;
+    for &(v, w) in sorted {
+        let at = before + 0.5 * w;
+        if at >= target {
+            return match prev {
+                Some((pv, pat)) if at > pat => pv + (v - pv) * (target - pat) / (at - pat),
+                _ => v,
+            };
+        }
+        prev = Some((v, at));
+        before += w;
+    }
+    prev.map_or(0.0, |(v, _)| v)
+}
+
+/// The sRGB transfer function (coded to linear).
+fn srgb_decode(c: f32) -> f32 {
+    let c = c.clamp(0.0, 1.0);
+    if c <= 0.040_45 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Table size of the transfer functions of the prediction (the loops evaluate them thousands of times a frame).
+const LUT: usize = 1024;
+
+/// Linear interpolation in `table` at `x` in `0..=1`.
+fn lerp_table(table: &[f32], x: f32) -> f32 {
+    let t = x.clamp(0.0, 1.0) * (LUT - 1) as f32;
+    let i = (t as usize).min(LUT - 2);
+    let f = t - i as f32;
+    table[i] + (table[i + 1] - table[i]) * f
+}
+
+/// `srgb_decode` from a table, within `1e-5`.
+fn fast_decode(c: f32) -> f32 {
+    static T: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    let t = T.get_or_init(|| {
+        (0..LUT)
+            .map(|i| srgb_decode(i as f32 / (LUT - 1) as f32))
+            .collect()
+    });
+    lerp_table(t, c)
+}
+
+/// `srgb_encode` from a table over the square root of the linear value (the curve is steep near 0).
+fn fast_encode(l: f32) -> f32 {
+    static T: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    let t = T.get_or_init(|| {
+        (0..LUT)
+            .map(|i| {
+                let u = i as f32 / (LUT - 1) as f32;
+                srgb_encode(u * u)
+            })
+            .collect()
+    });
+    lerp_table(t, l.clamp(0.0, 1.0).sqrt())
+}
+
+/// The brightness of a cell after the contrast curve `k` around the pivot `m`, as the shader makes it: the curve runs
+/// on each encoded channel, and the brightness is read from the result like every brightness here (the encoded luma of
+/// the linear colour). For a gray cell this is the curve of its brightness; for a coloured one it differs a little.
+fn tone_after(c: &Tone, k: f32, m: f32) -> f32 {
+    if (k - 1.0).abs() < 1e-6 {
+        return c.b;
+    }
+    fast_encode(luma(c.coded.map(|x| fast_decode(contrast_curve(x, k, m)))))
+}
+
+/// The weighted mean brightness of `cells` through the curve `k` around `m`.
+fn mean_after(cells: &[Tone], k: f32, m: f32, total: f32) -> f32 {
+    cells.iter().map(|c| c.w * tone_after(c, k, m)).sum::<f32>() / total
+}
+
+/// The percentiles (10th, 90th) of the brightness of `cells` through the curve `k` around `m`.
+fn percentiles_after(cells: &[Tone], k: f32, m: f32, total: f32) -> (f32, f32) {
+    let mut sorted: Vec<(f32, f32)> = cells.iter().map(|c| (tone_after(c, k, m), c.w)).collect();
+    sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+    (
+        weighted_quantile(&sorted, total, 0.1),
+        weighted_quantile(&sorted, total, 0.9),
+    )
+}
+
+/// The contrast of the picture through the curve `k` around `m`: the spread between the 10th and 90th percentile of
+/// the cell brightnesses.
+fn spread_after(cells: &[Tone], k: f32, m: f32, total: f32) -> f32 {
+    let (p10, p90) = percentiles_after(cells, k, m, total);
+    p90 - p10
+}
+
+/// The total weight and the mean brightness of `cells`; `None` when there is no weight.
+fn weight_and_mean(cells: &[Tone]) -> Option<(f32, f32)> {
+    let total: f32 = cells.iter().map(|c| c.w).sum();
+    if total <= 0.0 {
+        return None;
+    }
+    Some((total, cells.iter().map(|c| c.w * c.b).sum::<f32>() / total))
+}
+
+/// The pivot of the contrast curve with the slope `k` for which the weighted mean brightness of `cells` is what it
+/// was (`mean`), within `0.05 ..= 0.95`: regula falsi (Illinois) from a first try `guess`, `mean` when no pivot does it.
+fn contrast_pivot(cells: &[Tone], k: f32, mean: f32, total: f32, guess: f32) -> f32 {
+    let (lo_end, hi_end) = (0.05f32, 0.95f32);
+    let mean = mean.clamp(lo_end, hi_end);
+    if (k - 1.0).abs() < 1e-6 || total <= 0.0 {
+        return mean;
+    }
+    let diff = |m: f32| mean_after(cells, k, m, total) - mean;
+    const TOL: f32 = 2e-4;
+    let guess = guess.clamp(lo_end, hi_end);
+    let d_guess = diff(guess);
+    if d_guess.abs() < TOL {
+        return guess;
+    }
+    let (mut a, mut fa) = (lo_end, diff(lo_end));
+    let (mut b, mut fb) = (hi_end, diff(hi_end));
+    if fa.signum() == fb.signum() {
+        return mean;
+    }
+    // the guess narrows the bracket
+    if d_guess.signum() == fa.signum() {
+        (a, fa) = (guess, d_guess);
+    } else {
+        (b, fb) = (guess, d_guess);
+    }
+    let mut side = 0;
+    let mut m = 0.5 * (a + b);
+    for _ in 0..12 {
+        m = (a * fb - b * fa) / (fb - fa);
+        let fm = diff(m);
+        if fm.abs() < TOL {
+            break;
+        }
+        if fm.signum() == fb.signum() {
+            b = m;
+            fb = fm;
+            if side == -1 {
+                fa *= 0.5;
+            }
+            side = -1;
+        } else {
+            a = m;
+            fa = fm;
+            if side == 1 {
+                fb *= 0.5;
+            }
+            side = 1;
+        }
+    }
+    m
+}
+/// The wanted contrast gain (the slope of the curve at its pivot, natural logarithm) for the measured `stats`, the
+/// `target` spread and the gains held now: `ln_exposure`, `ln_wb` and the contrast `ln_cur`. A picture with nothing
+/// to measure (black, white or flat) gives `ln_cur`.
+pub fn contrast_target(
+    stats: &Stats,
+    ln_exposure: f64,
+    ln_wb: [f64; 3],
+    target: f32,
+    ln_cur: f64,
+) -> f64 {
+    let cells = tone_cells(stats, ln_exposure, ln_wb);
+    let Some((total, mean)) = weight_and_mean(&cells) else {
+        return ln_cur;
+    };
+    let spread = spread_after(&cells, 1.0, mean, total);
+    let confidence = f64::from(
+        smoothstep(0.03, 0.10, mean)
+            * (1.0 - smoothstep(0.93, 0.99, mean))
+            * smoothstep(0.02, 0.06, spread),
+    );
+    if confidence <= 0.0 {
+        return ln_cur;
+    }
+    let k_cur = ln_cur.exp() as f32;
+    let m_cur = contrast_pivot(&cells, k_cur, mean, total, mean);
+    let error = spread_after(&cells, k_cur, m_cur, total) - target;
+    if error.abs() <= CONTRAST_BAND {
+        return ln_cur;
+    }
+    let aim = target + error.clamp(-CONTRAST_BAND, CONTRAST_BAND);
+    // The slope that brings the spread to `aim` for a pivot `m` (the spread rises with the slope).
+    let solve = |m: f32| -> f64 {
+        let after = |ln_k: f64| spread_after(&cells, ln_k.exp() as f32, m, total);
+        let (mut lo, mut hi) = (MIN_CONTRAST.ln(), MAX_CONTRAST.ln());
+        if after(hi) <= aim {
+            return hi;
+        }
+        if after(lo) >= aim {
+            return lo;
+        }
+        for _ in 0..14 {
+            let mid = 0.5 * (lo + hi);
+            if after(mid) < aim {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi)
+    };
+    // The pivot depends on the slope and the slope on the pivot: two rounds of each settle it.
+    let mut want = solve(mean.clamp(0.05, 0.95));
+    for _ in 0..2 {
+        want = solve(contrast_pivot(&cells, want.exp() as f32, mean, total, mean));
+    }
+    ln_cur + confidence * (want - ln_cur)
+}
+
+/// The pivot the shader should use for the contrast gain `k` on the picture `stats` shows after the gains `ln_exposure`
+/// and `ln_wb`: mean brightness stays. `None` when nothing was measured.
+fn shader_pivot(stats: &Stats, ln_exposure: f64, ln_wb: [f64; 3], k: f32, guess: f32) -> Option<f32> {
+    let cells = tone_cells(stats, ln_exposure, ln_wb);
+    let (total, mean) = weight_and_mean(&cells)?;
+    Some(contrast_pivot(&cells, k, mean, total, guess))
+}
+/// The wanted saturation gain (natural logarithm) for the measured `stats`, the `target` colourfulness and the gains
+/// held now: `ln_exposure`, `ln_wb`, the contrast `ln_contrast` and the saturation `ln_cur`. Nothing to measure
+/// (gray, black, white) gives `ln_cur`.
+pub fn saturation_target(
+    stats: &Stats,
+    ln_exposure: f64,
+    ln_wb: [f64; 3],
+    ln_contrast: f64,
+    target: f32,
+    ln_cur: f64,
+) -> f64 {
+    let cells = tone_cells(stats, ln_exposure, ln_wb);
+    let Some((total, mean)) = weight_and_mean(&cells) else {
+        return ln_cur;
+    };
+    let k = ln_contrast.exp() as f32;
+    let pivot = contrast_pivot(&cells, k, mean, total, mean);
+    let (mut weight, mut sum) = (0.0f32, 0.0f32);
+    for c in &cells {
+        let (coded, b) = if (k - 1.0).abs() < 1e-6 {
+            (c.coded, c.b)
+        } else {
+            (c.coded.map(|x| contrast_curve(x, k, pivot)), tone_after(c, k, pivot))
+        };
+        let w = c.w * smoothstep(0.04, 0.12, b) * (1.0 - smoothstep(0.88, 0.97, b));
+        let chroma = coded[0].max(coded[1]).max(coded[2]) - coded[0].min(coded[1]).min(coded[2]);
+        weight += w;
+        sum += w * chroma;
+    }
+    if weight <= 0.0 {
+        return ln_cur;
+    }
+    let measured = sum / weight;
+    let confidence = f64::from(
+        smoothstep(0.02, 0.10, weight / total) * smoothstep(0.02, 0.05, measured),
+    );
+    if confidence <= 0.0 {
+        return ln_cur;
+    }
+    let ideal = (f64::from(target) / f64::from(measured)).ln();
+    let error = ln_cur - ideal;
+    if error.abs() <= SAT_BAND {
+        return ln_cur;
+    }
+    let want = (ideal + error.clamp(-SAT_BAND, SAT_BAND)).clamp(MIN_SAT.ln(), MAX_SAT.ln());
+    ln_cur + confidence * (want - ln_cur)
 }
 
 /// Move `cur` toward `target` by the fraction `alpha`; a gain that goes back to 1 lands on 1.
@@ -331,12 +782,17 @@ fn follow(cur: f64, target: f64, alpha: f64) -> f64 {
 pub struct Gains {
     pub exposure: f32,
     pub wb: [f32; 3],
+    /// The slope of the contrast curve at its pivot.
+    pub contrast: f32,
+    pub saturation: f32,
 }
 
 impl Gains {
     pub const NEUTRAL: Gains = Gains {
         exposure: 1.0,
         wb: [1.0; 3],
+        contrast: 1.0,
+        saturation: 1.0,
     };
 }
 
@@ -462,12 +918,21 @@ pub struct AutoAdjust {
     ln_exposure: f64,
     /// Natural logarithms of the white balance gains.
     ln_wb: [f64; 3],
+    /// Natural logarithm of the contrast gain.
+    ln_contrast: f64,
+    /// Natural logarithm of the saturation gain.
+    ln_saturation: f64,
+    /// The pivot of the contrast curve the shader got last.
+    pivot: f32,
     /// The newest measurement that has come back from the GPU.
     stats: Option<Stats>,
     main: Program,
     gpu: Option<Gpu>,
     /// Tests: map each measurement as soon as it is copied (one frame of latency, the same every run).
     sync_readback: bool,
+    /// Tests: leave the gains as they are (to time the GPU work without the CPU maths).
+    #[cfg(test)]
+    hold_gains: bool,
 }
 
 pub fn make() -> Box<dyn GpuFilter> {
@@ -482,10 +947,15 @@ impl AutoAdjust {
             last_time: None,
             ln_exposure: 0.0,
             ln_wb: [0.0; 3],
+            ln_contrast: 0.0,
+            ln_saturation: 0.0,
+            pivot: 0.45,
             stats: None,
             main: Program::new("auto_adjust", MAIN_HLSL),
             gpu: None,
             sync_readback: false,
+            #[cfg(test)]
+            hold_gains: false,
         }
     }
 
@@ -504,6 +974,8 @@ impl AutoAdjust {
         Gains {
             exposure: self.ln_exposure.exp() as f32,
             wb: self.ln_wb.map(|l| l.exp() as f32),
+            contrast: self.ln_contrast.exp() as f32,
+            saturation: self.ln_saturation.exp() as f32,
         }
     }
 
@@ -513,7 +985,28 @@ impl AutoAdjust {
         Gains {
             exposure: (s * self.ln_exposure).exp() as f32,
             wb: self.ln_wb.map(|l| (s * l).exp() as f32),
+            contrast: (s * self.ln_contrast).exp() as f32,
+            saturation: (s * self.ln_saturation).exp() as f32,
         }
+    }
+
+    /// The pivot of the contrast curve for the gains applied now: the one that keeps the mean brightness of the
+    /// latest measurement. Without a measurement, the last one used.
+    fn contrast_pivot_now(&mut self) -> f32 {
+        let s = f64::from(self.settings.strength);
+        if let Some(stats) = &self.stats {
+            let k = (s * self.ln_contrast).exp() as f32;
+            if let Some(p) = shader_pivot(
+                stats,
+                s * self.ln_exposure,
+                self.ln_wb.map(|l| s * l),
+                k,
+                self.pivot,
+            ) {
+                self.pivot = p;
+            }
+        }
+        self.pivot
     }
 
     fn ensure_gpu(&mut self, r: &Renderer) -> GpuResult<()> {
@@ -537,6 +1030,10 @@ impl AutoAdjust {
 
     /// Move the gains toward what the newest measurement asks for.
     fn steer(&mut self, dt: f64) {
+        #[cfg(test)]
+        if self.hold_gains {
+            return;
+        }
         let s = self.settings;
         let alpha = 1.0 - (-dt / time_constant(s.speed)).exp();
         let stats = self.stats.as_ref();
@@ -548,19 +1045,55 @@ impl AutoAdjust {
             0.0
         };
         let want_wb = if s.white_balance {
-            stats.map_or(self.ln_wb, |st| white_balance_target(st, self.ln_wb))
+            let aim = white_aim(s.temperature, s.tint);
+            stats.map_or(self.ln_wb, |st| {
+                white_balance_target(st, self.ln_wb, aim)
+            })
         } else {
             [0.0; 3]
+        };
+        // Contrast and saturation measure the picture after the stages before them, as held now.
+        let want_contrast = if s.contrast {
+            stats.map_or(self.ln_contrast, |st| {
+                contrast_target(
+                    st,
+                    self.ln_exposure,
+                    self.ln_wb,
+                    s.target_contrast,
+                    self.ln_contrast,
+                )
+            })
+        } else {
+            0.0
+        };
+        let want_saturation = if s.saturation {
+            stats.map_or(self.ln_saturation, |st| {
+                saturation_target(
+                    st,
+                    self.ln_exposure,
+                    self.ln_wb,
+                    self.ln_contrast,
+                    s.target_saturation,
+                    self.ln_saturation,
+                )
+            })
+        } else {
+            0.0
         };
         self.ln_exposure = follow(self.ln_exposure, want_exposure, alpha);
         for (cur, want) in self.ln_wb.iter_mut().zip(want_wb) {
             *cur = follow(*cur, want, alpha);
         }
+        self.ln_contrast = follow(self.ln_contrast, want_contrast, alpha);
+        self.ln_saturation = follow(self.ln_saturation, want_saturation, alpha);
     }
 
     /// Whether the gains held are exactly 1.
     fn neutral(&self) -> bool {
-        self.ln_exposure == 0.0 && self.ln_wb == [0.0; 3]
+        self.ln_exposure == 0.0
+            && self.ln_wb == [0.0; 3]
+            && self.ln_contrast == 0.0
+            && self.ln_saturation == 0.0
     }
 }
 
@@ -597,7 +1130,9 @@ impl GpuFilter for AutoAdjust {
 
         // Measure this frame's input, whatever the gains are (the loop never sees its own output). With both
         // corrections off and the gains home there is nothing to measure.
-        let measure = self.settings.exposure || self.settings.white_balance || !self.neutral();
+        let s = self.settings;
+        let measure =
+            s.exposure || s.white_balance || s.contrast || s.saturation || !self.neutral();
         let gpu = self.gpu.as_mut().expect("made above");
         if measure {
             let size = (input.width, input.height);
@@ -626,9 +1161,23 @@ impl GpuFilter for AutoAdjust {
             return r.copy(input, output);
         }
         let k = knee(g.exposure);
+        let pivot = if g.contrast == 1.0 {
+            self.pivot
+        } else {
+            self.contrast_pivot_now()
+        };
         self.main.draw(
             r,
-            &pack_f32(&[g.wb[0], g.wb[1], g.wb[2], g.exposure, k, 0.0, 0.0, 0.0]),
+            &pack_f32(&[
+                g.wb[0],
+                g.wb[1],
+                g.wb[2],
+                g.exposure,
+                k,
+                g.contrast,
+                pivot,
+                g.saturation,
+            ]),
             input,
             output,
         )

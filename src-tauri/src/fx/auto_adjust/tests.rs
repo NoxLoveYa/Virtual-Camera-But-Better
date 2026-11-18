@@ -16,6 +16,9 @@ use crate::gpu::{AdapterKind, GpuDevice, GpuTimer};
 
 type Pixel = [u8; 4];
 
+/// The white balance aim of warmth 0 and tint 0: gray.
+const NEUTRAL_AIM: [f32; 3] = [1.0; 3];
+
 fn params(v: Value) -> Params {
     v.as_object().cloned().unwrap_or_default()
 }
@@ -218,10 +221,10 @@ fn auto_adjust_a_bright_background_does_not_decide_the_exposure() {
 #[test]
 fn auto_adjust_the_white_balance_target() {
     // Neutral stays neutral.
-    assert_eq!(white_balance_target(&uniform([0.2; 3]), [0.0; 3]), [0.0; 3]);
+    assert_eq!(white_balance_target(&uniform([0.2; 3]), [0.0; 3], NEUTRAL_AIM), [0.0; 3]);
     // A blue cast asks for less blue and more red, and the luma of the mean stays.
     let m = [0.156, 0.188, 0.352];
-    let t = white_balance_target(&uniform(m), [0.0; 3]);
+    let t = white_balance_target(&uniform(m), [0.0; 3], NEUTRAL_AIM);
     assert!(t[0] > 0.0 && t[2] < 0.0, "{t:?}");
     let g = t.map(|l| l.exp() as f32);
     let before = luma(m);
@@ -229,20 +232,20 @@ fn auto_adjust_the_white_balance_target() {
     assert!((after - before).abs() / before < 0.02, "{before} {after}");
     // A red wall (saturated) is left alone instead of turned grey.
     assert_eq!(
-        white_balance_target(&uniform([0.58, 0.021, 0.013]), [0.0; 3]),
+        white_balance_target(&uniform([0.58, 0.021, 0.013]), [0.0; 3], NEUTRAL_AIM),
         [0.0; 3]
     );
     // Black and white say nothing about the light.
     assert_eq!(
-        white_balance_target(&uniform([0.0; 3]), [0.1, 0.0, 0.0]),
+        white_balance_target(&uniform([0.0; 3]), [0.1, 0.0, 0.0], NEUTRAL_AIM),
         [0.1, 0.0, 0.0]
     );
     assert_eq!(
-        white_balance_target(&uniform([1.0, 1.0, 0.9]), [0.0; 3]),
+        white_balance_target(&uniform([1.0, 1.0, 0.9]), [0.0; 3], NEUTRAL_AIM),
         [0.0; 3]
     );
     // Every gain stays in range even for a strong cast.
-    let t = white_balance_target(&uniform([0.4, 0.25, 0.12]), [0.0; 3]);
+    let t = white_balance_target(&uniform([0.4, 0.25, 0.12]), [0.0; 3], NEUTRAL_AIM);
     for l in t {
         assert!(
             (MIN_WB.ln() - 1e-6..=MAX_WB.ln() + 1e-6).contains(&l),
@@ -786,13 +789,24 @@ fn auto_adjust_defaults_match_the_schema() {
             exposure: true,
             white_balance: true,
             target: 0.45,
+            temperature: 0.0,
+            tint: 0.0,
+            contrast: false,
+            target_contrast: DEF_TARGET_CONTRAST,
+            saturation: false,
+            target_saturation: DEF_TARGET_SATURATION,
             strength: 1.0,
             speed: 0.3
         }
     );
     // out of range values are clamped
-    let s = settings(&params(json!({ "target": 5, "strength": -1, "speed": 0 })));
+    let s = settings(&params(json!({
+        "target": 5, "strength": -1, "speed": 0, "temperature": 3, "tint": -3,
+        "target_contrast": 0, "target_saturation": 9
+    })));
     assert_eq!((s.target, s.strength, s.speed), (0.8, 0.0, 0.05));
+    assert_eq!((s.temperature, s.tint), (1.0, -1.0));
+    assert_eq!((s.target_contrast, s.target_saturation), (0.1, 0.5));
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -823,7 +837,7 @@ fn median_gpu_ms(r: &Renderer, timer: &mut GpuTimer, frames: usize, mut run: imp
 }
 
 #[test]
-fn auto_adjust_costs_well_under_a_fifth_of_a_millisecond_at_1080p() {
+fn auto_adjust_costs_well_under_a_tenth_of_a_millisecond_at_1080p_with_everything_on() {
     let gpu = match GpuDevice::new(AdapterKind::Hardware) {
         Ok(g) => Arc::new(g),
         Err(e) => {
@@ -847,16 +861,41 @@ fn auto_adjust_costs_well_under_a_fifth_of_a_millisecond_at_1080p() {
     r.flush();
 
     let mut f = AutoAdjust::new(real_clock());
-    f.update(&r, &Params::new());
-    // Force the shader path (a filter that is neutral would copy).
+    f.update(
+        &r,
+        &params(json!({
+            "contrast": true, "saturation": true, "temperature": 0.5, "tint": 0.3
+        })),
+    );
+    // Force the shader path (a filter that is neutral would copy) with every stage working.
     f.ln_exposure = 0.5;
     f.ln_wb = [0.1, 0.0, -0.1];
+    f.ln_contrast = 0.3;
+    f.ln_saturation = 0.2;
     let mut color = crate::fx::make("color_filter").unwrap();
     color.update(
         &r,
         &params(json!({ "saturation": 0.2, "brightness": 0.05 })),
     );
 
+    // Warm up with the loop running so the measurements have come back, then hold the gains: the timed region is the
+    // GPU work (statistics chain, copy to the staging ring, shader), not the CPU maths of the loop (timed below).
+    for _ in 0..30 {
+        f.render(&r, &tex, &output).unwrap();
+        r.flush();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let cpu_frames = 200;
+    let t0 = std::time::Instant::now();
+    for _ in 0..cpu_frames {
+        f.render(&r, &tex, &output).unwrap();
+    }
+    let cpu_ms = t0.elapsed().as_secs_f64() * 1000.0 / cpu_frames as f64;
+    f.ln_exposure = 0.5;
+    f.ln_wb = [0.1, 0.0, -0.1];
+    f.ln_contrast = 0.3;
+    f.ln_saturation = 0.2;
+    f.hold_gains = true;
     let baseline = median_gpu_ms(&r, &mut timer, 120, || {});
     let with = median_gpu_ms(&r, &mut timer, 120, || {
         f.render(&r, &tex, &output).unwrap();
@@ -864,14 +903,803 @@ fn auto_adjust_costs_well_under_a_fifth_of_a_millisecond_at_1080p() {
     let color_ms = median_gpu_ms(&r, &mut timer, 120, || {
         color.render(&r, &tex, &output).unwrap();
     });
+    // The same with contrast and saturation neutral: the cost of the filter as it was.
+    f.ln_contrast = 0.0;
+    f.ln_saturation = 0.0;
+    let without = median_gpu_ms(&r, &mut timer, 120, || {
+        f.render(&r, &tex, &output).unwrap();
+    });
+    eprintln!(
+        "1080p: exposure and white balance only {:.3} ms",
+        without - baseline
+    );
+    // The same with the new corrections off: the CPU time of the filter as it was.
+    let mut old = AutoAdjust::new(real_clock());
+    old.update(&r, &Params::new());
+    for _ in 0..30 {
+        old.render(&r, &tex, &output).unwrap();
+        r.flush();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let t0 = std::time::Instant::now();
+    for _ in 0..cpu_frames {
+        old.render(&r, &tex, &output).unwrap();
+    }
+    let cpu_old_ms = t0.elapsed().as_secs_f64() * 1000.0 / cpu_frames as f64;
+    eprintln!(
+        "CPU time of a frame of the filter, loop included: {cpu_ms:.3} ms with everything on, {cpu_old_ms:.3} ms with the defaults"
+    );
+    assert!(
+        cpu_ms - cpu_old_ms < 0.6,
+        "contrast and saturation cost {:.3} ms of CPU a frame",
+        cpu_ms - cpu_old_ms
+    );
     eprintln!(
         "1080p on {}: no filter {baseline:.3} ms, auto adjust {with:.3} ms, colour correction {color_ms:.3} ms; the filter adds {:.3} ms",
         r.gpu.adapter_name,
         with - baseline
     );
     assert!(
-        with - baseline < 0.2,
+        with - baseline < 0.1,
         "auto adjust adds {:.3} ms",
         with - baseline
     );
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------
+// Contrast, saturation, warmth and tint
+
+/// The shader of the filter before contrast, saturation and the aim existed, as it was (comments dropped).
+const PREVIOUS_HLSL: &str = r#"
+Texture2D<float4> image : register(t0);
+SamplerState linear_clamp : register(s0);
+cbuffer Params : register(b0)
+{
+    float3 wb_gain;
+    float gain;
+    float knee;
+    float3 pad;
+};
+float3 srgb_to_linear(float3 c)
+{
+    return (c <= 0.04045) ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
+float3 linear_to_srgb(float3 c)
+{
+    c = saturate(c);
+    return (c <= 0.0031308) ? 12.92 * c : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+float4 main(float4 pos : SV_Position) : SV_Target
+{
+    float4 p = image.Load(int3(int2(pos.xy), 0));
+    float3 v = srgb_to_linear(p.rgb) * wb_gain * gain;
+    float3 y = v;
+    if (knee < 1.0)
+    {
+        float room = 1.0 - knee;
+        float3 shoulder = knee + room * (1.0 - exp(-(v - knee) / room));
+        y = (v <= knee) ? v : shoulder;
+    }
+    return float4(linear_to_srgb(y), p.a);
+}
+"#;
+
+/// Left half `lo`, right half `hi` (the picture is symmetrical about its centre, so the weights of both halves match).
+fn halves(lo: [u8; 3], hi: [u8; 3]) -> impl Fn(u32, u32) -> Pixel {
+    move |x, _| {
+        let c = if x < SMALL.0 / 2 { lo } else { hi };
+        [c[0], c[1], c[2], 255]
+    }
+}
+
+/// The brightness of pixel `i` of an RGBA picture.
+fn pixel_brightness(rgba: &[u8], i: usize) -> f32 {
+    let p = &rgba[i * 4..i * 4 + 3];
+    srgb_encode(luma([dec(p[0]), dec(p[1]), dec(p[2])]))
+}
+
+/// Brightness spread between the right and left half of a picture made by [`halves`].
+fn halves_spread(rgba: &[u8]) -> f32 {
+    pixel_brightness(rgba, 24) - pixel_brightness(rgba, 8)
+}
+
+/// Max minus min of the encoded channels of pixel `i`, on the scale 0 to 1.
+fn pixel_chroma(rgba: &[u8], i: usize) -> f32 {
+    let p = &rgba[i * 4..i * 4 + 3];
+    f32::from(*p.iter().max().unwrap() - *p.iter().min().unwrap()) / 255.0
+}
+
+fn halves_stats(lo: [u8; 3], hi: [u8; 3]) -> Stats {
+    let cells = (0..CELLS)
+        .map(|i| {
+            let c = if i % GRID < GRID / 2 { lo } else { hi };
+            [dec(c[0]), dec(c[1]), dec(c[2]), 1.0]
+        })
+        .collect();
+    Stats { cells }
+}
+
+#[test]
+fn auto_adjust_the_white_aim_is_gray_at_zero_and_documented_at_the_ends() {
+    assert_eq!(white_aim(0.0, 0.0), [1.0; 3]);
+    let lum = |a: [f32; 3]| 0.2126 * a[0] + 0.7152 * a[1] + 0.0722 * a[2];
+    let warm = white_aim(1.0, 0.0);
+    let cool = white_aim(-1.0, 0.0);
+    eprintln!("warmth +1 {warm:?}, -1 {cool:?}");
+    for a in [warm, cool, white_aim(0.5, 0.5), white_aim(-1.0, -1.0)] {
+        assert!((lum(a) - 1.0).abs() < 1e-5, "{a:?}");
+    }
+    // +1: orange (red up, blue down), about 1.25 : 0.96 : 0.63
+    assert!((warm[0] - 1.25).abs() < 0.04, "{warm:?}");
+    assert!((warm[1] - 0.96).abs() < 0.03, "{warm:?}");
+    assert!((warm[2] - 0.63).abs() < 0.03, "{warm:?}");
+    // -1: blue
+    assert!(cool[0] < 0.95 && cool[2] > 1.2 && cool[0] < cool[1] && cool[1] < cool[2], "{cool:?}");
+    // steady and signed: every step to the warm side raises red over blue
+    let mut last = f32::MIN;
+    for i in -10..=10 {
+        let a = white_aim(i as f32 / 10.0, 0.0);
+        let ratio = a[0] / a[2];
+        assert!(ratio > last, "{i}: {ratio} {last}");
+        last = ratio;
+    }
+    // tint: +1 is magenta (green 13 % under red and blue), -1 green; red and blue stay together
+    let m = white_aim(0.0, 1.0);
+    let g = white_aim(0.0, -1.0);
+    assert!((m[0] - m[2]).abs() < 1e-6 && (g[0] - g[2]).abs() < 1e-6);
+    assert!((m[1] / m[0] - (-3.0f32 * 0.045).exp()).abs() < 1e-4, "{m:?}");
+    assert!((g[1] / g[0] - (3.0f32 * 0.045).exp()).abs() < 1e-4, "{g:?}");
+    assert!(m[1] < 1.0 && g[1] > 1.0);
+    // out of range values are limited
+    assert_eq!(white_aim(5.0, 0.0), white_aim(1.0, 0.0));
+}
+
+#[test]
+fn auto_adjust_the_white_balance_target_aims_at_the_colour() {
+    let gray = uniform([0.2; 3]);
+    // Neutral aim and a gray scene: nothing. A warm aim on gray: the gains are the aim itself, since luma is kept.
+    let aim = white_aim(1.0, 0.0);
+    let t = white_balance_target(&gray, [0.0; 3], aim);
+    for k in 0..3 {
+        assert!((t[k].exp() as f32 - aim[k]).abs() < 0.01, "{t:?} {aim:?}");
+    }
+    // A scene that has the aim's colour already is left alone.
+    let warm_scene = uniform([0.2 * aim[0], 0.2 * aim[1], 0.2 * aim[2]]);
+    for l in white_balance_target(&warm_scene, [0.0; 3], aim) {
+        assert!(l.abs() < 0.01, "{l}");
+    }
+    // The gains stay in range for any aim.
+    for (te, ti) in [(1.0, 1.0), (-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0)] {
+        let t = white_balance_target(&uniform([0.5, 0.3, 0.1]), [0.0; 3], white_aim(te, ti));
+        for l in t {
+            assert!((MIN_WB.ln() - 1e-6..=MAX_WB.ln() + 1e-6).contains(&l), "{t:?}");
+        }
+    }
+}
+
+#[test]
+fn auto_adjust_the_contrast_curve_keeps_its_ends_and_never_reverses() {
+    for m in [0.1f32, 0.3, 0.45, 0.7, 0.9] {
+        for k in [0.5f32, 0.8, 1.0, 1.5, 2.0] {
+            assert!(contrast_curve(0.0, k, m).abs() < 1e-6);
+            assert!((contrast_curve(1.0, k, m) - 1.0).abs() < 1e-6);
+            assert!((contrast_curve(m, k, m) - m).abs() < 1e-6);
+            // the slope at the pivot is k
+            let e = 1e-3;
+            let slope = (contrast_curve(m + e, k, m) - contrast_curve(m - e, k, m)) / (2.0 * e);
+            assert!((slope - k).abs() < 0.01, "m {m} k {k}: {slope}");
+            let mut prev = -1.0f32;
+            for i in 0..=200 {
+                let y = contrast_curve(i as f32 / 200.0, k, m);
+                assert!((-1e-6..=1.0 + 1e-6).contains(&y), "m {m} k {k}: {y}");
+                assert!(y >= prev - 1e-6, "m {m} k {k} reverses at {i}");
+                prev = y;
+            }
+            if k == 1.0 {
+                for i in 0..=20 {
+                    let x = i as f32 / 20.0;
+                    assert!((contrast_curve(x, k, m) - x).abs() < 1e-6);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn auto_adjust_the_contrast_target_for_a_flat_and_for_a_harsh_picture() {
+    // 95 and 135 are brightnesses 0.373 and 0.529: a spread of 0.157.
+    let flat = halves_stats([95; 3], [135; 3]);
+    let up = contrast_target(&flat, 0.0, [0.0; 3], 0.28, 0.0);
+    assert!(
+        (1.4..2.0).contains(&up.exp()),
+        "a flat picture asks for more: {}",
+        up.exp()
+    );
+    // The result of the chosen slope is close to the target, and the mean brightness is where it was.
+    let k = up.exp() as f32;
+    let (lo, hi) = (0.373f32, 0.529f32);
+    let pivot = shader_pivot(&flat, 0.0, [0.0; 3], k, 0.45).unwrap();
+    let (lo2, hi2) = (contrast_curve(lo, k, pivot), contrast_curve(hi, k, pivot));
+    assert!(
+        (hi2 - lo2 - 0.28).abs() < 0.035,
+        "spread after: {}",
+        hi2 - lo2
+    );
+    assert!(
+        ((lo2 + hi2) - (lo + hi)).abs() < 0.004,
+        "the mean moved from {} to {}",
+        (lo + hi) / 2.0,
+        (lo2 + hi2) / 2.0
+    );
+    // 70 and 190: a spread of 0.474. Target 0.35 asks for less.
+    let harsh = halves_stats([70; 3], [190; 3]);
+    let down = contrast_target(&harsh, 0.0, [0.0; 3], 0.35, 0.0).exp();
+    assert!((0.5..0.8).contains(&down), "{down}");
+    // At the target (inside the dead band) the gain is held.
+    assert_eq!(contrast_target(&flat, 0.0, [0.0; 3], 0.157, 0.0), 0.0);
+    assert_eq!(contrast_target(&flat, 0.0, [0.0; 3], 0.162, 0.0), 0.0);
+    // A uniform picture has nothing to measure; black and white do not either.
+    for c in [0.2f32, 0.0, 1.0] {
+        assert_eq!(contrast_target(&uniform([c; 3]), 0.0, [0.0; 3], 0.5, 0.3), 0.3);
+    }
+    // The limits: never beyond half or double.
+    let extreme = halves_stats([100; 3], [104; 3]);
+    let v = contrast_target(&extreme, 0.0, [0.0; 3], 0.9, 0.0);
+    assert!(v <= MAX_CONTRAST.ln() + 1e-9, "{v}");
+    let v = contrast_target(&halves_stats([5; 3], [250; 3]), 0.0, [0.0; 3], 0.1, 0.0);
+    assert!(v >= MIN_CONTRAST.ln() - 1e-9, "{v}");
+}
+
+#[test]
+fn auto_adjust_the_saturation_target() {
+    // Chroma 40/255 = 0.157 for these (encoded max - min): target 0.28 asks for about 1.78.
+    let dull = uniform([dec(100), dec(120), dec(140)]);
+    let g = saturation_target(&dull, 0.0, [0.0; 3], 0.0, 0.28, 0.0).exp();
+    assert!((1.6..1.9).contains(&g), "{g}");
+    // 220/100/60: chroma 0.627, target 0.4 asks for about 0.64.
+    let vivid = uniform([dec(220), dec(100), dec(60)]);
+    let g = saturation_target(&vivid, 0.0, [0.0; 3], 0.0, 0.4, 0.0).exp();
+    assert!((0.55..0.72).contains(&g), "{g}");
+    // Inside the dead band: held.
+    assert_eq!(saturation_target(&dull, 0.0, [0.0; 3], 0.0, 0.157, 0.0), 0.0);
+    // Gray and nearly gray: nothing to measure, the gain stays.
+    assert_eq!(saturation_target(&uniform([0.2; 3]), 0.0, [0.0; 3], 0.0, 0.5, 0.0), 0.0);
+    let almost = uniform([dec(127), dec(128), dec(128)]);
+    assert_eq!(saturation_target(&almost, 0.0, [0.0; 3], 0.0, 0.5, 0.1), 0.1);
+    // Dark and bright colours are not measured.
+    let dark = uniform([dec(6), dec(2), dec(1)]);
+    assert_eq!(saturation_target(&dark, 0.0, [0.0; 3], 0.0, 0.5, 0.0), 0.0);
+    // A weak colour is raised by no more than double, a strong one lowered by no more than half.
+    let weak = uniform([dec(110), dec(120), dec(130)]);
+    let g = saturation_target(&weak, 0.0, [0.0; 3], 0.0, 0.5, 0.0);
+    assert!((g - MAX_SAT.ln()).abs() < 1e-9, "{g}");
+    let g = saturation_target(&vivid, 0.0, [0.0; 3], 0.0, 0.05, 0.0);
+    assert!((g - MIN_SAT.ln()).abs() < 1e-9, "{g}");
+}
+
+#[test]
+fn auto_adjust_defaults_give_the_output_of_the_previous_filter() {
+    // Every frame of 3 seconds: the new filter with the new switches off against the old shader with the gains the
+    // filter holds, bit for bit, on a coloured, textured picture with alpha.
+    let mut rig = Rig::new(json!({}));
+    let mut old = Program::new("auto_adjust_previous", PREVIOUS_HLSL);
+    let picture = |x: u32, y: u32| {
+        [
+            (60 + x * 3) as u8,
+            (50 + y * 5) as u8,
+            (90 + (x + y) * 2) as u8,
+            [255u8, 255, 200, 128][((x / 3 + y / 2) % 4) as usize],
+        ]
+    };
+    let mut moved = false;
+    for n in 0..90 {
+        rig.now += 1.0 / 30.0;
+        rig.clock.store(rig.now.to_bits(), Ordering::Relaxed);
+        let input = rig.r.texture(SMALL.0, SMALL.1).unwrap();
+        fill_rgba(&rig.r, &input, picture);
+        let output = rig.r.texture(SMALL.0, SMALL.1).unwrap();
+        rig.f.render(&rig.r, &input, &output).unwrap();
+        let new = read_rgba(&rig.r, &output);
+
+        let g = rig.f.applied();
+        assert_eq!((g.contrast, g.saturation), (1.0, 1.0));
+        let reference = rig.r.texture(SMALL.0, SMALL.1).unwrap();
+        if g == Gains::NEUTRAL {
+            rig.r.copy(&input, &reference).unwrap();
+        } else {
+            moved = true;
+            old.draw(
+                &rig.r,
+                &pack_f32(&[g.wb[0], g.wb[1], g.wb[2], g.exposure, knee(g.exposure), 0.0, 0.0, 0.0]),
+                &input,
+                &reference,
+            )
+            .unwrap();
+        }
+        assert_eq!(new, read_rgba(&rig.r, &reference), "frame {n}");
+    }
+    assert!(moved, "the test picture needs a correction");
+}
+
+#[test]
+fn auto_adjust_contrast_raises_a_flat_picture_to_the_target_and_keeps_the_mean() {
+    let mut rig = Rig::new(json!({
+        "exposure": false, "white_balance": false, "contrast": true, "target_contrast": 0.28
+    }));
+    let before = rig.frame(1.0 / 30.0, SMALL, halves([95; 3], [135; 3]));
+    assert!((halves_spread(&before) - 0.157).abs() < 0.01);
+    assert_eq!(&before[..4], &[95, 95, 95, 255], "nothing is measured yet");
+    let mut out = Vec::new();
+    for _ in 0..90 {
+        out = rig.frame(1.0 / 30.0, SMALL, halves([95; 3], [135; 3]));
+    }
+    let spread = halves_spread(&out);
+    assert!((spread - 0.28).abs() <= 0.03, "spread {spread}");
+    let (b0, b1) = (brightness(&before), brightness(&out));
+    assert!((b0 - b1).abs() <= 0.015, "mean brightness {b0} to {b1}");
+    assert!(rig.f.held().contrast > 1.4);
+    assert_eq!(rig.f.held().saturation, 1.0);
+}
+
+#[test]
+fn auto_adjust_contrast_lowers_a_harsh_picture_to_the_target_and_keeps_the_mean() {
+    let mut rig = Rig::new(json!({
+        "exposure": false, "white_balance": false, "contrast": true, "target_contrast": 0.35
+    }));
+    let before = rig.frame(1.0 / 30.0, SMALL, halves([70; 3], [190; 3]));
+    let mut out = Vec::new();
+    for _ in 0..90 {
+        out = rig.frame(1.0 / 30.0, SMALL, halves([70; 3], [190; 3]));
+    }
+    let spread = halves_spread(&out);
+    assert!((spread - 0.35).abs() <= 0.03, "spread {spread}");
+    let (b0, b1) = (brightness(&before), brightness(&out));
+    assert!((b0 - b1).abs() <= 0.015, "mean brightness {b0} to {b1}");
+    assert!(rig.f.held().contrast < 0.9);
+    // soft: the dark half is lifted and the bright half lowered, neither clips
+    assert!(out[0] > 70 && out[96] < 190 && out[96] > 150);
+}
+
+#[test]
+fn auto_adjust_a_picture_at_the_target_contrast_is_left_alone() {
+    let mut rig = Rig::new(json!({
+        "exposure": false, "white_balance": false, "contrast": true, "target_contrast": 0.16
+    }));
+    for _ in 0..90 {
+        let out = rig.frame(1.0 / 30.0, SMALL, halves([95; 3], [135; 3]));
+        assert_eq!(&out[..4], &[95, 95, 95, 255]);
+        assert_eq!(&out[96..100], &[135, 135, 135, 255]);
+    }
+    assert_eq!(rig.f.held().contrast, 1.0);
+}
+
+#[test]
+fn auto_adjust_contrast_keeps_the_mean_for_a_lopsided_picture_and_does_not_touch_flat_ones() {
+    // A dark picture with a small bright part: the mean sits near the dark side, the curve must not move it.
+    let picture = |x: u32, _y: u32| {
+        let c = if x >= 26 { 230u8 } else { 55 };
+        [c, c, c, 255]
+    };
+    let mut rig = Rig::new(json!({
+        "exposure": false, "white_balance": false, "contrast": true, "target_contrast": 0.45
+    }));
+    let before = rig.frame(1.0 / 30.0, SMALL, picture);
+    let mut out = Vec::new();
+    for _ in 0..90 {
+        out = rig.frame(1.0 / 30.0, SMALL, picture);
+    }
+    let (b0, b1) = (brightness(&before), brightness(&out));
+    assert!((b0 - b1).abs() <= 0.015, "mean brightness {b0} to {b1}");
+    // A flat picture has no contrast to correct: it stays as it is, whatever the target.
+    let mut rig = Rig::new(json!({
+        "exposure": false, "white_balance": false, "contrast": true, "target_contrast": 0.9
+    }));
+    let out = rig.run_flat(60, 30.0, [100; 3]);
+    assert_eq!(&out[..4], &[100, 100, 100, 255]);
+}
+
+/// A dull picture: left (100, 120, 140), right (120, 140, 160).
+fn dull_halves(x: u32, _y: u32) -> Pixel {
+    if x < 16 {
+        [100, 120, 140, 255]
+    } else {
+        [120, 140, 160, 255]
+    }
+}
+
+#[test]
+fn auto_adjust_saturation_raises_a_dull_picture_and_lowers_a_vivid_one() {
+    let mut rig = Rig::new(json!({
+        "exposure": false, "white_balance": false, "saturation": true, "target_saturation": 0.28
+    }));
+    let before = rig.frame(1.0 / 30.0, SMALL, dull_halves);
+    assert!((pixel_chroma(&before, 8) - 40.0 / 255.0).abs() < 0.01);
+    let mut out = Vec::new();
+    for _ in 0..90 {
+        out = rig.frame(1.0 / 30.0, SMALL, dull_halves);
+    }
+    for i in [8usize, 24] {
+        let c = pixel_chroma(&out, i);
+        assert!((c - 0.28).abs() <= 0.02, "pixel {i}: chroma {c}");
+    }
+    assert!(
+        (brightness(&before) - brightness(&out)).abs() <= 0.02,
+        "{} {}",
+        brightness(&before),
+        brightness(&out)
+    );
+    assert!(rig.f.held().saturation > 1.5);
+    assert_eq!(rig.f.held().contrast, 1.0);
+
+    let mut rig = Rig::new(json!({
+        "exposure": false, "white_balance": false, "saturation": true, "target_saturation": 0.4
+    }));
+    let out = rig.run_flat(90, 30.0, [220, 100, 60]);
+    let c = pixel_chroma(&out, 0);
+    assert!((c - 0.4).abs() <= 0.03, "chroma {c}");
+    assert!(rig.f.held().saturation < 0.75);
+}
+
+#[test]
+fn auto_adjust_saturation_leaves_gray_alone_and_respects_its_limits() {
+    let mut rig = Rig::new(json!({
+        "exposure": false, "white_balance": false, "saturation": true, "target_saturation": 0.5
+    }));
+    let out = rig.run_flat(90, 30.0, [128; 3]);
+    assert_eq!(&out[..4], &[128, 128, 128, 255]);
+    assert_eq!(rig.f.held().saturation, 1.0);
+    // Almost gray: under the floor, nothing is held to be measured.
+    let out = rig.run_flat(90, 30.0, [127, 128, 128]);
+    assert_eq!(&out[..4], &[127, 128, 128, 255]);
+    assert_eq!(rig.f.held().saturation, 1.0);
+    // A weak colour wanted far stronger gets double at most.
+    let out = rig.run_flat(240, 30.0, [110, 120, 130]);
+    let g = rig.f.held().saturation;
+    assert!((1.9..=2.0 + 1e-4).contains(&g), "{g}");
+    let c = pixel_chroma(&out, 0);
+    assert!((c - 2.0 * 20.0 / 255.0).abs() < 0.015, "chroma {c}");
+    // A strong colour wanted far weaker gets half at most.
+    let mut rig = Rig::new(json!({
+        "exposure": false, "white_balance": false, "saturation": true, "target_saturation": 0.05
+    }));
+    rig.run_flat(240, 30.0, [220, 100, 60]);
+    let g = rig.f.held().saturation;
+    assert!((0.5 - 1e-4..=0.55).contains(&g), "{g}");
+}
+
+#[test]
+fn auto_adjust_warmth_and_tint_move_a_gray_by_the_documented_amount() {
+    let lin = |p: &[u8]| [dec(p[0]), dec(p[1]), dec(p[2])];
+    for (temperature, tint) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0), (0.5, 0.5)] {
+        let mut rig = Rig::new(json!({
+            "exposure": false, "temperature": temperature, "tint": tint
+        }));
+        let out = rig.run_flat(150, 30.0, [110; 3]);
+        let aim = white_aim(temperature, tint);
+        let c = lin(&out);
+        let base = dec(110);
+        for k in 0..3 {
+            let got = c[k] / base;
+            assert!(
+                (got - aim[k]).abs() < 0.04 * aim[k] + 0.01,
+                "warmth {temperature}, tint {tint}: channel {k} is {got}, aim {}",
+                aim[k]
+            );
+        }
+        // luma kept
+        assert!(
+            (luma(c) - base).abs() / base < 0.02,
+            "{} {}",
+            luma(c),
+            base
+        );
+    }
+    // The directions: warm is orange, cool blue, magenta has green lowest, green has it highest.
+    let run = |t: f64, ti: f64| {
+        let mut rig = Rig::new(json!({ "exposure": false, "temperature": t, "tint": ti }));
+        rig.run_flat(150, 30.0, [110; 3])
+    };
+    let warm = run(1.0, 0.0);
+    assert!(warm[0] > warm[1] && warm[1] > warm[2], "{:?}", &warm[..3]);
+    let cool = run(-1.0, 0.0);
+    assert!(cool[2] > cool[1] && cool[1] > cool[0], "{:?}", &cool[..3]);
+    let magenta = run(0.0, 1.0);
+    assert!(magenta[1] < magenta[0] && magenta[1] < magenta[2]);
+    let green = run(0.0, -1.0);
+    assert!(green[1] > green[0] && green[1] > green[2]);
+    // Without white balance they do nothing.
+    let mut rig = Rig::new(json!({
+        "exposure": false, "white_balance": false, "temperature": 1, "tint": 1
+    }));
+    let out = rig.run_flat(60, 30.0, [110; 3]);
+    assert_eq!(&out[..4], &[110, 110, 110, 255]);
+    assert_eq!(rig.f.held(), Gains::NEUTRAL);
+}
+
+#[test]
+fn auto_adjust_warmth_aims_a_colour_cast_to_the_aim_not_to_gray() {
+    // A scene with a blue cast and a warm aim: the result is warmer than gray would be.
+    let tinted = [110u8, 120, 160];
+    let mut gray = Rig::new(json!({ "exposure": false }));
+    let g = gray.run_flat(150, 30.0, tinted);
+    let mut warm = Rig::new(json!({ "exposure": false, "temperature": 0.5 }));
+    let w = warm.run_flat(150, 30.0, tinted);
+    assert!(w[0] > g[0] && w[2] < g[2], "{:?} {:?}", &g[..3], &w[..3]);
+}
+
+/// Everything on, a coloured picture with a dark and a bright half.
+fn busy(x: u32, _y: u32) -> Pixel {
+    if x < 16 {
+        [40, 52, 80, 255]
+    } else {
+        [140, 118, 95, 255]
+    }
+}
+
+fn all_on() -> Value {
+    json!({
+        "contrast": true, "target_contrast": 0.5, "saturation": true, "target_saturation": 0.35,
+        "temperature": 0.3, "tint": -0.2
+    })
+}
+
+/// Held gains (natural logarithms: exposure, three of white balance, contrast, saturation) after each frame.
+fn all_series(fps: f64, seconds: f64, p: Value) -> Vec<[f64; 6]> {
+    let mut rig = Rig::new(p);
+    (0..(fps * seconds) as usize)
+        .map(|_| {
+            rig.frame(1.0 / fps, SMALL, busy);
+            let h = rig.f.held();
+            [
+                f64::from(h.exposure).ln(),
+                f64::from(h.wb[0]).ln(),
+                f64::from(h.wb[2]).ln(),
+                f64::from(h.contrast).ln(),
+                f64::from(h.saturation).ln(),
+                0.0,
+            ]
+        })
+        .collect()
+}
+
+#[test]
+fn auto_adjust_everything_on_settles_the_same_in_real_time_at_15_30_and_60_fps() {
+    let series: Vec<(f64, Vec<[f64; 6]>)> = [15.0, 30.0, 60.0]
+        .map(|fps| (fps, all_series(fps, 6.0, all_on())))
+        .to_vec();
+    let last = |s: &Vec<[f64; 6]>| *s.last().unwrap();
+    let end = last(&series[2].1);
+    for k in 0..5 {
+        assert!(end[k].abs() > 0.05, "gain {k} is {} and does not move", end[k]);
+        // where every rate ends
+        for (fps, s) in &series {
+            let e = last(s);
+            assert!(
+                (e[k] - end[k]).abs() < 0.03 + 0.03 * end[k].abs(),
+                "gain {k} at {fps} fps ends at {} against {}",
+                e[k],
+                end[k]
+            );
+        }
+        for fraction in [0.5, 0.8] {
+            let times: Vec<f64> = series
+                .iter()
+                .map(|(fps, s)| {
+                    let up = end[k] > 0.0;
+                    let i = s
+                        .iter()
+                        .position(|v| if up { v[k] >= fraction * end[k] } else { v[k] <= fraction * end[k] })
+                        .unwrap_or(s.len());
+                    (i + 1) as f64 / fps
+                })
+                .collect();
+            let spread = times.iter().cloned().fold(f64::MIN, f64::max)
+                - times.iter().cloned().fold(f64::MAX, f64::min);
+            assert!(
+                spread <= 0.2,
+                "gain {k}, {fraction} of the way: {times:?} s at 15, 30 and 60 fps"
+            );
+        }
+    }
+}
+
+#[test]
+fn auto_adjust_everything_on_does_not_oscillate_over_300_frames() {
+    let series = all_series(30.0, 10.0, all_on());
+    assert_eq!(series.len(), 300);
+    for k in 0..5 {
+        let values: Vec<f64> = series.iter().map(|s| s[k]).collect();
+        let settled = &values[150..];
+        let (lo, hi) = settled
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(l, h), v| (l.min(*v), h.max(*v)));
+        assert!(hi - lo < 0.01, "gain {k} varies by {} after 5 s", hi - lo);
+        // at most one turn on the way (a gain may overshoot while exposure settles, but it does not swing)
+        let mut turns = 0;
+        let mut dir = 0.0f64;
+        for w in values.windows(2) {
+            let d = w[1] - w[0];
+            if d.abs() < 1e-7 {
+                continue;
+            }
+            if dir != 0.0 && d.signum() != dir {
+                turns += 1;
+            }
+            dir = d.signum();
+        }
+        assert!(turns <= 2, "gain {k} turns {turns} times");
+    }
+}
+
+#[test]
+fn auto_adjust_everything_on_does_not_flicker_on_a_noisy_static_scene() {
+    let mut rig = Rig::new(all_on());
+    let mut seed = 0x1234_5678u32;
+    let mut means = Vec::new();
+    let mut gains = Vec::new();
+    for _ in 0..300 {
+        let noise: Vec<i32> = (0..SMALL.0 * SMALL.1)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((seed >> 24) % 13) as i32 - 6
+            })
+            .collect();
+        // Neighbouring pixels carry opposite noise, so the picture itself has the same mean every frame and what
+        // the test sees is the filter, not the luck of the noise.
+        let out = rig.frame(1.0 / 30.0, SMALL, |x, y| {
+            let i = (y * SMALL.0 + x) as usize;
+            let n = if i % 2 == 0 { noise[i] } else { -noise[i - 1] };
+            let base = busy(x, y);
+            let c = |v: u8| (i32::from(v) + n).clamp(0, 255) as u8;
+            [c(base[0]), c(base[1]), c(base[2]), 255]
+        });
+        means.push(brightness(&out));
+        let h = rig.f.held();
+        gains.push([h.exposure, h.contrast, h.saturation]);
+    }
+    let settled = &means[150..];
+    let lo = settled.iter().cloned().fold(f32::MAX, f32::min);
+    let hi = settled.iter().cloned().fold(f32::MIN, f32::max);
+    assert!((hi - lo) / hi < 0.01, "mean brightness {lo} to {hi}");
+    for k in 0..3 {
+        let lo = gains[150..].iter().map(|g| g[k]).fold(f32::MAX, f32::min);
+        let hi = gains[150..].iter().map(|g| g[k]).fold(f32::MIN, f32::max);
+        assert!((hi - lo) / hi < 0.015, "gain {k} varies from {lo} to {hi}");
+    }
+}
+
+#[test]
+fn auto_adjust_everything_on_reaches_all_its_targets_together() {
+    let mut rig = Rig::new(json!({
+        "contrast": true, "target_contrast": 0.35, "saturation": true, "target_saturation": 0.25
+    }));
+    let mut out = Vec::new();
+    for _ in 0..240 {
+        out = rig.frame(1.0 / 30.0, SMALL, busy);
+    }
+    assert!(
+        (brightness(&out) - 0.45).abs() <= 0.05,
+        "brightness {}",
+        brightness(&out)
+    );
+    let spread = halves_spread(&out);
+    assert!((spread - 0.35).abs() <= 0.04, "spread {spread}");
+    let c = (pixel_chroma(&out, 8) + pixel_chroma(&out, 24)) / 2.0;
+    assert!((c - 0.25).abs() <= 0.03, "chroma {c}");
+}
+
+#[test]
+fn auto_adjust_strength_zero_is_the_identity_with_everything_on_and_half_goes_half_way() {
+    let mut p = all_on();
+    p["strength"] = json!(0);
+    let mut rig = Rig::new(p);
+    let mut want = Vec::new();
+    for y in 0..SMALL.1 {
+        for x in 0..SMALL.0 {
+            want.extend_from_slice(&busy(x, y));
+        }
+    }
+    for _ in 0..60 {
+        assert_eq!(rig.frame(1.0 / 30.0, SMALL, busy), want);
+    }
+    let h = rig.f.held();
+    assert!(h.contrast != 1.0 && h.saturation != 1.0, "the loop kept running: {h:?}");
+    // Raised to 1 at once, to 0.5 half way in the logarithm.
+    let ln = |g: f32| f64::from(g).ln();
+    rig.set({
+        let mut p = all_on();
+        p["strength"] = json!(0.5);
+        p
+    });
+    let a = rig.f.applied();
+    let h = rig.f.held();
+    assert!((ln(a.contrast) - 0.5 * ln(h.contrast)).abs() < 1e-5);
+    assert!((ln(a.saturation) - 0.5 * ln(h.saturation)).abs() < 1e-5);
+    assert!((ln(a.wb[0]) - 0.5 * ln(h.wb[0])).abs() < 1e-5);
+    assert_ne!(rig.frame(1.0 / 30.0, SMALL, busy), want);
+}
+
+#[test]
+fn auto_adjust_each_new_switch_off_returns_its_gain_smoothly_to_one() {
+    for (key, pick) in [
+        ("contrast", (|g: &Gains| g.contrast) as fn(&Gains) -> f32),
+        ("saturation", |g: &Gains| g.saturation),
+    ] {
+        let mut rig = Rig::new(all_on());
+        for _ in 0..240 {
+            rig.frame(1.0 / 30.0, SMALL, busy);
+        }
+        let settled = rig.f.held();
+        assert!((pick(&settled) - 1.0).abs() > 0.1, "{key}: {settled:?}");
+        let mut p = all_on();
+        p[key] = json!(false);
+        rig.set(p);
+        let start = f64::from(pick(&settled)).ln();
+        let mut previous = start;
+        let mut biggest = 0.0f64;
+        let mut home = None;
+        for n in 1..=240 {
+            rig.frame(1.0 / 30.0, SMALL, busy);
+            let now = f64::from(pick(&rig.f.held())).ln();
+            // monotone toward 1 (the other gains settling a little moves the target, not the direction)
+            assert!(
+                now.abs() <= previous.abs() + 1e-6 && now * start >= -1e-9,
+                "{key}: {previous} to {now}"
+            );
+            biggest = biggest.max((now - previous).abs());
+            previous = now;
+            if now == 0.0 && home.is_none() {
+                home = Some(n);
+            }
+        }
+        assert!(home.is_some(), "{key}: the gain never returned to 1");
+        // one frame moves at most 1 - exp(-dt / tau) = 6.5 % of the way
+        assert!(biggest < 0.065 * start.abs() + 1e-3, "{key}: step {biggest}");
+    }
+    // Warmth back to 0: the white balance gains return to neutral (within the dead band).
+    let mut rig = Rig::new(json!({ "exposure": false, "temperature": 1 }));
+    rig.run_flat(150, 30.0, [110; 3]);
+    assert!(rig.f.held().wb[0] > 1.2);
+    rig.set(json!({ "exposure": false, "temperature": 0 }));
+    let mut previous = rig.f.held().wb[0];
+    for _ in 0..150 {
+        rig.run_flat(1, 30.0, [110; 3]);
+        let now = rig.f.held().wb[0];
+        assert!(now <= previous + 1e-6, "{previous} {now}");
+        previous = now;
+    }
+    for g in rig.f.held().wb {
+        assert!((g - 1.0).abs() < 0.02, "{:?}", rig.f.held().wb);
+    }
+    // With everything off and the gains home the filter is a copy again.
+    rig.set(json!({
+        "exposure": false, "white_balance": false, "contrast": false, "saturation": false
+    }));
+    rig.run_flat(300, 30.0, [110; 3]);
+    assert_eq!(rig.f.held(), Gains::NEUTRAL);
+    assert_eq!(&rig.run_flat(1, 30.0, [110; 3])[..4], &[110, 110, 110, 255]);
+}
+
+#[test]
+fn auto_adjust_leaves_alpha_alone_with_everything_on() {
+    let mut rig = Rig::new(all_on());
+    let picture = |x: u32, y: u32| {
+        let mut p = busy(x, y);
+        p[3] = [255u8, 200, 128, 64, 10, 0][((x + y) % 6) as usize];
+        p
+    };
+    let mut last = Vec::new();
+    for _ in 0..90 {
+        last = rig.frame(1.0 / 30.0, SMALL, picture);
+    }
+    let h = rig.f.held();
+    assert!(h.contrast != 1.0 && h.saturation != 1.0, "{h:?}");
+    for y in 0..SMALL.1 {
+        for x in 0..SMALL.0 {
+            let i = ((y * SMALL.0 + x) * 4) as usize;
+            assert_eq!(last[i + 3], picture(x, y)[3], "alpha at {x},{y}");
+        }
+    }
+    assert_ne!(last[0], busy(0, 0)[0], "the colour changed");
 }
