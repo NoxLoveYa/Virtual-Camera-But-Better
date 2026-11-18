@@ -1,8 +1,26 @@
 import { useEffect, type CSSProperties, type KeyboardEvent } from "react";
 import { useStore } from "../store";
-import { CONTROL_LABELS, controlKind, controlValueText, findCamera, powerlineOptions, type ControlInfo } from "../camera/schema";
+import {
+  CONTROL_LABELS,
+  MODE_LABELS,
+  autoCfgOf,
+  capText,
+  controlKind,
+  controlValueText,
+  findCamera,
+  hasModeList,
+  limitFraction,
+  maxGainValue,
+  modeOf,
+  powerlineOptions,
+  showsStatus,
+  statusOf,
+  type ControlInfo,
+  type ControlMode,
+} from "../camera/schema";
+import { ExposureAuto, LimitMark, LoopStatus, WhiteBalanceAuto, type AutoCtx } from "./AutoControls";
 import { Icon } from "./Icon";
-import { Select } from "./Select";
+import { Select, type SelectOption } from "./Select";
 
 /** The device controls of the selected camera (plan 6.2): the device's own ranges, Auto switches, double-click to reset. */
 export function ControlsCard() {
@@ -13,6 +31,8 @@ export function ControlsCard() {
   const error = useStore((s) => s.controlsError);
   const resetting = useStore((s) => s.controlsResetting);
   const state = useStore((s) => s.engine.state);
+  const stored = useStore((s) => s.controls);
+  const autoStatus = useStore((s) => s.autoStatus);
   // Remembered across launches (`Saved.ui`); a folded card does not read the camera.
   const open = useStore((s) => s.ui.controls);
   const { refreshControls, resetAllControls, setUi } = useStore.getState();
@@ -40,14 +60,22 @@ export function ControlsCard() {
   else if (error) body = <p className="ctl-note bad">{error}</p>;
   else if (!shown) body = <p className="ctl-note">Reading the camera’s controls…</p>;
   else if (shown.length === 0) body = <p className="ctl-note">This camera does not report any adjustable controls.</p>;
-  else
+  else {
+    const ctx: AutoCtx = {
+      infos: shown,
+      cfg: autoCfgOf(stored, cam),
+      exposure: statusOf(autoStatus, cam, "exposure"),
+      whiteBalance: statusOf(autoStatus, cam, "white_balance"),
+      live: state === "live",
+    };
     body = (
       <div className="ctl-rows">
         {shown.map((i) => (
-          <ControlRow key={i.key} info={i} />
+          <ControlRow key={i.key} info={i} ctx={ctx} />
         ))}
       </div>
     );
+  }
 
   return (
     <section className="card controls" aria-label="Camera controls">
@@ -74,22 +102,54 @@ export function ControlsCard() {
   );
 }
 
-function ControlRow({ info }: { info: ControlInfo }) {
-  const { setControl, resetControl } = useStore.getState();
+/** Manual, Camera auto, Better Cam auto: what the camera has; a Better Cam auto it cannot offer is listed, disabled, with the reason. */
+const modeOptions = (info: ControlInfo): SelectOption[] => [
+  ...(info.can_manual ? [{ value: "manual", label: MODE_LABELS.manual }] : []),
+  ...(info.can_auto ? [{ value: "camera", label: MODE_LABELS.camera }] : []),
+  { value: "app", label: MODE_LABELS.app, disabled: info.app == null, title: info.app == null ? (info.app_why ?? "Better Cam auto is not available for this control.") : undefined },
+];
+
+function ControlRow({ info, ctx }: { info: ControlInfo; ctx: AutoCtx }) {
+  const { setControl, resetControl, setControlMode } = useStore.getState();
   const kind = controlKind(info.key);
   const label = CONTROL_LABELS[info.key];
   const reset = () => resetControl(info.key);
-  // With Auto on the camera sets the value; the slider only shows it.
-  const locked = info.auto || !info.can_manual;
+  const mode = modeOf(info);
+  const app = mode === "app";
+  const modal = hasModeList(info);
+  // With Auto on, or Better Cam auto, the controller sets the value; the slider only shows it.
+  const locked = app || info.auto || !info.can_manual;
+  const loop = info.key === "exposure" ? "exposure" : info.key === "white_balance" ? "white_balance" : null;
+  const status = loop === "exposure" ? ctx.exposure : loop === "white_balance" ? ctx.whiteBalance : null;
+  const gain = ctx.infos.find((i) => i.key === "gain");
+
+  // The limits Better Cam auto keeps, as ticks on the sliders it moves (the range beyond is shaded).
+  let limit: { fraction: number; title: string } | null = null;
+  if (info.key === "exposure" && app) {
+    const user = ctx.cfg.exposure.longest;
+    const cap = status ? { stop: ctx.exposure!.cap, title: capText(ctx.exposure!.cap_reason, ctx.exposure!.target_fps) } : user !== "fit" ? { stop: user, title: "Your limit" } : null;
+    const f = cap && limitFraction(cap.stop, info);
+    if (cap && f != null) limit = { fraction: f, title: cap.title };
+  } else if (info.key === "gain" && info.driven_by === "exposure" && gain && gain.can_manual) {
+    const most = maxGainValue(ctx.cfg.exposure.max_gain, gain);
+    const f = limitFraction(most, gain);
+    if (f != null) limit = { fraction: f, title: `Most gain: ${most}` };
+  }
 
   return (
-    <div className={`ctl${locked ? " auto" : ""}`} data-key={info.key}>
+    <div className={`ctl${locked ? " auto" : ""}${modal ? " multi" : ""}`} data-key={info.key} data-mode={mode}>
       <div className="ctl-head">
         <span className="ctl-name" title={label}>
           {label}
         </span>
         {kind !== "select" && <b>{controlValueText(info)}</b>}
-        {info.can_auto && (
+        {modal && (
+          <label className="ctl-mode">
+            <span className="sr-only">{label} mode</span>
+            <Select value={mode} options={modeOptions(info)} onChange={(m) => void setControlMode(info.key, m as ControlMode)} />
+          </label>
+        )}
+        {!modal && info.can_auto && (
           <label className="ctl-auto" title={info.auto ? "The camera sets this" : "Let the camera set this"}>
             <span>Auto</span>
             <button
@@ -114,7 +174,8 @@ function ControlRow({ info }: { info: ControlInfo }) {
           />
         )}
       </div>
-      {kind === "slider" && <Slider info={info} label={label} locked={locked} onReset={reset} />}
+      {kind === "slider" && <Slider info={info} label={label} locked={locked} onReset={reset} limit={limit} />}
+      {info.driven_by && <span className="ctl-hint">Set by Better Cam auto exposure</span>}
       {kind === "select" && (
         <Select
           value={String(info.value)}
@@ -123,11 +184,24 @@ function ControlRow({ info }: { info: ControlInfo }) {
           onChange={(v) => setControl(info.key, { value: Number(v) })}
         />
       )}
+      {loop === "exposure" && app && <ExposureAuto info={info} ctx={ctx} />}
+      {loop === "white_balance" && app && <WhiteBalanceAuto ctx={ctx} />}
+      {/* After a hand-back the line stays (with Try again) while the control is where it was handed to. */}
+      {loop && !app && showsStatus(mode, status) && <LoopStatus loop={loop} label={label} status={status} live={ctx.live} />}
     </div>
   );
 }
 
-function Slider({ info, label, locked, onReset }: { info: ControlInfo; label: string; locked: boolean; onReset: () => void }) {
+function Slider({
+  info, label, locked, onReset, limit,
+}: {
+  info: ControlInfo;
+  label: string;
+  locked: boolean;
+  onReset: () => void;
+  /** A limit Better Cam auto keeps: a tick, and the range beyond it shaded. */
+  limit: { fraction: number; title: string } | null;
+}) {
   const { setControl } = useStore.getState();
   const span = info.max - info.min;
   const fill = span > 0 ? ((info.value - info.min) / span) * 100 : 0;
@@ -137,11 +211,11 @@ function Slider({ info, label, locked, onReset }: { info: ControlInfo; label: st
       onReset();
     }
   };
-  return (
+  const range = (
     <input
       type="range"
       aria-label={label}
-      title="Double-click or press Delete to reset"
+      title={locked ? undefined : "Double-click or press Delete to reset"}
       style={{ "--p": `${fill}%` } as CSSProperties}
       min={info.min}
       max={info.max}
@@ -152,5 +226,13 @@ function Slider({ info, label, locked, onReset }: { info: ControlInfo; label: st
       onDoubleClick={onReset}
       onKeyDown={onKeyDown}
     />
+  );
+  return limit ? (
+    <div className="ctl-range">
+      {range}
+      <LimitMark fraction={limit.fraction} title={limit.title} />
+    </div>
+  ) : (
+    range
   );
 }

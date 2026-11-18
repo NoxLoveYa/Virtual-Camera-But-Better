@@ -543,7 +543,18 @@ export type ControlKind = "slider" | "switch" | "select";
 export const controlKind = (key: ControlKey): ControlKind =>
   key === "color_enable" || key === "low_light_compensation" ? "switch" : key === "powerline_frequency" ? "select" : "slider";
 
-/** One control as the device reports it (`get_camera_controls`, `set_camera_control`, `controls-changed`). */
+/** Who sets a control: the user (`manual`), the camera's own Auto flag (`camera`), or Better Cam's controller (`app`). */
+export type ControlMode = "manual" | "camera" | "app";
+export const CONTROL_MODES: readonly ControlMode[] = ["manual", "camera", "app"];
+export const MODE_LABELS: Record<ControlMode, string> = { manual: "Manual", camera: "Camera auto", app: "Better Cam auto" };
+
+/** The controls Better Cam auto drives (the gain follows the exposure loop, 2.2 of docs/AUTO-CONTROLS.md). */
+const APP_KEYS: readonly ControlKey[] = ["exposure", "white_balance", "gain"];
+
+/**
+ * One control as the device reports it (`get_camera_controls`, `set_camera_control`, `controls-changed`; the backend's
+ * `ControlInfoDto`). The last four fields are Better Cam auto's (docs/AUTO-CONTROLS.md 5.3); an older backend sends none.
+ */
 export interface ControlInfo {
   key: ControlKey;
   min: number;
@@ -555,7 +566,21 @@ export interface ControlInfo {
   auto: boolean;
   can_auto: boolean;
   can_manual: boolean;
+  mode?: ControlMode;
+  /** Better Cam auto is offered (`stops`: whole stops only); `null` when it is not, and for controls that have none. */
+  app?: "full" | "stops" | null;
+  /** Why Better Cam auto is not offered. */
+  app_why?: string;
+  /** `exposure` for the gain while the exposure loop sets it. */
+  driven_by?: "exposure";
 }
+
+/** The mode of a control: what the backend says, else what the Auto flag says. */
+export const modeOf = (i: Pick<ControlInfo, "auto"> & { mode?: ControlMode }): ControlMode => i.mode ?? (i.auto ? "camera" : "manual");
+
+/** Whether the control has a mode list (Manual / Camera auto / Better Cam auto) instead of the Auto switch. The gain has none: it follows the exposure. */
+export const hasModeList = (i: Pick<ControlInfo, "key" | "app" | "app_why" | "mode">): boolean =>
+  i.key !== "gain" && (i.app != null || i.app_why != null || i.mode === "app");
 
 /** Exposure is log2 of seconds: -6 is "1/64 s", -1 is "1/2 s", 0 is "1 s", 2 is "4 s". */
 export const exposureText = (log2Seconds: number): string => {
@@ -589,24 +614,82 @@ export const controlValueText = (info: Pick<ControlInfo, "key" | "value" | "min"
   }
 };
 
-/** A control in the state the device starts in: Auto on where it has Auto, else its default value. Only other states are stored. */
-export const isDefaultState = (i: Pick<ControlInfo, "value" | "def" | "auto" | "can_auto">): boolean =>
-  i.auto === i.can_auto && (i.auto || i.value === i.def);
+/**
+ * A control in the state the device starts in: Auto on where it has Auto, else its default value. Only other states
+ * are stored. Better Cam auto is never the device's state.
+ */
+export const isDefaultState = (i: Pick<ControlInfo, "value" | "def" | "auto" | "can_auto"> & { mode?: ControlMode }): boolean =>
+  i.mode !== "app" && i.auto === i.can_auto && (i.auto || i.value === i.def);
 
 /** The device's values in the order of plan 6.2, and the ones it does not know dropped. */
 export const sortControls = (infos: ControlInfo[]): ControlInfo[] =>
   CONTROL_KEYS.flatMap((k) => infos.filter((i) => i.key === k));
 
-/** What the user changed on one control. `value` is kept while Auto is on (the last manual value). */
+/**
+ * What the user changed on one control. `value` is kept while Auto is on (the last manual value); for `mode: "app"`
+ * (Better Cam auto) it is the resume point, which the controller keeps up to date and the engine writes on open.
+ */
 export interface StoredControl {
   value: number;
+  /** The camera's Auto flag; false for `app`. */
   auto: boolean;
+  /** Absent: Manual or Camera auto, as `auto` says. A build without Better Cam auto reads an `app` control as Manual at `value`. */
+  mode?: "app";
+}
+
+export type Speed = "slow" | "normal" | "fast";
+export const SPEEDS: readonly Speed[] = ["slow", "normal", "fast"];
+export const SPEED_OPTIONS: Option[] = [
+  { value: "slow", label: "Slow" },
+  { value: "normal", label: "Normal" },
+  { value: "fast", label: "Fast" },
+];
+
+/** Better Cam auto's settings of one camera (docs/AUTO-CONTROLS.md 5.1). They are not in presets. */
+export interface AutoCfg {
+  exposure: {
+    /** 0.2..0.8: the sRGB-coded mean brightness to hold (Auto Adjust's scale). */
+    target: number;
+    /** `"fit"` (the frame time) or a whole stop in log2 seconds. */
+    longest: "fit" | number;
+    /** In device gain units; `null`: 75 % of the range. */
+    max_gain: number | null;
+    speed: Speed;
+  };
+  white_balance: {
+    /** -1..1, +1 is warmer. */
+    warmth: number;
+    speed: Speed;
+  };
+}
+
+export const DEFAULT_AUTO: AutoCfg = {
+  exposure: { target: 0.45, longest: "fit", max_gain: null, speed: "normal" },
+  white_balance: { warmth: 0, speed: "normal" },
+};
+
+export const TARGET_MIN = 0.2;
+export const TARGET_MAX = 0.8;
+
+/** What the controller learned about one camera (kept for next time; the backend sends it with `auto-status`). */
+export interface Learned {
+  /** Stops across the whole gain range, 0.5..6. */
+  gain_stops?: number;
+  /** Colour signal per mired, 0.002..0.02. */
+  wb_alpha?: number;
+  /** Capture fps (rounded, as text) to the longest exposure that held it. */
+  rate_caps?: Record<string, number>;
+  /** Controls whose Better Cam auto is off because the camera ignored it; "Try again" clears this. */
+  blocked?: ("exposure" | "white_balance")[];
 }
 
 /** The changed controls of one camera, with the name the camera had (a camera on another USB port has another id). */
 export interface StoredDevice {
   name: string;
   values: Partial<Record<ControlKey, StoredControl>>;
+  /** Kept when no control is in Better Cam auto, so switching back restores the targets. */
+  auto?: AutoCfg;
+  learned?: Learned;
 }
 
 /** Plan 5.1 `controls`, keyed by the camera's id (symbolic link). */
@@ -622,39 +705,149 @@ export const findStored = (stored: StoredControls, cam: { id: string; name: stri
   return id ? { id, device: stored[id] } : null;
 };
 
-/** `stored` with `info` noted for `cam`: nothing is kept for a control in the device's own state. A moved camera is re-keyed. */
-export const rememberControl = (
-  stored: StoredControls,
-  cam: { id: string; name: string },
-  info: Pick<ControlInfo, "key" | "value" | "def" | "auto" | "can_auto">,
-): StoredControls => {
+/** A camera's record with nothing in it is not kept. */
+const isEmptyDevice = (d: StoredDevice) => Object.keys(d.values).length === 0 && !d.auto && !d.learned;
+
+/** `stored` with the record of `cam` edited (an empty one is dropped). A moved camera is re-keyed. */
+const editDevice = (stored: StoredControls, cam: { id: string; name: string }, edit: (d: StoredDevice) => StoredDevice): StoredControls => {
   const found = findStored(stored, cam);
   const next = { ...stored };
   if (found && found.id !== cam.id) delete next[found.id];
-  const values = { ...(found?.device.values ?? {}) };
-  if (isDefaultState(info)) delete values[info.key];
-  else values[info.key] = { value: info.value, auto: info.auto };
-  if (Object.keys(values).length === 0) delete next[cam.id];
-  else next[cam.id] = { name: cam.name, values };
+  const d = edit(found?.device ?? { name: cam.name, values: {} });
+  if (isEmptyDevice(d)) delete next[cam.id];
+  else next[cam.id] = { ...d, name: cam.name };
   return next;
 };
 
-/** `stored` without the camera's changes (Reset all). */
-export const forgetControls = (stored: StoredControls, cam: { id: string; name: string }): StoredControls => {
-  const found = findStored(stored, cam);
-  if (!found) return stored;
-  const next = { ...stored };
-  delete next[found.id];
-  return next;
+/**
+ * `stored` with `info` noted for `cam`: nothing is kept for a control in the device's own state. A moved camera is
+ * re-keyed. Better Cam auto is kept as `mode: "app"` with the value as the resume point; the camera's Better Cam auto
+ * settings and learned values stay as they are.
+ */
+export const rememberControl = (
+  stored: StoredControls,
+  cam: { id: string; name: string },
+  info: Pick<ControlInfo, "key" | "value" | "def" | "auto" | "can_auto"> & { mode?: ControlMode },
+): StoredControls =>
+  editDevice(stored, cam, (d) => {
+    const values = { ...d.values };
+    if (isDefaultState(info)) delete values[info.key];
+    else values[info.key] = info.mode === "app" ? { value: info.value, auto: false, mode: "app" } : { value: info.value, auto: info.auto };
+    return { ...d, values };
+  });
+
+/** `stored` without the camera's changed controls (Reset all). Its Better Cam auto settings and learned values stay for next time. */
+export const forgetControls = (stored: StoredControls, cam: { id: string; name: string }): StoredControls =>
+  findStored(stored, cam) ? editDevice(stored, cam, (d) => ({ ...d, values: {} })) : stored;
+
+/** The Better Cam auto settings of `cam`: the stored ones, else the defaults. */
+export const autoCfgOf = (stored: StoredControls, cam: { id: string; name: string } | null): AutoCfg =>
+  (cam && findStored(stored, cam)?.device.auto) || DEFAULT_AUTO;
+
+/** `stored` with the Better Cam auto settings of `cam` (the defaults are not kept). */
+export const withAutoCfg = (stored: StoredControls, cam: { id: string; name: string }, cfg: AutoCfg): StoredControls =>
+  editDevice(stored, cam, (d) => ({ ...d, auto: JSON.stringify(cfg) === JSON.stringify(DEFAULT_AUTO) ? undefined : cfg }));
+
+/** `stored` with what the controller learned about `cam` (an empty `learned` removes it). */
+export const withLearned = (stored: StoredControls, cam: { id: string; name: string }, learned: unknown): StoredControls => {
+  const l = normalizeLearned(learned);
+  return editDevice(stored, cam, (d) => ({ ...d, learned: l }));
 };
 
-/** The `controls` argument of `start_engine` and `set_source`: the stored changes of `cam`, even if there are none. */
+/** What the controller reports on entering `holding` (`auto-status.resume`): where each loop starts next time. */
+export interface Resume {
+  exposure?: number;
+  gain?: number;
+  white_balance?: number;
+}
+
+/**
+ * `stored` with the resume point of `cam`'s Better Cam auto controls updated. Only a control stored as `app` takes one
+ * (a stale event after the user left Better Cam auto must not store a value); `stored` itself when nothing changes.
+ */
+export const withResume = (stored: StoredControls, cam: { id: string; name: string }, resume: Resume): StoredControls => {
+  const device = findStored(stored, cam)?.device;
+  if (!device) return stored;
+  const values = { ...device.values };
+  let changed = false;
+  for (const key of ["exposure", "gain", "white_balance"] as const) {
+    const v = resume[key];
+    const cur = values[key];
+    if (cur?.mode === "app" && typeof v === "number" && Number.isInteger(v) && cur.value !== v) {
+      values[key] = { ...cur, value: v };
+      changed = true;
+    }
+  }
+  return changed ? editDevice(stored, cam, (d) => ({ ...d, values })) : stored;
+};
+
+/** The `controls` argument of `start_engine` and `set_source`: the stored record of `cam` (controls, Better Cam auto settings, learned values), even if there is none. */
 export const controlsRecord = (stored: StoredControls, cam: { id: string; name: string } | null) => {
   if (!cam) return null;
-  return { id: cam.id, name: cam.name, controls: findStored(stored, cam)?.device.values ?? {} };
+  const d = findStored(stored, cam)?.device;
+  return { id: cam.id, name: cam.name, controls: d?.values ?? {}, ...(d?.auto && { auto: d.auto }), ...(d?.learned && { learned: d.learned }) };
 };
 
-/** Reads the saved `controls`: every entry is checked, so a hand-edited or old save can't send the backend something it rejects. */
+// ---------------------------------------------------------------------------------------------------------------
+// Reading what is saved
+
+const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
+const finite = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+
+/** The exposure range Better Cam auto accepts for "Longest exposure": whole stops of log2 seconds (the backend's own clamp). */
+const LONGEST_MIN = -16;
+const LONGEST_MAX = 5;
+
+/** Reads `AutoCfg` with every field checked; a bad field is its default, a non-object is no settings (`undefined`). */
+export function normalizeAutoCfg(raw: unknown): AutoCfg | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const obj = (v: unknown) => (v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {});
+  const e = obj(r.exposure);
+  const w = obj(r.white_balance);
+  const d = DEFAULT_AUTO;
+  return {
+    exposure: {
+      target: finite(e.target) ? clamp(e.target, TARGET_MIN, TARGET_MAX) : d.exposure.target,
+      longest:
+        Number.isInteger(e.longest) && (e.longest as number) >= LONGEST_MIN && (e.longest as number) <= LONGEST_MAX ? (e.longest as number) : "fit",
+      max_gain: Number.isInteger(e.max_gain) && (e.max_gain as number) >= 0 && (e.max_gain as number) <= 100000 ? (e.max_gain as number) : null,
+      speed: oneOf(e.speed, SPEEDS, d.exposure.speed),
+    },
+    white_balance: {
+      warmth: finite(w.warmth) ? clamp(w.warmth, -1, 1) : d.white_balance.warmth,
+      speed: oneOf(w.speed, SPEEDS, d.white_balance.speed),
+    },
+  };
+}
+
+/** Reads `Learned` with every value inside its range and unknown keys dropped; `undefined` when nothing valid is left. */
+export function normalizeLearned(raw: unknown): Learned | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const out: Learned = {};
+  if (finite(r.gain_stops)) out.gain_stops = clamp(r.gain_stops, 0.5, 6);
+  if (finite(r.wb_alpha)) out.wb_alpha = clamp(r.wb_alpha, 0.002, 0.02);
+  if (r.rate_caps && typeof r.rate_caps === "object" && !Array.isArray(r.rate_caps)) {
+    const caps: Record<string, number> = {};
+    for (const [fps, stop] of Object.entries(r.rate_caps as Record<string, unknown>)) {
+      if (/^\d{1,3}$/.test(fps) && finite(stop)) caps[fps] = clamp(Math.round(stop), LONGEST_MIN, LONGEST_MAX);
+    }
+    if (Object.keys(caps).length > 0) out.rate_caps = caps;
+  }
+  if (Array.isArray(r.blocked)) {
+    const blocked = (["exposure", "white_balance"] as const).filter((k) => (r.blocked as unknown[]).includes(k));
+    if (blocked.length > 0) out.blocked = [...blocked];
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * Reads the saved `controls`: every entry is checked, so a hand-edited or old save can't send the backend something it
+ * rejects. `mode: "app"` stays only on the controls Better Cam auto drives, with the Auto flag off, and on the gain only
+ * while the exposure is in Better Cam auto too (the gain follows it); anything else about `mode` is dropped and the
+ * control is Manual / Camera auto as before.
+ */
 export function normalizeControls(raw: unknown): StoredControls {
   const out: StoredControls = {};
   if (!raw || typeof raw !== "object") return out;
@@ -662,13 +855,157 @@ export function normalizeControls(raw: unknown): StoredControls {
     if (!dev || typeof dev !== "object") continue;
     const d = dev as Record<string, unknown>;
     const values: StoredDevice["values"] = {};
+    const at = (key: ControlKey) =>
+      (d.values && typeof d.values === "object" ? (d.values as Record<string, unknown>)[key] : undefined) as Record<string, unknown> | undefined;
     for (const key of CONTROL_KEYS) {
-      const v = (d.values && typeof d.values === "object" ? (d.values as Record<string, unknown>)[key] : undefined) as
-        | Record<string, unknown>
-        | undefined;
-      if (v && Number.isInteger(v.value) && typeof v.auto === "boolean") values[key] = { value: v.value as number, auto: v.auto };
+      const v = at(key);
+      if (v && Number.isInteger(v.value) && typeof v.auto === "boolean") {
+        values[key] = v.mode === "app" && !v.auto && APP_KEYS.includes(key) ? { value: v.value as number, auto: false, mode: "app" } : { value: v.value as number, auto: v.auto };
+      }
     }
-    if (Object.keys(values).length > 0) out[id] = { name: typeof d.name === "string" ? d.name : "", values };
+    // The gain is Better Cam auto only with the exposure.
+    if (values.gain?.mode === "app" && values.exposure?.mode !== "app") values.gain = { value: values.gain.value, auto: false };
+    const auto = normalizeAutoCfg(d.auto);
+    const learned = normalizeLearned(d.learned);
+    const device: StoredDevice = { name: typeof d.name === "string" ? d.name : "", values, ...(auto && { auto }), ...(learned && { learned }) };
+    if (!isEmptyDevice(device)) out[id] = device;
   }
   return out;
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Better Cam auto on the card (docs/AUTO-CONTROLS.md 4.1-4.3)
+
+/** The exposure loop's state (`auto-status.exposure.state`); the white balance loop has `at_limit` instead of the three limits. */
+export type AutoState =
+  | "starting" | "adjusting" | "holding" | "limit_gain" | "limit_exposure" | "too_bright" | "no_signal" | "at_limit"
+  | "no_picture" | "paused" | "closed" | "conflict" | "ignored" | "no_response" | "not_answering" | "hunting";
+
+/** Where a hand-back put the control. */
+export type HandedBack = "camera" | "manual";
+
+export interface ExposureStatus {
+  state: AutoState;
+  exposure: number;
+  gain: number | null;
+  /** The longest exposure now allowed (log2 seconds), and why it is there. */
+  cap: number;
+  cap_reason: "fps" | "user" | "learned";
+  max_gain: number | null;
+  /** The capture rate measured, and the rate asked for. */
+  fps: number;
+  target_fps: number;
+  /** The text of 4.2, made by the backend. `null` when the state has none (the watchdog states draw theirs from `handed_back`). */
+  message: string | null;
+  handed_back?: HandedBack;
+  /** The stripes note of 2.5.10, while it applies. */
+  note?: string | null;
+}
+
+export interface WhiteBalanceStatus {
+  state: AutoState;
+  kelvin: number;
+  message: string | null;
+  handed_back?: HandedBack;
+}
+
+/** `auto-status` (docs/AUTO-CONTROLS.md 5.4). `learned` and `resume` are the store's to persist; they are not kept in the state. */
+export interface AutoStatus {
+  /** The camera. */
+  id: string;
+  exposure?: ExposureStatus;
+  white_balance?: WhiteBalanceStatus;
+  learned?: Learned;
+  resume?: Resume;
+}
+
+/** The loop the card shows a status for, by the control row it sits under. */
+export type AutoLoop = "exposure" | "white_balance";
+
+/** The dot of the status line: neutral while it works, warning at a limit, error when it stopped. */
+export type AutoTone = "neutral" | "warn" | "error";
+export const autoTone = (state: AutoState): AutoTone => {
+  switch (state) {
+    case "limit_gain":
+    case "limit_exposure":
+    case "too_bright":
+    case "no_signal":
+    case "at_limit":
+      return "warn";
+    case "conflict":
+    case "ignored":
+    case "no_response":
+    case "not_answering":
+    case "hunting":
+      return "error";
+    default:
+      return "neutral";
+  }
+};
+
+/** The faults that end the loop and give the control back (`handed_back`), as opposed to `conflict`, which only pauses it. */
+export const isHandBackState = (state: AutoState): boolean =>
+  state === "ignored" || state === "no_response" || state === "not_answering" || state === "hunting";
+
+/** The button of the status line: Resume after a conflict, Try again after the camera ignored Better Cam auto. */
+export const autoAction = (state: AutoState): "resume" | "retry" | null => (state === "conflict" ? "resume" : state === "ignored" ? "retry" : null);
+
+/** The status of `cam`'s loop, if it is about this camera (the backend names it by the link of its record; a camera that moved to another port is the same by vid/pid). */
+export const statusOf = <L extends AutoLoop>(status: AutoStatus | null, cam: { id: string } | null, loop: L): NonNullable<AutoStatus[L]> | null => {
+  if (!status || !cam) return null;
+  const vp = vidPid(cam.id);
+  const same = status.id === cam.id || linkKey(status.id) === linkKey(cam.id) || (vp !== null && vidPid(status.id) === vp);
+  return same ? ((status[loop] ?? null) as NonNullable<AutoStatus[L]> | null) : null;
+};
+
+/**
+ * Whether the status line of a loop shows for a control in `mode`: while it is in Better Cam auto, and after a
+ * hand-back while the control is where it was handed to (that line carries "Try again"). Anything else is stale.
+ */
+export const showsStatus = (mode: ControlMode, s: { state: AutoState; handed_back?: HandedBack } | null): boolean =>
+  !!s && (mode === "app" || (isHandBackState(s.state) && s.handed_back === mode));
+
+/** The line under the row: the backend's text, else nothing (`no_picture` has none before 10 s). */
+export const autoText = (s: { message: string | null }): string | null => (s.message && s.message.trim() ? s.message : null);
+
+/** The frame-rate limit of the exposure loop: the longest whole stop that fits `fps` (2.5.2). */
+export const rateStop = (fps: number): number => Math.floor(Math.log2(0.95 / fps));
+
+/** What a camera that is asked for a longer exposure than the frame time runs at, about. */
+const droppedFps = (stop: number): number => Math.max(1, Math.round(0.95 * 2 ** -stop));
+
+/** `"fit"` or a whole stop, as the Select widget's text, and back. */
+export const longestKey = (v: "fit" | number): string => String(v);
+export const parseLongest = (s: string): "fit" | number => (s === "fit" ? "fit" : Number(s));
+
+/**
+ * The "Longest exposure" list: the frame rate first, then every whole stop of the camera's range from the shortest to
+ * the longest, each with what it means. Without the rate (the camera is closed) the stops carry no meaning.
+ */
+export const longestOptions = (range: { min: number; max: number }, fps: number | null): Option[] => {
+  const limit = fps && fps > 0 ? rateStop(fps) : null;
+  const fit = limit === null ? "Fit the frame rate" : `Fit the frame rate (${exposureText(limit)} at ${Math.round(fps!)} fps)`;
+  const out: Option[] = [{ value: "fit", label: fit }];
+  for (let n = Math.round(range.min); n <= Math.round(range.max); n++) {
+    const meaning = limit === null ? "" : n < limit ? " (sharper motion, more gain)" : n === limit ? " (the frame-rate limit)" : ` (camera drops to ≈ ${droppedFps(n)} fps)`;
+    out.push({ value: longestKey(n), label: `${exposureText(n)}${meaning}` });
+  }
+  return out;
+};
+
+/** The tooltip of the limit tick on the exposure slider. */
+export const capText = (reason: ExposureStatus["cap_reason"], fps: number): string =>
+  reason === "user" ? "Your limit" : reason === "learned" ? "Learned limit" : `${Math.round(fps)} fps limit`;
+
+/** The "Most gain" slider's value: `null` is 75 % of the range, as the backend works it out. */
+export const maxGainValue = (maxGain: number | null, range: { min: number; max: number; step: number }): number => {
+  if (maxGain !== null) return clamp(maxGain, range.min, range.max);
+  const raw = range.min + Math.round(0.75 * (range.max - range.min));
+  const step = Math.max(1, range.step);
+  return clamp(range.min + Math.round((raw - range.min) / step) * step, range.min, range.max);
+};
+
+/** Where a limit sits on a slider, 0..1 (a tick and the shaded range beyond it), or `null` when it is outside the range. */
+export const limitFraction = (limit: number | null | undefined, range: { min: number; max: number }): number | null =>
+  limit == null || range.max <= range.min || limit < range.min || limit > range.max ? null : (limit - range.min) / (range.max - range.min);
+

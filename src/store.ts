@@ -7,6 +7,9 @@ import { DEFAULT_UI, normalizeUi, type UiState } from "./ui/layout";
 import {
   DEFAULT_OUTPUT,
   DEFAULT_SOURCE,
+  autoCfgOf,
+  modeOf,
+  normalizeAutoCfg,
   normalizeControls,
   normalizeOutput,
   normalizeSource,
@@ -15,7 +18,12 @@ import {
   touchesCapture,
   effectiveSource,
   findCamera,
+  findStored,
   forgetControls,
+  isHandBackState,
+  withAutoCfg,
+  withLearned,
+  withResume,
   afterVcamRemoval,
   inUseAfterStart,
   inUseAfterState,
@@ -26,9 +34,14 @@ import {
   savedAfterEdit,
   shouldPushSettings,
   sortControls,
+  statusOf,
+  type AutoCfg,
+  type AutoLoop,
+  type AutoStatus,
   type CameraInfo,
   type ControlInfo,
   type ControlKey,
+  type ControlMode,
   type InUse,
   type OutputCfg,
   type SourceCfg,
@@ -167,6 +180,11 @@ interface State extends Saved {
   controlsError: string | null;
   /** Reset all is running. */
   controlsResetting: boolean;
+  /**
+   * What Better Cam auto does for the camera that runs (`auto-status`; its `learned` and `resume` are persisted when
+   * they arrive and not kept here). `null` until the first one, and after the engine stops.
+   */
+  autoStatus: AutoStatus | null;
   /** The virtual camera as `vcam_status` last said; `null` until the first answer. */
   vcam: VcamStatus | null;
   /** The action whose administrator prompt or work is running; the buttons are disabled meanwhile. */
@@ -207,6 +225,17 @@ interface State extends Saved {
   /** One control back to the device's default (Auto on where it has Auto). */
   resetControl: (key: ControlKey) => void;
   resetAllControls: () => Promise<void>;
+  /**
+   * Who sets a control: Manual, Camera auto or Better Cam auto (`app`, exposure and white balance). The exposure
+   * carries the gain with it. Stored per camera; works while the camera is closed (the loop starts at the next open).
+   */
+  setControlMode: (key: ControlKey, mode: ControlMode) => Promise<void>;
+  /** Changes the camera's Better Cam auto settings (target, longest exposure, most gain, warmth, response); live, stored per camera. */
+  setAutoConfig: (patch: { exposure?: Partial<AutoCfg["exposure"]>; white_balance?: Partial<AutoCfg["white_balance"]> }) => void;
+  /** The status line's button: starts a paused loop again (`conflict`) or, after "ignored", clears the block and tries Better Cam auto again. */
+  resumeAuto: (key: AutoLoop) => Promise<void>;
+  /** `auto-status`: shows it, stores its `learned` and `resume`, and says why when Better Cam auto handed a control back. */
+  applyAutoStatus: (status: AutoStatus) => void;
   /** Changes camera settings (repaired against the device), persists them and, while running, sends them at once. */
   patchSource: (patch: Partial<SourceCfg>) => void;
   patchOutput: (patch: Partial<OutputCfg>) => void;
@@ -481,6 +510,52 @@ export const useStore = create<State>((set, get) => {
     persist();
   };
 
+  /** The control keys a loop sets: the exposure loop sets the gain too. */
+  const keysOf = (loop: AutoLoop): ControlKey[] => (loop === "exposure" ? ["exposure", "gain"] : ["white_balance"]);
+
+  /** Drops the slider writes still waiting for `keys` (a mode change ends them) and waits for the one in flight. */
+  const settleWrites = async (keys: ControlKey[]) => {
+    for (const k of keys) {
+      const p = pumps.get(k);
+      if (!p) continue;
+      p.pending = [];
+      clearTimeout(p.timer);
+      p.timer = undefined;
+    }
+    await Promise.all(keys.map((k) => pumps.get(k)?.busy));
+  };
+
+  /**
+   * After Better Cam auto handed a loop back (the camera went to Camera auto, or to its earlier value): reads the
+   * controls again and stores them as they are now, so the record no longer says Better Cam auto.
+   */
+  const followHandBack = async (cam: { id: string; name: string }, loop: AutoLoop) => {
+    try {
+      const infos = await api.getCameraControls(cam.id);
+      if (get().controlsFor === cam.id) set({ controlInfos: sortControls(infos) });
+      let controls = get().controls;
+      for (const key of keysOf(loop)) {
+        const i = infos.find((x) => x.key === key);
+        if (i && modeOf(i) !== "app") controls = rememberControl(controls, cam, i);
+      }
+      set({ controls });
+      persist();
+    } catch {
+      /* the next read of the controls shows the truth */
+    }
+  };
+
+  let autoTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Sends the camera's Better Cam auto settings, at most about every 80 ms while a slider moves; the last call has the newest values. */
+  const pushAutoConfig = () => {
+    if (autoTimer !== undefined) return;
+    autoTimer = setTimeout(() => {
+      autoTimer = undefined;
+      const cam = selectedCam();
+      if (cam) api.setAutoConfig(cam.id, autoCfgOf(get().controls, cam)).catch((e) => say(`Better Cam auto: ${String(e)}`));
+    }, 80);
+  };
+
   const finish = async () => {
     try {
       await api.stopEngine();
@@ -511,6 +586,7 @@ export const useStore = create<State>((set, get) => {
     controlsFor: null,
     controlsError: null,
     controlsResetting: false,
+    autoStatus: null,
     vcam: null,
     vcamBusy: null,
     vcamEpoch: 0,
@@ -639,7 +715,7 @@ export const useStore = create<State>((set, get) => {
           // the error is about (`format`).
           paused: pausedAfterState(s.paused, e),
           inUse: inUseAfterState(s.inUse, e),
-          ...(e.state === "stopped" && { filterStatus: {}, ...(e.kind && { errorKind: e.kind }) }),
+          ...(e.state === "stopped" && { filterStatus: {}, autoStatus: null, ...(e.kind && { errorKind: e.kind }) }),
         }));
         if (e.state === "stopped") useStats.setState({ stats: null });
       });
@@ -694,6 +770,7 @@ export const useStore = create<State>((set, get) => {
         const next = sortControls(infos).map((i) => (queued(i.key) ? (cur?.find((c) => c.key === i.key) ?? i) : i));
         if (JSON.stringify(next) !== JSON.stringify(cur)) set({ controlInfos: next, controlsFor: selectedCam()?.id ?? get().controlsFor });
       });
+      await api.onAutoStatus((s) => get().applyAutoStatus(s));
       // The virtual camera is read at startup, after each action (above) and whenever the window gets focus back
       // (a repair by hand, or `vcam-tool`, shows up without a restart).
       const vcamRead = get().refreshVcam();
@@ -790,19 +867,20 @@ export const useStore = create<State>((set, get) => {
     setControl: (key, patch) => {
       const cam = selectedCam();
       const info = get().controlInfos?.find((i) => i.key === key);
-      if (!cam || !info || get().controlsFor !== cam.id) return;
+      // Better Cam auto sets the control (the gain with the exposure): the card shows it, the user does not change it.
+      if (!cam || !info || get().controlsFor !== cam.id || modeOf(info) === "app") return;
       const value = patch.value === undefined ? info.value : Math.min(info.max, Math.max(info.min, Math.round(patch.value)));
       const auto = patch.auto ?? (patch.value === undefined ? info.auto : false);
       if (value === info.value && auto === info.auto) return;
-      showControl(cam, { ...info, value, auto });
+      showControl(cam, { ...info, value, auto, mode: auto ? "camera" : "manual" });
       queueControl(key, cam.id, [{ value, auto }]);
     },
 
     resetControl: (key) => {
       const cam = selectedCam();
       const info = get().controlInfos?.find((i) => i.key === key);
-      if (!cam || !info || get().controlsFor !== cam.id) return;
-      showControl(cam, { ...info, value: info.def, auto: info.can_auto });
+      if (!cam || !info || get().controlsFor !== cam.id || modeOf(info) === "app") return;
+      showControl(cam, { ...info, value: info.def, auto: info.can_auto, mode: info.can_auto ? "camera" : "manual" });
       // The device's default value first, so the manual value behind an Auto control is the default too, then Auto.
       queueControl(key, cam.id, [{ value: info.def, auto: false }, ...(info.can_auto ? [{ value: info.def, auto: true }] : [])]);
     },
@@ -828,6 +906,88 @@ export const useStore = create<State>((set, get) => {
         void get().refreshControls();
       } finally {
         set({ controlsResetting: false });
+      }
+    },
+
+    setControlMode: async (key, mode) => {
+      const cam = selectedCam();
+      const info = get().controlInfos?.find((i) => i.key === key);
+      if (!cam || !info || get().controlsFor !== cam.id || modeOf(info) === mode) return;
+      const keys: ControlKey[] = key === "exposure" ? ["exposure", "gain"] : [key];
+      // The card follows at once; the answer (the rows as the device reports them, after the first slow write) replaces it.
+      set((s) => ({
+        controlInfos: (s.controlInfos ?? []).map((i) => {
+          if (i.key === key) return { ...i, mode, auto: mode === "camera" };
+          if (key === "exposure" && i.key === "gain" && (mode === "app" || i.driven_by === "exposure")) {
+            const { driven_by: _by, ...rest } = i;
+            return mode === "app" ? { ...rest, mode: "app", auto: false, driven_by: "exposure" } : { ...rest, mode: "manual" };
+          }
+          return i;
+        }),
+      }));
+      try {
+        await settleWrites(keys);
+        const changed = await api.setControlMode(cam.id, key, mode);
+        if (get().controlsFor === cam.id) set((s) => ({ controlInfos: sortControls((s.controlInfos ?? []).map((i) => changed.find((c) => c.key === i.key) ?? i)) }));
+        let controls = get().controls;
+        for (const c of changed) controls = rememberControl(controls, cam, c);
+        set({ controls });
+        persist();
+        pushSource();
+      } catch (e) {
+        say(`${key.replace(/_/g, " ")}: ${String(e)}`);
+        void get().refreshControls();
+      }
+    },
+
+    setAutoConfig: (patch) => {
+      const cam = selectedCam();
+      if (!cam) return;
+      const cur = autoCfgOf(get().controls, cam);
+      const next = normalizeAutoCfg({
+        exposure: { ...cur.exposure, ...patch.exposure },
+        white_balance: { ...cur.white_balance, ...patch.white_balance },
+      })!;
+      if (JSON.stringify(next) === JSON.stringify(cur)) return;
+      set({ controls: withAutoCfg(get().controls, cam, next) });
+      persist();
+      pushAutoConfig();
+    },
+
+    resumeAuto: async (loop) => {
+      const cam = selectedCam();
+      if (!cam) return;
+      const ignored = statusOf(get().autoStatus, cam, loop)?.state === "ignored";
+      try {
+        await api.resumeAuto(cam.id, loop);
+        // "Try again" after the camera ignored Better Cam auto: the block is gone, so ask for the mode again.
+        if (ignored) await get().setControlMode(loop, "app");
+      } catch (e) {
+        say(`${loop.replace(/_/g, " ")}: ${String(e)}`);
+      }
+    },
+
+    applyAutoStatus: (status) => {
+      const { learned, resume, ...shown } = status;
+      const prev = get().autoStatus;
+      const cams = get().cameras;
+      const cam = (cams && findCamera(cams, status.id)) || { id: status.id, name: findStored(get().controls, { id: status.id, name: "" })?.device.name ?? "" };
+      set({ autoStatus: shown });
+      // What the loops learned and where they start next time belong to the camera's record.
+      let controls = get().controls;
+      if (learned) controls = withLearned(controls, cam, learned);
+      if (resume) controls = withResume(controls, cam, resume);
+      if (controls !== get().controls) {
+        set({ controls });
+        persist();
+      }
+      // A hand-back says why once (the line under the row says it as long as it holds), and the record follows it.
+      for (const loop of ["exposure", "white_balance"] as const) {
+        const now = shown[loop];
+        const was = prev && prev.id === shown.id ? prev[loop] : undefined;
+        if (!now?.handed_back || !isHandBackState(now.state) || (was?.state === now.state && was.handed_back)) continue;
+        if (now.message) say(now.message);
+        void followHandBack(cam, loop);
       }
     },
 

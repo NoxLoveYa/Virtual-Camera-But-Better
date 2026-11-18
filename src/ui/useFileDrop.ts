@@ -5,11 +5,13 @@
  * decided by the pure `routeDrop` in `fileDrop.ts`.
  *
  * In debug builds `window.__betterCam` runs the same code as the listener (after the coordinate conversion), because a
- * test driven through the DevTools protocol cannot make an OS drop.
+ * test driven through the DevTools protocol cannot make an OS drop. It also patches the store and feeds `auto-status`
+ * payloads, so the Camera controls card can be looked at without a camera.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { useStore } from "../store";
+import type { AutoStatus } from "../camera/schema";
 import { insertionIndex } from "./chainDrag";
 import { fieldAt, firstSupported, hintFor, routeDrop, type DropTarget, type FieldTarget } from "./fileDrop";
 
@@ -208,6 +210,8 @@ export function useFileDrop() {
         leave: clear,
         toast: (text: string) => useStore.getState().notify(text),
         set: (patch: Record<string, unknown>) => useStore.setState(patch),
+        // An `auto-status` payload as the backend sends it (Better Cam auto's status line, hand-backs, learned values).
+        autoStatus: (status: AutoStatus) => useStore.getState().applyAutoStatus(status),
       };
     }
     return () => {

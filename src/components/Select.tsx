@@ -6,6 +6,8 @@ export interface SelectOption {
   value: string;
   label: string;
   disabled?: boolean;
+  /** The tooltip of the entry (the label when absent): why a disabled entry is not available. */
+  title?: string;
 }
 
 interface Props {
@@ -103,7 +105,7 @@ export function Select({ value, options, onChange, disabled, placeholder = "Sele
             data-active={i === active}
             disabled={o.disabled}
             tabIndex={-1}
-            title={o.label}
+            title={o.title ?? o.label}
             onMouseEnter={() => enabled(i) && setActive(i)}
             onClick={() => pick(i)}
           >

@@ -2,10 +2,19 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { FilterCfg } from "./filters/schema";
 import { presetChain, presetFile } from "./filters/chain";
-import type { CameraInfo, ControlInfo, OutputCfg, SourceCfg } from "./camera/schema";
+import type { AutoCfg, AutoStatus, CameraInfo, ControlInfo, ControlKey, ControlMode, Learned, OutputCfg, SourceCfg, StoredControl } from "./camera/schema";
 
-/** The changed controls of the selected camera, as `start_engine` and `set_source` take them (see `controlsRecord`). */
-export type ControlsRecord = { id: string; name: string; controls: Record<string, { value: number; auto: boolean }> } | null;
+/**
+ * The record of the selected camera, as `start_engine` and `set_source` take it (see `controlsRecord`): its changed
+ * controls (`mode: "app"` for Better Cam auto, `value` then the resume point), Better Cam auto's settings and what it learned.
+ */
+export type ControlsRecord = {
+  id: string;
+  name: string;
+  controls: Partial<Record<ControlKey, StoredControl>>;
+  auto?: AutoCfg;
+  learned?: Learned;
+} | null;
 
 export type EngineStateName = "stopped" | "standby" | "live" | "reconnecting";
 
@@ -104,6 +113,16 @@ export const api = {
   setCameraControl: (id: string, key: string, value: number, auto: boolean) =>
     invoke<ControlInfo>("set_camera_control", { id, key, value, auto }),
   resetCameraControls: (id: string) => invoke<ControlInfo[]>("reset_camera_controls", { id }),
+  /**
+   * Who sets a control: Manual (the last driven value stays), the camera's Auto flag, or Better Cam auto (exposure and
+   * white balance). Resolves to the rows that changed (the exposure together with the gain). Works while the camera is
+   * closed: the mode is stored and the loop starts at the next open.
+   */
+  setControlMode: (id: string, key: ControlKey, mode: ControlMode) => invoke<ControlInfo[]>("set_control_mode", { id, key, mode }),
+  /** Better Cam auto's settings of the camera; the next decision uses them. */
+  setAutoConfig: (id: string, cfg: AutoCfg) => invoke<void>("set_auto_config", { id, cfg }),
+  /** Starts Better Cam auto again after a `conflict`; also clears `blocked` ("Try again": set the mode again after). */
+  resumeAuto: (id: string, key: ControlKey) => invoke<void>("resume_auto", { id, key }),
   setOutput: (output: OutputCfg) => invoke<void>("set_output", { output }),
   setPause: (on: boolean) => invoke<void>("set_pause", { on }),
   /** Starts, resizes (a new call replaces the stream) or stops the preview; `onFrame` gets each frame: 16-byte header + RGBA pixels. */
@@ -177,6 +196,11 @@ export const api = {
     listen<{ id: string; message: string }>("filter-status", (e) => cb(e.payload)),
   onStats: (cb: (s: Stats) => void) => listen<Stats>("stats", (e) => cb(e.payload)),
   onDevicesChanged: (cb: () => void) => listen("devices-changed", () => cb()),
-  /** About once a second while the camera is open and a control is on Auto, and after the stored values were re-applied. */
+  /**
+   * About once a second while the camera is open and a control is on Auto, up to 4 times a second while Better Cam auto
+   * writes, and after the stored values were re-applied. The entries carry `mode` and the other Better Cam auto fields.
+   */
   onControlsChanged: (cb: (infos: ControlInfo[]) => void) => listen<ControlInfo[]>("controls-changed", (e) => cb(e.payload)),
+  /** What Better Cam auto is doing for a camera: on every state change, up to twice a second while it adjusts. */
+  onAutoStatus: (cb: (s: AutoStatus) => void) => listen<AutoStatus>("auto-status", (e) => cb(e.payload)),
 };

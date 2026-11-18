@@ -9,6 +9,7 @@
  * It throws at the first failure and prints `ok` otherwise.
  */
 import {
+  DEFAULT_AUTO,
   DEFAULT_SOURCE,
   afterVcamRemoval,
   inUseAfterStart,
@@ -25,7 +26,29 @@ import {
   shouldPushSettings,
   stripCodes,
   touchesCapture,
+  autoAction,
+  autoCfgOf,
+  autoTone,
+  controlsRecord,
+  forgetControls,
+  hasModeList,
+  isDefaultState,
+  limitFraction,
+  longestOptions,
+  maxGainValue,
+  modeOf,
+  normalizeAutoCfg,
+  normalizeControls,
+  normalizeLearned,
+  rememberControl,
+  showsStatus,
+  statusOf,
+  withAutoCfg,
+  withLearned,
+  withResume,
+  type ControlInfo,
   type SourceCfg,
+  type StoredControls,
 } from "./schema";
 
 const same = (got: unknown, want: unknown, what: string) => {
@@ -168,5 +191,164 @@ for (const kind of ["in_use", "disconnected", "not_found", "privacy", "error", n
   const p = problemText(kind, raw, ["a.exe"], false);
   same(/0x[0-9A-Fa-f]{8}/.test(p.short + p.long), false, `no code in the text for ${kind}`);
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Better Cam auto (docs/AUTO-CONTROLS.md 5.1, 6.2): the stored record
+
+const cam = { id: "\\\\?\\usb#vid_0c45&pid_636d#1&2&3#{guid}\\global", name: "W4GS" };
+const exposureInfo: ControlInfo = {
+  key: "exposure", min: -13, max: -1, step: 1, def: -6, value: -5, auto: false, can_auto: true, can_manual: true, mode: "app", app: "full",
+};
+const gainInfo: ControlInfo = { key: "gain", min: 0, max: 100, step: 1, def: 0, value: 48, auto: false, can_auto: false, can_manual: true, mode: "app", app: null, driven_by: "exposure" };
+
+// old saves load unchanged: no mode, no auto, no learned
+const old = { [cam.id]: { name: "W4GS", values: { brightness: { value: 20, auto: false }, focus: { value: 300, auto: true } } } };
+same(normalizeControls(JSON.parse(JSON.stringify(old))), old, "an old save loads as it is");
+same(normalizeControls(null), {}, "nothing saved");
+same(normalizeControls({ [cam.id]: { name: "x", values: {} } }), {}, "an empty record is not kept");
+
+// valid mode / auto / learned stay, invalid ones go
+const newSave = {
+  [cam.id]: {
+    name: "W4GS",
+    values: {
+      exposure: { value: -5, auto: false, mode: "app" },
+      gain: { value: 48, auto: false, mode: "app" },
+      white_balance: { value: 4650, auto: false, mode: "app" },
+      brightness: { value: 3, auto: false, mode: "app" },
+      focus: { value: 300, auto: true, mode: "banana" },
+    },
+    auto: { exposure: { target: 0.5, longest: -6, max_gain: 60, speed: "fast" }, white_balance: { warmth: -0.3, speed: "slow" } },
+    learned: { gain_stops: 2.5, wb_alpha: 0.006, rate_caps: { "30": -6 }, blocked: ["white_balance"] },
+  },
+};
+const read = normalizeControls(JSON.parse(JSON.stringify(newSave)));
+same(read[cam.id].values.exposure, { value: -5, auto: false, mode: "app" }, "exposure app kept");
+same(read[cam.id].values.gain, { value: 48, auto: false, mode: "app" }, "gain app kept with the exposure");
+same(read[cam.id].values.white_balance, { value: 4650, auto: false, mode: "app" }, "white balance app kept");
+same(read[cam.id].values.brightness, { value: 3, auto: false }, "app on a control Better Cam does not drive: dropped, the value stays");
+same(read[cam.id].values.focus, { value: 300, auto: true }, "an unknown mode: dropped, the Auto flag stays");
+same(read[cam.id].auto, newSave[cam.id].auto, "auto kept");
+same(read[cam.id].learned, newSave[cam.id].learned, "learned kept");
+same(
+  normalizeControls({ [cam.id]: { name: "", values: { gain: { value: 1, auto: false, mode: "app" } } } })[cam.id].values.gain,
+  { value: 1, auto: false },
+  "gain app without exposure app: Manual",
+);
+same(
+  normalizeControls({ [cam.id]: { name: "", values: { exposure: { value: -5, auto: true, mode: "app" } } } })[cam.id].values.exposure,
+  { value: -5, auto: true },
+  "app with the Auto flag on is a contradiction: Camera auto",
+);
+same(
+  normalizeAutoCfg({ exposure: { target: "dark", longest: "never", max_gain: -4, speed: "warp" }, white_balance: { warmth: "hot" } }),
+  DEFAULT_AUTO,
+  "bad auto fields are the defaults",
+);
+same(normalizeAutoCfg({ exposure: { target: 7 } })!.exposure.target, 0.8, "target clamped down");
+same(normalizeAutoCfg({ exposure: { target: 0.01 }, white_balance: { warmth: 9 } })!.exposure.target, 0.2, "target clamped up");
+same(normalizeAutoCfg({ white_balance: { warmth: 9 } })!.white_balance.warmth, 1, "warmth clamped");
+same(normalizeAutoCfg({ exposure: { longest: 99 } })!.exposure.longest, "fit", "longest out of range: fit");
+same(normalizeAutoCfg("x"), undefined, "auto that is no object");
+same(
+  normalizeLearned({ gain_stops: 99, wb_alpha: 0, rate_caps: { "30": -99, x: 1, "60": "no" }, blocked: ["exposure", "gain", "exposure"], extra: 1 }),
+  { gain_stops: 6, wb_alpha: 0.002, rate_caps: { "30": -16 }, blocked: ["exposure"] },
+  "learned clamped, unknown dropped",
+);
+same(normalizeLearned({ gain_stops: "x", blocked: [] }), undefined, "learned with nothing valid");
+same(normalizeControls({ [cam.id]: { name: "W4GS", values: {}, learned: { gain_stops: 3 } } })[cam.id].learned, { gain_stops: 3 }, "a record with only learned values is kept");
+
+// rememberControl stores app controls, with the value as the resume point
+same(isDefaultState({ value: -6, def: -6, auto: false, can_auto: false, mode: "app" }), false, "app is never the default state");
+let stored: StoredControls = {};
+stored = rememberControl(stored, cam, exposureInfo);
+stored = rememberControl(stored, cam, gainInfo);
+same(stored[cam.id].values, { exposure: { value: -5, auto: false, mode: "app" }, gain: { value: 48, auto: false, mode: "app" } }, "app controls stored");
+// back to the device's own state (Camera auto): the entry goes
+same(
+  rememberControl(stored, cam, { ...exposureInfo, mode: "camera", auto: true })[cam.id].values,
+  { gain: { value: 48, auto: false, mode: "app" } },
+  "Camera auto is the default state again",
+);
+// Manual keeps no mode
+same(rememberControl(stored, cam, { ...exposureInfo, mode: "manual", value: -7 })[cam.id].values.exposure, { value: -7, auto: false }, "Manual: no mode");
+
+// settings, learned values and resume points
+stored = withAutoCfg(stored, cam, { ...DEFAULT_AUTO, exposure: { ...DEFAULT_AUTO.exposure, target: 0.6 } });
+same(autoCfgOf(stored, cam).exposure.target, 0.6, "auto settings stored");
+same(autoCfgOf({}, cam), DEFAULT_AUTO, "defaults without a record");
+same(autoCfgOf(withAutoCfg(stored, cam, DEFAULT_AUTO), cam), DEFAULT_AUTO, "default settings are not kept");
+same(withAutoCfg({}, cam, DEFAULT_AUTO), {}, "nothing to keep, no record");
+stored = withLearned(stored, cam, { gain_stops: 2.2 });
+same(stored[cam.id].learned, { gain_stops: 2.2 }, "learned stored");
+const resumed = withResume(stored, cam, { exposure: -6, gain: 60, white_balance: 5000 });
+same(resumed[cam.id].values.exposure!.value, -6, "resume point of exposure");
+same(resumed[cam.id].values.gain!.value, 60, "resume point of gain");
+same(resumed[cam.id].values.white_balance, undefined, "no resume for a control that is not in Better Cam auto");
+same(withResume(stored, cam, { exposure: -5 }), stored, "an unchanged resume point changes nothing");
+same(withResume({}, cam, { exposure: -5 }), {}, "no record, no resume");
+
+// Reset all keeps the settings and what was learned
+const forgotten = forgetControls(stored, cam);
+same(forgotten[cam.id].values, {}, "Reset all drops the controls");
+same(forgotten[cam.id].auto, stored[cam.id].auto, "Reset all keeps auto");
+same(forgotten[cam.id].learned, stored[cam.id].learned, "Reset all keeps learned");
+same(forgetControls(withResume(rememberControl({}, cam, { ...exposureInfo, mode: "manual", value: -7 }), cam, {}), cam), {}, "Reset all with nothing else leaves no record");
+same(forgetControls({}, cam), {}, "Reset all without a record");
+
+// controlsRecord sends all of it
+const rec = controlsRecord(stored, cam)!;
+same(rec.controls.exposure, { value: -5, auto: false, mode: "app" }, "record: mode");
+same(rec.auto, stored[cam.id].auto, "record: auto");
+same(rec.learned, { gain_stops: 2.2 }, "record: learned");
+same(controlsRecord(old as unknown as StoredControls, cam)!, { id: cam.id, name: "W4GS", controls: old[cam.id].values }, "record of an old save has no extra fields");
+same(controlsRecord({}, cam), { id: cam.id, name: "W4GS", controls: {} }, "record without anything stored");
+same(controlsRecord({}, null), null, "no camera, no record");
+// a camera that moved to another port keeps its settings
+const moved = { id: "\\\\?\\usb#vid_0c45&pid_636d#9&9&9#{guid}\\global", name: "W4GS" };
+same(autoCfgOf(stored, moved).exposure.target, 0.6, "settings follow the camera to another port");
+
+// modes on the wire and the card
+same(modeOf({ auto: true }), "camera", "no mode from an older backend: the Auto flag");
+same(modeOf({ auto: false }), "manual", "no mode from an older backend: Manual");
+same(modeOf(exposureInfo), "app", "mode from the backend");
+same(hasModeList(exposureInfo), true, "exposure has the mode list");
+same(hasModeList(gainInfo), false, "gain has none");
+same(hasModeList({ key: "focus", mode: "manual", app: null }), false, "focus keeps the Auto switch");
+same(hasModeList({ key: "white_balance", mode: "manual", app: null, app_why: "This camera has no manual white balance." }), true, "not offered: still listed");
+
+// the status line
+const stat = { id: cam.id, exposure: { state: "holding", message: "Holding 30 fps · gain 48 of 75" }, white_balance: { state: "ignored", message: "x", handed_back: "camera" } };
+same(statusOf(stat as never, cam, "exposure")?.state, "holding", "status of this camera");
+same(statusOf(stat as never, moved, "exposure")?.state, "holding", "status follows the port");
+same(statusOf(stat as never, { id: "\\\\?\\usb#vid_1111&pid_2222#1#{g}\\global" }, "exposure"), null, "status of another camera");
+same(statusOf(null, cam, "exposure"), null, "no status");
+same(showsStatus("app", { state: "holding" }), true, "shown in Better Cam auto");
+same(showsStatus("manual", { state: "holding" }), false, "a stale line is not shown in Manual");
+same(showsStatus("camera", { state: "ignored", handed_back: "camera" }), true, "after a hand-back to Camera auto: Try again");
+same(showsStatus("manual", { state: "ignored", handed_back: "camera" }), false, "not once the control moved on");
+same(showsStatus("camera", null), false, "no status");
+same(autoAction("conflict"), "resume", "Resume after a conflict");
+same(autoAction("ignored"), "retry", "Try again after ignored");
+same(autoAction("holding"), null, "no button while it works");
+same(autoTone("holding"), "neutral", "tone: working");
+same(autoTone("limit_gain"), "warn", "tone: limit");
+same(autoTone("hunting"), "error", "tone: stopped");
+
+// limits on the sliders and the "Longest exposure" list
+const stops = longestOptions({ min: -13, max: -1 }, 30);
+same(stops[0], { value: "fit", label: "Fit the frame rate (1/32 s at 30 fps)" }, "fit option");
+same(stops.length, 14, "fit and 13 whole stops");
+same(stops.find((o) => o.value === "-6")?.label, "1/64 s (sharper motion, more gain)", "shorter than the frame time");
+same(stops.find((o) => o.value === "-5")?.label, "1/32 s (the frame-rate limit)", "at the frame time");
+same(stops.find((o) => o.value === "-4")?.label, "1/16 s (camera drops to ≈ 15 fps)", "longer than the frame time");
+same(longestOptions({ min: -13, max: -1 }, 60)[0].label, "Fit the frame rate (1/64 s at 60 fps)", "fit at 60 fps");
+same(longestOptions({ min: -3, max: -1 }, null).map((o) => o.label), ["Fit the frame rate", "1/8 s", "1/4 s", "1/2 s"], "no frame rate: no meanings");
+same(maxGainValue(null, { min: 0, max: 100, step: 1 }), 75, "default most gain: 75 % of the range");
+same(maxGainValue(null, { min: 0, max: 100, step: 10 }), 80, "default most gain on the step grid");
+same(maxGainValue(500, { min: 0, max: 100, step: 1 }), 100, "most gain clamped");
+same(limitFraction(-5, { min: -13, max: -1 }), 8 / 12, "limit tick position");
+same(limitFraction(5, { min: -13, max: -1 }), null, "a limit outside the range has no tick");
+same(limitFraction(null, { min: 0, max: 1 }), null, "no limit");
 
 console.log("ok");
