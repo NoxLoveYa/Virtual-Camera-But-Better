@@ -41,6 +41,8 @@ fn watch_visibility(app: AppHandle) {
 /// Every path that surfaces the main window (start-up, tray, second launch) goes through here. With the debug-only
 /// `BETTER_CAM_TEST_WINDOW` the window is placed and shown without activation and nothing takes the focus.
 fn show_main(app: &AppHandle) {
+    #[cfg(debug_assertions)]
+    better_cam::test_window::trace::note("show_main");
     if let Some(w) = app.get_webview_window("main") {
         if let Some(placement) = better_cam::test_window::requested() {
             match w.hwnd() {
@@ -92,6 +94,11 @@ fn run_helper_if_asked() {
 
 fn main() {
     run_helper_if_asked();
+    // Before the window exists, so its creation is part of the trace.
+    #[cfg(debug_assertions)]
+    better_cam::test_window::trace::install();
+    let mut context = tauri::generate_context!();
+    better_cam::test_window::prepare(&mut context.config_mut().app.windows, better_cam::test_window::requested().as_ref());
     let builder = tauri::Builder::default();
     // A relaunch while the app sits in the tray should surface that window, not start a second instance.
     // Debug builds skip this so `tauri dev` still works while an installed copy is running.
@@ -191,7 +198,7 @@ fn main() {
             commands::nvidia_gpu,
             commands::install_nvidia_sdk,
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building Better Cam")
         .run(|app, event| {
             if let RunEvent::Exit = event {
