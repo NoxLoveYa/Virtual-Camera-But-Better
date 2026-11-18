@@ -343,3 +343,198 @@ with `PSSetConstantBuffers(1, ...)` before `ShaderFilter::render`. No change to 
   `vec4<f32>`), `ExtShaderFilter` (two constant buffers, `history`, path image textures, per-frame `FrameValues`,
   upload only when changed), `Renderer::draw_with`, caching of `Translated` by source hash, hot reload, and the choice
   between threads and a helper process for FXC.
+
+---
+
+# Spike E2: Direct2D layer on the engine device
+
+Date: 2026-11-18. Code: `src-tauri/examples/layer_spike.rs` (the only code), `src-tauri/Cargo.toml` (`windows` features
+`Win32_Graphics_Direct2D`, `Win32_Graphics_Direct2D_Common`, `Win32_Graphics_DirectWrite`). Scope: phase E2 of
+`docs/EXTENSIONS.md` (section 7), decisions 3.2 O5 threading, 6.3 scene and raster caps, the `gpu/d2d.rs` reset list of
+5.2, and unverified item 3 of 3.4. Nothing under `src-tauri/src/` changed.
+
+Run it: `cargo run -p better-cam --release --example layer_spike [-- --warp] [--frames N] [--st-factory]
+[--high-priority] [--skip-typical] [--cap-runs N --cap-chars N --cap-images N --cap-shapes N --cap-groups N]`.
+Exit code 0 = PASS, 1 = FAIL, 2 = error. The extra flags exist so the cap scene can be resized and the factory type
+compared; the defaults run the spec.
+
+## E2.1 Verdict
+
+**FAIL by the spec's rule, in the mild way: only the cap scene misses.** The two questions have different answers:
+
+1. **Can D2D/DirectWrite draw into a texture on the engine's own device without changing the next engine pass?
+   Yes.** On the RTX 5080 and on WARP, D2D left **no** D3D11 state changed (not one of the 24 states checked; the diff
+   is empty), the probe pass rendered byte-identical to its reference after typical and cap rasters, and the layer was
+   byte-identical whether it was rasterized on a cleared context or right after a probe pass. **No reset list is
+   needed.**
+2. **What does a raster cost?** Typical scene (the clock): **0.07 to 0.18 ms p50, 0.11 to 0.23 ms p95 cold** on a quiet
+   machine (pass limit 0.5 ms). Cap scene at the current 6.3 caps (512 nodes, 4 096 characters): **p50 3.0 to 3.6 ms,
+   p95 3.6 to 6.3 ms cold** (limit 3 ms), so the scene caps in 6.3 must come down (E2.5). D2D works on WARP.
+
+What follows from the spec's fail rules: "Only the cap scene misses 3 ms → keep O5 on the render thread and lower the
+scene caps in 6.3 (text characters first, then nodes)". The separate-device design of 3.2 is **not** needed.
+
+## E2.2 What was built
+
+- Device `GpuDevice::new(Hardware | Warp)` + `Renderer::new`. D2D: `ID2D1Factory1` (multi-threaded; `--st-factory`
+  for single-threaded), `CreateDevice(IDXGIDevice)`, one `ID2D1DeviceContext`, shared `IDWriteFactory`.
+- Layer: one 1920×1080 `B8G8R8A8_UNORM` texture (`BIND_RENDER_TARGET | BIND_SHADER_RESOURCE`) wrapped by
+  `CreateBitmapFromDxgiSurface` (premultiplied, `TARGET | CANNOT_DRAW`), `SetTextAntialiasMode(GRAYSCALE)` (ClearType
+  makes no sense on a transparent layer). Each raster: `BeginDraw`, `SetTransform(identity)`, `Clear(transparent)`,
+  scene, `EndDraw`.
+- Typical scene: rounded rectangle at 50 % black plus "12:34:56", Segoe UI 40 px weight 600, white.
+- Cap scene (default = the 6.3 caps): 512 nodes = 8 nested groups (D2D layers: rotation ±2°, scale 0.93 per level,
+  rounded-rectangle geometric mask, opacity 0.95; depth of the deepest leaf 9) + 112 text runs of 36 or 37 characters
+  (4 096 in all, wrapped at 320 px, Segoe UI 14 to 28 px, weights 400 and 600) + 16 bitmap draws from one 256×256
+  atlas (half with a source rectangle, some with opacity) + 376 filled or stroked rectangles, rounded rectangles,
+  ellipses and lines, some translucent. Leaves are spread over the 9 levels. All geometry comes from a fixed
+  pseudo-random generator, so every run draws the same scene.
+- **Cold** = every raster builds all 112 `IDWriteTextLayout`s and the 8 mask geometries inside the timed region.
+  **Warm** = layouts and geometries cached, only drawing repeats. Brushes, text formats and the atlas are cached in
+  both. Each scene and mode runs 10 untimed frames, then `--frames` (600) timed frames paced at 60 Hz (the process
+  calls `timeBeginPeriod(1)`).
+- Per frame: probe pass, raster (`GpuTimer` around `BeginDraw`..`EndDraw`), probe pass, `Flush`. CPU time is the wall
+  time from `BeginDraw` to the return of `EndDraw`.
+- State check: probe pixel shader reading `t0` through `s0` at a half-texel offset and `b0`, returning alpha 0.5, into
+  a 1920×1080 target cleared to (0.2, 0.4, 0.6, 1). Reference = its readback before D2D exists on the device. After
+  each scene's raster: probe again, compare byte for byte. Plus a snapshot of 24 states before `BeginDraw` and after
+  `EndDraw` (IA topology, input layout, vertex buffer 0, index buffer, VS/HS/DS/GS/PS, PS cb0-1, sampler 0, SRV 0-5,
+  RS state, viewports, scissors, OM blend state/factor/mask, depth-stencil state/ref, render targets 0-7 and DSV).
+- Self-test of the check (printed every run): a rasterizer state with scissor enabled and a 100×100 scissor rectangle
+  is injected on the same context; the snapshot diff must list `RS state, RS scissor`, the probe pixels must change,
+  and restoring exactly the listed states must give the reference back. All three held, so "none" and "identical" are
+  not a blind spot.
+- Reverse check and layer check as in the spec. The layer check verifies: every byte outside the rounded rectangle
+  (plus 2 px) is zero, the rectangle interior is (0, 0, 0, ~128) (premultiplied 50 % black), every pixel in the text
+  box has alpha > 0, and at least 100 glyph pixels are opaque white.
+
+## E2.3 Output
+
+WARP:
+
+```
+adapter: Microsoft Basic Render Driver (warp)   d2d init 0.9 ms   first text layout 0.8 ms
+cap scene: 512 nodes (text runs 112 / 4096 chars, images 16, shapes 376, groups 8)
+self-test: injected scissor -> diff [RS state, RS scissor], probe pixels changed: true, restored by reset: true
+first raster 1.42 ms (includes lazy D2D setup)
+  typical: probe pixels identical
+  cap: probe pixels identical
+typical cold  frames 600  raster cpu ms p50 0.08 p95 0.13 max 0.31  gpu ms p50 0.13 p95 0.22
+typical warm  frames 600  raster cpu ms p50 0.06 p95 0.10 max 0.42  gpu ms p50 0.12 p95 0.25
+cap cold      frames 600  raster cpu ms p50 3.65 p95 4.81 max 12.10  gpu ms p50 3.76 p95 4.41
+cap warm      frames 600  raster cpu ms p50 2.29 p95 3.41 max 9.39  gpu ms p50 4.38 p95 6.13
+state diff after EndDraw: none
+state check: identical
+reverse check: identical
+layer check: ok
+verdict: PASS (WARP: times not judged)
+```
+
+RTX 5080 (hardware), last run at the default caps and normal priority:
+
+```
+adapter: NVIDIA GeForce RTX 5080 (hardware)   d2d init 1.3 ms   first text layout 0.7 ms
+cap scene: 512 nodes (text runs 112 / 4096 chars, images 16, shapes 376, groups 8)
+self-test: injected scissor -> diff [RS state, RS scissor], probe pixels changed: true, restored by reset: true
+first raster 1.42 ms (includes lazy D2D setup)
+  typical: probe pixels identical
+  cap: probe pixels identical
+typical cold  frames 600  raster cpu ms p50 0.11 p95 0.17 max 0.25  gpu ms p50 0.00 p95 0.00
+typical warm  frames 600  raster cpu ms p50 0.08 p95 0.13 max 0.26  gpu ms p50 0.00 p95 0.00
+cap cold      frames 600  raster cpu ms p50 5.85 p95 19.44 max 141.61  gpu ms p50 0.34 p95 0.39
+cap warm      frames 600  raster cpu ms p50 2.28 p95 7.67 max 41.50  gpu ms p50 0.34 p95 0.40
+state diff after EndDraw: none
+state check: identical
+reverse check: identical
+layer check: ok
+verdict: FAIL (cap cold p95 19.44 ms > 3 ms)
+```
+
+**Read the cap numbers with the machine in mind.** The user's game (Fortnite, 35 to 48 % CPU) and other agents' builds
+ran during every hardware run, so p95 and max swing a lot between runs (the same scene gave cap cold p95 4.67, 6.85,
+18.62, 19.44 ms at the default caps). The medians are stable and carry the verdict. Hardware runs at the default caps,
+cap cold p50: 3.03, 3.18, 3.31, 3.33, 3.53, 3.56, 5.02, 5.45, 5.85 ms; typical cold p95: 0.42, 0.23, 0.17, 0.16, 0.11
+to 0.14 ms. Even the quietest run has a cap cold median above 3 ms, so the failure is real, not noise. The first
+`--high-priority` runs (flag added to cut scheduler noise) are cleaner: cap cold p95 6.28 and 3.5 to 3.9 ms.
+
+GPU time (reported, not judged): typical 0.00 ms (below the timer's resolution; two small primitives), cap scene
+0.34 ms on the RTX 5080 (the 8 nested layers alone take 0.25 ms, the 376 shapes 0.07 ms), 3.8 to 4.4 ms on WARP. The raster is CPU-bound.
+
+## E2.4 State findings and the reset list
+
+- **The state diff after `EndDraw` is empty on both adapters, for both scenes.** D2D put back or never touched every
+  state in the list, including the render target:
+  `OM render targets` after `EndDraw` is the probe target again, so the layer is **not** left bound as a render
+  target and can be bound as a shader resource by the next pass without unbinding.
+- Probe pixels identical after the typical and the cap raster, with no reset. The probe is sensitive: `Renderer::draw`
+  sets render target, topology, input layout, VS, PS, SRV 0, sampler 0, constant buffer 0 and the viewport on every
+  call, so it relies on the *defaults* for blend, rasterizer, depth-stencil, scissor, HS/DS/GS and the sample mask. Those
+  are exactly the states a D2D leak would break, and the self-test shows a leaked scissor is caught.
+- **Reset list for `gpu/d2d.rs` (5.2): empty.** The planned "reset blend, rasterizer and depth state after `EndDraw`"
+  is not needed on this evidence. E8 should keep the check as a regression test instead of a runtime reset: take
+  a snapshot before and after one raster on WARP and on hardware and assert an empty diff and an identical probe. If
+  a driver ever leaks, the restore code in this example (`Snap::restore`) is the shape of the fix.
+- Reverse direction (probe state does not change the layer): identical. D2D does not read any D3D11 state of the
+  engine's passes.
+- **The factory type did not matter.** Three alternating pairs, high priority, 300 frames: multi-threaded factory cap
+  cold p50 3.31, 3.33, 3.03 ms, single-threaded 3.18, 3.05, 3.17 ms; typical cold p50 0.07 to 0.08 ms in all six; every
+  check identical in all six. The engine device is multithread-protected either way. Use
+  `D2D1_FACTORY_TYPE_MULTI_THREADED` (the spec's choice, since Media Foundation threads share the device); there is no
+  speed reason to prefer the single-threaded one.
+- D2D init is cheap: factory + device + context + one atlas bitmap 0.9 to 1.5 ms; the first text layout (font
+  collection load) 0.6 to 0.9 ms; the very first raster 1.3 to 2.7 ms. None of it is a startup problem.
+- D2D works on WARP (all three checks identical/ok), so E8's raster tests can run on WARP and on hardware.
+- Not tested (outside the spec): D2D from a thread other than the one that owns the context (3.4 item 4); device loss
+  during a raster; binding the layer texture as an SRV in a blend pass (the readback used `CopyResource`).
+
+## E2.5 Cost model and new caps for 6.3
+
+Typical scene, cold: 0.07 to 0.23 ms p95 on a quiet machine, 0.42 ms at worst under load. **Passes** (limit 0.5 ms).
+
+Where the cap scene's cold time goes (hardware, p50, from the sweeps; quiet to moderately busy machine):
+
+| Part | Cold ms | Warm ms | Note |
+|---|---|---|---|
+| 112 text runs, 4 096 characters, nothing else | 2.56 | 0.46 | layout creation ≈ 2.1 ms ≈ 19 µs per run (≈ 0.5 µs per character); drawing ≈ 4 µs per run |
+| 8 nested layers (mask, rotation, opacity), no leaves | 0.52 | 0.51 | ≈ 65 µs per layer; building the mask geometry is negligible |
+| 376 shapes | 1.2 to 1.6 | 1.6 | ≈ 3 to 4 µs per shape |
+| 401 nodes without text (16 images, 376 shapes, 8 groups) | 2.14 | 1.84 | |
+| Default cap scene (512 nodes) | 3.0 to 5.9 | 1.7 to 2.6 | sum of the parts |
+
+So text layout creation is the largest single cost and the only one a cache removes: the warm scene is already
+near 2 ms. Candidates, hardware, 600 frames, cap cold p95 (ms), with the default scene shape scaled down:
+
+| Caps (nodes / text characters / images / groups) | Cap cold p50 | p95, high priority | p95, normal priority |
+|---|---|---|---|
+| 512 / 4 096 / 16 / 8 (current) | 3.0 to 5.9 | 3.5 to 6.9 | 4.7 to 19.4 |
+| 384 / 1 536 / 16 / 8 | 3.0 to 3.4 | 5.24 | 3.85 |
+| **256 / 1 024 / 16 / 8** | 1.6 to 2.1 (3.5 in one loaded run) | 2.96 | 2.10 (23.97 in one loaded run) |
+| 192 / 768 / 8 / 8 | 1.4 | 2.12 | 1.92 |
+
+**New 6.3 scene caps: 256 nodes, 1 024 text characters, 16 images, depth 16 (unchanged, the test scene only reaches
+9), 256 KB as JSON (unchanged).** Text characters went down 4×, nodes 2×. 256 nodes passes in the runs on a machine that
+was not saturated (cold p95 2.10 ms at normal priority, 2.96 ms high priority, warm p95 1.4 to 2.7 ms). One
+normal-priority run while the game was running gave cold p95 23.97 ms (max 74.7 ms; warm p95 5.79 ms), which is
+contention, not the scene: that run's median was 3.5 ms against 1.6 ms in the quiet one. The margin is thin on a
+loaded machine; the 192-node row (1.9 to 2.1 ms) is the safe fallback if E8 wants room. Because the cost is per text
+run more than per character, E8 should also cap text *runs* (e.g. 32) or count each run as 8 nodes in the node total.
+The "Layer raster: budget 2 ms p95 per layer" row stays as the runtime guard; a full 256-node scene sits right at it
+when every text changes, which is the case the guard exists for. Unchanged scenes are never re-rastered, and a clock
+changes one text run per second.
+
+## E2.6 What E8 takes from this
+
+- `gpu/d2d.rs`: device-level D2D on `gpu.device.cast::<IDXGIDevice>()`, multi-threaded factory, one device context, a
+  shared `IDWriteFactory`, layer = `B8G8R8A8_UNORM` + `BIND_RENDER_TARGET | BIND_SHADER_RESOURCE` + `CreateBitmapFromDxgiSurface`
+  (premultiplied, `TARGET | CANNOT_DRAW`), grayscale text antialiasing, `PushLayer(.., None)` for groups (D2D makes the
+  layer itself), cached `IDWriteTextFormat`s per (family, size, weight), cached `IDWriteTextLayout`s keyed by text and
+  style, cached mask geometry per group. **No D3D11 state reset after `EndDraw`.**
+- The layer is premultiplied BGRA: the blend pass must use premultiplied-over (`out = layer + (1 - layer.a) * frame`)
+  and swizzle nothing (BGRA is sampled as RGBA by the shader).
+- Cargo: the three `windows` features are enough, but `windows` 0.62 takes `Vector2` and `Matrix3x2` from the
+  `windows-numerics` crate and does not re-export them. The example builds them from `[f32; N]` with a size-checked
+  `transmute_copy`; E8 should add `windows-numerics = "0.3"` (already in `Cargo.lock` at 0.3.1) as a direct dependency
+  instead of copying that trick.
+- Tests: reuse the probe (`PROBE_HLSL`), `Snap` (take, diff, restore), `max_diff` and `layer_check` from the
+  example as the E8 raster regression test on WARP and hardware.
+- Fallback not needed: the overlay-thread design with its own device and keyed-mutex textures (3.2) stays on paper.
