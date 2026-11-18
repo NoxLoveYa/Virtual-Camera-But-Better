@@ -12,7 +12,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "GPL-2.0-or-later"
-rust-version = "1.82"
+rust-version = "1.87"
 
 [workspace.dependencies]
 windows = "0.62"
