@@ -37,7 +37,7 @@ use windows::Win32::Graphics::Direct3D11::ID3D11PixelShader;
 use super::assets::{Asset, AssetHandle, AssetKind, CubeLut, LutDim};
 use super::shader_filter::PATH_KEY;
 use super::{pb, pf, ps, GpuFilter, Params};
-use crate::gpu::{ConstantBuffer, GpuResult, Pass, Renderer, RgbaTexture};
+use crate::gpu::{ConstantBuffer, GpuResult, Pass, Renderer, RgbaTexture, Views};
 
 pub const KIND: &str = "clut_filter";
 
@@ -201,11 +201,15 @@ impl GpuFilter for LutFilter {
             buffer.write_bytes(&r.gpu.context, &packed)?;
             self.uploaded = Some(packed);
         }
+        // t0: the picture in linear light, t1: the table, t2: the picture's codes (the lookup coordinate); the
+        // output is written in linear light (the hardware decodes on read and encodes on write).
+        let views = Views::LINEAR_WITH_CODES;
+        let srvs = views.bind(input, &[Some(table.srv.clone())]);
         r.draw(&Pass {
             ps: &ps,
-            srvs: &[Some(input.srv.clone()), Some(table.srv.clone())],
+            srvs: &srvs,
             constants: Some(buffer),
-            target: &output.rtv,
+            target: views.target(output),
             width: output.width,
             height: output.height,
         });

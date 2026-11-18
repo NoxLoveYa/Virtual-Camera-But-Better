@@ -3,7 +3,10 @@
 //! chain gives the next filter and the output stage the new size.
 //!
 //! The pixel work is in `gpu/shaders/{crop,scale_basic,scale_bicubic,scale_lanczos,scale_area,transform}.hlsl`, with
-//! `geometry_common.hlsl` (linear-light, premultiplied texel access) in front of all but the crop shader.
+//! `geometry_common.hlsl` (linear-light, premultiplied texel access) in front of all but the crop shader. A pass that
+//! resamples works in linear light on the `_SRGB` views of the pooled textures ([`crate::gpu::Views::LINEAR`]: the
+//! hardware decodes on read and encodes on write); a pass that only moves texels (crop, a point copy, a quarter turn)
+//! works on the codes, so each texel keeps its exact code.
 //!
 //! Sizes never leave `1..=`[`MAX_SIDE`] per side and [`MAX_PIXELS`] in all ([`clamp_size`]), whatever the settings
 //! and the input say, so no setting can ask for a texture the device cannot make.
@@ -16,7 +19,7 @@ pub mod transform;
 
 use windows::Win32::Graphics::Direct3D11::ID3D11PixelShader;
 
-use crate::gpu::{ConstantBuffer, GpuResult, Pass, Renderer, RgbaTexture};
+use crate::gpu::{ConstantBuffer, GpuResult, Pass, Renderer, RgbaTexture, Views};
 
 /// The longest side a geometry filter produces (the limit of the Crop/Pad settings).
 pub const MAX_SIDE: u32 = 8192;
@@ -69,13 +72,27 @@ impl Program {
         Ok(ps)
     }
 
-    /// Draw `input` into `output` with the shader and the constants `packed` (a multiple of 16 bytes).
+    /// Draw `input` into `output` with the shader and the constants `packed` (a multiple of 16 bytes), on the codes of
+    /// the pooled textures ([`Views::ENCODED`]).
     pub(crate) fn draw(
         &mut self,
         r: &Renderer,
         packed: &[u8],
         input: &RgbaTexture,
         output: &RgbaTexture,
+    ) -> GpuResult<()> {
+        self.draw_with(r, packed, input, output, Views::ENCODED)
+    }
+
+    /// [`Program::draw`] with the views of the pooled textures the shader works in: [`Views::LINEAR`] for a shader
+    /// that works in linear light (the hardware converts on read and on write).
+    pub(crate) fn draw_with(
+        &mut self,
+        r: &Renderer,
+        packed: &[u8],
+        input: &RgbaTexture,
+        output: &RgbaTexture,
+        views: Views,
     ) -> GpuResult<()> {
         let ps = self.shader(r)?;
         if self.constants.is_none() || self.written.len() != packed.len() {
@@ -89,9 +106,9 @@ impl Program {
         }
         r.draw(&Pass {
             ps: &ps,
-            srvs: &[Some(input.srv.clone())],
+            srvs: &views.bind(input, &[]),
             constants: Some(constants),
-            target: &output.rtv,
+            target: views.target(output),
             width: output.width,
             height: output.height,
         });

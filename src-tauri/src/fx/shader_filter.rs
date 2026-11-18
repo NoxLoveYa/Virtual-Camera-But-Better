@@ -14,12 +14,19 @@
 //! ```
 //! The pass draws a full-screen triangle into a texture of the input's size, so `pos.xy` is the pixel centre and
 //! `image.Load(int3(pos.xy, 0))` reads the matching input texel.
+//!
+//! The pooled textures hold gamma-encoded sRGB codes. [`ShaderFilter::new`] binds them as they are (`image` holds the
+//! codes, the return value is stored as it is). A shader that works in linear light is made with
+//! [`ShaderFilter::with_views`] and [`Views::LINEAR`]: `image` then holds linear light (the hardware decodes on
+//! read) and the value it returns is linear too (the hardware encodes on write), so it needs no `pow` of its own.
+//! A shader that also needs the code of the texel declares `Texture2D<float4> image_code` at the register after its
+//! extras and is made with [`Views::LINEAR_WITH_CODES`].
 
 use windows::Win32::Graphics::Direct3D11::{ID3D11PixelShader, ID3D11ShaderResourceView};
 
 use super::assets::{Asset, AssetHandle, AssetKind, LutDim};
 use super::{ps, GpuFilter, Params};
-use crate::gpu::{ConstantBuffer, GpuResult, Pass, Renderer, RgbaTexture};
+use crate::gpu::{ConstantBuffer, GpuResult, Pass, Renderer, RgbaTexture, Views};
 
 /// The setting that holds the path of a file extra input (the OBS name, shared by the LUT and mask filters).
 pub const PATH_KEY: &str = "image_path";
@@ -64,11 +71,20 @@ pub struct ShaderFilter {
     extras: Vec<Option<ID3D11ShaderResourceView>>,
     /// Present when the engine has an asset service and the definition has file extras.
     assets: Option<AssetHandle>,
+    /// Which views of the pooled textures the pass binds.
+    views: Views,
 }
 
 impl ShaderFilter {
-    /// A filter with the default params (what `pack` makes of an empty map).
+    /// A filter with the default params (what `pack` makes of an empty map). The shader sees the codes of the pooled
+    /// textures and writes codes ([`Views::ENCODED`]): the convention of an extension's shader.
     pub fn new(def: &'static ShaderFilterDef) -> ShaderFilter {
+        ShaderFilter::with_views(def, Views::ENCODED)
+    }
+
+    /// As [`ShaderFilter::new`] for a shader that works in linear light (or needs the codes next to it): `views` says
+    /// which views of the input and the output the pass binds, see [`Views`].
+    pub fn with_views(def: &'static ShaderFilterDef, views: Views) -> ShaderFilter {
         ShaderFilter {
             def,
             packed: (def.pack)(&Params::new()),
@@ -77,6 +93,7 @@ impl ShaderFilter {
             ps: None,
             extras: vec![None; def.extra.len()],
             assets: None,
+            views,
         }
     }
 
@@ -163,14 +180,12 @@ impl GpuFilter for ShaderFilter {
             constants.write_bytes(&r.gpu.context, &self.packed)?;
             self.dirty = false;
         }
-        let mut srvs = Vec::with_capacity(1 + self.extras.len());
-        srvs.push(Some(input.srv.clone()));
-        srvs.extend(self.extras.iter().cloned());
+        let srvs = self.views.bind(input, &self.extras);
         r.draw(&Pass {
             ps: &ps,
             srvs: &srvs,
             constants: Some(constants),
-            target: &output.rtv,
+            target: self.views.target(output),
             width: output.width,
             height: output.height,
         });

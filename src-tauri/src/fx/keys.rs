@@ -33,6 +33,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use super::shader_filter::{ShaderFilter, ShaderFilterDef};
 use super::{pc, pf, pi, ps, GpuFilter, Params};
+use crate::gpu::Views;
 
 #[cfg(test)]
 mod tests;
@@ -86,16 +87,21 @@ pub static LUMA_DEF: ShaderFilterDef = ShaderFilterDef {
     extra: &[],
 };
 
+/// Linear light in and out, and the code of the texel at `t1`: the key measures the colour on the codes (the chroma
+/// distance) and works the rest in linear light.
 pub fn make_chroma() -> Box<dyn GpuFilter> {
-    Box::new(ShaderFilter::new(&CHROMA_DEF))
+    Box::new(ShaderFilter::with_views(&CHROMA_DEF, Views::LINEAR_WITH_CODES))
 }
 
+/// As [`make_chroma`].
 pub fn make_color() -> Box<dyn GpuFilter> {
-    Box::new(ShaderFilter::new(&COLOR_DEF))
+    Box::new(ShaderFilter::with_views(&COLOR_DEF, Views::LINEAR_WITH_CODES))
 }
 
+/// The luminance is measured in linear light (`t0`); the colour goes out untouched, so the code is read at `t1` and
+/// written as it is.
 pub fn make_luma() -> Box<dyn GpuFilter> {
-    Box::new(ShaderFilter::new(&LUMA_DEF))
+    Box::new(ShaderFilter::with_views(&LUMA_DEF, Views::LINEAR_IN_CODES_OUT))
 }
 
 // ---------------------------------------------------------------------------------------------------------------

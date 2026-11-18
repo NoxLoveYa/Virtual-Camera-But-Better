@@ -38,7 +38,7 @@ use super::assets::{Asset, AssetHandle, AssetKind};
 use super::color::srgb_to_linear;
 use super::shader_filter::PATH_KEY;
 use super::{pb, pc, pf, ps, GpuFilter, Params};
-use crate::gpu::{ConstantBuffer, GpuResult, Pass, Renderer, RgbaTexture};
+use crate::gpu::{ConstantBuffer, GpuResult, Pass, Renderer, RgbaTexture, Views};
 
 #[cfg(test)]
 mod tests;
@@ -243,11 +243,15 @@ impl GpuFilter for MaskFilter {
             constants.write_bytes(&r.gpu.context, &packed)?;
             self.uploaded = packed;
         }
+        // Both pictures are read in linear light (OBS binds them with gs_effect_set_texture_srgb) and the result is
+        // written in linear light: the hardware decodes on read and encodes on write.
+        let views = Views::LINEAR;
+        let srvs = views.bind(input, &[Some(img.srv_linear.clone())]);
         r.draw(&Pass {
             ps: &ps,
-            srvs: &[Some(input.srv.clone()), Some(img.srv.clone())],
+            srvs: &srvs,
             constants: Some(constants),
-            target: &output.rtv,
+            target: views.target(output),
             width: output.width,
             height: output.height,
         });

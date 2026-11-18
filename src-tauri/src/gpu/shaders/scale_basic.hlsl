@@ -18,6 +18,10 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 *****************************************************************************/
 
+// Which views the filter binds depends on the mode (fx/geometry/scale.rs): mode 0 reads and writes the codes (the
+// plain views), modes 1 and 2 work in linear light (the `_SRGB` views: the hardware decodes on read, `finish` returns
+// linear light and the output merger encodes it).
+
 cbuffer Params : register(b0)
 {
     float2 out_dim;

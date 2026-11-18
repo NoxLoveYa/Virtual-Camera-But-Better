@@ -23,8 +23,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //
 // OBS runs the effect on an sRGB texture with an sRGB framebuffer (gs_effect_set_texture_srgb, framebuffer sRGB on),
 // so the sampler hands the shader linear light and the output merger encodes it again: gamma, the matrix, the colour
-// multiply and the colour add all work on linear values. The working texture here is gamma-encoded, so the shader does
-// both conversions itself.
+// multiply and the colour add all work on linear values. So does this pass: the working texture holds gamma-encoded
+// codes, and the filter binds its `_SRGB` shader resource view and `_SRGB` render target view (gpu::Views::LINEAR), so
+// the hardware decodes on read and encodes on write, as in OBS, and the shader has no pow of its own for it.
 //
 // OBS also un-premultiplies the sample before the maths and premultiplies the result afterwards, because its
 // textures hold premultiplied alpha. This pipeline keeps straight alpha, so both steps are left out; the matrix
@@ -43,26 +44,16 @@ cbuffer Params : register(b0)
     float3 pad;
 };
 
-float3 srgb_to_linear(float3 c)
-{
-    return (c <= 0.04045) ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
-}
-
-float3 linear_to_srgb(float3 c)
-{
-    c = saturate(c);
-    return (c <= 0.0031308) ? 12.92 * c : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
-}
-
 float4 main(float4 pos : SV_Position) : SV_Target
 {
+    // Linear light (the `_SRGB` view decodes the colour; alpha is as stored).
     float4 p = image.Load(int3(int2(pos.xy), 0));
-    p.rgb = srgb_to_linear(p.rgb);
 
     // Always address the gamma first.
     p.rgb = pow(p.rgb, float3(gamma, gamma, gamma));
 
     p = mul(p, color_matrix);
 
-    return float4(linear_to_srgb(p.rgb), saturate(p.a));
+    // The `_SRGB` render target clamps to 0..1 and encodes.
+    return float4(saturate(p.rgb), saturate(p.a));
 }

@@ -96,7 +96,7 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16G16B16A16_UNORM, DXG
 use super::geometry::{pack_f32, Program};
 use super::{pb, pf, GpuFilter, Params};
 use crate::gpu::readback::{MappedPlane, PlaneDesc, ReadbackRing};
-use crate::gpu::{ConstantBuffer, GpuResult, Pass, Renderer, RgbaTexture};
+use crate::gpu::{ConstantBuffer, GpuResult, Pass, Renderer, RgbaTexture, Space, Views};
 
 #[cfg(test)]
 mod tests;
@@ -1166,7 +1166,16 @@ impl GpuFilter for AutoAdjust {
         } else {
             self.contrast_pivot_now()
         };
-        self.main.draw(
+        // The picture is read in linear light (the `_SRGB` view decodes). Contrast and saturation work on the encoded
+        // colour, so the shader encodes by hand and writes the codes when either is on; without them it returns linear
+        // light and the `_SRGB` render target encodes (see `auto_adjust.hlsl`; the shader tests the same two values).
+        let plain = g.contrast == 1.0 && g.saturation == 1.0;
+        let views = Views {
+            read: Space::Linear,
+            write: if plain { Space::Linear } else { Space::Encoded },
+            with_codes: false,
+        };
+        self.main.draw_with(
             r,
             &pack_f32(&[
                 g.wb[0],
@@ -1180,6 +1189,7 @@ impl GpuFilter for AutoAdjust {
             ]),
             input,
             output,
+            views,
         )
     }
 }

@@ -15,6 +15,7 @@ cbuffer FitParams : register(b0)
 {
     float4 dst_rect;   // x, y, w, h in output pixels
     float4 background; // rgb
+    float4 background_linear; // the same colour in linear light (made on the CPU: no pow per pixel for it)
     uint point_mode;   // 1: the rectangle maps 1:1, copy texels exactly
     uint3 pad;
 };
@@ -73,6 +74,6 @@ float4 main(float4 pos : SV_Position) : SV_Target
     }
     if (c.a >= 0.9999)
         return float4(c.rgb, 1.0);
-    float3 lin = lerp(srgb_to_linear(background.rgb), srgb_to_linear(c.rgb), c.a);
+    float3 lin = lerp(background_linear.rgb, srgb_to_linear(c.rgb), c.a);
     return float4(linear_to_srgb(lin), 1.0);
 }

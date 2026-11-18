@@ -34,7 +34,7 @@ pub(crate) fn warp() -> Arc<Renderer> {
 }
 
 /// Copy a texture through a staging texture and return tight rows (`w * bpt` bytes each).
-fn read_texture(r: &Renderer, tex: &ID3D11Texture2D, w: u32, h: u32, bpt: u32) -> Vec<u8> {
+pub(crate) fn read_texture(r: &Renderer, tex: &ID3D11Texture2D, w: u32, h: u32, bpt: u32) -> Vec<u8> {
     let mut desc = D3D11_TEXTURE2D_DESC::default();
     unsafe { tex.GetDesc(&mut desc) };
     let staging = r
@@ -1018,4 +1018,278 @@ fn the_gpu_timer_reports_a_time() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert!(timer.last_ms.unwrap() >= 0.0);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// sRGB views of the pool textures
+
+const COPY_PS: &str = "Texture2D<float4> t : register(t0);\n\
+    float4 main(float4 p : SV_Position) : SV_Target { return t.Load(int3(int2(p.xy), 0)); }";
+
+fn srgb_decode(code: f64) -> f64 {
+    let u = code / 255.0;
+    if u <= 0.04045 {
+        u / 12.92
+    } else {
+        ((u + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn srgb_encode(lin: f64) -> f64 {
+    let c = lin.clamp(0.0, 1.0);
+    let u = if c <= 0.0031308 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+    u * 255.0
+}
+
+/// Every code value, every channel (alpha equal to the red code).
+fn ramp(r: &Arc<Renderer>) -> super::Pooled {
+    let t = r.texture(256, 1).unwrap();
+    fill_rgba(r, &t, |x, _| [x as u8, x as u8, (255 - x) as u8, x as u8]);
+    t
+}
+
+fn view_test_on(r: &Arc<Renderer>) {
+    let ps = r.shaders.pixel_source("test_copy_load", COPY_PS).unwrap();
+    use windows::Win32::Graphics::Direct3D11::{ID3D11RenderTargetView, ID3D11ShaderResourceView};
+    let draw = |src: &ID3D11ShaderResourceView, target: &ID3D11RenderTargetView| {
+        r.draw(&super::Pass {
+            ps: &ps,
+            srvs: &[Some(src.clone())],
+            constants: None,
+            target,
+            width: 256,
+            height: 1,
+        });
+    };
+    let input = ramp(r);
+
+    // The decoded values in float: what the sampler hands the shader.
+    {
+        use windows::Win32::Graphics::Direct3D11::D3D11_BIND_RENDER_TARGET;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+        let tex = r
+            .gpu
+            .create_texture(&D3D11_TEXTURE2D_DESC {
+                Width: 256,
+                Height: 1,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            })
+            .unwrap();
+        let rtv = r.gpu.create_rtv(&tex).unwrap();
+        draw(&input.srv_srgb, &rtv);
+        let bytes = read_texture(r, &tex, 256, 1, 16);
+        let mut worst = 0.0f64;
+        for x in 0..256usize {
+            let v = f32::from_le_bytes(bytes[x * 16..x * 16 + 4].try_into().unwrap()) as f64;
+            worst = worst.max((v - srgb_decode(x as f64)).abs());
+        }
+        // The curve is exact on WARP. NVIDIA's texture unit hands over about 7 bits of mantissa for a decoded texel
+        // (0.9375, 0.945312, 0.953125 ... for the codes 248 to 250: steps of 1/128 near 1), so up to 0.004 off at the
+        // top: less than half a code once the value is encoded again.
+        eprintln!("{}: worst decode error in float {worst:.6}", r.gpu.adapter_name);
+        assert!(worst <= 0.004, "decoded values are {worst} from the sRGB curve");
+    }
+
+    // Reading through the sRGB view hands the shader linear light (a `Load` too, not only a `Sample`); alpha is not
+    // touched. The result is stored as plain 8 bit linear values through the UNORM view, so it is the decode table.
+    let out = r.texture(256, 1).unwrap();
+    draw(&input.srv_srgb, &out.rtv);
+    let got = read_rgba(r, &out);
+    let mut worst = (0.0f64, 0usize);
+    for x in 0..256usize {
+        for (c, code) in [x, x, 255 - x].into_iter().enumerate() {
+            let want = srgb_decode(code as f64) * 255.0;
+            let d = (got[x * 4 + c] as f64 - want).abs();
+            if d > worst.0 {
+                worst = (d, code);
+            }
+        }
+        assert_eq!(got[x * 4 + 3], x as u8, "alpha is never converted");
+    }
+    // (one 8 bit linear code is allowed for the texture unit's precision above; WARP is within the rounding)
+    assert!(worst.0 <= 1.05, "decode on read is {} codes from the table (code {})", worst.0, worst.1);
+
+    // Writing through the sRGB view encodes what the shader returns: the codes of a plain 8 bit copy are the encode.
+    let out = r.texture(256, 1).unwrap();
+    draw(&input.srv, &out.rtv_srgb);
+    let got = read_rgba(r, &out);
+    let mut worst = 0.0f64;
+    for x in 0..256usize {
+        for (c, code) in [x, x, 255 - x].into_iter().enumerate() {
+            let want = srgb_encode(code as f64 / 255.0);
+            worst = worst.max((got[x * 4 + c] as f64 - want).abs());
+        }
+        assert_eq!(got[x * 4 + 3], x as u8, "alpha is never converted");
+    }
+    assert!(worst <= 0.6, "encode on write is {worst} codes from the formula");
+
+    // Decoding on read and encoding on write give back the codes exactly: a filter that leaves a texel alone leaves
+    // its code alone.
+    let out = r.texture(256, 1).unwrap();
+    draw(&input.srv_srgb, &out.rtv_srgb);
+    assert_eq!(read_rgba(r, &out), read_rgba(r, &input), "the round trip through both sRGB views is exact");
+}
+
+#[test]
+fn pool_textures_read_linear_and_write_encoded_through_their_srgb_views_warp() {
+    view_test_on(&warp());
+}
+
+#[test]
+fn pool_textures_read_linear_and_write_encoded_through_their_srgb_views_hardware() {
+    match renderer(AdapterKind::Hardware) {
+        Some(r) => view_test_on(&r),
+        None => eprintln!("no hardware adapter here"),
+    }
+}
+
+#[test]
+fn a_typeless_pool_texture_copies_to_and_from_typed_textures() {
+    // The readback rings, the preview and NVIDIA's interop copy pool textures into `R8G8B8A8_UNORM` textures.
+    let r = warp();
+    let a = r.texture(8, 2).unwrap();
+    fill_rgba(&r, &a, |x, y| [x as u8 * 30, y as u8 * 100, 7, 255]);
+    let typed = r
+        .gpu
+        .create_texture(&D3D11_TEXTURE2D_DESC {
+            Width: 8,
+            Height: 2,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        })
+        .unwrap();
+    unsafe { r.gpu.context.CopyResource(&typed, &a.texture) };
+    assert_eq!(read_texture(&r, &typed, 8, 2, 4), read_rgba(&r, &a));
+    let b = r.texture(8, 2).unwrap();
+    unsafe { r.gpu.context.CopyResource(&b.texture, &typed) };
+    assert_eq!(read_rgba(&r, &b), read_rgba(&r, &a));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// NV12 in one dispatch
+
+/// A picture with every kind of value: noise, ramps, saturated colours, black and white.
+fn noisy(w: u32, h: u32) -> Vec<[u8; 4]> {
+    let mut seed = 0x9e37_79b9u32;
+    (0..w * h)
+        .map(|i| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let n = (seed >> 24) as u8;
+            let (x, y) = (i % w, i / w);
+            match i % 7 {
+                0 => [n, (x * 255 / w) as u8, (y * 255 / h) as u8, 255],
+                1 => [255, 255, 255, 255],
+                2 => [0, 0, 0, 255],
+                3 => [255, 0, 0, 255],
+                _ => [n, n.wrapping_mul(3), n.wrapping_add(91), 255],
+            }
+        })
+        .collect()
+}
+
+fn encode_both_ways(r: &Arc<Renderer>, w: u32, h: u32) {
+    let px = noisy(w, h);
+    let src = r.texture(w, h).unwrap();
+    fill_rgba(r, &src, |x, y| px[(y * w + x) as usize]);
+    let planes = |enc: &mut Encoder| -> (bool, Vec<Vec<u8>>) {
+        let t = enc.encode(&src, EncodeFormat::Nv12).unwrap();
+        let bytes = t
+            .planes
+            .iter()
+            .map(|p| read_texture(r, &p.texture, p.desc.width, p.desc.height, p.desc.bytes_per_texel))
+            .collect();
+        (t.packed, bytes)
+    };
+    let mut one = Encoder::new(r.clone()).unwrap();
+    let mut two = Encoder::new(r.clone()).unwrap();
+    two.force_two_passes = true;
+    let (packed, a) = planes(&mut one);
+    let (unpacked, b) = planes(&mut two);
+    assert!(!unpacked, "the two-pass encoder never packs");
+    assert_eq!(packed, w.is_multiple_of(4) && h.is_multiple_of(2), "{w}x{h}: packed only where a thread's block fits");
+    // The same bytes, plane for plane (the planes may be different textures: R32_UINT or R8 / R8G8).
+    assert_eq!(a.len(), 2);
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        assert_eq!(x.len(), y.len(), "{w}x{h} plane {i}: size");
+        let worst = x.iter().zip(y).map(|(p, q)| p.abs_diff(*q)).max().unwrap();
+        let differing = x.iter().zip(y).filter(|(p, q)| p != q).count();
+        // The render target converts float to 8 bit in the output merger (with the hardware's own tolerance), the
+        // shader rounds by hand: a value within a hair of .5 may land on either side. One code at most, and rarely.
+        assert!(worst <= 1 && differing * 100 <= x.len() * 4, "{w}x{h} plane {i}: worst {worst}, {differing} of {} differ", x.len());
+    }
+    // And the bytes are what a CPU calculation of BT.709 limited range gives, within a code.
+    let rows = rgb_to_yuv_rows(ColorSpace::Bt709, ColorRange::Limited);
+    let y_at = |x: u32, y: u32| {
+        let p = px[(y * w + x) as usize];
+        let v = rows[0][0] * p[0] as f64 / 255.0 + rows[0][1] * p[1] as f64 / 255.0 + rows[0][2] * p[2] as f64 / 255.0 + rows[0][3];
+        (v.clamp(0.0, 1.0) * 255.0).round()
+    };
+    for (x, y) in [(0, 0), (w - 1, 0), (w / 2, h / 2), (w - 1, h - 1), (1, h - 1)] {
+        let got = a[0][(y * w + x) as usize] as f64;
+        assert!((got - y_at(x, y)).abs() <= 1.0, "{w}x{h} luma at ({x},{y}): {got} against {}", y_at(x, y));
+    }
+}
+
+fn nv12_in_one_dispatch_on(r: &Arc<Renderer>) {
+    // The packed path (width a multiple of 4), at sizes that fill a thread group exactly, leave a partial one, and
+    // are as small as one block; and the sizes that fall back to two draws (a width of 2 mod 4).
+    for (w, h) in [(64, 32), (48, 34), (68, 18), (4, 2), (8, 2), (1920, 1080), (50, 34), (2, 2), (642, 360)] {
+        encode_both_ways(r, w, h);
+    }
+}
+
+#[test]
+fn nv12_in_one_dispatch_matches_the_two_draws_warp() {
+    nv12_in_one_dispatch_on(&warp());
+}
+
+#[test]
+fn nv12_in_one_dispatch_matches_the_two_draws_hardware() {
+    match renderer(AdapterKind::Hardware) {
+        Some(r) => nv12_in_one_dispatch_on(&r),
+        None => eprintln!("no hardware adapter here"),
+    }
+}
+
+#[test]
+fn packed_nv12_planes_read_back_through_the_ring_with_the_rows_of_the_nv12_planes() {
+    let r = warp();
+    let (w, h) = (64u32, 32u32);
+    let px = noisy(w, h);
+    let src = r.texture(w, h).unwrap();
+    fill_rgba(&r, &src, |x, y| px[(y * w + x) as usize]);
+    let mut enc = Encoder::new(r.clone()).unwrap();
+    let t = enc.encode(&src, EncodeFormat::Nv12).unwrap();
+    assert!(t.packed);
+    let descs = t.plane_descs();
+    // The rows hold w bytes in both planes, whatever the texel format, and the heights are those of NV12.
+    assert_eq!((descs[0].row_bytes(), descs[0].height), (w as usize, h));
+    assert_eq!((descs[1].row_bytes(), descs[1].height), (w as usize, h / 2));
+    let mut ring: ReadbackRing<()> = ReadbackRing::new(r.gpu.clone(), &descs).unwrap();
+    ring.submit(&t.textures(), ()).unwrap();
+    let want_y = read_texture(&r, &t.planes[0].texture, descs[0].width, descs[0].height, descs[0].bytes_per_texel);
+    let want_uv = read_texture(&r, &t.planes[1].texture, descs[1].width, descs[1].height, descs[1].bytes_per_texel);
+    ring.poll(true, |planes, ()| {
+        let mut y = vec![0u8; (w * h) as usize];
+        planes[0].copy_to(&mut y, w as usize);
+        let mut uv = vec![0u8; (w * h / 2) as usize];
+        planes[1].copy_to(&mut uv, w as usize);
+        assert_eq!(y, want_y);
+        assert_eq!(uv, want_uv);
+    })
+    .unwrap()
+    .expect("a frame");
 }

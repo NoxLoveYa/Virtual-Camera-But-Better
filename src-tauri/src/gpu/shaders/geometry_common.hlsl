@@ -19,10 +19,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 // OBS filters the picture in linear light on premultiplied alpha: its textures are sRGB views, so the sampler decodes
 // before it filters, and the framebuffer encodes again. The working texture here holds gamma-encoded sRGB with
-// straight alpha, so the scaling shaders do both steps themselves: `fetch` returns a texel as premultiplied linear
-// light, the shader weights and adds those, and `finish` turns the sum back into a gamma-encoded straight texel.
-// Opaque pixels (every camera frame) see no difference from straight alpha; translucent ones (after a key or a
-// mask) keep their colour at the edges instead of fading towards black.
+// straight alpha. A pass in linear light (every mode but a point copy, see gpu::Views::LINEAR) binds the `_SRGB`
+// shader resource view as `image` and the `_SRGB` render target view, so the hardware does both conversions: `fetch`
+// returns a texel as premultiplied linear light (a load is already linear), the shader weights and adds those, and
+// `finish` turns the sum into a straight texel that the output merger encodes. Opaque pixels (every camera frame)
+// see no difference from straight alpha; translucent ones (after a key or a mask) keep their colour at the edges
+// instead of fading towards black. A pass that moves texels without changing them (a point copy, a quarter turn) binds
+// the plain views instead and `Load`s the codes, so every code survives exactly.
 //
 // The shaders read the input with Load only, so the sampler is not used: every filtering mode is spelled out here.
 
@@ -38,23 +41,12 @@ void init_dims()
     g_dim = int2(w, h);
 }
 
-float3 srgb_to_linear(float3 c)
-{
-    return (c <= 0.04045) ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
-}
-
-float3 linear_to_srgb(float3 c)
-{
-    c = saturate(c);
-    return (c <= 0.0031308) ? 12.92 * c : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
-}
-
-// Premultiplied linear texel `p`; coordinates outside the picture read the nearest edge texel (OBS: clamp).
+// Premultiplied linear texel `p` (the `_SRGB` view decodes on load); coordinates outside the picture read the nearest edge texel (OBS: clamp).
 float4 fetch(int2 p)
 {
     p = clamp(p, int2(0, 0), g_dim - 1);
     float4 t = image.Load(int3(p, 0));
-    return float4(srgb_to_linear(t.rgb) * t.a, t.a);
+    return float4(t.rgb * t.a, t.a);
 }
 
 // The same, but a coordinate outside the picture is transparent (OBS: border colour 00000000).
@@ -90,10 +82,11 @@ float4 sample_bilinear_border(float2 pos)
     return lerp(top, bottom, f.y);
 }
 
-// A premultiplied linear sum back to the working format: straight alpha, gamma-encoded.
+// A premultiplied linear sum back to the working format: straight alpha, linear (the `_SRGB` render target clamps to
+// 0..1 and encodes).
 float4 finish(float4 p)
 {
     float a = saturate(p.a);
     float3 rgb = (a > 0.0) ? p.rgb / a : float3(0.0, 0.0, 0.0);
-    return float4(linear_to_srgb(rgb), a);
+    return float4(saturate(rgb), a);
 }

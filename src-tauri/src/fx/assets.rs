@@ -143,11 +143,14 @@ impl Asset {
     }
 }
 
-/// A picture on the GPU: `R8G8B8A8_UNORM`, straight alpha, top row first.
+/// A picture on the GPU: `R8G8B8A8` (typeless, so it has two views), straight alpha, top row first.
 pub struct ImageAsset {
     pub width: u32,
     pub height: u32,
+    /// The codes as stored (`R8G8B8A8_UNORM`).
     pub srv: ID3D11ShaderResourceView,
+    /// The same texels read in linear light (`R8G8B8A8_UNORM_SRGB`), for a shader that works in linear light.
+    pub srv_linear: ID3D11ShaderResourceView,
 }
 
 /// A `.cube` table and the texture made from it with [`CubeLut::create_texture`]`(gpu, true)`, which is what OBS
@@ -724,6 +727,48 @@ pub fn create_texture_rgba8(
     create_texture2d(gpu, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, 4, rgba)
 }
 
+/// A picture as an `R8G8B8A8_TYPELESS` texture with two views: the codes as stored (`UNORM`) and the same texels read
+/// in linear light (`UNORM_SRGB`: the hardware decodes on read, alpha untouched). Returns `(codes, linear)`.
+pub fn create_image_rgba8(
+    gpu: &GpuDevice,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> GpuResult<(ID3D11ShaderResourceView, ID3D11ShaderResourceView)> {
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB};
+    if width == 0 || height == 0 || rgba.len() != width as usize * height as usize * 4 {
+        return Err(GpuError::Invalid(format!(
+            "{} bytes for a {width}x{height} texture of 4-byte texels",
+            rgba.len()
+        )));
+    }
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_R8G8B8A8_TYPELESS,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: D3D11_USAGE_IMMUTABLE,
+        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let init = D3D11_SUBRESOURCE_DATA {
+        pSysMem: rgba.as_ptr() as *const _,
+        SysMemPitch: width * 4,
+        SysMemSlicePitch: 0,
+    };
+    let mut tex = None;
+    // SAFETY: `desc`, `init` and `rgba` live through the call; the data length was checked against the pitch.
+    unsafe { gpu.device.CreateTexture2D(&desc, Some(&init), Some(&mut tex))? };
+    let tex = tex.ok_or_else(null_pointer)?;
+    Ok((
+        gpu.create_srv(&tex, DXGI_FORMAT_R8G8B8A8_UNORM)?,
+        gpu.create_srv(&tex, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)?,
+    ))
+}
+
 /// A cubic 3D texture of `R8G8B8A8_UNORM` texels (a `.png` table cut into `size` slices, for example).
 pub fn create_texture3d_rgba8(
     gpu: &GpuDevice,
@@ -812,12 +857,13 @@ pub fn load_asset(gpu: &GpuDevice, kind: AssetKind, path: &Path) -> Result<Asset
     match kind {
         AssetKind::Image => {
             let img = decode_image(path)?;
-            let srv = create_texture_rgba8(gpu, img.width, img.height, &img.rgba)
+            let (srv, srv_linear) = create_image_rgba8(gpu, img.width, img.height, &img.rgba)
                 .map_err(|e| e.to_string())?;
             Ok(Asset::Image(ImageAsset {
                 width: img.width,
                 height: img.height,
                 srv,
+                srv_linear,
             }))
         }
         AssetKind::Lut | AssetKind::ColorLut if is_cube(path) => {

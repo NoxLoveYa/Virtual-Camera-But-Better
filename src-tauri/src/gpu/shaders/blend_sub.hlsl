@@ -23,8 +23,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //
 // OBS runs the effect on an sRGB texture with an sRGB framebuffer, and binds the mask picture with
 // gs_effect_set_texture_srgb: both pictures are linear light, filtered in linear light. The textures here are
-// gamma-encoded, so the shader decodes and encodes itself, and filters the mask by hand (four Loads, decoded, then
-// the bilinear weights) instead of with the sampler. OBS un-premultiplies the picture first and premultiplies the
+// gamma-encoded: the filter binds the _SRGB shader resource views (a load gives linear light) and the _SRGB render
+// target view (the value returned is encoded by the output merger), see gpu::Views::LINEAR. The shader filters the
+// mask by hand (four Loads, then the bilinear weights) instead of with the sampler, so the weights see the alpha. OBS un-premultiplies the picture first and premultiplies the
 // result; this pipeline keeps straight alpha, so both steps are left out. The mask picture is straight alpha too (OBS
 // loads it with GS_IMAGE_ALPHA_STRAIGHT; the blend ignores its alpha). For a translucent pixel whose colour overshoots
 // 1 OBS clamps the premultiplied colour, this pipeline the straight one: a small difference at low alpha.
@@ -46,23 +47,12 @@ cbuffer Params : register(b0)
     float2 pad;
 };
 
-float3 srgb_to_linear(float3 c)
-{
-    return (c <= 0.04045) ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
-}
-
-float3 linear_to_srgb(float3 c)
-{
-    c = saturate(c);
-    return (c <= 0.0031308) ? 12.92 * c : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
-}
-
 // One texel of the mask picture: linear colour, straight alpha.
 float4 mask_texel(int2 p)
 {
     int2 q = clamp(p, int2(0, 0), int2(target_size) - 1);
     float4 t = target.Load(int3(q, 0));
-    return float4(srgb_to_linear(t.rgb), t.a);
+    return t;
 }
 
 // target.Sample(textureSampler, uv2): bilinear, clamped, filtered in linear light.
@@ -85,11 +75,12 @@ float4 main(float4 pos : SV_Position) : SV_Target
     float2 uv = pos.xy / float2(iw, ih);
 
     float4 t = image.Load(int3(int2(pos.xy), 0));
-    float4 rgba = float4((t.a > 0.0) ? srgb_to_linear(t.rgb) : float3(0.0, 0.0, 0.0), t.a);
+    float4 rgba = float4((t.a > 0.0) ? t.rgb : float3(0.0, 0.0, 0.0), t.a);
     rgba *= color;
 
     float4 target_rgba = sample_target(uv * mul_val + add_val);
     rgba.rgb = saturate(rgba.rgb - target_rgba.rgb);
 
-    return float4(linear_to_srgb(rgba.rgb), saturate(rgba.a));
+    // The `_SRGB` render target clamps to 0..1 and encodes.
+    return float4(saturate(rgba.rgb), saturate(rgba.a));
 }

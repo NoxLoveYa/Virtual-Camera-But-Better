@@ -28,8 +28,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //
 // OBS runs the effect on an sRGB texture with an sRGB framebuffer, so the maths is in linear light, and its textures
 // hold premultiplied alpha, so the kernel runs on (r, g, b) * a and a together (alpha is sharpened as well). The
-// working texture here is gamma-encoded with straight alpha, so the shader linearizes and premultiplies on load and
-// does the opposite on the way out.
+// working texture here is gamma-encoded with straight alpha: the filter binds its `_SRGB` shader resource view and
+// render target view (gpu::Views::LINEAR), so a load already gives linear light and the value returned is encoded by
+// the output merger. The shader premultiplies on load and does the opposite on the way out.
 
 Texture2D<float4> image : register(t0);
 SamplerState linear_clamp : register(s0);
@@ -40,23 +41,12 @@ cbuffer Params : register(b0)
     float3 pad;
 };
 
-float3 srgb_to_linear(float3 c)
-{
-    return (c <= 0.04045) ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
-}
-
-float3 linear_to_srgb(float3 c)
-{
-    c = saturate(c);
-    return (c <= 0.0031308) ? 12.92 * c : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
-}
-
-// The texel at `p` (clamped into the picture) as OBS sees it: linear light, premultiplied.
+// The texel at `p` (clamped into the picture) as OBS sees it: linear light (from the `_SRGB` view), premultiplied.
 float4 fetch(int2 p, int2 size)
 {
     p = clamp(p, int2(0, 0), size - 1);
     float4 s = image.Load(int3(p, 0));
-    return float4(srgb_to_linear(s.rgb) * s.a, s.a);
+    return float4(s.rgb * s.a, s.a);
 }
 
 float4 main(float4 pos : SV_Position) : SV_Target
@@ -93,8 +83,8 @@ float4 main(float4 pos : SV_Position) : SV_Target
         ? saturate(E + color * sharpness)
         : E;
 
-    // Back to straight alpha and gamma-encoded light.
+    // Back to straight alpha; the `_SRGB` render target clamps and encodes.
     float a = color.a;
     float3 rgb = (a > 0.0) ? color.rgb / a : float3(0.0, 0.0, 0.0);
-    return float4(linear_to_srgb(rgb), a);
+    return float4(saturate(rgb), a);
 }

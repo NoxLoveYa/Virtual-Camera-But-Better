@@ -1217,7 +1217,14 @@ fn auto_adjust_defaults_give_the_output_of_the_previous_filter() {
             )
             .unwrap();
         }
-        assert_eq!(new, read_rgba(&rig.r, &reference), "frame {n}");
+        // The colour is converted by the hardware now (decoded on read, encoded on write) where the previous shader
+        // did it with `pow`: the two round differently in the last bit, so a code may differ by one. Alpha is exact.
+        let reference = read_rgba(&rig.r, &reference);
+        assert_eq!(new.len(), reference.len());
+        for (i, (a, b)) in new.iter().zip(&reference).enumerate() {
+            let limit = if i % 4 == 3 { 0 } else { 1 };
+            assert!(a.abs_diff(*b) <= limit, "frame {n}, byte {i}: {a} against {b}");
+        }
     }
     assert!(moved, "the test picture needs a correction");
 }

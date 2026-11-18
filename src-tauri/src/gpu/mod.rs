@@ -5,7 +5,9 @@
 //!   bytecode embedded ([`precompiled`]), so creating the cache and the shader objects compiles nothing. A source that
 //!   is not built in (a test's, an extension's) compiles at runtime with [`compile_shader`]. The bytecode and the
 //!   shader objects are cached in memory.
-//! * [`TexturePool`] / [`RgbaTexture`]: pooled `R8G8B8A8_UNORM` render targets keyed by size (the working format).
+//! * [`TexturePool`] / [`RgbaTexture`]: pooled `R8G8B8A8_TYPELESS` render targets keyed by size (the working format:
+//!   gamma-encoded sRGB codes), each with `UNORM` views for the codes and `UNORM_SRGB` views for linear light
+//!   ([`Space`]), so the hardware converts on sample and on write where a pass works in linear light.
 //! * [`Renderer`]: the device plus those caches and a fullscreen-triangle draw helper. Every pass of the pipeline
 //!   (convert, filters, output, encode) is one [`Renderer::draw`].
 //! * [`GpuTimer`]: GPU time of the frame via timestamp queries.
@@ -39,9 +41,10 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
+    D3D11CreateDevice, ID3D11Buffer, ID3D11ComputeShader, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
     ID3D11PixelShader, ID3D11Query, ID3D11RenderTargetView, ID3D11SamplerState,
-    ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader, D3D11_BIND_CONSTANT_BUFFER,
+    ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11UnorderedAccessView, ID3D11VertexShader,
+    D3D11_BIND_CONSTANT_BUFFER,
     D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BUFFER_DESC,
     D3D11_COMPARISON_NEVER, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
     D3D11_CREATE_DEVICE_FLAG, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_FILTER_MIN_MAG_MIP_LINEAR,
@@ -50,7 +53,10 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT,
     D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+    DXGI_SAMPLE_DESC,
+};
 use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIAdapter1, IDXGIDevice};
 use windows::Win32::Media::MediaFoundation::{IMFDXGIDeviceManager, MFCreateDXGIDeviceManager};
 
@@ -319,6 +325,59 @@ impl GpuDevice {
         };
         v.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_POINTER).into())
     }
+
+    /// An unordered access view of mip 0 of `texture` (made with `D3D11_BIND_UNORDERED_ACCESS`) as `format`.
+    pub fn create_uav(
+        &self,
+        texture: &ID3D11Texture2D,
+        format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    ) -> GpuResult<ID3D11UnorderedAccessView> {
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_TEX2D_UAV, D3D11_UAV_DIMENSION_TEXTURE2D, D3D11_UNORDERED_ACCESS_VIEW_DESC,
+            D3D11_UNORDERED_ACCESS_VIEW_DESC_0,
+        };
+        let desc = D3D11_UNORDERED_ACCESS_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D11_UAV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture2D: D3D11_TEX2D_UAV { MipSlice: 0 },
+            },
+        };
+        let mut v = None;
+        // SAFETY: plain call; `desc` and the out pointer are locals.
+        unsafe {
+            self.device
+                .CreateUnorderedAccessView(texture, Some(&desc), Some(&mut v))?
+        };
+        v.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_POINTER).into())
+    }
+
+    /// A render target view of mip 0 of `texture` seen as `format` (a typeless texture needs one, and a `_SRGB`
+    /// view of a `UNORM` family).
+    pub fn create_rtv_as(
+        &self,
+        texture: &ID3D11Texture2D,
+        format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    ) -> GpuResult<ID3D11RenderTargetView> {
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_RENDER_TARGET_VIEW_DESC, D3D11_RENDER_TARGET_VIEW_DESC_0, D3D11_RTV_DIMENSION_TEXTURE2D,
+            D3D11_TEX2D_RTV,
+        };
+        let desc = D3D11_RENDER_TARGET_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
+                Texture2D: D3D11_TEX2D_RTV { MipSlice: 0 },
+            },
+        };
+        let mut v = None;
+        // SAFETY: plain call; `desc` and the out pointer are locals.
+        unsafe {
+            self.device
+                .CreateRenderTargetView(texture, Some(&desc), Some(&mut v))?
+        };
+        v.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_POINTER).into())
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -334,13 +393,15 @@ pub enum ShaderId {
     ConvertI420,
     ConvertRgb,
     EncodeNv12,
+    /// Both NV12 planes in one compute dispatch (entry point `main`, `cs_5_0`).
+    EncodeNv12Cs,
     EncodeBgra,
     OutputFit,
     PreviewDown,
 }
 
 impl ShaderId {
-    pub const ALL: [ShaderId; 10] = [
+    pub const ALL: [ShaderId; 11] = [
         ShaderId::FullscreenVs,
         ShaderId::ConvertNv12,
         ShaderId::ConvertP010,
@@ -348,6 +409,7 @@ impl ShaderId {
         ShaderId::ConvertI420,
         ShaderId::ConvertRgb,
         ShaderId::EncodeNv12,
+        ShaderId::EncodeNv12Cs,
         ShaderId::EncodeBgra,
         ShaderId::OutputFit,
         ShaderId::PreviewDown,
@@ -362,6 +424,7 @@ impl ShaderId {
             ShaderId::ConvertI420 => "convert_i420",
             ShaderId::ConvertRgb => "convert_rgb",
             ShaderId::EncodeNv12 => "encode_nv12",
+            ShaderId::EncodeNv12Cs => "encode_nv12_cs",
             ShaderId::EncodeBgra => "encode_bgra",
             ShaderId::OutputFit => "output_fit",
             ShaderId::PreviewDown => "preview_down",
@@ -379,6 +442,7 @@ impl ShaderId {
             ShaderId::ConvertI420 => include_str!("shaders/convert_i420.hlsl"),
             ShaderId::ConvertRgb => include_str!("shaders/convert_rgb.hlsl"),
             ShaderId::EncodeNv12 => include_str!("shaders/encode_nv12.hlsl"),
+            ShaderId::EncodeNv12Cs => include_str!("shaders/encode_nv12_cs.hlsl"),
             ShaderId::EncodeBgra => include_str!("shaders/encode_bgra.hlsl"),
             ShaderId::OutputFit => include_str!("shaders/output_fit.hlsl"),
             ShaderId::PreviewDown => include_str!("shaders/preview_down.hlsl"),
@@ -470,6 +534,7 @@ pub struct ShaderCache {
     device: ID3D11Device,
     vertex: Mutex<HashMap<ShaderId, ID3D11VertexShader>>,
     pixel: Mutex<HashMap<(ShaderId, &'static str), ID3D11PixelShader>>,
+    compute: Mutex<HashMap<ShaderId, ID3D11ComputeShader>>,
     bytecode: Mutex<Bytecodes>,
     /// Pixel shaders compiled from sources that do not belong to [`ShaderId`] (the filters), by name.
     custom: Mutex<HashMap<&'static str, ID3D11PixelShader>>,
@@ -484,6 +549,7 @@ impl ShaderCache {
             device,
             vertex: Mutex::default(),
             pixel: Mutex::default(),
+            compute: Mutex::default(),
             bytecode: Mutex::default(),
             custom: Mutex::default(),
         }
@@ -565,12 +631,33 @@ impl ShaderCache {
         Ok(ps)
     }
 
+    /// The compute shader `id` (entry point `main`).
+    pub fn compute(&self, id: ShaderId) -> GpuResult<ID3D11ComputeShader> {
+        if let Some(c) = lock(&self.compute).get(&id) {
+            return Ok(c.clone());
+        }
+        let code = self.bytecode(id, "main", "cs_5_0")?;
+        let mut cs = None;
+        // SAFETY: plain call with valid bytecode.
+        unsafe { self.device.CreateComputeShader(&code, None, Some(&mut cs))? };
+        let cs = cs.ok_or_else(|| {
+            GpuError::Api(windows::core::Error::from(
+                windows::Win32::Foundation::E_POINTER,
+            ))
+        })?;
+        lock(&self.compute).insert(id, cs.clone());
+        Ok(cs)
+    }
+
     /// Compile everything now (startup), so the first frame does not pay for it. Returns the first error.
     pub fn warm_up(&self) -> GpuResult<()> {
         self.vertex(ShaderId::FullscreenVs)?;
         for id in ShaderId::ALL {
             match id {
                 ShaderId::FullscreenVs => {}
+                ShaderId::EncodeNv12Cs => {
+                    self.compute(id)?;
+                }
                 ShaderId::EncodeNv12 => {
                     self.pixel(id, "PSLuma")?;
                     self.pixel(id, "PSChroma")?;
@@ -587,13 +674,93 @@ impl ShaderCache {
 // ---------------------------------------------------------------------------------------------------------------
 // Textures
 
-/// A pooled working texture: `R8G8B8A8_UNORM`, render target and shader resource.
+/// Which way a pass looks at the texels of a pooled texture.
+///
+/// The texture holds gamma-encoded sRGB codes. A pass that works in linear light reads it through the `_SRGB` view,
+/// so the sampler hands over linear values, and writes it through the `_SRGB` render target view, so the output
+/// merger encodes what the shader returns: the hardware does the conversion that every shader used to do with `pow`.
+/// A pass that works on the codes themselves (copies, the YUV conversions, a filter defined in gamma space) uses the
+/// plain `UNORM` views and sees the codes as they are. Alpha is never converted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Space {
+    /// The codes as stored (`R8G8B8A8_UNORM` views).
+    Encoded,
+    /// Linear light (`R8G8B8A8_UNORM_SRGB` views): decoded on read, encoded on write.
+    Linear,
+}
+
+/// The views one filter pass uses: how it reads its input, how it writes its output, and whether the codes of the
+/// input are bound as well (as the last texture, after the extra inputs, for a shader that needs both the linear
+/// light and the code it came from, such as a lookup table addressed by the code).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Views {
+    pub read: Space,
+    pub write: Space,
+    pub with_codes: bool,
+}
+
+impl Views {
+    /// Codes in, codes out: copies and filters defined on the encoded values.
+    pub const ENCODED: Views = Views { read: Space::Encoded, write: Space::Encoded, with_codes: false };
+    /// Linear light in, linear light out: the hardware decodes on read and encodes on write.
+    pub const LINEAR: Views = Views { read: Space::Linear, write: Space::Linear, with_codes: false };
+    /// As [`Views::LINEAR`], with the codes of the input bound too.
+    pub const LINEAR_WITH_CODES: Views = Views { read: Space::Linear, write: Space::Linear, with_codes: true };
+    /// Linear light in and the codes of the input bound too, but the shader writes codes (it keeps the colour).
+    pub const LINEAR_IN_CODES_OUT: Views = Views { read: Space::Linear, write: Space::Encoded, with_codes: true };
+
+    /// The shader resources of a pass over `input`: `t0` is the input as these views read it, then `extras`, then (with
+    /// [`Views::with_codes`]) the codes of the input.
+    pub fn bind(
+        self,
+        input: &RgbaTexture,
+        extras: &[Option<ID3D11ShaderResourceView>],
+    ) -> Vec<Option<ID3D11ShaderResourceView>> {
+        let mut srvs = Vec::with_capacity(2 + extras.len());
+        srvs.push(Some(input.srv_in(self.read).clone()));
+        srvs.extend(extras.iter().cloned());
+        if self.with_codes {
+            srvs.push(Some(input.srv.clone()));
+        }
+        srvs
+    }
+
+    /// The render target that takes the output of a pass with these views.
+    pub fn target(self, output: &RgbaTexture) -> &ID3D11RenderTargetView {
+        output.rtv_in(self.write)
+    }
+}
+
+/// A pooled working texture: `R8G8B8A8_TYPELESS` with a render target view and a shader resource view of each kind,
+/// `UNORM` ([`RgbaTexture::srv`], [`RgbaTexture::rtv`]: the codes) and `UNORM_SRGB` (linear light, see [`Space`]).
 pub struct RgbaTexture {
     pub texture: ID3D11Texture2D,
     pub rtv: ID3D11RenderTargetView,
     pub srv: ID3D11ShaderResourceView,
+    /// The same texels through the `_SRGB` format: a read gives linear light.
+    pub srv_srgb: ID3D11ShaderResourceView,
+    /// The same texels through the `_SRGB` format: a write is encoded from linear light.
+    pub rtv_srgb: ID3D11RenderTargetView,
     pub width: u32,
     pub height: u32,
+}
+
+impl RgbaTexture {
+    /// The shader resource view that shows the texels in `space`.
+    pub fn srv_in(&self, space: Space) -> &ID3D11ShaderResourceView {
+        match space {
+            Space::Encoded => &self.srv,
+            Space::Linear => &self.srv_srgb,
+        }
+    }
+
+    /// The render target view that takes values in `space`.
+    pub fn rtv_in(&self, space: Space) -> &ID3D11RenderTargetView {
+        match space {
+            Space::Encoded => &self.rtv,
+            Space::Linear => &self.rtv_srgb,
+        }
+    }
 }
 
 /// Textures per size that stay in the pool when returned.
@@ -646,7 +813,7 @@ impl TexturePool {
             Height: height,
             MipLevels: 1,
             ArraySize: 1,
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            Format: DXGI_FORMAT_R8G8B8A8_TYPELESS,
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
@@ -657,12 +824,16 @@ impl TexturePool {
             MiscFlags: 0,
         };
         let texture = self.gpu.create_texture(&desc)?;
-        let rtv = self.gpu.create_rtv(&texture)?;
+        let rtv = self.gpu.create_rtv_as(&texture, DXGI_FORMAT_R8G8B8A8_UNORM)?;
         let srv = self.gpu.create_srv(&texture, DXGI_FORMAT_R8G8B8A8_UNORM)?;
+        let rtv_srgb = self.gpu.create_rtv_as(&texture, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)?;
+        let srv_srgb = self.gpu.create_srv(&texture, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)?;
         Ok(RgbaTexture {
             texture,
             rtv,
             srv,
+            srv_srgb,
+            rtv_srgb,
             width,
             height,
         })
@@ -875,6 +1046,36 @@ impl Renderer {
             ctx.RSSetViewports(Some(&[viewport]));
             ctx.Draw(3, 0);
             ctx.PSSetShaderResources(0, Some(&none[..pass.srvs.len().min(none.len())]));
+        }
+    }
+
+    /// One compute dispatch of `groups` thread groups. `srvs` are bound from slot 0, `uavs` from slot 0, and all of
+    /// it is unbound again afterwards. Render targets are unbound first: a texture that is still the output of the
+    /// previous draw would read as black through a shader resource view.
+    pub fn dispatch(
+        &self,
+        cs: &ID3D11ComputeShader,
+        srvs: &[Option<ID3D11ShaderResourceView>],
+        constants: Option<&ConstantBuffer>,
+        uavs: &[Option<ID3D11UnorderedAccessView>],
+        groups: (u32, u32),
+    ) {
+        let ctx = &self.gpu.context;
+        let no_srvs: [Option<ID3D11ShaderResourceView>; 4] = [None, None, None, None];
+        let no_uavs: [Option<ID3D11UnorderedAccessView>; 4] = [None, None, None, None];
+        // SAFETY: plain state-setting calls on the render thread's context; every slice and COM pointer outlives the
+        // calls, and the counts are the slice lengths (at most 4, the size of the null arrays).
+        unsafe {
+            ctx.OMSetRenderTargets(None, None);
+            ctx.CSSetShader(cs, None);
+            ctx.CSSetShaderResources(0, Some(srvs));
+            if let Some(c) = constants {
+                ctx.CSSetConstantBuffers(0, Some(&[Some(c.buffer.clone())]));
+            }
+            ctx.CSSetUnorderedAccessViews(0, uavs.len() as u32, Some(uavs.as_ptr()), None);
+            ctx.Dispatch(groups.0, groups.1, 1);
+            ctx.CSSetUnorderedAccessViews(0, uavs.len() as u32, Some(no_uavs.as_ptr()), None);
+            ctx.CSSetShaderResources(0, Some(&no_srvs[..srvs.len().min(no_srvs.len())]));
         }
     }
 

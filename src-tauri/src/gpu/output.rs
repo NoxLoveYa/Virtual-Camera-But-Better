@@ -2,18 +2,20 @@
 //!
 //! * [`OutputStage`]: places the filter chain result in the output frame (fit / fill / stretch) over a background
 //!   colour. Transparent pixels from keys and masks show the background; the result is opaque.
-//! * [`Encoder`]: RGBA to NV12 (BT.709 limited range) as an `R8_UNORM` Y target (W x H) and an `R8G8_UNORM` UV target
-//!   (W/2 x H/2), or to `B8G8R8A8` for RGB32 consumers.
+//! * [`Encoder`]: RGBA to NV12 (BT.709 limited range), or to `B8G8R8A8` for RGB32 consumers. NV12 is made in one compute
+//!   dispatch that writes both planes (a frame whose width is a multiple of 4 and whose height is even; the planes are
+//!   `R32_UINT` textures whose bytes are the rows of the Y and the UV plane), or, for any other even size, by two draws
+//!   into an `R8_UNORM` Y target (W x H) and an `R8G8_UNORM` UV target (W/2 x H/2).
 
 use std::sync::Arc;
 
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11RenderTargetView, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT,
+    ID3D11RenderTargetView, ID3D11Texture2D, ID3D11UnorderedAccessView, D3D11_BIND_RENDER_TARGET,
+    D3D11_BIND_UNORDERED_ACCESS, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM,
-    DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R8G8_UNORM,
+    DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
 };
 
 use super::convert::{rgb_to_yuv_rows, ColorRange, ColorSpace};
@@ -88,8 +90,19 @@ pub struct OutputParams {
 struct FitParams {
     dst_rect: [f32; 4],
     background: [f32; 4],
+    /// `background` in linear light, for compositing translucent pixels (made here once, not by `pow` per pixel).
+    background_linear: [f32; 4],
     point_mode: u32,
     pad: [u32; 3],
+}
+
+/// The sRGB code `c` (0..1) in linear light.
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 /// Stage 3: fit the filter chain result into the output frame.
@@ -126,6 +139,12 @@ impl OutputStage {
                 params.background[2],
                 1.0,
             ],
+            background_linear: [
+                srgb_to_linear(params.background[0]),
+                srgb_to_linear(params.background[1]),
+                srgb_to_linear(params.background[2]),
+                1.0,
+            ],
             // 1:1 placement: copy texels exactly instead of going through the bilinear sampler.
             point_mode: (rect.w as u32 == input.width && rect.h as u32 == input.height) as u32,
             pad: [0; 3],
@@ -157,10 +176,12 @@ pub enum EncodeFormat {
     Bgra,
 }
 
-/// One render target of the encoded frame.
+/// One plane of the encoded frame: the texture, how the encoder writes it (a render target view for the draws, an
+/// unordered access view for the compute dispatch) and how it is read back.
 pub struct EncodePlane {
     pub texture: ID3D11Texture2D,
-    pub rtv: ID3D11RenderTargetView,
+    pub rtv: Option<ID3D11RenderTargetView>,
+    pub uav: Option<ID3D11UnorderedAccessView>,
     pub desc: PlaneDesc,
 }
 
@@ -169,6 +190,8 @@ pub struct EncodeTargets {
     pub format: EncodeFormat,
     pub width: u32,
     pub height: u32,
+    /// The NV12 planes are `R32_UINT` textures a compute shader writes (four bytes of the plane to a texel).
+    pub packed: bool,
     pub planes: Vec<EncodePlane>,
 }
 
@@ -190,11 +213,31 @@ struct EncodeParams {
     row_v: [f32; 4],
 }
 
+/// `cbuffer EncodeParams` of `encode_nv12_cs.hlsl`: the rows, then the blocks of 4 x 2 pixels per row and column.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct EncodeCsParams {
+    rows: EncodeParams,
+    blocks: [u32; 2],
+    pad: [u32; 2],
+}
+
+/// Whether one compute dispatch can write both NV12 planes of a `w` x `h` frame: a thread owns 4 x 2 pixels, and the
+/// planes are `R32_UINT` textures of whole texels.
+fn packs(w: u32, h: u32) -> bool {
+    w.is_multiple_of(4) && h.is_multiple_of(2)
+}
+
 /// Stage 4: RGBA to the consumer's format.
 pub struct Encoder {
     renderer: Arc<Renderer>,
     constants: ConstantBuffer,
+    /// The constants of the compute dispatch, made when the first NV12 frame needs them.
+    cs_constants: Option<ConstantBuffer>,
     targets: Option<EncodeTargets>,
+    /// Test hook: use the two draws even where one dispatch could write both planes.
+    #[cfg(test)]
+    pub(crate) force_two_passes: bool,
 }
 
 impl Encoder {
@@ -203,13 +246,17 @@ impl Encoder {
         Ok(Encoder {
             renderer,
             constants,
+            cs_constants: None,
             targets: None,
+            #[cfg(test)]
+            force_two_passes: false,
         })
     }
 
     fn make_targets(&self, format: EncodeFormat, w: u32, h: u32) -> GpuResult<EncodeTargets> {
         let gpu = &self.renderer.gpu;
-        let plane = |f: DXGI_FORMAT, w: u32, h: u32, bpt: u32| -> GpuResult<EncodePlane> {
+        // A plane written by draws (`packed` false) or by the compute shader (`packed` true: `R32_UINT`).
+        let plane = |f: DXGI_FORMAT, w: u32, h: u32, bpt: u32, packed: bool| -> GpuResult<EncodePlane> {
             let texture = gpu.create_texture(&D3D11_TEXTURE2D_DESC {
                 Width: w,
                 Height: h,
@@ -221,14 +268,19 @@ impl Encoder {
                     Quality: 0,
                 },
                 Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                BindFlags: if packed { D3D11_BIND_UNORDERED_ACCESS.0 } else { D3D11_BIND_RENDER_TARGET.0 } as u32,
                 CPUAccessFlags: 0,
                 MiscFlags: 0,
             })?;
-            let rtv = gpu.create_rtv(&texture)?;
+            let (rtv, uav) = if packed {
+                (None, Some(gpu.create_uav(&texture, f)?))
+            } else {
+                (Some(gpu.create_rtv(&texture)?), None)
+            };
             Ok(EncodePlane {
                 texture,
                 rtv,
+                uav,
                 desc: PlaneDesc {
                     format: f,
                     width: w,
@@ -237,6 +289,7 @@ impl Encoder {
                 },
             })
         };
+        let mut packed = false;
         let planes = match format {
             EncodeFormat::Nv12 => {
                 if w % 2 != 0 || h % 2 != 0 {
@@ -244,19 +297,38 @@ impl Encoder {
                         "NV12 needs an even size, got {w}x{h}"
                     )));
                 }
-                vec![
-                    plane(DXGI_FORMAT_R8_UNORM, w, h, 1)?,
-                    plane(DXGI_FORMAT_R8G8_UNORM, w / 2, h / 2, 2)?,
-                ]
+                packed = self.wants_packed(w, h);
+                if packed {
+                    // The same bytes as the R8 and R8G8 planes (a row is `w` bytes in both), four to a texel.
+                    vec![
+                        plane(DXGI_FORMAT_R32_UINT, w / 4, h, 4, true)?,
+                        plane(DXGI_FORMAT_R32_UINT, w / 4, h / 2, 4, true)?,
+                    ]
+                } else {
+                    vec![
+                        plane(DXGI_FORMAT_R8_UNORM, w, h, 1, false)?,
+                        plane(DXGI_FORMAT_R8G8_UNORM, w / 2, h / 2, 2, false)?,
+                    ]
+                }
             }
-            EncodeFormat::Bgra => vec![plane(DXGI_FORMAT_B8G8R8A8_UNORM, w, h, 4)?],
+            EncodeFormat::Bgra => vec![plane(DXGI_FORMAT_B8G8R8A8_UNORM, w, h, 4, false)?],
         };
         Ok(EncodeTargets {
             format,
             width: w,
             height: h,
+            packed,
             planes,
         })
+    }
+
+    /// Whether NV12 of this size is written by the compute dispatch (see [`packs`]).
+    fn wants_packed(&self, w: u32, h: u32) -> bool {
+        #[cfg(test)]
+        if self.force_two_passes {
+            return false;
+        }
+        packs(w, h)
     }
 
     /// Render `input` into the encode targets (kept between calls while format and size stay the same).
@@ -266,13 +338,17 @@ impl Encoder {
         format: EncodeFormat,
     ) -> GpuResult<&EncodeTargets> {
         let (w, h) = (input.width, input.height);
+        let packed = format == EncodeFormat::Nv12 && self.wants_packed(w, h);
         let same = self
             .targets
             .as_ref()
-            .is_some_and(|t| t.format == format && t.width == w && t.height == h);
+            .is_some_and(|t| t.format == format && t.width == w && t.height == h && t.packed == packed);
         if !same {
             self.targets = None;
             self.targets = Some(self.make_targets(format, w, h)?);
+        }
+        if packed && self.cs_constants.is_none() {
+            self.cs_constants = Some(self.renderer.constants(std::mem::size_of::<EncodeCsParams>())?);
         }
         let r = &self.renderer;
         let targets = self.targets.as_ref().expect("targets were just made");
@@ -282,25 +358,48 @@ impl Encoder {
                 // Encoded frames are BT.709 limited range, the media type the virtual camera advertises.
                 let rows = rgb_to_yuv_rows(ColorSpace::Bt709, ColorRange::Limited)
                     .map(|row| row.map(|v| v as f32));
-                self.constants.write(
-                    &r.gpu.context,
-                    &EncodeParams {
-                        row_y: rows[0],
-                        row_u: rows[1],
-                        row_v: rows[2],
-                    },
-                )?;
-                let luma = r.shaders.pixel(ShaderId::EncodeNv12, "PSLuma")?;
-                let chroma = r.shaders.pixel(ShaderId::EncodeNv12, "PSChroma")?;
-                for (ps, plane) in [(&luma, &targets.planes[0]), (&chroma, &targets.planes[1])] {
-                    r.draw(&Pass {
-                        ps,
-                        srvs: &srvs,
-                        constants: Some(&self.constants),
-                        target: &plane.rtv,
-                        width: plane.desc.width,
-                        height: plane.desc.height,
-                    });
+                if targets.packed {
+                    // One dispatch writes both planes: every thread reads a block of 4 x 2 pixels once.
+                    let constants = self.cs_constants.as_ref().expect("made above");
+                    constants.write(
+                        &r.gpu.context,
+                        &EncodeCsParams {
+                            rows: EncodeParams {
+                                row_y: rows[0],
+                                row_u: rows[1],
+                                row_v: rows[2],
+                            },
+                            blocks: [w / 4, h / 2],
+                            pad: [0; 2],
+                        },
+                    )?;
+                    let cs = r.shaders.compute(ShaderId::EncodeNv12Cs)?;
+                    let uavs = [targets.planes[0].uav.clone(), targets.planes[1].uav.clone()];
+                    r.dispatch(&cs, &srvs, Some(constants), &uavs, ((w / 4).div_ceil(8), (h / 2).div_ceil(8)));
+                } else {
+                    self.constants.write(
+                        &r.gpu.context,
+                        &EncodeParams {
+                            row_y: rows[0],
+                            row_u: rows[1],
+                            row_v: rows[2],
+                        },
+                    )?;
+                    let luma = r.shaders.pixel(ShaderId::EncodeNv12, "PSLuma")?;
+                    let chroma = r.shaders.pixel(ShaderId::EncodeNv12, "PSChroma")?;
+                    for (ps, plane) in [(&luma, &targets.planes[0]), (&chroma, &targets.planes[1])] {
+                        let Some(target) = &plane.rtv else {
+                            return Err(GpuError::Invalid("an NV12 plane of the two-pass encoder has no render target".into()));
+                        };
+                        r.draw(&Pass {
+                            ps,
+                            srvs: &srvs,
+                            constants: Some(&self.constants),
+                            target,
+                            width: plane.desc.width,
+                            height: plane.desc.height,
+                        });
+                    }
                 }
             }
             EncodeFormat::Bgra => {
@@ -309,7 +408,7 @@ impl Encoder {
                     ps: &ps,
                     srvs: &srvs,
                     constants: None,
-                    target: &targets.planes[0].rtv,
+                    target: targets.planes[0].rtv.as_ref().expect("the BGRA plane is a render target"),
                     width: w,
                     height: h,
                 });

@@ -46,12 +46,12 @@ use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Graphics::Direct3D11::ID3D11PixelShader;
+use windows::Win32::Graphics::Direct3D11::{ID3D11PixelShader, ID3D11ShaderResourceView};
 
 use super::effect::{live_pipelines, Kind, Pipeline, Spec, MIN_SEGMENTATION_SIZE};
 use super::Runtime;
 use crate::fx::{pf, pi, GpuFilter, Note, Params};
-use crate::gpu::{ConstantBuffer, GpuDevice, GpuResult, Pass, Renderer, RgbaTexture};
+use crate::gpu::{ConstantBuffer, GpuDevice, GpuResult, Pass, Renderer, RgbaTexture, Views};
 
 pub const REMOVAL_KIND: &str = "nv_greenscreen_filter";
 pub const BLUR_KIND: &str = "nv_blur_filter";
@@ -544,28 +544,14 @@ impl NvFilter {
                 let ps = shader(r, "nv_mask", include_str!("../../gpu/shaders/nv_mask.hlsl")).map_err(|e| e.to_string())?;
                 constants.write(&r.gpu.context, &[threshold.min(THRESHOLD_CAP), 0.0, 0.0, 0.0]).map_err(|e| e.to_string())?;
                 let mask = a.pipeline.mask.as_ref().ok_or("the mask texture is missing")?;
-                r.draw(&Pass {
-                    ps: &ps,
-                    srvs: &[Some(input.srv.clone()), Some(mask.srv.clone())],
-                    constants: Some(constants),
-                    target: &output.rtv,
-                    width: output.width,
-                    height: output.height,
-                });
+                draw_mask(r, &ps, constants, input, &mask.srv, output);
             }
             Kind::Blur | Kind::BackgroundBlur => {
                 let ps = shader(r, "nv_blend", include_str!("../../gpu/shaders/nv_blend.hlsl")).map_err(|e| e.to_string())?;
                 let use_mask: f32 = if kind == Kind::BackgroundBlur { 1.0 } else { 0.0 };
                 constants.write(&r.gpu.context, &[use_mask, 0.0, 0.0, 0.0]).map_err(|e| e.to_string())?;
                 let blurred = a.pipeline.blurred.as_ref().ok_or("the blur texture is missing")?;
-                r.draw(&Pass {
-                    ps: &ps,
-                    srvs: &[Some(input.srv.clone()), Some(blurred.srv.clone()), a.pipeline.mask.as_ref().map(|m| m.srv.clone())],
-                    constants: Some(constants),
-                    target: &output.rtv,
-                    width: output.width,
-                    height: output.height,
-                });
+                draw_blend(r, &ps, constants, input, &blurred.srv, a.pipeline.mask.as_ref().map(|m| m.srv.clone()), output);
             }
         }
         Ok(())
@@ -588,6 +574,50 @@ impl NvFilter {
 
 fn shader(r: &Renderer, name: &'static str, source: &'static str) -> GpuResult<ID3D11PixelShader> {
     r.shaders.pixel_source(name, source)
+}
+
+/// The final pass of background removal (`nv_mask.hlsl`): the picture with its alpha scaled by the mask. Nothing in
+/// it is in linear light, so the pooled textures are bound as they are (the codes).
+fn draw_mask(
+    r: &Renderer,
+    ps: &ID3D11PixelShader,
+    constants: &ConstantBuffer,
+    input: &RgbaTexture,
+    mask: &ID3D11ShaderResourceView,
+    output: &RgbaTexture,
+) {
+    let views = Views::ENCODED;
+    r.draw(&Pass {
+        ps,
+        srvs: &views.bind(input, &[Some(mask.clone())]),
+        constants: Some(constants),
+        target: views.target(output),
+        width: output.width,
+        height: output.height,
+    });
+}
+
+/// The final pass of the blurs (`nv_blend.hlsl`): the sharp picture and the blurred one mixed in linear light by the
+/// mask. The picture is read through the `_SRGB` view and the result written through the `_SRGB` render target view;
+/// the blurred picture is NVIDIA's own typed texture, which the shader decodes by hand.
+fn draw_blend(
+    r: &Renderer,
+    ps: &ID3D11PixelShader,
+    constants: &ConstantBuffer,
+    input: &RgbaTexture,
+    blurred: &ID3D11ShaderResourceView,
+    mask: Option<ID3D11ShaderResourceView>,
+    output: &RgbaTexture,
+) {
+    let views = Views::LINEAR;
+    r.draw(&Pass {
+        ps,
+        srvs: &views.bind(input, &[Some(blurred.clone()), mask]),
+        constants: Some(constants),
+        target: views.target(output),
+        width: output.width,
+        height: output.height,
+    });
 }
 
 impl Drop for NvFilter {
@@ -710,6 +740,107 @@ mod tests {
         assert!(!interval_due(&mut c, 4) || c == 1);
         let mut c = 2;
         assert!(interval_due(&mut c, 2) && c == 1);
+    }
+
+    /// The two final passes on WARP with made-up blur and mask textures (no NVIDIA runtime needed): the blend is
+    /// `lerp(blurred, picture, smoothstep(0.85, 0.95, mask.a))` in linear light, the mask pass scales alpha only.
+    #[test]
+    fn nvidia_the_final_passes_blend_in_linear_light_and_scale_alpha() {
+        use crate::gpu::pipeline_tests::{fill_rgba, read_rgba, warp};
+        use windows::Win32::Graphics::Direct3D11::{D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT};
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+
+        let r = warp();
+        let (w, h) = (8u32, 2u32);
+        let picture = |x: u32, y: u32| [(x * 36) as u8, (255 - x * 30) as u8, (y * 200) as u8, if x.is_multiple_of(3) { 255 } else { 200 }];
+        let blur_px = |x: u32, y: u32| [(255 - x * 20) as u8, (x * 25) as u8, 90 + y as u8 * 40, 255];
+        // mask alpha at every step of the smooth step
+        let mask_a = |x: u32, _y: u32| [0u8, 120, 217, 225, 232, 242, 250, 255][x as usize];
+
+        let input = r.texture(w, h).unwrap();
+        fill_rgba(&r, &input, picture);
+        // the blurred picture and the mask are textures of their own, as NVIDIA's are
+        let typed = |f: &dyn Fn(u32, u32) -> [u8; 4]| {
+            let mut data = Vec::new();
+            for y in 0..h {
+                for x in 0..w {
+                    data.extend_from_slice(&f(x, y));
+                }
+            }
+            let tex = r
+                .gpu
+                .create_texture(&D3D11_TEXTURE2D_DESC {
+                    Width: w,
+                    Height: h,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Usage: D3D11_USAGE_DEFAULT,
+                    BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                    CPUAccessFlags: 0,
+                    MiscFlags: 0,
+                })
+                .unwrap();
+            unsafe { r.gpu.context.UpdateSubresource(&tex, 0, None, data.as_ptr() as *const _, w * 4, 0) };
+            r.gpu.create_srv(&tex, DXGI_FORMAT_R8G8B8A8_UNORM).unwrap()
+        };
+        let blurred = typed(&blur_px);
+        let mask = typed(&|x, y| [0, 0, 0, mask_a(x, y)]);
+
+        let dec = |c: f64| {
+            let u = c / 255.0;
+            if u <= 0.04045 { u / 12.92 } else { ((u + 0.055) / 1.055).powf(2.4) }
+        };
+        let enc = |l: f64| {
+            let c = l.clamp(0.0, 1.0);
+            255.0 * if c <= 0.0031308 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
+        };
+        let smoothstep = |a: f64, b: f64, x: f64| {
+            let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+        let constants = r.constants(16).unwrap();
+
+        // Blur with the mask (Background Blur): the mix.
+        let ps = shader(&r, "nv_blend", include_str!("../../gpu/shaders/nv_blend.hlsl")).unwrap();
+        for use_mask in [1.0f32, 0.0] {
+            constants.write(&r.gpu.context, &[use_mask, 0.0, 0.0, 0.0]).unwrap();
+            let out = r.texture(w, h).unwrap();
+            draw_blend(&r, &ps, &constants, &input, &blurred, Some(mask.clone()), &out);
+            let got = read_rgba(&r, &out);
+            for y in 0..h {
+                for x in 0..w {
+                    let i = ((y * w + x) * 4) as usize;
+                    let m = if use_mask > 0.5 { smoothstep(0.85, 0.95, mask_a(x, y) as f64 / 255.0) } else { 0.0 };
+                    for c in 0..3 {
+                        let want = enc((1.0 - m) * dec(blur_px(x, y)[c] as f64) + m * dec(picture(x, y)[c] as f64));
+                        assert!(
+                            (got[i + c] as f64 - want).abs() <= 1.5,
+                            "use_mask {use_mask} ({x},{y}) channel {c}: {} vs {want:.1}",
+                            got[i + c]
+                        );
+                    }
+                    assert_eq!(got[i + 3], picture(x, y)[3], "alpha comes from the picture");
+                }
+            }
+        }
+
+        // Removal: the colour stays as it is, alpha is scaled.
+        let ps = shader(&r, "nv_mask", include_str!("../../gpu/shaders/nv_mask.hlsl")).unwrap();
+        let threshold = 0.9f32;
+        constants.write(&r.gpu.context, &[threshold, 0.0, 0.0, 0.0]).unwrap();
+        let out = r.texture(w, h).unwrap();
+        draw_mask(&r, &ps, &constants, &input, &mask, &out);
+        let got = read_rgba(&r, &out);
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                assert_eq!(&got[i..i + 3], &picture(x, y)[..3], "the colour is untouched");
+                let want = picture(x, y)[3] as f64 * smoothstep(threshold as f64 - 0.1, threshold as f64, mask_a(x, y) as f64 / 255.0);
+                assert!((got[i + 3] as f64 - want).abs() <= 1.5, "alpha at ({x},{y}): {} vs {want:.1}", got[i + 3]);
+            }
+        }
     }
 
     #[test]

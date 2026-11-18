@@ -10,7 +10,7 @@
 
 use super::{clamp_size, pack_f32, Program};
 use crate::fx::{pb, pf, GpuFilter, Params};
-use crate::gpu::{GpuResult, Renderer, RgbaTexture};
+use crate::gpu::{GpuResult, Renderer, RgbaTexture, Views};
 
 pub const KIND: &str = "transform";
 
@@ -129,6 +129,8 @@ impl GpuFilter for Transform {
             exact,
             0.0,
         ]);
-        self.program.draw(r, &packed, input, output)
+        // A flip or a quarter turn moves texels as they are (the codes); any other angle resamples in linear light.
+        let views = if s.quarter_turns().is_some() { Views::ENCODED } else { Views::LINEAR };
+        self.program.draw_with(r, &packed, input, output, views)
     }
 }

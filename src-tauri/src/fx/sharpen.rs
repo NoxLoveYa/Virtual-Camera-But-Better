@@ -27,6 +27,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //! which are the same points. See `sharpen.hlsl` for what the straight-alpha, gamma-encoded pipeline changes.
 
 use super::shader_filter::{ShaderFilter, ShaderFilterDef};
+use crate::gpu::Views;
 use super::{pf, GpuFilter, Params};
 
 pub const KIND: &str = "sharpness_filter";
@@ -42,7 +43,8 @@ pub static DEF: ShaderFilterDef = ShaderFilterDef {
 };
 
 pub fn make() -> Box<dyn GpuFilter> {
-    Box::new(ShaderFilter::new(&DEF))
+    // Linear light: the sampler decodes and the output merger encodes (`sharpen.hlsl`).
+    Box::new(ShaderFilter::with_views(&DEF, Views::LINEAR))
 }
 
 /// `cbuffer Params`: `float sharpness; float3 pad;`. The slider's range of `sharpness_properties` is 0 to 1.

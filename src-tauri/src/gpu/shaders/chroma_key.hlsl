@@ -22,8 +22,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // Chroma Key (OBS "chroma_key_filter" v2).
 //
 // OBS runs the effect on an sRGB texture with an sRGB framebuffer, so `image.Sample` hands the shader linear light
-// and the output merger encodes it again. The working texture here is gamma-encoded, so the shader decodes and
-// encodes itself. The chroma distance is measured on the encoded colour (OBS converts back with GetNonlinearColor).
+// and the output merger encodes it again. The working texture here is gamma-encoded: the filter binds its `_SRGB`
+// shader resource view at t0 (a load gives linear light) and its `_SRGB` render target view (the value returned is
+// encoded by the output merger), see gpu::Views::LINEAR_WITH_CODES. The chroma distance is measured on the encoded
+// colour (OBS converts back with GetNonlinearColor): the centre texel's code comes from the plain view at t1, the
+// averages of neighbours are encoded here.
 //
 // OBS's box filter reads four neighbours with the hardware's bilinear filter at offsets of one and a half pixels;
 // each of those samples sits exactly between two texels, so it is the mean of two texels in linear light. They are
@@ -36,7 +39,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // colour, which lets a channel that overshoots 1 (brightness, contrast) survive at low alpha; the straight colour is
 // clamped to 1 before it is composited.
 
-Texture2D<float4> image : register(t0);
+Texture2D<float4> image : register(t0);      // linear light (the `_SRGB` view)
+Texture2D<float4> image_code : register(t1); // the same texels as stored (the codes)
 SamplerState linear_clamp : register(s0);
 
 cbuffer Params : register(b0)
@@ -57,11 +61,6 @@ static const float cb_off = 0.501961;
 static const float3 cr_v3 = float3(0.439216, -0.398942, -0.040274);
 static const float cr_off = 0.501961;
 
-float3 srgb_to_linear(float3 c)
-{
-    return (c <= 0.04045) ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
-}
-
 float get_nonlinear_channel(float u)
 {
     return (u <= 0.0031308) ? (12.92 * u) : ((1.055 * pow(u, 1.0 / 2.4)) - 0.055);
@@ -70,11 +69,6 @@ float get_nonlinear_channel(float u)
 float3 get_nonlinear_color(float3 rgb)
 {
     return float3(get_nonlinear_channel(rgb.r), get_nonlinear_channel(rgb.g), get_nonlinear_channel(rgb.b));
-}
-
-float3 linear_to_srgb(float3 c)
-{
-    return get_nonlinear_color(saturate(c));
 }
 
 float get_chroma_dist(float3 rgb)
@@ -89,7 +83,7 @@ float get_chroma_dist(float3 rgb)
 float3 texel_premultiplied(int2 p, int2 size)
 {
     float4 t = image.Load(int3(clamp(p, int2(0, 0), size - 1), 0));
-    return srgb_to_linear(t.rgb) * t.a;
+    return t.rgb * t.a;
 }
 
 // A sample halfway between two texels, as an encoded colour (SampleTexture in the effect).
@@ -106,7 +100,9 @@ float4 main(float4 pos : SV_Position) : SV_Target
     int2 size = int2(w, h);
 
     float4 t = image.Load(int3(p, 0));
-    float3 rgb = (t.a > 0.0) ? srgb_to_linear(t.rgb) : float3(0.0, 0.0, 0.0);
+    float3 rgb = (t.a > 0.0) ? t.rgb : float3(0.0, 0.0, 0.0);
+    // The centre colour as an encoded one (OBS: GetNonlinearColor of the decoded texel, which is the code itself).
+    float3 centre = (t.a > 0.0) ? image_code.Load(int3(p, 0)).rgb : float3(0.0, 0.0, 0.0);
 
     // GetBoxFilteredChromaDist: the offsets are (1, 0.5) and (0.5, -1) pixels.
     float dist_val = get_chroma_dist(sample_between(p + int2(-1, -1), p + int2(-1, 0), size));   // uv - point_0
@@ -114,7 +110,7 @@ float4 main(float4 pos : SV_Position) : SV_Target
     dist_val += get_chroma_dist(sample_between(p + int2(-1, 1), p + int2(0, 1), size));          // uv - point_1
     dist_val += get_chroma_dist(sample_between(p + int2(0, -1), p + int2(1, -1), size));         // uv + point_1
     dist_val *= 2.0;
-    dist_val += get_chroma_dist(get_nonlinear_color(rgb));
+    dist_val += get_chroma_dist(centre);
     float chroma_dist = dist_val / 9.0;
 
     // ProcessChromaKey
@@ -131,5 +127,6 @@ float4 main(float4 pos : SV_Position) : SV_Target
     // CalcColor
     rgb = pow(rgb, float3(gamma, gamma, gamma)) * contrast + brightness;
 
-    return float4(linear_to_srgb(rgb), saturate(a));
+    // The `_SRGB` render target clamps to 0..1 and encodes.
+    return float4(saturate(rgb), saturate(a));
 }

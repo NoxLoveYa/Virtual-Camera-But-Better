@@ -50,7 +50,8 @@ fn copy_if_different(from: &Path, to: &Path) {
 ///
 /// Which source each program is made of mirrors the run-time callers: the convert shaders get `convert_common.hlsl`
 /// in front, the scale and transform shaders `geometry_common.hlsl` (both followed by `"\n"`), every other file is a
-/// pixel shader by itself with the entry point `main`. The run time finds a blob by a hash of the source text, so a
+/// pixel shader by itself with the entry point `main` (the vertex shader and the NV12 compute shader are the exceptions
+/// listed below). The run time finds a blob by a hash of the source text, so a
 /// source that differs by a byte (a test's, an extension's) is not found and compiles at run time as before.
 mod shaders {
     use std::ffi::{c_void, CString};
@@ -174,6 +175,7 @@ mod shaders {
             let programs: &[(&str, &str)] = match stem.as_str() {
                 "fullscreen_vs" => &[("main", "vs_5_0")],
                 "encode_nv12" => &[("PSLuma", "ps_5_0"), ("PSChroma", "ps_5_0")],
+                "encode_nv12_cs" => &[("main", "cs_5_0")],
                 _ => &[("main", "ps_5_0")],
             };
             for &(entry, target) in programs {

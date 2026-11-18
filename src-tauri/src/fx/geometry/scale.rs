@@ -44,7 +44,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use super::{clamp_size, pack_f32, Program};
 use crate::fx::{pb, ps, GpuFilter, Params};
-use crate::gpu::{GpuResult, Renderer, RgbaTexture};
+use crate::gpu::{GpuResult, Renderer, RgbaTexture, Views};
 
 pub const KIND: &str = "scale_filter";
 
@@ -338,28 +338,31 @@ impl GpuFilter for Scale {
         let k = plan.undistort_factor;
         match plan.method {
             Method::Copy => r.copy(input, output),
+            // A point copy takes the texel as it is: the codes in, the codes out.
             Method::Point => self
                 .basic
                 .draw(r, &pack_f32(&[w, h, 0.0, 0.0]), input, output),
+            // Every mode that filters works in linear light on the `_SRGB` views (the hardware converts).
             Method::Bilinear => self
                 .basic
-                .draw(r, &pack_f32(&[w, h, 0.0, 1.0]), input, output),
+                .draw_with(r, &pack_f32(&[w, h, 0.0, 1.0]), input, output, Views::LINEAR),
             Method::LowRes => self
                 .basic
-                .draw(r, &pack_f32(&[w, h, 0.0, 2.0]), input, output),
+                .draw_with(r, &pack_f32(&[w, h, 0.0, 2.0]), input, output, Views::LINEAR),
             Method::Bicubic { undistort } => {
                 let u = if undistort { 1.0 } else { 0.0 };
                 self.bicubic
-                    .draw(r, &pack_f32(&[w, h, k, u]), input, output)
+                    .draw_with(r, &pack_f32(&[w, h, k, u]), input, output, Views::LINEAR)
             }
             Method::Lanczos { undistort } => {
                 let u = if undistort { 1.0 } else { 0.0 };
                 self.lanczos
-                    .draw(r, &pack_f32(&[w, h, k, u]), input, output)
+                    .draw_with(r, &pack_f32(&[w, h, k, u]), input, output, Views::LINEAR)
             }
             Method::Area { upscale } => {
                 let u = if upscale { 1.0 } else { 0.0 };
-                self.area.draw(r, &pack_f32(&[w, h, u, 0.0]), input, output)
+                self.area
+                    .draw_with(r, &pack_f32(&[w, h, u, 0.0]), input, output, Views::LINEAR)
             }
         }
     }

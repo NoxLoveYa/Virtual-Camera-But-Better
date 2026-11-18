@@ -20,7 +20,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // Each output pixel finds its place in the input: it is turned back by the angle about the centre of the picture, then
 // the mirror is undone. Multiples of 90 degrees (`exact`) land on texel centres and copy the texel raw. Other angles
 // sample bilinearly in linear light with a transparent border, so the edge of the rotated picture is smooth and the
-// corners stay empty.
+// corners stay empty. The filter binds the plain views of the pooled textures for `exact` (the codes in, the codes
+// out) and the `_SRGB` views otherwise (the hardware decodes on read and encodes on write, see geometry_common.hlsl).
 
 cbuffer Params : register(b0)
 {

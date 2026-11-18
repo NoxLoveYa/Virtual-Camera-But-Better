@@ -27,6 +27,10 @@ pub mod nvidia;
 pub mod shader_filter;
 pub mod sharpen;
 #[cfg(test)]
+mod golden_tests;
+#[cfg(test)]
+mod perf_tests;
+#[cfg(test)]
 mod tests;
 
 use serde::{Deserialize, Serialize};

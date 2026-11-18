@@ -270,3 +270,122 @@ Method: the ignored test `gpu::pipeline_tests::shader_setup_time` (release build
 | GPU rebuild, shader share (device 94 ms on top, unchanged) | about 0.61 s | about 1.4 ms |
 
 Tests: `built_in_shaders_are_not_compiled_at_run_time` (no run-time compile during all three warm-ups; every table entry is used) and `precompiled_bytecode_equals_a_run_time_compile` (each embedded blob is byte-identical to a run-time compile of the same source, so the pixels are the same). Cost at build time: the build script run is 1.7 s (cargo `--timings`; it includes the FXC compile of all 33 programs (32 files) and `tauri-build`), only when an `.hlsl` or `build.rs` changes.
+
+
+## sRGB views and NV12 in one pass (2026-11-18)
+
+Two changes for weak GPUs (GTX 1650, Iris Xe: the plan's 4K figures are estimated to be missed there). This PC has an RTX 5080, so the numbers below show the saving as a ratio, not the time a weak GPU would take.
+
+### What changed
+
+1. **The pool textures are `R8G8B8A8_TYPELESS` with four views** (`gpu::RgbaTexture`): `srv` / `rtv` as `UNORM` (the codes, as before: everything outside the filters keeps using them) and `srv_srgb` / `rtv_srgb` as `UNORM_SRGB`. A pass that works in linear light binds the `_SRGB` views (`gpu::Views`, `gpu::Space`): the texture unit decodes on read (`Load` too, checked), the output merger encodes on write, and the shader has no `pow` for either. This is what OBS does (libobs makes its `GS_RGBA` textures typeless, with a linear view for `gs_effect_set_texture_srgb` and for `gs_enable_framebuffer_srgb`; from memory, not re-read). The mask picture asset is typeless too and carries a linear view (`ImageAsset::srv_linear`).
+2. **NV12 is written by one compute dispatch** (`encode_nv12_cs.hlsl`, `cs_5_0`, compiled by `build.rs`) when the width is a multiple of 4 and the height is even; any other even size keeps the two draws.
+
+### Choice per filter and pass
+
+"codes" = the plain `UNORM` views, "linear" = the `_SRGB` views. "Saved" counts the per-pixel `pow` conversions that went away.
+
+| Filter / pass | Reads | Writes | Why | Saved per pixel |
+|---|---|---|---|---|
+| Color Correction | linear | linear | OBS runs gamma, matrix, multiply and add in linear light | 1 decode + 1 encode |
+| Sharpen | linear | linear | kernel in linear light, premultiplied (OBS) | 9 decodes + 1 encode |
+| Chroma Key | linear + codes (centre texel) | linear | the distance is measured on the encoded colour, the rest is linear; the four box-filter means are still encoded by hand | 9 decodes + 2 encodes (4 encodes left) |
+| Color Key | linear + codes | linear | distance on the code, gamma/contrast in linear light | 1 decode + 2 encodes |
+| Luma Key | linear + codes | codes | luminance of the linear colour; the colour goes out untouched | 1 decode |
+| Apply LUT 3D and 1D | linear + codes | linear | table addressed by the code, blend in linear light | 1 decode + 1 encode (mode 0 with alpha below 1 keeps one encode for the coordinate) |
+| Image Mask/Blend (5 types) | linear picture, linear mask asset | linear | OBS binds both as sRGB | 5 decodes + 1 encode |
+| Scaling: point | codes | codes | a raw texel copy, every code must survive | 0 (none was spent) |
+| Scaling: bilinear, low-res bilinear, bicubic, lanczos, area | linear | linear | OBS filters in linear light on premultiplied alpha | 1 decode per tap (4 to 36) + 1 encode |
+| Transform: flips and quarter turns | codes | codes | raw copy | 0 |
+| Transform: other angles | linear | linear | bilinear in linear light | 4 decodes + 1 encode |
+| Crop/Pad | codes | codes | raw copy | 0 |
+| Auto Adjust, render pass | linear | linear when contrast and saturation are both 1 (the default), else codes | contrast and saturation are defined on the encoded colour, so with either on the shader still encodes by hand | 1 decode (+ 1 encode by default) |
+| Auto Adjust, statistics chain (`StatsChain`) | codes | | left as it was: its first stage filters bilinearly in gamma space and decodes the result; the `_SRGB` view would filter in linear light, which changes the measurements | 0 |
+| NVIDIA Background Removal, final pass (`nv_mask`) | codes | codes | only alpha is scaled | 0 |
+| NVIDIA Blur / Background Blur, final pass (`nv_blend`) | picture linear, blurred picture codes | linear | the blurred picture is NVIDIA's own typed `R8G8B8A8_UNORM` texture (the SDK wants a typed format; a typeless one was not tried), so that decode stays in the shader | 1 decode + 1 encode (1 decode left) |
+| Output stage (`output_fit`) | codes | codes | opaque pixels are copied or filtered bilinearly in gamma space (unchanged); a translucent pixel is composited in linear light | the background's decode is made once on the CPU instead of per translucent pixel |
+| Convert (all formats), encode BGRX, preview downscale, meter | codes | codes | not linear-light work | 0 |
+
+### NV12 in one pass: why a compute shader
+
+Two render targets of one draw must have the same width and height; luma is W x H and chroma W/2 x H/2, so MRT cannot write both planes. The options on D3D11 feature level 11.0:
+
+* *Pixel shader with a UAV for chroma* (luma as the render target): needs a typed UAV store to `R8G8_UNORM`, which feature level 11.0 does not guarantee (only the 32 bit single channel formats are mandatory), so it would need a capability query and a fallback.
+* *Compute shader writing `R32_UINT` planes* (chosen): compute shader 5.0, UAVs and `R32_UINT` typed stores are all mandatory at 11.0, so it needs no query and runs on Intel, NVIDIA and AMD alike (not tried on the latter two). A thread owns 4 x 2 pixels, reads each once, and writes two luma texels and one chroma texel (four bytes of the plane each; the bytes in memory are the rows of the R8 and the R8G8 plane). The staging copy and `MappedPlane` rows are therefore the same bytes as before: `output_writer.rs` needed no change (`plane_descs()` / `textures()` give the new descriptors, the row is `W` bytes in both planes).
+* Not done: luma at full size and chroma from quad derivatives in the same draw (still two render targets of different sizes).
+
+The compute version needs width % 4 == 0 and an even height (a thread's block); every other even size falls back to the two draws. The rounding to a byte is done by hand (`saturate(v) * 255 + 0.5`), where the render target rounds in the output merger: on the RTX the two differ by one code in about 1.4 % of the luma bytes (64x32 test), never more; on WARP the bytes are identical.
+
+### GPU time, before and after
+
+Method: the ignored test `fx::perf_tests::filter_gpu_times` (timestamp queries around the commands; median of 100 frames on the hardware adapter, then the median of 5 runs; "after" is this working tree, "before" is a build of commit `ce45acc` with only the test files added; the two were run in turns). One filter alone: the cost of the chain minus the copy that feeds it. Input: a 16:9 picture with texture and a translucent corner. The last rows are whole stages. RTX 5080, driver 621.01, other agents working on the PC. Milliseconds of GPU time.
+
+| Case | 1920x1080 before | 1920x1080 after | change | 3840x2160 before | 3840x2160 after | change |
+|---|---|---|---|---|---|---|
+| color_filter | 0.014 | 0.008 | -43% | 0.051 | 0.042 | -18% |
+| sharpness_filter 0.35 | 0.039 | 0.021 | -46% | 0.153 | 0.080 | -48% |
+| chroma_key_filter | 0.062 | 0.029 | -53% | 0.243 | 0.115 | -53% |
+| color_key_filter | 0.016 | 0.009 | -44% | 0.061 | 0.031 | -49% |
+| luma_key_filter | 0.009 | 0.008 | -11% | 0.032 | 0.028 | -12% |
+| scale point (2/3) | 0.005 | 0.005 | +0% | 0.014 | 0.014 | +0% |
+| scale bilinear (2/3) | 0.012 | 0.006 | -50% | 0.039 | 0.018 | -54% |
+| scale bicubic (2/3) | 0.031 | 0.018 | -42% | 0.117 | 0.064 | -45% |
+| scale lanczos (2/3) | 0.074 | 0.038 | -49% | 0.285 | 0.144 | -49% |
+| scale area (2/3) | 0.021 | 0.013 | -38% | 0.079 | 0.048 | -39% |
+| scale bilinear low-res (1/2 and less) | 0.008 | 0.005 | -38% | 0.023 | 0.011 | -52% |
+| transform 30 deg | 0.035 | 0.023 | -34% | 0.131 | 0.088 | -33% |
+| transform flip_h | 0.008 | 0.009 | +12% | 0.028 | 0.028 | +0% |
+| crop | 0.009 | 0.009 | +0% | 0.028 | 0.028 | +0% |
+| auto_adjust (exposure + wb) | 0.033 | 0.029 | -12% | 0.085 | 0.060 | -29% |
+| four filters (color, sharpen, scale bicubic 2/3, chroma key) | 0.112 | 0.060 | -46% | 0.431 | 0.226 | -48% |
+| output stage (same size) + encode NV12 | 0.018 | 0.014 | -22% | 0.061 | 0.042 | -31% |
+| encode NV12 alone | 0.010 | 0.006 | -40% | 0.034 | 0.014 | -59% |
+| encode BGRX alone | 0.008 | 0.008 | +0% | 0.027 | 0.027 | +0% |
+| convert NV12 + output + encode (no filters) | 0.102 | 0.100 | -2% | 0.327 | 0.309 | -6% |
+| convert NV12 + four filters + output + encode | 0.213 | 0.159 | -25% | 0.754 | 0.527 | -30% |
+
+The 5080 is far from ALU-bound at these sizes, so absolute times are tiny; the ratios are what carry over (the saving is ALU: texture reads and render target writes cost what they did). Rows at 0 % are paths that did not change (raw copies, crop, BGRX). The "convert" rows include the upload of the NV12 frame. `transform flip_h` at 1080p (+12 %) is one microsecond of noise.
+
+**WARP** (the software rasterizer: CPU time of the same commands; median of 5 runs at 1080p and 3 at 4K) as a proxy for a GPU that is bound by ALU. Treat it as an upper bound, not an estimate, and the machine was busy: the point copy and the flip are the same raw texel copy before and after, yet are 40 to 80 % faster here, which is what a rasterizer that also pays for the untaken branches of the shader they share (the other scaling modes with their `pow`) would show; on the RTX they did not move. This explanation was not checked.
+
+| Case | 1920x1080 before | 1920x1080 after | change | 3840x2160 before | 3840x2160 after | change |
+|---|---|---|---|---|---|---|
+| color_filter | 6.497 | 3.291 | -49% | 25.405 | 14.144 | -44% |
+| sharpness_filter 0.35 | 22.484 | 4.450 | -80% | 89.338 | 21.218 | -76% |
+| chroma_key_filter | 39.397 | 15.900 | -60% | 150.103 | 84.660 | -44% |
+| color_key_filter | 7.499 | 3.228 | -57% | 34.610 | 20.367 | -41% |
+| luma_key_filter | 3.281 | 1.226 | -63% | 13.559 | 4.634 | -66% |
+| scale point (2/3) | 33.664 | 6.513 | -81% | 143.303 | 29.445 | -79% |
+| scale bilinear (2/3) | 39.420 | 8.174 | -79% | 180.969 | 33.453 | -82% |
+| scale bicubic (2/3) | 16.622 | 4.058 | -76% | 86.922 | 17.784 | -80% |
+| scale lanczos (2/3) | 44.147 | 13.546 | -69% | 184.026 | 66.266 | -64% |
+| scale area (2/3) | 12.672 | 5.475 | -57% | 59.253 | 23.693 | -60% |
+| scale bilinear low-res (1/2 and less) | 23.799 | 4.671 | -80% | 93.310 | 19.485 | -79% |
+| transform 30 deg | 16.644 | 6.706 | -60% | 68.968 | 27.434 | -60% |
+| transform flip_h | 4.051 | 2.411 | -40% | 16.805 | 9.341 | -44% |
+| crop | 0.952 | 0.976 | +3% | 3.861 | 3.446 | -11% |
+| auto_adjust (exposure + wb) | 8.831 | 7.242 | -18% | 34.774 | 29.564 | -15% |
+| four filters (color, sharpen, scale bicubic 2/3, chroma key) | 66.656 | 20.330 | -70% | 279.998 | 78.213 | -72% |
+| output stage (same size) + encode NV12 | 7.660 | 6.479 | -15% | 31.649 | 23.992 | -24% |
+| encode NV12 alone | 1.041 | 0.811 | -22% | 3.832 | 2.786 | -27% |
+| encode BGRX alone | 0.714 | 0.723 | +1% | 2.352 | 2.086 | -11% |
+| convert NV12 + output + encode (no filters) | 8.939 | 7.544 | -16% | 39.228 | 29.331 | -25% |
+| convert NV12 + four filters + output + encode | 83.619 | 29.203 | -65% | 327.172 | 129.487 | -60% |
+
+### Accuracy
+
+* **WARP** (exact conversions): every case of the golden file differs from the old output by at most **1 code**, most by 0 (`fx::golden_tests`: 35 cases, every filter that needs no asset file or NVIDIA runtime, plus the output stage and both encoders; the golden file was made with the old shaders). The LUT and mask filters and the NVIDIA final passes are covered by their own tests against a CPU reference (all pass).
+* **RTX 5080:** NVIDIA's texture unit returns a decoded texel with about 7 bits of mantissa (the codes 248 to 252 decode to 0.9375, 0.9453, 0.9531, 0.9609 and 0.9766, against the exact 0.9387, 0.9473, 0.9560, 0.9647 and 0.9734: up to 0.0037 off in linear light, a third of a code once it is encoded again; checked in `pool_textures_read_linear_and_write_encoded_through_their_srgb_views_hardware`). The encode on write is exact (within 0.6 of a code) and decode followed by encode gives back every code. OBS on NVIDIA behaves the same way, since it uses the same hardware path. A filter that amplifies the decoded values shows it. Worst difference from the golden file on this GPU, old shaders / new shaders: Color Correction default 0 / 0, with every setting 1 / **4**; Sharpen 0.08 (the default) 1 / 1, Sharpen 0.9 1 / **13** (6 % of the bytes more than 1 code off, on a picture of random noise of +-12 codes); Chroma Key 1 / 1; Color Key 1 / 1; Luma Key with smoothing 1 / **6** (alpha, on a smoothstep edge); Bilinear 1 / 1; Bicubic 1 / **4**; Lanczos 1 / **5** (2 on the smaller size); Area 1 / 1; Transform 1 / 1; output stage 1 / 1. An Intel or AMD part may round differently (not measured: none here). If a strong Sharpen shows banding in highlights on NVIDIA, Sharpen is the filter to put back on the codes with its own `pow` (`Views::ENCODED` and the two conversion functions): its default setting is not affected.
+* The `scale area` upscale case of the golden file differs by up to 252 on this GPU in pixels whose alpha is near 0, before and after the change (a division by an alpha near 0: the colour of a nearly clear pixel is meaningless and WARP and the GPU round it differently); the hardware comparison leaves out the colour of pixels with alpha below 64.
+
+### Tests
+
+`gpu::pipeline_tests`: the sRGB views decode on `Load`, encode on write, leave alpha alone and round-trip every code exactly (WARP and hardware); a typeless pool texture copies to and from typed textures; NV12 in one dispatch equals the two draws, and a CPU luma, at nine sizes including the fall-back ones (WARP and hardware); the packed planes read back through `ReadbackRing` with the rows of the NV12 planes. `fx::golden_tests`: old against new output, WARP strict and hardware loose. `fx::nvidia::filter::tests`: the two final NVIDIA passes against their formulas (WARP, no runtime needed). The test `auto_adjust_defaults_give_the_output_of_the_previous_filter` compared bytes with the previous shader; it now allows one code on the colour (alpha stays exact), because the conversion is the hardware's.
+
+### What remains for weak GPUs
+
+* The output stage still draws the picture when it is not scaled (`output_fit` with the rectangle equal to the frame and an opaque picture). Skipping it needs `engine.rs` (hand the chain's last texture to the encoder in that case); its GPU cost is the "output stage + encode" row minus the "encode NV12 alone" row.
+* Decoder surfaces (the camera's frame reaching the convert pass without the CPU upload) are a capture / engine task.
+* Convert is unchanged (the convert row includes the upload of the NV12 frame: 0.10 ms at 1080p and 0.3 ms at 4K on the 5080).
+* Chroma Key still encodes the four means of its box filter by hand (4 `pow` per colour channel); Lanczos still loads 36 texels per pixel. Whether either is now bound by texture reads rather than ALU was not measured.
+* Not measured: an Intel or AMD GPU, a GTX 1650, the NVIDIA final passes (one draw each), the engine end to end (`engine_script`) with these changes.

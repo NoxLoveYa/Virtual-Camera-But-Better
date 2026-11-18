@@ -35,6 +35,7 @@ use std::f64::consts::PI;
 
 use super::shader_filter::{ShaderFilter, ShaderFilterDef};
 use super::{pc, pf, GpuFilter, Params};
+use crate::gpu::Views;
 
 pub const KIND: &str = "color_filter";
 
@@ -58,7 +59,8 @@ pub static DEF: ShaderFilterDef = ShaderFilterDef {
 };
 
 pub fn make() -> Box<dyn GpuFilter> {
-    Box::new(ShaderFilter::new(&DEF))
+    // Linear light: the sampler decodes and the output merger encodes (`color.hlsl`).
+    Box::new(ShaderFilter::with_views(&DEF, Views::LINEAR))
 }
 
 /// OBS `matrix4`: four rows `x, y, z, t`.
