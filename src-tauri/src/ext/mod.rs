@@ -258,6 +258,10 @@ struct Shared {
     config: Mutex<Config>,
     inner: Mutex<Inner>,
     snapshot: Mutex<Arc<Snapshot>>,
+    /// Held for the whole of a [`ExtRegistry::scan`], so that two scans (the poll and a Reload or switch from the page)
+    /// never overlap: the sink is told in the order the snapshots were swapped, and the last list it got is the one
+    /// `list` returns.
+    scanning: Mutex<()>,
     stop: Mutex<bool>,
     wake: Condvar,
 }
@@ -280,6 +284,7 @@ impl Default for ExtRegistry {
                 config: Mutex::new(Config::default()),
                 inner: Mutex::new(Inner::default()),
                 snapshot: Mutex::new(Arc::new(Snapshot::default())),
+                scanning: Mutex::new(()),
                 stop: Mutex::new(false),
                 wake: Condvar::new(),
             }),
@@ -382,6 +387,9 @@ impl ExtRegistry {
     /// Look at the folder; with `force` read every extension again, else only the ones whose files changed. Rebuilds
     /// the snapshot and, when the list differs from the previous one, calls the sink. Returns the list.
     pub(crate) fn scan(&self, force: bool) -> Vec<ExtensionInfo> {
+        // Before anything is read: a scan that starts later also reads later, so its list is the newer one. The sink
+        // runs under this lock and must not call back into the registry.
+        let _one_at_a_time = lock(&self.shared.scanning);
         let Some(root) = lock(&self.shared.config).root.clone() else {
             return Vec::new();
         };
@@ -706,6 +714,76 @@ mod registry_tests {
         assert_eq!(again.list()[0].state, ExtState::Disabled);
         assert_eq!(again.set_enabled("tint", true).unwrap()[0].state, ExtState::Ready);
         assert!(read_disabled(&s.state()).is_empty());
+    }
+
+    /// Waits (at most 5 s) until the sink was called `n` times in total.
+    fn wait_for_events(events: &AtomicUsize, n: usize) -> Duration {
+        let started = std::time::Instant::now();
+        while events.load(Ordering::SeqCst) < n && started.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        started.elapsed()
+    }
+
+    #[test]
+    fn the_polling_thread_survives_the_folder_being_deleted_and_made_again() {
+        let s = Scratch::new("recreate");
+        let (sink, events) = counting();
+        let last: Arc<Mutex<Vec<String>>> = Arc::default();
+        let last2 = last.clone();
+        let sink2: Sink = Arc::new(move |list: &[ExtensionInfo]| {
+            *lock(&last2) = list.iter().map(|e| e.id.clone()).collect();
+            sink(list);
+        });
+        install(&s, "vignette", "Vignette");
+        let reg = ExtRegistry::new();
+        reg.start(s.root(), s.state(), Some(sink2));
+        assert_eq!(reg.list().len(), 1);
+        // The first read (in `start`) already told the sink once.
+        assert_eq!(events.load(Ordering::SeqCst), 1);
+
+        for round in 1..=2usize {
+            std::fs::remove_dir_all(s.root()).unwrap();
+            let took = wait_for_events(&events, round * 2);
+            assert_eq!(events.load(Ordering::SeqCst), round * 2, "round {round}: no event for the deleted folder after {took:?}");
+            assert!(lock(&last).is_empty(), "round {round}: the emitted list is not empty");
+
+            install(&s, "vignette", "Vignette");
+            let took = wait_for_events(&events, round * 2 + 1);
+            assert_eq!(events.load(Ordering::SeqCst), round * 2 + 1, "round {round}: no event for the re-created folder after {took:?}");
+            assert_eq!(*lock(&last), vec!["vignette".to_string()]);
+            assert!(took < Duration::from_millis(2500), "round {round}: found after {took:?}");
+        }
+        reg.stop();
+    }
+
+    #[test]
+    fn two_overlapping_scans_leave_the_sink_with_the_newest_list() {
+        let s = Scratch::new("overlap");
+        install(&s, "vignette", "Vignette");
+        let last: Arc<Mutex<Vec<String>>> = Arc::default();
+        let last2 = last.clone();
+        // A sink that is slow to take the empty list (the page busy), as when the poll and a Reload meet.
+        let sink: Sink = Arc::new(move |list: &[ExtensionInfo]| {
+            if list.is_empty() {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            *lock(&last2) = list.iter().map(|e| e.id.clone()).collect();
+        });
+        let reg = ExtRegistry::new();
+        reg.configure(s.root(), s.state(), Some(sink));
+        std::fs::remove_dir_all(s.root().join("vignette")).unwrap();
+        let poll = {
+            let reg = reg.clone();
+            std::thread::spawn(move || reg.scan(false))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        install(&s, "vignette", "Vignette");
+        let reload = reg.reload();
+        poll.join().unwrap();
+        assert_eq!(reload.len(), 1);
+        assert_eq!(reg.list().len(), 1);
+        assert_eq!(*lock(&last), vec!["vignette".to_string()], "the page was left with an older list than list_extensions returns");
     }
 
     #[test]
