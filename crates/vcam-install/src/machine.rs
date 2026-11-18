@@ -540,6 +540,7 @@ mod tests {
             listed: true,
             shipped_build: Some("aaaaaaaa".into()),
             shipped_protocol: vcam_protocol::PROTOCOL_VERSION,
+            data_problem: None,
         };
         assert_eq!(state_from(&facts), VcamState::Missing);
     }

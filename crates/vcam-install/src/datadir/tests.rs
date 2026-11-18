@@ -62,6 +62,37 @@ fn good(is_directory: bool) -> Facts {
         bad_attributes: false,
         sparse_or_compressed: false,
         extra_streams: false,
+        encrypted: false,
+    }
+}
+
+/// An encrypted data folder or `logs` is replaced, never kept: whatever is made in it is encrypted too (the helper's
+/// own `install.log` under the key of whoever elevated), and the camera service cannot read that. A frame file that
+/// is encrypted is replaced as before (`bad_attributes`).
+#[test]
+fn an_encrypted_folder_is_replaced_and_so_is_an_encrypted_file() {
+    for obj in [Object::DataDir, Object::LogsDir] {
+        let Plan::Replace(why) = decide(
+            obj,
+            Some(&Facts {
+                encrypted: true,
+                ..good(true)
+            }),
+        ) else {
+            panic!("{obj:?}: an encrypted folder must be replaced")
+        };
+        assert!(why.contains("encrypted"), "{why}");
+    }
+    for obj in [Object::FramesFile, Object::InstallLog] {
+        let f = Facts {
+            encrypted: true,
+            bad_attributes: true,
+            ..good(false)
+        };
+        assert!(
+            matches!(decide(obj, Some(&f)), Plan::Replace(w) if w.contains("encrypted")),
+            "{obj:?}"
+        );
     }
 }
 
@@ -2796,4 +2827,373 @@ fn a_frame_file_that_still_carries_the_attribute_is_accepted_with_one_line() {
         remove_no_follow(&s.paths.frames()).unwrap();
         run(&s, &mut VecLog::default()).unwrap();
     }
+}
+
+// ---- the data folder is held with the least access its checks need
+
+/// The data folder opened the way an indexer, backup or anti-virus tool may: reading, sharing reading but not writing.
+fn held_without_write_sharing(s: &Sandbox) -> OwnedHandle {
+    secure::open_with(
+        &s.paths.data,
+        GENERIC_READ,
+        secure::SHARE_READ,
+        DISP_OPEN_EXISTING,
+        true,
+        0,
+    )
+    .unwrap()
+}
+
+/// The access the helper used to ask for on the data folder on every run (`GENERIC_READ | FILE_ADD_FILE`) is refused
+/// while such a program has the folder open, which made every Install and Repair fail; the access it asks for now is
+/// not. The control proves that the simulation is the real thing.
+#[test]
+fn a_data_folder_that_another_program_holds_without_write_sharing_does_not_fail_the_repair() {
+    let s = sandbox("held-no-write-share");
+    run(&s, &mut VecLog::default()).unwrap();
+    let held = held_without_write_sharing(&s);
+    // control: the old request is a sharing violation (ERROR_SHARING_VIOLATION, 32)
+    let old = secure::open_with(
+        &s.paths.data,
+        GENERIC_READ | acl::SECURITY_ACCESS | FILE_ADD_FILE,
+        share_for(Object::DataDir),
+        DISP_OPEN_EXISTING,
+        true,
+        0,
+    );
+    assert_eq!(
+        old.err().and_then(|e| e.raw_os_error()),
+        Some(32),
+        "the holder does not refuse a write open: the test proves nothing"
+    );
+    // what is asked for now: listing (the data right that makes Windows weigh the sharing mode, see the next test),
+    // attributes, and permissions; no write right, which is what the holder refuses
+    assert_eq!(
+        access_for(Object::DataDir),
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | acl::SECURITY_ACCESS
+    );
+    assert_eq!(
+        access_for(Object::DataDir) & (GENERIC_READ | GENERIC_WRITE | FILE_ADD_FILE),
+        0
+    );
+    for _ in 0..2 {
+        let mut log = VecLog::default();
+        run(&s, &mut log).unwrap_or_else(|e| panic!("{e}: {:?}", log.0));
+        assert!(mentions(&log, "BetterCam: kept"), "{:?}", log.0);
+        assert!(mentions(&log, "the data folder: owner"), "{:?}", log.0);
+    }
+    // the folder is checked and locked as ever
+    let snap = security_of(&s.paths.data);
+    acl::check(&snap, &acl::expected(Object::DataDir, &s.p), &s.p.owner).unwrap();
+    drop(held);
+}
+
+/// The held data folder cannot be renamed, deleted or swapped for one of the user's own between the open and the lock.
+/// Windows weighs a handle's sharing mode only when the handle has a data right (read, write, append, execute or
+/// `DELETE`); with attribute and permission rights alone the missing `FILE_SHARE_DELETE` stopped nothing, and the user
+/// (who may have `DELETE` on a folder an older version made) could rename it away. The rename fails with
+/// `ERROR_SHARING_VIOLATION` (32) as long as the folder is held, and works once it is let go (so the hold is what
+/// stopped it).
+#[test]
+fn a_held_data_folder_cannot_be_renamed_while_the_helper_holds_it() {
+    let s = sandbox("held-no-rename");
+    run(&s, &mut VecLog::default()).unwrap();
+    let away = s.paths.program_data.join("BetterCam.swapped");
+    let held = open_checked(&s.paths, Object::DataDir).unwrap();
+    let err = std::fs::rename(&s.paths.data, &away).expect_err("a held folder must not be renamed");
+    assert_eq!(err.raw_os_error(), Some(32), "{err}");
+    assert!(s.paths.data.is_dir() && !away.exists());
+    // a folder is held the same way when it is made new
+    drop(held);
+    assert!(remove_all(&s.paths));
+    let new = create_new(&s.paths, Object::DataDir, &s.p).unwrap();
+    let err =
+        std::fs::rename(&s.paths.data, &away).expect_err("a new held folder must not be renamed");
+    assert_eq!(err.raw_os_error(), Some(32), "{err}");
+    drop(new);
+    std::fs::rename(&s.paths.data, &away).expect("it can be renamed once it is let go");
+}
+
+/// The same holder, and a data folder that is compressed: the clear needs the wider access, which the holder refuses.
+/// That is one line of the log and not a failure (the frame file is made without compression whatever the folder
+/// says); once the holder lets go, the next Repair clears the folder.
+#[test]
+fn a_compressed_data_folder_that_is_held_without_write_sharing_is_a_line_of_the_log_and_cleared_later(
+) {
+    let s = sandbox("held-compressed");
+    run(&s, &mut VecLog::default()).unwrap();
+    if !compress_folder(&s.paths.data) {
+        eprintln!("this volume cannot compress a folder: skipped");
+        return;
+    }
+    // no frame file: the run makes a new one in a folder that is still compressed
+    secure::remove_tree(&s.paths.frames()).unwrap();
+    let held = held_without_write_sharing(&s);
+    let mut log = VecLog::default();
+    run(&s, &mut log).unwrap_or_else(|e| panic!("{e}: {:?}", log.0));
+    assert!(
+        mentions(&log, "is compressed and that could not be cleared"),
+        "{:?}",
+        log.0
+    );
+    assert!(
+        compressed(&s.paths.data),
+        "nothing could be cleared meanwhile"
+    );
+    assert_plain_frame_file(&s, "held and compressed");
+    drop(held);
+    let mut log = VecLog::default();
+    run(&s, &mut log).unwrap_or_else(|e| panic!("{e}: {:?}", log.0));
+    assert!(
+        mentions(&log, "was compressed: cleared that"),
+        "{:?}",
+        log.0
+    );
+    assert!(!compressed(&s.paths.data));
+}
+
+/// The second handle of the clear is the folder that is held, or nothing is cleared.
+#[test]
+fn the_wider_handle_for_clearing_compression_must_be_the_folder_that_is_held() {
+    let s = sandbox("reopen-identity");
+    run(&s, &mut VecLog::default()).unwrap();
+    let held = open_checked(&s.paths, Object::DataDir).unwrap();
+    assert!(reopen_for_compression(&s.paths, &held).is_ok());
+    // another folder in its place: the logs folder is a folder too, with another id
+    let other = open_checked(&s.paths, Object::LogsDir).unwrap();
+    let err = reopen_for_compression(&s.paths, &other).unwrap_err();
+    assert!(err.contains("not the folder that is held"), "{err}");
+}
+
+// ---- encrypted (EFS) data folder, `logs` or frame file
+
+fn paths_at(root: &str) -> Paths {
+    Paths::below(Path::new(root))
+}
+
+#[test]
+fn a_new_data_folder_that_is_encrypted_is_refused_with_a_sentence_that_names_the_folder_around_it()
+{
+    let paths = paths_at(r"C:\x");
+    let (data, parent) = (
+        paths.data.display().to_string(),
+        paths.program_data.display().to_string(),
+    );
+    // nothing to say for a folder that is not encrypted
+    assert_eq!(encryption_refusal(&paths, 0x10, Some(0x10)), None);
+    assert_eq!(encryption_refusal(&paths, 0x10 | 0x800, None), None);
+    // encrypted because the folder around it is: what an administrator does about that, said as it is
+    let why = encryption_refusal(
+        &paths,
+        0x10 | ATTRIBUTE_ENCRYPTED,
+        Some(0x10 | ATTRIBUTE_ENCRYPTED),
+    )
+    .unwrap();
+    assert!(
+        why.starts_with(&format!("The folder {data} is encrypted (Windows EFS) because the folder around it, {parent}, is"))
+            && why.contains("camera service cannot read")
+            && why.contains(&format!(r#"cipher /d "{parent}""#))
+            && why.contains("administrator")
+            && why.contains("run Repair again"),
+        "{why}"
+    );
+    // not "as the user who encrypted it": clearing the flag of a folder needs no key
+    assert!(!why.contains("who encrypted"), "{why}");
+    // encrypted and the folder around it is not: the folder itself is the one to turn off
+    let why = encryption_refusal(&paths, ATTRIBUTE_ENCRYPTED, Some(0x10)).unwrap();
+    assert!(
+        why.contains(&format!(r#"cipher /d "{data}""#)) && why.contains("run Repair again"),
+        "{why}"
+    );
+    // a sentence, not a Rust error
+    assert!(!why.contains("os error") && !why.contains('{'), "{why}");
+}
+
+/// The cipher tests change the machine they run on: the first `cipher /e` of a user makes an EFS certificate and key
+/// for them (in `Cert:\CurrentUser\My`), which nothing here removes. They run only when asked for.
+fn efs_tests_enabled(name: &str) -> bool {
+    if std::env::var("BETTER_CAM_EFS_TESTS").is_ok_and(|v| v == "1") {
+        return true;
+    }
+    eprintln!("{name}: skipped; set BETTER_CAM_EFS_TESTS=1 to run it (`cipher /e` creates an EFS certificate for the user on first use)");
+    false
+}
+
+/// Run `cipher.exe` (by full path, from the system folder) with `args`; false when EFS is not available here (not
+/// NTFS, or turned off).
+fn cipher(args: &[&str], path: &Path) -> bool {
+    std::process::Command::new(crate::util::system_dir().join("cipher.exe"))
+        .args(args)
+        .arg(path)
+        .output()
+        .is_ok_and(|o| o.status.success())
+        && std::fs::metadata(path).is_ok()
+}
+
+fn encrypted(p: &Path) -> bool {
+    attributes_of(p) & ATTRIBUTE_ENCRYPTED != 0
+}
+
+/// A data folder that is encrypted (a person ran `cipher /e` on it): the status report says to run Repair, and Repair
+/// moves it aside and makes a plain one, with a plain `logs`, `frames.bin` and `install.log` in it.
+#[test]
+fn an_encrypted_data_folder_is_replaced_by_a_plain_one() {
+    if !efs_tests_enabled("an_encrypted_data_folder_is_replaced_by_a_plain_one") {
+        return;
+    }
+    let s = sandbox("efs-data-folder");
+    run(&s, &mut VecLog::default()).unwrap();
+    assert_eq!(encryption_problem(&s.paths), None);
+    if !cipher(&["/e"], &s.paths.data) || !encrypted(&s.paths.data) {
+        eprintln!("EFS is not available here: skipped");
+        return;
+    }
+    let report = encryption_problem(&s.paths).expect("the report says so");
+    assert!(
+        report.contains(&s.paths.data.display().to_string()) && report.contains("Run Repair"),
+        "{report}"
+    );
+    let mut log = VecLog::default();
+    run(&s, &mut log).unwrap_or_else(|e| panic!("{e}: {:?}", log.0));
+    assert!(
+        mentions(&log, "it is encrypted (Windows EFS); moving it aside"),
+        "{:?}",
+        log.0
+    );
+    for p in [
+        s.paths.data.clone(),
+        s.paths.logs(),
+        s.paths.frames(),
+        s.paths.install_log(),
+    ] {
+        assert!(!encrypted(&p), "{} is encrypted", p.display());
+    }
+    assert_plain_frame_file(&s, "efs data folder replaced");
+    assert_eq!(encryption_problem(&s.paths), None);
+    // permissions as ever
+    acl::check(
+        &security_of(&s.paths.data),
+        &acl::expected(Object::DataDir, &s.p),
+        &s.p.owner,
+    )
+    .unwrap();
+}
+
+/// `logs` that is encrypted is not kept (the helper's own `install.log` would be made in it, encrypted under the key
+/// of the administrator who elevated, and the app and the service could not read or write it): it is replaced.
+#[test]
+fn an_encrypted_logs_folder_is_replaced_by_a_plain_one() {
+    if !efs_tests_enabled("an_encrypted_logs_folder_is_replaced_by_a_plain_one") {
+        return;
+    }
+    let s = sandbox("efs-logs");
+    run(&s, &mut VecLog::default()).unwrap();
+    if !cipher(&["/e"], &s.paths.logs()) || !encrypted(&s.paths.logs()) {
+        eprintln!("EFS is not available here: skipped");
+        return;
+    }
+    // the log file is made inside it, and would be encrypted with it
+    let mut log = VecLog::default();
+    run(&s, &mut log).unwrap_or_else(|e| panic!("{e}: {:?}", log.0));
+    assert!(
+        mentions(&log, "it is encrypted (Windows EFS); moving it aside"),
+        "{:?}",
+        log.0
+    );
+    assert!(!encrypted(&s.paths.logs()));
+    assert!(!encrypted(&s.paths.install_log()));
+    acl::check(
+        &security_of(&s.paths.logs()),
+        &acl::expected(Object::LogsDir, &s.p),
+        &s.p.owner,
+    )
+    .unwrap();
+}
+
+/// `%ProgramData%` itself encrypted: the `BetterCam` folder made in it is encrypted too and cannot be made plain. That
+/// is refused before anything is made below it, with a sentence that is true: after `cipher /d` on `%ProgramData%` (the
+/// one thing it says to do) the next Repair goes through and everything is plain.
+#[test]
+fn a_data_folder_made_inside_an_encrypted_program_data_is_refused_until_that_is_turned_off() {
+    if !efs_tests_enabled(
+        "a_data_folder_made_inside_an_encrypted_program_data_is_refused_until_that_is_turned_off",
+    ) {
+        return;
+    }
+    let s = sandbox("efs-program-data");
+    if !cipher(&["/e"], &s.paths.program_data) || !encrypted(&s.paths.program_data) {
+        eprintln!("EFS is not available here: skipped");
+        return;
+    }
+    let mut log = VecLog::default();
+    let result = run(&s, &mut log);
+    if !encrypted(&s.paths.data) {
+        // this system made the folder in plain text (no key for the account that makes it): nothing to refuse
+        eprintln!("the new folder is not encrypted here: {result:?}");
+        return;
+    }
+    let err = result.expect_err("an encrypted data folder is refused");
+    assert!(
+        err.contains(&format!(
+            r#"cipher /d "{}""#,
+            s.paths.program_data.display()
+        )) && err.contains("encrypted"),
+        "{err}"
+    );
+    assert!(!s.paths.frames().exists(), "nothing was made below it");
+    // locked all the same
+    acl::check(
+        &security_of(&s.paths.data),
+        &acl::expected(Object::DataDir, &s.p),
+        &s.p.owner,
+    )
+    .unwrap();
+    // the report says the same
+    assert_eq!(encryption_problem(&s.paths), Some(err));
+    // what the sentence says to do works: the encrypted folder is replaced by a plain one
+    assert!(cipher(&["/d"], &s.paths.program_data));
+    assert!(!encrypted(&s.paths.program_data));
+    let mut log = VecLog::default();
+    run(&s, &mut log).unwrap_or_else(|e| panic!("{e}: {:?}", log.0));
+    for p in [
+        s.paths.data.clone(),
+        s.paths.logs(),
+        s.paths.frames(),
+        s.paths.install_log(),
+    ] {
+        assert!(!encrypted(&p), "{} is encrypted", p.display());
+    }
+    assert_eq!(encryption_problem(&s.paths), None);
+}
+
+/// An encrypted frame file in a data folder that is not encrypted is replaced by a new, plain file (the file system
+/// does not make a new file encrypted there), and the status report says that Repair does that.
+#[test]
+fn an_encrypted_frame_file_in_a_plain_folder_is_replaced_by_a_plain_one() {
+    if !efs_tests_enabled("an_encrypted_frame_file_in_a_plain_folder_is_replaced_by_a_plain_one") {
+        return;
+    }
+    let s = sandbox("efs-frames");
+    run(&s, &mut VecLog::default()).unwrap();
+    mark(&s);
+    if !cipher(&["/e", "/a"], &s.paths.frames()) || !encrypted(&s.paths.frames()) {
+        eprintln!("EFS is not available here: skipped");
+        return;
+    }
+    let report = encryption_problem(&s.paths).expect("the report says so");
+    assert!(
+        report.contains("frames.bin") && report.contains("Run Repair"),
+        "{report}"
+    );
+    let mut log = VecLog::default();
+    run(&s, &mut log).unwrap_or_else(|e| panic!("{e}: {:?}", log.0));
+    assert!(
+        mentions(&log, "it is read-only or encrypted"),
+        "{:?}",
+        log.0
+    );
+    assert!(!marked(&s), "the file was not replaced");
+    assert!(!encrypted(&s.paths.frames()));
+    assert_plain_frame_file(&s, "efs replaced");
+    assert_eq!(encryption_problem(&s.paths), None);
 }

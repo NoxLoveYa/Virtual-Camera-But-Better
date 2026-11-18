@@ -277,6 +277,18 @@ impl ActionDone {
 
 /// A sentence for what happened, or how it went when the helper succeeded. `log_tail` is the end of `install.log`.
 pub fn outcome_to_result(action: Action, outcome: &LaunchOutcome, log_tail: &[String]) -> Result<ActionDone, String> {
+    outcome_to_result_or(action, outcome, log_tail, &|| None)
+}
+
+/// [`outcome_to_result`] that asks `no_log_reason` for a reason when an install failed and its log has no `ERROR:`
+/// line (the helper can fail before the log folder exists: on a fresh install into an encrypted `%ProgramData%` it
+/// refuses before `logs` is made, so nothing was written). Asked only then, and only for an install.
+pub fn outcome_to_result_or(
+    action: Action,
+    outcome: &LaunchOutcome,
+    log_tail: &[String],
+    no_log_reason: &dyn Fn() -> Option<String>,
+) -> Result<ActionDone, String> {
     let verb = action.verb();
     match outcome {
         LaunchOutcome::Exited(c) if *c as i32 == EXIT_OK => Ok(ActionDone::Done),
@@ -302,7 +314,9 @@ pub fn outcome_to_result(action: Action, outcome: &LaunchOutcome, log_tail: &[St
                 .iter()
                 .rev()
                 .find(|l| l.contains("ERROR:"))
-                .map(|l| format!(": {}", strip_stamp(l)))
+                .map(|l| strip_stamp(l).to_string())
+                .or_else(|| (action == Action::Install).then(no_log_reason).flatten())
+                .map(|w| format!(": {w}"))
                 .unwrap_or_default();
             Err(format!("Could not {verb} the virtual camera (exit code {code}){why}"))
         }
@@ -330,7 +344,10 @@ pub fn run_action(launcher: &dyn Launcher, exe: &str, action: Action, user_sid: 
     } else {
         Vec::new()
     };
-    let result = outcome_to_result(action, &outcome, &tail);
+    // unelevated and read-only (attributes only): the app can say what the helper could not write down
+    let result = outcome_to_result_or(action, &outcome, &tail, &|| {
+        vcam_install::datadir::encryption_problem(&vcam_install::util::Paths::system())
+    });
     // a helper that failed leaves its reason in install.log; when a program of the user holds a lock on that file
     // neither the helper could write it nor can this read it: say that instead of showing no reason
     match result {
@@ -613,6 +630,47 @@ mod tests {
         ];
         let e = outcome_to_result(Action::Install, &LaunchOutcome::Exited(1), &tail).unwrap_err();
         assert_eq!(e, "Could not install the virtual camera (exit code 1)");
+    }
+
+    /// A fresh install into an encrypted `%ProgramData%` is refused before `logs` exists, so there is no `ERROR:`
+    /// line: the sentence of the status check is the reason. An `ERROR:` line, when there is one, wins; the check is
+    /// not asked for it, nor for a removal, a success, a refused prompt or a busy lock.
+    #[test]
+    fn a_failed_install_without_an_error_line_gives_the_encryption_sentence_when_there_is_one() {
+        use std::cell::Cell;
+        let asked = Cell::new(0);
+        let sentence = || {
+            asked.set(asked.get() + 1);
+            Some("The folder X is encrypted (Windows EFS)".to_string())
+        };
+        let exited = LaunchOutcome::Exited(1);
+        let e = outcome_to_result_or(Action::Install, &exited, &[], &sentence).unwrap_err();
+        assert_eq!(e, "Could not install the virtual camera (exit code 1): The folder X is encrypted (Windows EFS)");
+        assert_eq!(asked.get(), 1);
+        // nothing to say: as before
+        let e = outcome_to_result_or(Action::Install, &exited, &[], &|| None).unwrap_err();
+        assert_eq!(e, "Could not install the virtual camera (exit code 1)");
+        // the helper's own line is the reason, and the check is not asked
+        let tail = vec!["2026-11-17 01:02:04 ERROR: MFCreateVirtualCamera: boom".to_string()];
+        let e = outcome_to_result_or(Action::Install, &exited, &tail, &sentence).unwrap_err();
+        assert!(e.ends_with(": MFCreateVirtualCamera: boom") && !e.contains("encrypted"), "{e}");
+        assert_eq!(asked.get(), 1);
+        // only an install: a failed removal is not about the data folder being encrypted
+        let e = outcome_to_result_or(Action::Uninstall, &exited, &[], &sentence).unwrap_err();
+        assert_eq!(e, "Could not remove the virtual camera (exit code 1)");
+        assert_eq!(asked.get(), 1);
+        // none of the other outcomes asks
+        for o in [
+            LaunchOutcome::Cancelled,
+            LaunchOutcome::Exited(EXIT_BUSY as u32),
+            LaunchOutcome::Exited(EXIT_NOT_ELEVATED as u32),
+            LaunchOutcome::Failed("boom".into()),
+        ] {
+            let e = outcome_to_result_or(Action::Install, &o, &[], &sentence).unwrap_err();
+            assert!(!e.contains("encrypted"), "{e}");
+        }
+        assert_eq!(outcome_to_result_or(Action::Install, &LaunchOutcome::Exited(0), &[], &sentence), Ok(ActionDone::Done));
+        assert_eq!(asked.get(), 1);
     }
 
     #[test]

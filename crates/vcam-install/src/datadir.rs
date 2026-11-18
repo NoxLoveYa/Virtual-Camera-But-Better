@@ -6,7 +6,9 @@
 //!   reparse point, the right kind, one hard link, and its final path is exactly `<ProgramData>\BetterCam[\...]`
 //!   (so a junction anywhere in the chain fails the comparison). Permissions are set and read back on that handle,
 //!   never by path;
-//! * the folder handle is held without delete sharing while the helper works in it, so it cannot be swapped;
+//! * the folder handle is held without delete sharing, and with a data right (`FILE_LIST_DIRECTORY`, see
+//!   [`access_for`]: without one Windows does not weigh the sharing mode), while the helper works in it, so it cannot
+//!   be renamed, deleted or swapped;
 //! * an object that is not what it must be (a link, the wrong kind, extra hard links, a frame file that is read-only,
 //!   sparse or compressed, an owner who is not SYSTEM or Administrators, for `logs` also any other permissions) is
 //!   moved aside and made again; what is moved aside is deleted without ever recursing through a link;
@@ -32,6 +34,15 @@
 //!   `FILE_NO_COMPRESSION`, and the data folder's own compressed state is cleared so that it hands none on. A file
 //!   that is sparse or compressed all the same after it was made is accepted with one line of the log (the helper
 //!   replaces a file once per run and never fails on this alone); only the length is a failure.
+//!
+//! * the data folder is held with listing, attribute and permission rights, so another program that has it open
+//!   without sharing writing cannot make the open fail; the wider rights that clearing its compressed state needs are
+//!   asked for in a second handle, only when the folder is compressed (see [`clear_folder_compression`]);
+//! * an object that is encrypted (EFS) is never decrypted and never kept: the camera service cannot read a file that
+//!   is encrypted for somebody else's key. A data folder, `logs` or a frame file that is encrypted is moved aside and
+//!   made again like any other that is not what it must be (the new one is plain when the folder around it is). Only
+//!   a data folder that is encrypted *when it is new*, because `%ProgramData%` itself is, is refused, with a sentence
+//!   that says what an administrator can do about `%ProgramData%` (see [`encryption_refusal`]).
 //!
 //! Nothing is ever left with the permissions it would inherit: a new object is created with its final security
 //! descriptor in the create call, and the order is the data folder first (its permissions are replaced before
@@ -61,8 +72,18 @@ const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
 /// `READ_CONTROL`: enough to read owner and DACL.
 const READ_CONTROL: u32 = 0x0002_0000;
+/// `FILE_READ_ATTRIBUTES`.
+const FILE_READ_ATTRIBUTES: u32 = 0x80;
+/// `FILE_LIST_DIRECTORY` (`FILE_READ_DATA` of a folder).
+const FILE_LIST_DIRECTORY: u32 = 0x1;
 /// `FILE_ADD_FILE` (`FILE_WRITE_DATA` of a folder).
 const FILE_ADD_FILE: u32 = 0x2;
+/// What clearing the compressed state of the data folder needs (`FSCTL_SET_COMPRESSION`: read and write data, for a
+/// folder list and add-file). Asked for in a handle of its own, only when the folder is compressed: see
+/// [`clear_folder_compression`].
+const COMPRESSION_ACCESS: u32 = FILE_LIST_DIRECTORY | FILE_ADD_FILE | FILE_READ_ATTRIBUTES;
+/// `FILE_ATTRIBUTE_ENCRYPTED`.
+pub const ATTRIBUTE_ENCRYPTED: u32 = 0x4000;
 
 /// What is known about an object that already exists (facts of an opened handle).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,6 +107,10 @@ pub struct Facts {
     /// A file with a data stream besides its own contents (`frames.bin:name`). A handle with only `FILE_WRITE_DATA`
     /// can create one, and what is in it would survive a Repair that kept the file.
     pub extra_streams: bool,
+    /// A folder or file that is encrypted (EFS). The camera service cannot read what is encrypted for somebody else's
+    /// key, and a folder hands the flag to everything made in it, so a folder is replaced as well (the helper never
+    /// clears the flag in place: that works by path and needs the key of whoever encrypted it).
+    pub encrypted: bool,
 }
 
 /// `FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ENCRYPTED`.
@@ -129,6 +154,12 @@ pub fn decide(obj: Object, facts: Option<&Facts>) -> Plan {
     }
     if !wants_dir && f.bad_attributes {
         return Plan::Replace("it is read-only or encrypted".into());
+    }
+    // the data folder and `logs`: a folder that is encrypted hands that on to every file made in it (`install.log`
+    // would be encrypted under the key of whoever runs the helper), and the camera service could not read them. The
+    // new folder is plain when the folder around it is; when that is encrypted too, `prepare` says so
+    if wants_dir && f.encrypted {
+        return Plan::Replace("it is encrypted (Windows EFS)".into());
     }
     if !wants_dir && f.extra_streams {
         return Plan::Replace("it has an extra data stream".into());
@@ -182,6 +213,7 @@ fn inspect(paths: &Paths, obj: Object, p: &Principals) -> Res<Option<Facts>> {
                 bad_attributes: false,
                 sparse_or_compressed: false,
                 extra_streams: false,
+                encrypted: false,
             }))
         }
     };
@@ -213,6 +245,7 @@ fn inspect(paths: &Paths, obj: Object, p: &Principals) -> Res<Option<Facts>> {
             & (secure::ATTRIBUTE_SPARSE | secure::ATTRIBUTE_COMPRESSED)
             != 0,
         extra_streams,
+        encrypted: kind.attributes & ATTRIBUTE_ENCRYPTED != 0,
     }))
 }
 
@@ -527,16 +560,31 @@ fn locked_message(path: &Path) -> String {
 // Preparing
 
 /// The access the helper needs to an object: to set and read permissions, and to size a file.
+///
+/// The data folder is held with the least that keeps it held: its attributes (the kind, the final path, the
+/// compressed and encrypted flags), its owner and DACL (to read and set them), and **listing** it
+/// (`FILE_LIST_DIRECTORY`, the one data right that asks nothing of a program that has it open besides reading).
+///
+/// **The share-mode trap.** Windows weighs a handle's sharing mode against other opens only when the handle has a
+/// data right: read data, write data, append, execute or `DELETE`. A handle with only attribute, `READ_CONTROL`,
+/// `WRITE_DAC` and `WRITE_OWNER` rights has none, so leaving out `FILE_SHARE_DELETE` ([`share_for`]) would stop
+/// nothing: the folder could be renamed or deleted (and one of the user's own put in its place) between
+/// [`open_checked`] and [`lock`]. `FILE_LIST_DIRECTORY` is that right. It is the least that is asked, so the open
+/// still succeeds while a program that did not share writing has the folder open (an indexer, a backup or
+/// anti-virus tool with read access and `FILE_SHARE_READ`): no write right is asked, and only a write right would
+/// conflict with that. Clearing the folder's compressed state is the one thing that needs more (read and write
+/// data); it opens a handle of its own for that, and only when the folder is compressed
+/// ([`clear_folder_compression`]).
 fn access_for(obj: Object) -> u32 {
-    GENERIC_READ
-        | acl::SECURITY_ACCESS
-        | if obj.is_file() { GENERIC_WRITE } else { 0 }
-        // the data folder's compressed state is cleared through this handle (`FSCTL_SET_COMPRESSION` needs read and
-        // write data, for a folder list and add-file): see `clear_folder_compression`
-        | if obj == Object::DataDir { FILE_ADD_FILE } else { 0 }
+    if obj == Object::DataDir {
+        return FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | acl::SECURITY_ACCESS;
+    }
+    GENERIC_READ | acl::SECURITY_ACCESS | if obj.is_file() { GENERIC_WRITE } else { 0 }
 }
 
 /// Folders are held without delete sharing: nobody can rename, delete or replace one while the helper works in it.
+/// That holds only because [`access_for`] asks for a data right on every folder: Windows weighs a handle's sharing
+/// mode against other opens only when the handle has one (read, write, append, execute or `DELETE`).
 fn share_for(obj: Object) -> FILE_SHARE_MODE {
     if obj.is_file() {
         secure::SHARE_ALL
@@ -790,7 +838,16 @@ fn lock(h: &OwnedHandle, obj: Object, p: &Principals, log: &mut dyn Log) -> Res<
 /// cannot be cleared (a volume without compression) is a line of the log and never a failure: the frame file is made
 /// with `FILE_NO_COMPRESSION` whatever its folder says. `logs` is left as it is: it holds log files only, which
 /// nothing sizes or maps, so a compressed one does no harm.
-fn clear_folder_compression(dir: &OwnedHandle, shown: &Path, log: &mut dyn Log) {
+///
+/// The folder is held with attribute and permission rights only ([`access_for`]); the clear needs read and write
+/// data, so it goes through a second handle that is opened here and only here, when the folder is compressed. That
+/// handle is opened like every other (no link followed, no waiting for a lock), verified the same way as the held
+/// one ([`verify_opened`]), and must be the very folder the held handle is (same volume and file id): a folder that
+/// was swapped in between is not touched. When it cannot be opened (a program holds the folder open without sharing
+/// writing, say) that is a line of the log, like a clear that fails.
+fn clear_folder_compression(paths: &Paths, dir: &OwnedHandle, log: &mut dyn Log) {
+    let shown = path_of(paths, Object::DataDir);
+    let shown = shown.as_path();
     let compressed = match secure::kind(secure::raw(dir)) {
         Ok(k) => k.attributes & secure::ATTRIBUTE_COMPRESSED != 0,
         Err(e) => {
@@ -804,7 +861,17 @@ fn clear_folder_compression(dir: &OwnedHandle, shown: &Path, log: &mut dyn Log) 
     if !compressed {
         return;
     }
-    match secure::set_compressed(secure::raw(dir), false) {
+    let wide = match reopen_for_compression(paths, dir) {
+        Ok(h) => h,
+        Err(e) => {
+            log.line(&format!(
+                "{} is compressed and that could not be cleared ({e}); the frame file is made without compression anyway",
+                shown.display()
+            ));
+            return;
+        }
+    };
+    match secure::set_compressed(secure::raw(&wide), false) {
         Ok(()) => log.line(&format!(
             "{} was compressed: cleared that, so that nothing made in it starts out compressed",
             shown.display()
@@ -814,6 +881,116 @@ fn clear_folder_compression(dir: &OwnedHandle, shown: &Path, log: &mut dyn Log) 
             shown.display()
         )),
     }
+}
+
+/// The data folder opened with the rights that clearing its compressed state needs ([`COMPRESSION_ACCESS`]), checked
+/// to be what the held handle `held` is.
+fn reopen_for_compression(paths: &Paths, held: &OwnedHandle) -> Res<OwnedHandle> {
+    let path = path_of(paths, Object::DataDir);
+    let h = secure::open_with(
+        &path,
+        COMPRESSION_ACCESS,
+        share_for(Object::DataDir),
+        DISP_OPEN_EXISTING,
+        true,
+        0,
+    )
+    .map_err(|e| {
+        if secure::is_oplock_busy(&e) {
+            "another program holds a lock on it".to_string()
+        } else {
+            werr("open for writing", e)
+        }
+    })?;
+    verify_opened(paths, Object::DataDir, &h)?;
+    match (
+        secure::file_identity(secure::raw(held)),
+        secure::file_identity(secure::raw(&h)),
+    ) {
+        (Ok(a), Ok(b)) if a == b => Ok(h),
+        (Ok(_), Ok(_)) => Err("it is not the folder that is held any more".into()),
+        (Err(e), _) | (_, Err(e)) => Err(werr("its file id cannot be read", e)),
+    }
+}
+
+/// The sentence for a data folder that is encrypted although the helper has just made it new, which can only mean
+/// that something around it hands the flag down (an encrypted `%ProgramData%`: NTFS encrypts a new child of an
+/// encrypted folder). The camera service (Frame Server, LocalService) cannot read what is encrypted with EFS for
+/// somebody else's key, so the camera would show nothing and nothing would say why. The helper does not decrypt
+/// anything (that works by path, and the helper is not whoever encrypted it), and it cannot make a plain folder inside
+/// an encrypted one, so it stops and says what to do about the folder around it. `parent_attributes` are those of
+/// `%ProgramData%`. `None` when the data folder is not encrypted.
+///
+/// `cipher /d` on a folder (without `/s`) only turns encryption off for what is made in it from then on; nothing that
+/// is in it already is decrypted, so it is safe to run on `%ProgramData%`.
+pub fn encryption_refusal(
+    paths: &Paths,
+    data_attributes: u32,
+    parent_attributes: Option<u32>,
+) -> Option<String> {
+    if data_attributes & ATTRIBUTE_ENCRYPTED == 0 {
+        return None;
+    }
+    let data = paths.data.display();
+    let parent = paths.program_data.display();
+    Some(
+        if parent_attributes.is_some_and(|a| a & ATTRIBUTE_ENCRYPTED != 0) {
+            format!(
+            "The folder {data} is encrypted (Windows EFS) because the folder around it, {parent}, is: a new folder is encrypted too, and Repair cannot make a plain one. The camera service cannot read encrypted files, so the virtual camera would show nothing. Ask an administrator to turn off encryption for new items in {parent} (run cipher /d \"{parent}\" in an administrator command prompt; it changes that folder only, nothing already in it), then run Repair again."
+        )
+        } else {
+            format!(
+            "The folder {data} is encrypted (Windows EFS) although Repair just made it new, so something on this PC encrypts new folders in {parent}. The camera service cannot read encrypted files, so the virtual camera would show nothing. Ask an administrator to turn off encryption for it (run cipher /d \"{data}\" in an administrator command prompt), then run Repair again."
+        )
+        },
+    )
+}
+
+/// Refuse (with [`encryption_refusal`]) when the data folder behind `h`, just made or kept, is still encrypted: the
+/// helper replaces an encrypted one ([`decide`]), so what is left is a new folder that inherited the flag.
+fn refuse_if_encrypted(h: &OwnedHandle, paths: &Paths) -> Res<()> {
+    let attributes = secure::kind(secure::raw(h))
+        .map_err(|e| werr(&format!("look at {}", paths.data.display()), e))?
+        .attributes;
+    match encryption_refusal(paths, attributes, attributes_of_path(&paths.program_data)) {
+        Some(sentence) => Err(sentence),
+        None => Ok(()),
+    }
+}
+
+/// The attributes of `p` read by path, or `None` when they cannot be read.
+fn attributes_of_path(p: &Path) -> Option<u32> {
+    attributes(p).ok()
+}
+
+/// Whether the data folder or the frame file is encrypted right now, as the sentence that says so and what to do. For
+/// the status report: it needs no elevation and changes nothing. `None` when neither is encrypted or not there.
+///
+/// An encrypted data folder or frame file is something Repair puts right (it replaces it with a new one that is
+/// not encrypted), so the sentence says "run Repair"; except when `%ProgramData%` itself is encrypted, where Repair
+/// cannot help and the sentence is [`encryption_refusal`]'s.
+pub fn encryption_problem(paths: &Paths) -> Option<String> {
+    // attributes only, no link followed, nothing opened for data (no lock of another program is broken or waited for)
+    let data = attributes_of_path(&paths.data);
+    if let Some(a) = data.filter(|a| a & ATTRIBUTE_ENCRYPTED != 0) {
+        let parent = attributes_of_path(&paths.program_data);
+        if parent.is_some_and(|a| a & ATTRIBUTE_ENCRYPTED != 0) {
+            return encryption_refusal(paths, a, parent);
+        }
+        return Some(format!(
+            "The folder {} is encrypted (Windows EFS), so the camera service cannot read the files in it and the virtual camera would show nothing. Run Repair: it replaces the folder with a new one that is not encrypted.",
+            paths.data.display()
+        ));
+    }
+    let frames = paths.frames();
+    attributes_of_path(&frames)
+        .filter(|a| a & ATTRIBUTE_ENCRYPTED != 0)
+        .map(|_| {
+            format!(
+                "{} is encrypted (Windows EFS), so the camera service cannot read it and the virtual camera would show nothing. Run Repair: it replaces the file with a new one that is not encrypted.",
+                frames.display()
+            )
+        })
 }
 
 /// The last look at the frame file the helper holds, before its permissions are set: it must be exactly
@@ -1236,8 +1413,13 @@ pub fn prepare_recording(
     // create nor rename anything in it, and what it hands down to new children is only what the helper wants
     let data = ensure_exists(paths, Object::DataDir, p, stop_service, log, ledger)?;
     // (a folder made inside a compressed `%ProgramData%` is compressed, and would hand that on to what is made in it)
-    clear_folder_compression(&data, &path_of(paths, Object::DataDir), log);
+    clear_folder_compression(paths, &data, log);
     lock(&data, Object::DataDir, p, log)?;
+    // an encrypted folder was replaced above ([`decide`]); one that is encrypted all the same is a new folder in an
+    // encrypted `%ProgramData%`. After the lock (so that the permissions an older version left are gone whatever
+    // happens next), before anything is made in it: a child of an encrypted folder is encrypted too, and the camera
+    // service could not read it
+    refuse_if_encrypted(&data, paths)?;
     // 2. the folder's children, each with a protected DACL of its own
     let logs = ensure_exists(paths, Object::LogsDir, p, stop_service, log, ledger)?;
     lock(&logs, Object::LogsDir, p, log)?;
@@ -1247,6 +1429,8 @@ pub fn prepare_recording(
     let frames = ensure_exists(paths, Object::FramesFile, p, stop_service, log, ledger)?;
     finish_frame_file(&frames, log)?;
     lock(&frames, Object::FramesFile, p, log)?;
+    // (no look at the encrypted flag here: an encrypted frame file was replaced above, and the new one is made in a
+    // data folder that was just found not encrypted, so it is plain)
     // the helper's own log: a DACL of its own, so the service's inheritable modify right on `logs` stops short of it
     let install_log = ensure_exists(paths, Object::InstallLog, p, stop_service, log, ledger)?;
     lock(&install_log, Object::InstallLog, p, log)?;
