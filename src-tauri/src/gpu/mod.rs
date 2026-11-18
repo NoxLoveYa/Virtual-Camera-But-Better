@@ -1,8 +1,10 @@
 //! Direct3D 11 core (plan 4.2).
 //!
 //! * [`GpuDevice`]: the device, its immediate context and the Media Foundation DXGI device manager bound to it.
-//! * [`ShaderCache`]: HLSL embedded with `include_str!`, compiled at runtime with `D3DCompile` (`ps_5_0`), the bytecode
-//!   and the shader objects cached in memory.
+//! * [`ShaderCache`]: the built-in HLSL is compiled by `build.rs` with `D3DCompile` (`ps_5_0` / `vs_5_0`) and the
+//!   bytecode embedded ([`precompiled`]), so creating the cache and the shader objects compiles nothing. A source that
+//!   is not built in (a test's, an extension's) compiles at runtime with [`compile_shader`]. The bytecode and the
+//!   shader objects are cached in memory.
 //! * [`TexturePool`] / [`RgbaTexture`]: pooled `R8G8B8A8_UNORM` render targets keyed by size (the working format).
 //! * [`Renderer`]: the device plus those caches and a fullscreen-triangle draw helper. Every pass of the pipeline
 //!   (convert, filters, output, encode) is one [`Renderer::draw`].
@@ -16,6 +18,7 @@ pub mod convert;
 pub mod downscale;
 pub mod output;
 pub mod pattern;
+pub(crate) mod precompiled;
 #[cfg(test)]
 pub(crate) mod pipeline_tests;
 pub mod readback;
@@ -443,8 +446,26 @@ pub fn compile_shader(name: &str, source: &str, entry: &str, target: &str) -> Gp
     }
 }
 
-/// Compiled shaders of one device. Each shader is compiled the first time it is asked for (`ps_5_0` / `vs_5_0`), then
-/// the bytecode and the shader object stay in memory. Clone the returned COM pointers freely.
+/// The bytecode `build.rs` made from exactly this source, or, for a source that is not built in, a run-time compile.
+fn built_in_or_compile(
+    name: &str,
+    source: &str,
+    entry: &str,
+    target: &str,
+) -> GpuResult<std::borrow::Cow<'static, [u8]>> {
+    if let Some(p) = precompiled::find(source, entry, target) {
+        #[cfg(test)]
+        precompiled::tracking::note_served(source, entry, target);
+        return Ok(std::borrow::Cow::Borrowed(p.code));
+    }
+    #[cfg(test)]
+    precompiled::tracking::note_runtime_compile();
+    compile_shader(name, source, entry, target).map(std::borrow::Cow::Owned)
+}
+
+/// Shaders of one device. A shader object is made the first time it is asked for from the embedded bytecode (see
+/// [`precompiled`]; `ps_5_0` / `vs_5_0`), then the bytecode and the shader object stay in memory. Clone the returned
+/// COM pointers freely.
 pub struct ShaderCache {
     device: ID3D11Device,
     vertex: Mutex<HashMap<ShaderId, ID3D11VertexShader>>,
@@ -478,7 +499,7 @@ impl ShaderCache {
         if let Some(p) = lock(&self.custom).get(name) {
             return Ok(p.clone());
         }
-        let code = compile_shader(name, source, "main", "ps_5_0")?;
+        let code = built_in_or_compile(name, source, "main", "ps_5_0")?;
         let mut ps = None;
         // SAFETY: plain call with valid bytecode.
         unsafe { self.device.CreatePixelShader(&code, None, Some(&mut ps))? };
@@ -501,7 +522,9 @@ impl ShaderCache {
         if let Some(b) = lock(&self.bytecode).get(&(id, entry)) {
             return Ok(b.clone());
         }
-        let bytes: Arc<[u8]> = compile_shader(id.name(), &id.source(), entry, target)?.into();
+        let bytes: Arc<[u8]> = built_in_or_compile(id.name(), &id.source(), entry, target)?
+            .into_owned()
+            .into();
         lock(&self.bytecode).insert((id, entry), bytes.clone());
         Ok(bytes)
     }

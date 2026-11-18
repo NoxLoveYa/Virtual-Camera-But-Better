@@ -255,3 +255,18 @@ counted, and that the oldest-first path is the one that is two frames old.
 A live camera (14 fps in this light; the pacing needs a rate above the consumer's), 4K with an app at a lower rate, the preview window (the
 engine runs without a tap in these scripts), the gain of the fence that keeps the CPU two frames ahead of the GPU when nothing is read back (it
 costs two calls a frame; it matters only where the GPU is slower than the camera, which no run here had), and a one-hour run.
+
+## Shaders compiled at build time (2026-11-18)
+
+Before, every built-in HLSL shader was compiled with FXC (`D3DCompile`) when the engine was created (`Engine::build`) and again when the GPU device was rebuilt after a device loss (`Engine::rebuild_gpu`): `ShaderCache::warm_up`, `fx::warm_up` and `meter::warm_up` each compile what they warm. Now `build.rs` compiles every `src/gpu/shaders/*.hlsl` (same entry points, `vs_5_0` / `ps_5_0`, `ENABLE_STRICTNESS | OPTIMIZATION_LEVEL3`) and embeds the bytecode (`gpu/precompiled.rs`); the warm-ups only create the shader objects. Extension shaders (WGSL from the user) still compile at run time.
+
+Method: the ignored test `gpu::pipeline_tests::shader_setup_time` (release build, hardware adapter RTX 5080, one process, 3 rounds; the "run time" rows switch the embedded table off for the thread, which is the old path). Time of `Renderer::new` plus the three warm-ups, which is the whole shader share of both engine creation and the GPU rebuild (the rebuild also pays for `GpuDevice::new`, about 94 ms, unchanged, and `Assets::new`).
+
+| | before (run-time FXC) | after (embedded) |
+|---|---|---|
+| shader warm-up (all three warm-ups), 3 rounds | 613 / 601 / 609 ms | 1.5 / 1.0 / 1.0 ms |
+| `Renderer::new` | 1.4-1.8 ms | 0.34-0.44 ms |
+| engine creation, shader share | about 0.61 s | about 1.4 ms |
+| GPU rebuild, shader share (device 94 ms on top, unchanged) | about 0.61 s | about 1.4 ms |
+
+Tests: `built_in_shaders_are_not_compiled_at_run_time` (no run-time compile during all three warm-ups; every table entry is used) and `precompiled_bytecode_equals_a_run_time_compile` (each embedded blob is byte-identical to a run-time compile of the same source, so the pixels are the same). Cost at build time: the build script run is 1.7 s (cargo `--timings`; it includes the FXC compile of all 33 programs (32 files) and `tauri-build`), only when an `.hlsl` or `build.rs` changes.

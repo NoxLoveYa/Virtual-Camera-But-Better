@@ -107,6 +107,7 @@ fn cpu_frame<'a>(
 fn every_shader_compiles() {
     let r = warp();
     r.shaders.warm_up().expect("all shaders compile");
+    assert_eq!(super::precompiled::tracking::runtime_compiles(), 0);
     // The cache hands back the same bytecode.
     let a = r
         .shaders
@@ -129,6 +130,77 @@ fn every_shader_compiles() {
         matches!(&err, GpuError::Shader { log, .. } if log.contains("nope")),
         "{err}"
     );
+}
+
+/// What engine creation and the GPU rebuild warm up (`Engine::build`, `Engine::rebuild_gpu`).
+fn warm_everything(r: &Renderer) {
+    r.shaders.warm_up().expect("pipeline shaders");
+    crate::fx::warm_up(r).expect("filter shaders");
+    crate::meter::warm_up(r).expect("meter shaders");
+}
+
+#[test]
+fn built_in_shaders_are_not_compiled_at_run_time() {
+    use super::precompiled::{tracking, PRECOMPILED};
+    let r = warp();
+    warm_everything(&r);
+    assert_eq!(tracking::runtime_compiles(), 0, "a built-in shader missed the embedded table");
+    // Every program of the table is one the engine asks for (a stale entry would be dead weight).
+    let served = tracking::served();
+    for p in PRECOMPILED {
+        assert!(
+            served.iter().any(|(src, entry, target)| {
+                super::precompiled::find(src, entry, target).is_some_and(|f| std::ptr::eq(f, p))
+            }),
+            "{} {} is in the table but nothing uses it",
+            p.name,
+            p.entry
+        );
+    }
+}
+
+/// The embedded bytecode is what the run-time path produces for the same source: same compiler, profile, entry
+/// point and flags, so the pixels are the same.
+#[test]
+fn precompiled_bytecode_equals_a_run_time_compile() {
+    use super::precompiled::{find, tracking};
+    let r = warp();
+    warm_everything(&r);
+    let served = tracking::served();
+    assert!(!served.is_empty());
+    for (src, entry, target) in served {
+        let table = find(&src, &entry, &target).expect("served from the table");
+        let fresh = super::compile_shader(table.name, &src, &entry, &target).expect("run-time compile");
+        assert!(fresh == table.code, "{} {entry}: the embedded bytecode differs from a run-time compile", table.name);
+    }
+}
+
+/// Not a check: prints what the engine's shader setup costs with the embedded bytecode and with the old run-time
+/// compile. `cargo test --release -p better-cam --lib shader_setup_time -- --ignored --nocapture`
+#[test]
+#[ignore = "measurement"]
+fn shader_setup_time() {
+    use super::precompiled::tracking;
+    use std::time::Instant;
+    for round in 0..3 {
+        for forced in [true, false] {
+            tracking::force_runtime(forced);
+            let t = Instant::now();
+            let gpu = Arc::new(GpuDevice::new(AdapterKind::Hardware).expect("hardware device"));
+            let device = t.elapsed();
+            let t = Instant::now();
+            let r = Arc::new(Renderer::new(gpu).expect("renderer"));
+            let create = t.elapsed();
+            let t = Instant::now();
+            warm_everything(&r);
+            let shaders = t.elapsed();
+            eprintln!(
+                "round {round} {:>10}: device {device:>9.1?}  Renderer::new {create:>9.1?}  shader warm-up {shaders:>9.1?}  (engine create / GPU rebuild shader share)",
+                if forced { "run time" } else { "embedded" },
+            );
+        }
+    }
+    tracking::force_runtime(false);
 }
 
 /// The convert matrices against hand-checked values: (space, range, [y, cb, cr], expected rgb).
