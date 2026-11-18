@@ -12,6 +12,13 @@
 //! * Calls that write (user and re-apply) pass one gate, so a re-apply that runs in the background after an open
 //!   can never overwrite a value the user set meanwhile.
 //! * [`ControlsHub::poll`] re-reads the controls that are on Auto, for the `controls-changed` event.
+//! * Better Cam auto (docs/AUTO-CONTROLS.md 5.1-5.3): the record also holds a control's **mode** (a control the
+//!   controller drives has `app` set; its value is the resume point), the camera's Better Cam auto settings and what
+//!   the controller learned. [`ControlsHub::set_mode`] changes a mode, [`ControlsHub::drive`] is the controller's
+//!   write (only while the mode is Better Cam auto, under the same write gate as the user's writes, so a user's mode
+//!   change always wins), [`ControlsHub::hand_back`] its watchdog's. The controller thread
+//!   (`auto_controls::runner`) reads [`ControlsHub::auto_snapshot`] whenever [`ControlsHub::auto_generation`]
+//!   moves.
 //!
 //! Every device call blocks for one USB transfer (2-7 ms; the first write to white balance, focus or exposure after
 //! an open takes 200-700 ms), so callers are never the UI or the render thread.
@@ -24,6 +31,10 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::auto_controls::exposure::ExposureCaps;
+use crate::auto_controls::{
+    AutoCfg, AutoController, HandBack, Learned, Mode as ControlMode, Modes, Offer, Prior, Resume,
+};
 use crate::capture::controls::{
     apply_snapshot, ApplyReport, ControlDevice, ControlError, ControlInfo, ControlKey,
     ControlSnapshot, DeviceControls, StoredControl,
@@ -114,8 +125,18 @@ impl ControlsOpener for DeviceOpener {
 // ---------------------------------------------------------------------------------------------------------------
 // Wire types
 
-/// One entry of the `get_camera_controls` / `controls-changed` payloads (plan 5.5): `ControlInfo` with the field
-/// names the frontend uses.
+/// How Better Cam auto is offered for a control (`app` of [`ControlInfoDto`], docs/AUTO-CONTROLS.md 5.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AppOffer {
+    /// Exposure with gain, or white balance.
+    Full,
+    /// Exposure in whole stops only (no usable gain).
+    Stops,
+}
+
+/// One entry of the `get_camera_controls` / `controls-changed` payloads (plan 5.5, docs/AUTO-CONTROLS.md 5.3):
+/// `ControlInfo` with the field names the frontend uses, and who drives the control.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ControlInfoDto {
     pub key: ControlKey,
@@ -127,6 +148,17 @@ pub struct ControlInfoDto {
     pub auto: bool,
     pub can_auto: bool,
     pub can_manual: bool,
+    /// `manual`, `camera` (the camera's Auto flag) or `app` (Better Cam auto; the Auto flag is off).
+    pub mode: ControlMode,
+    /// Better Cam auto is offered for this control (`full`, or `stops`: whole stops only); `null` when it is not,
+    /// and for the controls that have none.
+    pub app: Option<AppOffer>,
+    /// Why Better Cam auto is not offered (the tooltip of the disabled option).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_why: Option<String>,
+    /// `exposure` for the gain while the exposure loop drives it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub driven_by: Option<ControlKey>,
 }
 
 impl From<&ControlInfo> for ControlInfoDto {
@@ -141,12 +173,61 @@ impl From<&ControlInfo> for ControlInfoDto {
             auto: i.auto,
             can_auto: i.can_auto,
             can_manual: i.can_manual,
+            mode: if i.auto {
+                ControlMode::Camera
+            } else {
+                ControlMode::Manual
+            },
+            app: None,
+            app_why: None,
+            driven_by: None,
         }
     }
 }
 
+/// The plain entries: no record, so no Better Cam auto ([`ControlsHub`] adds the modes).
 pub fn dtos(infos: &[ControlInfo]) -> Vec<ControlInfoDto> {
     infos.iter().map(ControlInfoDto::from).collect()
+}
+
+/// The controls Better Cam auto drives, as the controller's key.
+fn is_loop_key(key: ControlKey) -> bool {
+    matches!(key, ControlKey::Exposure | ControlKey::WhiteBalance)
+}
+
+/// Gain follows the exposure loop (docs/AUTO-CONTROLS.md 2.2).
+fn loop_of(key: ControlKey) -> Option<ControlKey> {
+    match key {
+        ControlKey::Exposure | ControlKey::Gain => Some(ControlKey::Exposure),
+        ControlKey::WhiteBalance => Some(ControlKey::WhiteBalance),
+        _ => None,
+    }
+}
+
+/// Whether the exposure loop uses the camera's gain (2.3: manual and fine enough).
+fn loop_uses_gain(infos: &[ControlInfo]) -> bool {
+    ExposureCaps::from_controls(infos).is_some_and(|c| c.gain.is_some())
+}
+
+/// The mode of `key` in `rec`, with `info` as the device reports it. Gain is Better Cam auto while the exposure
+/// loop drives it.
+fn mode_in(rec: Option<&ControlSnapshot>, info: &ControlInfo, support: crate::auto_controls::Support) -> ControlMode {
+    let app = rec.is_some_and(|r| match info.key {
+        ControlKey::Exposure => r.is_app(ControlKey::Exposure) && support.exposure.offered(),
+        ControlKey::WhiteBalance => {
+            r.is_app(ControlKey::WhiteBalance) && support.white_balance.offered()
+        }
+        // The exposure loop drives the gain when the camera has a usable one ([`Offer::Full`]).
+        ControlKey::Gain => r.is_app(ControlKey::Exposure) && support.exposure == Offer::Full,
+        _ => false,
+    });
+    if app {
+        ControlMode::App
+    } else if info.auto {
+        ControlMode::Camera
+    } else {
+        ControlMode::Manual
+    }
 }
 
 /// The `controls` argument of `start_engine` and `set_source`: what the user changed on one camera.
@@ -158,6 +239,18 @@ pub fn dtos(infos: &[ControlInfo]) -> Vec<ControlInfoDto> {
 ///
 /// `auto: true` keeps the device's own Auto mode (the value is not written); `auto: false` switches it off and
 /// writes `value`. Controls the app does not know are ignored.
+///
+/// Better Cam auto (docs/AUTO-CONTROLS.md 5.1): `"mode": "app"` on exposure, white balance and (with exposure) gain
+/// means the controller drives the control; `value` is then the resume point, written as a manual value on open.
+/// `auto` is the camera's Better Cam auto settings and `learned` what it learned; both are optional and a bad one
+/// is dropped, not an error (an old save must always load).
+///
+/// ```json
+/// { "id": "...", "name": "W4GS",
+///   "controls": { "exposure": { "value": -5, "auto": false, "mode": "app" }, "gain": { "value": 48, "mode": "app" } },
+///   "auto": { "exposure": { "target": 0.45, "longest": "fit", "max_gain": null, "speed": "normal" } },
+///   "learned": { "gain_stops": 3.0 } }
+/// ```
 #[derive(Debug, Deserialize)]
 struct WireRecord {
     id: String,
@@ -165,6 +258,10 @@ struct WireRecord {
     name: String,
     #[serde(default)]
     controls: BTreeMap<String, WireControl>,
+    #[serde(default)]
+    auto: Option<Value>,
+    #[serde(default)]
+    learned: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,6 +270,29 @@ struct WireControl {
     value: Option<i32>,
     #[serde(default)]
     auto: Option<bool>,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+/// Learned values inside their ranges (2.5.7, 2.6, 5.1); what is not a number or not a known key is dropped.
+pub fn sanitize_learned(mut l: Learned) -> Learned {
+    l.gain_stops = l
+        .gain_stops
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(0.5, 6.0));
+    l.wb_alpha = l
+        .wb_alpha
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(0.002, 0.02));
+    l.blocked
+        .retain(|k| matches!(k, ControlKey::Exposure | ControlKey::WhiteBalance));
+    l.blocked.sort();
+    l.blocked.dedup();
+    l.rate_caps.retain(|k, _| k.parse::<u32>().is_ok());
+    for v in l.rate_caps.values_mut() {
+        *v = (*v).clamp(-16, 5);
+    }
+    l
 }
 
 /// Parse the `controls` argument. `null` or a missing argument is no record.
@@ -182,19 +302,43 @@ pub fn parse_record(v: Option<&Value>) -> Result<Option<ControlSnapshot>, String
     };
     let w: WireRecord = serde_json::from_value(v.clone()).map_err(|e| format!("controls: {e}"))?;
     let mut snap = ControlSnapshot::new(DeviceKey::new(&w.id, &w.name));
+    let app_of = |key: ControlKey| {
+        w.controls
+            .get(key.key())
+            .is_some_and(|c| c.mode.as_deref() == Some("app"))
+    };
     for key in ControlKey::ALL {
         let Some(c) = w.controls.get(key.key()) else {
             continue;
         };
-        if c.auto.is_none() && c.value.is_none() {
+        // Gain follows exposure: it is Better Cam auto only while exposure is.
+        let app = match key {
+            ControlKey::Exposure | ControlKey::WhiteBalance => app_of(key),
+            ControlKey::Gain => app_of(key) && app_of(ControlKey::Exposure),
+            _ => false,
+        };
+        if c.auto.is_none() && c.value.is_none() && !app {
             continue;
         }
         snap.controls.push(StoredControl {
             key,
-            auto: c.auto,
-            value: if c.auto == Some(true) { None } else { c.value },
+            auto: if app { Some(false) } else { c.auto },
+            value: if !app && c.auto == Some(true) {
+                None
+            } else {
+                c.value
+            },
+            app,
         });
     }
+    snap.auto = w
+        .auto
+        .and_then(|a| serde_json::from_value::<AutoCfg>(a).ok())
+        .map(AutoCfg::sanitized);
+    snap.learned = w
+        .learned
+        .and_then(|l| serde_json::from_value::<Learned>(l).ok())
+        .map(sanitize_learned);
     Ok(Some(snap))
 }
 
@@ -276,6 +420,51 @@ pub struct ControlsHub {
     resend: AtomicBool,
     lease_idle: Duration,
     opener: Arc<dyn ControlsOpener>,
+    /// The token of the camera whose [`apply_on_open`](ControlsHub::apply_on_open) finished (0: none yet).
+    applied: AtomicU64,
+    /// Moves with every change the controller must look at: a mode, the settings, a restart request.
+    auto_gen: AtomicU64,
+    /// A control moved (the controller wrote, a mode changed): the poller sends the list ([`take_driven`]).
+    ///
+    /// [`take_driven`]: ControlsHub::take_driven
+    driven: AtomicBool,
+    /// What the controls were before Better Cam auto took them (the controller hands back to it).
+    prior: Mutex<Prior>,
+    /// Controls the user asked to resume (after a conflict, "Try again" after an ignored camera).
+    resumes: Mutex<Vec<ControlKey>>,
+}
+
+/// What the controller thread needs from the hub (see [`ControlsHub::auto_snapshot`]).
+#[derive(Clone, Debug)]
+pub struct AutoSnapshot {
+    /// [`ControlsHub::auto_generation`] when it was made.
+    pub generation: u64,
+    /// The camera the record is for (empty when there is no record and no camera).
+    pub id: String,
+    pub cfg: AutoCfg,
+    pub learned: Learned,
+    /// `seeded` is false: the runner decides it against the device.
+    pub modes: Modes,
+}
+
+/// Why [`ControlsHub::drive`] and [`ControlsHub::hand_back`] did not write.
+#[derive(Debug)]
+pub enum DriveError {
+    /// The camera of that token is not the engine's open one any more.
+    NotAttached,
+    /// The control is not in Better Cam auto (the user changed its mode): the controller drops the loop.
+    NotApp,
+    Control(ControlError),
+}
+
+impl std::fmt::Display for DriveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DriveError::NotAttached => f.write_str("the camera is not open"),
+            DriveError::NotApp => f.write_str("the control is not in Better Cam auto"),
+            DriveError::Control(e) => write!(f, "{e}"),
+        }
+    }
 }
 
 /// Counts a running call for [`ControlsHub::expire_lease`].
@@ -306,6 +495,11 @@ impl ControlsHub {
             resend: AtomicBool::new(false),
             lease_idle: LEASE_IDLE,
             opener,
+            applied: AtomicU64::new(0),
+            auto_gen: AtomicU64::new(1),
+            driven: AtomicBool::new(false),
+            prior: Mutex::new(Prior::default()),
+            resumes: Mutex::new(Vec::new()),
         }
     }
 
@@ -319,7 +513,26 @@ impl ControlsHub {
 
     /// Replace the record (`start_engine`, `set_source`).
     pub fn set_record(&self, record: Option<ControlSnapshot>) {
-        *lock(&self.record) = record;
+        {
+            let mut g = lock(&self.record);
+            let same = match (g.as_ref(), record.as_ref()) {
+                (Some(a), Some(b)) => same_camera(&a.device.symbolic_link, &b.device.symbolic_link),
+                _ => false,
+            };
+            if !same {
+                *lock(&self.prior) = Prior::default();
+            }
+            *g = record;
+        }
+        self.bump(false);
+    }
+
+    /// The controller must look at the hub again (`resend`: also send the list to the window).
+    fn bump(&self, send: bool) {
+        self.auto_gen.fetch_add(1, Ordering::SeqCst);
+        if send {
+            self.driven.store(true, Ordering::Release);
+        }
     }
 
     pub fn record(&self) -> Option<ControlSnapshot> {
@@ -437,19 +650,64 @@ impl ControlsHub {
                         r.device = key;
                     }
                 }
-                report = apply_snapshot(
-                    &Cancellable {
-                        inner: device.as_ref(),
-                        cancel,
-                    },
-                    &rec,
-                )?;
+                let dev = Cancellable {
+                    inner: device.as_ref(),
+                    cancel,
+                };
+                // What Better Cam auto drives goes last, exposure first (2.5.11: the slow first write, then gain),
+                // as a manual value at the resume point. Everything else as always: Auto flags, then values.
+                let mut plain = rec.clone();
+                plain.controls.retain(|c| !c.app);
+                report = apply_snapshot(&dev, &plain)?;
+                for key in [ControlKey::Exposure, ControlKey::Gain, ControlKey::WhiteBalance] {
+                    let Some(c) = rec.get(key).filter(|c| c.app) else {
+                        continue;
+                    };
+                    let mut one = ControlSnapshot::new(rec.device.clone());
+                    one.controls.push(c.clone());
+                    let r = apply_snapshot(&dev, &one)?;
+                    report.applied.extend(r.applied);
+                    report.skipped.extend(r.skipped);
+                }
             }
         }
         let infos = device.read_all()?;
-        let out = dtos(&infos);
+        self.normalize_app(link, &infos);
+        let out = self.annotate(link, &infos);
         self.set_last(token, infos);
+        if !cancel.load(Ordering::Acquire) {
+            self.applied.store(token, Ordering::Release);
+            self.bump(false);
+        }
         Ok((report, out))
+    }
+
+    /// The gain follows the exposure: it is flagged as Better Cam auto while the exposure is and the camera has a
+    /// usable gain, and never otherwise (the frontend's record may not say).
+    fn normalize_app(&self, link: &str, infos: &[ControlInfo]) {
+        let mut g = lock(&self.record);
+        let Some(r) = g
+            .as_mut()
+            .filter(|r| same_camera(&r.device.symbolic_link, link))
+        else {
+            return;
+        };
+        let want = r.is_app(ControlKey::Exposure) && loop_uses_gain(infos);
+        if want && !r.is_app(ControlKey::Gain) {
+            if let Some(i) = infos.iter().find(|i| i.key == ControlKey::Gain) {
+                r.record_app(ControlKey::Gain, i.value);
+            }
+        } else if !want {
+            if let Some(c) = r.controls.iter_mut().find(|c| c.key == ControlKey::Gain && c.app) {
+                c.app = false;
+            }
+        }
+    }
+
+    /// Whether [`apply_on_open`](Self::apply_on_open) finished for the camera of `token`: the controller starts
+    /// after it, so its first write never races the stored values.
+    pub fn applied(&self, token: u64) -> bool {
+        token != 0 && self.applied.load(Ordering::Acquire) == token
     }
 
     /// The engine's camera when `id` names it.
@@ -565,11 +823,13 @@ impl ControlsHub {
             }
             Ok(infos)
         })?;
-        Ok(dtos(&infos))
+        Ok(self.annotate(id, &infos))
     }
 
     /// `set_camera_control`: Auto on (`auto`), or a manual `value` (clamped to the device's range). Returns the
-    /// control as the device reports it. The record follows.
+    /// control as the device reports it. The record follows. A control in Better Cam auto leaves it (the user's
+    /// write wins: the controller's next write finds the mode changed); the gain, which follows the exposure loop,
+    /// is not set by hand while that runs.
     pub fn set(
         &self,
         id: &str,
@@ -579,6 +839,10 @@ impl ControlsHub {
     ) -> Result<ControlInfoDto, String> {
         let key = ControlKey::from_key(key).ok_or_else(|| format!("unknown control '{key}'"))?;
         let _gate = lock(&self.gate);
+        let was_app = self.with_record(id, |r| r.is_app(key));
+        if key == ControlKey::Gain && self.with_record(id, |r| r.is_app(ControlKey::Exposure) && r.is_app(key)) {
+            return Err("Gain is set by Better Cam auto exposure".into());
+        }
         let info = self.run(id, |src, dev| {
             let info = if auto {
                 dev.set_auto(key, true)?
@@ -591,7 +855,24 @@ impl ControlsHub {
             Ok(info)
         })?;
         self.note(id, &info);
-        Ok(ControlInfoDto::from(&info))
+        if was_app {
+            self.left_app(id, key);
+        }
+        Ok(self.annotate(id, std::slice::from_ref(&info)).remove(0))
+    }
+
+    /// `key` left Better Cam auto by the user's hand: the exposure takes the gain along (it stays at its last driven
+    /// value, as a manual one). The controller finds out at its next write or its next look at the hub.
+    fn left_app(&self, id: &str, key: ControlKey) {
+        if key == ControlKey::Exposure {
+            self.with_record(id, |r| {
+                if let Some(g) = r.controls.iter_mut().find(|c| c.key == ControlKey::Gain) {
+                    g.app = false;
+                    g.auto = Some(false);
+                }
+            });
+        }
+        self.bump(true);
     }
 
     /// `reset_camera_controls`: every control back to the device's default (its default value, and Auto on where
@@ -616,8 +897,423 @@ impl ControlsHub {
             }
             Ok(infos)
         })?;
+        // Every Better Cam auto mode ends; its settings and what it learned are kept for next time (docs 3).
         self.with_record(id, |r| r.controls.clear());
-        Ok(dtos(&infos))
+        self.bump(true);
+        Ok(self.annotate(id, &infos))
+    }
+
+    // ---- Better Cam auto
+
+    /// The entries of `infos` (the controls of the camera `link`) with their modes and whether Better Cam auto is
+    /// offered, from the record when it is for that camera.
+    pub fn annotate(&self, link: &str, infos: &[ControlInfo]) -> Vec<ControlInfoDto> {
+        let rec = lock(&self.record)
+            .as_ref()
+            .filter(|r| same_camera(&r.device.symbolic_link, link))
+            .cloned();
+        let learned = rec
+            .as_ref()
+            .and_then(|r| r.learned.clone())
+            .unwrap_or_default();
+        let support = AutoController::support(infos, &learned);
+        infos
+            .iter()
+            .map(|i| {
+                let mut d = ControlInfoDto::from(i);
+                d.mode = mode_in(rec.as_ref(), i, support);
+                let offer = match i.key {
+                    ControlKey::Exposure => Some(support.exposure),
+                    ControlKey::WhiteBalance => Some(support.white_balance),
+                    _ => None,
+                };
+                if let Some(o) = offer {
+                    d.app = match o {
+                        Offer::Full => Some(AppOffer::Full),
+                        Offer::Stops => Some(AppOffer::Stops),
+                        Offer::No(_) => None,
+                    };
+                    d.app_why = o.why(i.key);
+                }
+                if i.key == ControlKey::Gain && d.mode == ControlMode::App {
+                    d.driven_by = Some(ControlKey::Exposure);
+                }
+                d
+            })
+            .collect()
+    }
+
+    /// `set_control_mode(id, key, mode)`: who drives `key` (docs/AUTO-CONTROLS.md 5.3, section 3).
+    ///
+    /// * `app`: engage Better Cam auto (exposure and white balance only). The control is written manual at the
+    ///   resume point (the stored value, else the camera's default; for exposure the gain follows at its own resume
+    ///   point), which switches the camera's Auto flag off; what the control was before is kept for a hand-back.
+    ///   Works on a lease too: the camera keeps the seed and the controller starts at the next open.
+    /// * `manual`: the controller stops and the last driven values stay as manual ones, so the picture does not jump.
+    /// * `camera`: the camera's Auto flag on; for exposure the gain stays at its last driven value, as manual.
+    ///
+    /// Returns the rows that changed (exposure together with gain).
+    pub fn set_mode(
+        &self,
+        id: &str,
+        key: ControlKey,
+        mode: ControlMode,
+    ) -> Result<Vec<ControlInfoDto>, String> {
+        if key == ControlKey::Gain && mode == ControlMode::App {
+            return Err("Gain is driven by Better Cam auto exposure".into());
+        }
+        if mode == ControlMode::App && !is_loop_key(key) {
+            return Err(format!("Better Cam auto is not available for {}", key.label()));
+        }
+        let _gate = lock(&self.gate);
+        let (was_app, resume, learned) = self.with_record(id, |r| {
+            (
+                r.is_app(key),
+                Resume {
+                    exposure: r.get(ControlKey::Exposure).and_then(|c| c.value),
+                    gain: r.get(ControlKey::Gain).and_then(|c| c.value),
+                    white_balance: r.get(ControlKey::WhiteBalance).and_then(|c| c.value),
+                },
+                r.learned.clone().unwrap_or_default(),
+            )
+        });
+        if key == ControlKey::Gain && self.with_record(id, |r| r.is_app(ControlKey::Exposure) && r.is_app(key)) {
+            return Err("Gain is set by Better Cam auto exposure".into());
+        }
+        /// What the closure did, for the record.
+        struct Done {
+            rows: Vec<ControlInfo>,
+            /// Better Cam auto engaged: what the controls were, and the values written.
+            engaged: Option<(Prior, Option<i32>, Option<i32>)>,
+        }
+        let result = self.run(id, |src, dev| -> Result<Result<Done, String>, ControlError> {
+            let caps = dev.read_all()?;
+            let find = |k: ControlKey| caps.iter().find(|c| c.key == k);
+            let Some(info) = find(key) else {
+                // A camera without the control says so in the words of 2.3.
+                let why = (mode == ControlMode::App)
+                    .then(|| {
+                        let s = AutoController::support(&caps, &learned);
+                        if key == ControlKey::Exposure {
+                            s.exposure
+                        } else {
+                            s.white_balance
+                        }
+                        .why(key)
+                    })
+                    .flatten();
+                return Ok(Err(why.unwrap_or_else(|| ControlError::NotSupported(key).to_string())));
+            };
+            let mut done = Done {
+                rows: Vec::new(),
+                engaged: None,
+            };
+            match mode {
+                ControlMode::App if was_app => {}
+                ControlMode::App => {
+                    let support = AutoController::support(&caps, &learned);
+                    let offer = if key == ControlKey::Exposure {
+                        support.exposure
+                    } else {
+                        support.white_balance
+                    };
+                    if let Some(why) = offer.why(key) {
+                        return Ok(Err(why));
+                    }
+                    let mut prior = Prior::default();
+                    let e_seed;
+                    let mut g_seed = None;
+                    if key == ControlKey::Exposure {
+                        prior.exposure = (!info.auto).then_some(info.value);
+                        if let Some(g) = find(ControlKey::Gain).filter(|_| loop_uses_gain(&caps)) {
+                            prior.gain = Some(g.value);
+                            prior.gain_auto = g.auto;
+                        }
+                        let e = resume.exposure.unwrap_or(info.default);
+                        let ie = dev.set_value(ControlKey::Exposure, e)?;
+                        e_seed = ie.value;
+                        if let Some(g) = find(ControlKey::Gain).filter(|_| loop_uses_gain(&caps)) {
+                            let ig = dev.set_value(ControlKey::Gain, resume.gain.unwrap_or(g.min))?;
+                            g_seed = Some(ig.value);
+                        }
+                    } else {
+                        prior.white_balance = (!info.auto).then_some(info.value);
+                        let iw = dev.set_value(ControlKey::WhiteBalance, resume.white_balance.unwrap_or(info.value))?;
+                        e_seed = iw.value;
+                    }
+                    done.engaged = Some((prior, Some(e_seed), g_seed));
+                }
+                ControlMode::Manual if was_app => {}
+                ControlMode::Manual => {
+                    if key == ControlKey::Gain && !info.can_manual {
+                        return Ok(Err(ControlError::ManualNotSupported(key).to_string()));
+                    }
+                    dev.set_auto(key, false)?;
+                }
+                ControlMode::Camera => {
+                    dev.set_auto(key, true)?;
+                }
+            }
+            for k in [ControlKey::Exposure, ControlKey::Gain, ControlKey::WhiteBalance] {
+                let wanted = match key {
+                    ControlKey::WhiteBalance => k == ControlKey::WhiteBalance,
+                    ControlKey::Exposure | ControlKey::Gain => k != ControlKey::WhiteBalance,
+                    _ => k == key,
+                };
+                if wanted {
+                    if let Some(i) = dev.read(k)? {
+                        if let Source::Engine(t) = src {
+                            self.update_last(*t, &i);
+                        }
+                        done.rows.push(i);
+                    }
+                }
+            }
+            if !matches!(key, ControlKey::Exposure | ControlKey::Gain | ControlKey::WhiteBalance) {
+                done.rows = dev.read(key)?.into_iter().collect();
+            }
+            Ok(Ok(done))
+        })?;
+        let done = result?;
+        let main = done
+            .rows
+            .iter()
+            .find(|i| i.key == key)
+            .cloned()
+            .ok_or_else(|| "the camera did not answer".to_string())?;
+        match mode {
+            ControlMode::App => {
+                if let Some((prior, first, gain)) = done.engaged {
+                    {
+                        let mut p = lock(&self.prior);
+                        if key == ControlKey::Exposure {
+                            p.exposure = prior.exposure;
+                            p.gain = prior.gain;
+                            p.gain_auto = prior.gain_auto;
+                        } else {
+                            p.white_balance = prior.white_balance;
+                        }
+                    }
+                    self.with_record(id, |r| {
+                        if let Some(v) = first {
+                            r.record_app(key, v);
+                        }
+                        if let Some(v) = gain {
+                            r.record_app(ControlKey::Gain, v);
+                        }
+                    });
+                }
+            }
+            ControlMode::Manual | ControlMode::Camera => {
+                self.note(id, &main);
+                if was_app {
+                    if key == ControlKey::Exposure {
+                        // The gain stays where the loop left it, as a manual value.
+                        if let Some(g) = done.rows.iter().find(|i| i.key == ControlKey::Gain) {
+                            self.note(id, g);
+                        }
+                    }
+                    self.left_app(id, key);
+                }
+            }
+        }
+        self.bump(true);
+        Ok(self.annotate(id, &done.rows))
+    }
+
+    /// `set_auto_config(id, cfg)`: the camera's Better Cam auto settings; live, the next decision uses them.
+    pub fn set_auto_config(&self, id: &str, cfg: AutoCfg) {
+        self.with_record(id, |r| r.auto = Some(cfg.sanitized()));
+        self.bump(false);
+    }
+
+    /// `resume_auto(id, key)`: start again after a conflict, or clear `blocked` ("Try again" after a camera ignored
+    /// Better Cam auto; the frontend then sets the mode again).
+    pub fn resume_auto(&self, id: &str, key: ControlKey) -> Result<(), String> {
+        let key = loop_of(key).ok_or_else(|| format!("{} has no Better Cam auto", key.label()))?;
+        self.with_record(id, |r| {
+            if let Some(l) = r.learned.as_mut() {
+                l.blocked.retain(|k| *k != key);
+            }
+        });
+        lock(&self.resumes).push(key);
+        self.bump(true);
+        Ok(())
+    }
+
+    /// The controller keeps what it learned with the camera's record (`auto-status` carries it for the frontend's
+    /// store too).
+    pub fn store_learned(&self, id: &str, learned: Learned) {
+        self.with_record(id, |r| r.learned = Some(sanitize_learned(learned)));
+    }
+
+    /// The generation the controller compares with [`AutoSnapshot::generation`]: it moves with every mode,
+    /// setting or restart request.
+    pub fn auto_generation(&self) -> u64 {
+        self.auto_gen.load(Ordering::Acquire)
+    }
+
+    /// The controls whose restart was asked for since the last call.
+    pub fn take_resumes(&self) -> Vec<ControlKey> {
+        std::mem::take(&mut *lock(&self.resumes))
+    }
+
+    /// The camera the engine has open, for the controller: its token (when it is `token`), link and the controls
+    /// as last read.
+    pub fn attached_caps(&self, token: u64) -> Option<(String, Vec<ControlInfo>)> {
+        lock(&self.attached)
+            .as_ref()
+            .filter(|a| a.token == token)
+            .map(|a| (a.link.clone(), a.last.clone()))
+    }
+
+    /// What the controller needs: the modes, settings and learned values of the record, for the engine's open
+    /// camera (or, with none open, the record's).
+    pub fn auto_snapshot(&self) -> AutoSnapshot {
+        let generation = self.auto_generation();
+        let attached = lock(&self.attached)
+            .as_ref()
+            .map(|a| (a.link.clone(), a.last.clone()));
+        let rec = lock(&self.record).clone();
+        let rec = rec.filter(|r| {
+            attached
+                .as_ref()
+                .is_none_or(|(link, _)| same_camera(&r.device.symbolic_link, link))
+        });
+        let Some(rec) = rec else {
+            return AutoSnapshot {
+                generation,
+                id: attached.map(|(l, _)| l).unwrap_or_default(),
+                cfg: AutoCfg::default(),
+                learned: Learned::default(),
+                modes: Modes::default(),
+            };
+        };
+        let caps: Vec<ControlInfo> = attached.map(|(_, c)| c).unwrap_or_default();
+        let mode_of = |key: ControlKey| {
+            if rec.is_app(key) {
+                ControlMode::App
+            } else {
+                match rec.get(key).and_then(|c| c.auto) {
+                    Some(true) => ControlMode::Camera,
+                    Some(false) => ControlMode::Manual,
+                    None if caps.iter().any(|i| i.key == key && !i.auto && i.can_manual) => ControlMode::Manual,
+                    None => ControlMode::Camera,
+                }
+            }
+        };
+        let value = |key: ControlKey| rec.get(key).and_then(|c| c.value);
+        AutoSnapshot {
+            generation,
+            id: rec.device.symbolic_link.clone(),
+            cfg: rec.auto.unwrap_or_default(),
+            learned: rec.learned.clone().unwrap_or_default(),
+            modes: Modes {
+                exposure: mode_of(ControlKey::Exposure),
+                white_balance: mode_of(ControlKey::WhiteBalance),
+                resume: Resume {
+                    exposure: value(ControlKey::Exposure),
+                    gain: value(ControlKey::Gain),
+                    white_balance: value(ControlKey::WhiteBalance),
+                },
+                prior: *lock(&self.prior),
+                seeded: false,
+            },
+        }
+    }
+
+    fn attached_device(&self, token: u64) -> Option<(String, Arc<dyn CameraControls>)> {
+        lock(&self.attached)
+            .as_ref()
+            .filter(|a| a.token == token)
+            .map(|a| (a.link.clone(), a.device.clone()))
+    }
+
+    /// Whether the controller may write `key` of the camera `link` now: the control is in Better Cam auto in the
+    /// record. The gain only with the exposure.
+    fn driven(&self, link: &str, key: ControlKey) -> bool {
+        lock(&self.record)
+            .as_ref()
+            .filter(|r| same_camera(&r.device.symbolic_link, link))
+            .is_some_and(|r| match key {
+                ControlKey::Exposure | ControlKey::WhiteBalance => r.is_app(key),
+                // The loop only writes the gain when it has one to use, and it follows the exposure.
+                ControlKey::Gain => r.is_app(ControlKey::Exposure),
+                _ => false,
+            })
+    }
+
+    /// The controller's write (docs/AUTO-CONTROLS.md 5.3): a manual `value` for `key` of the attached camera
+    /// `token`, only while the control's mode is Better Cam auto. Takes the write gate, so the user's writes, the
+    /// re-apply and the loop are ordered; a user's mode change that came first makes this return
+    /// [`DriveError::NotApp`] and the manual value stays the last driven one. Updates what the window was last
+    /// told and the record's resume point; does not touch `prior`.
+    pub fn drive(&self, token: u64, key: ControlKey, value: i32) -> Result<ControlInfo, DriveError> {
+        let _gate = lock(&self.gate);
+        let (link, device) = self.attached_device(token).ok_or(DriveError::NotAttached)?;
+        if !self.driven(&link, key) {
+            return Err(DriveError::NotApp);
+        }
+        let _call = Call::begin(&self.calls);
+        let info = device.set_value(key, value).map_err(DriveError::Control)?;
+        self.update_last(token, &info);
+        if let Some(r) = lock(&self.record)
+            .as_mut()
+            .filter(|r| same_camera(&r.device.symbolic_link, &link))
+        {
+            r.record_app(key, info.value);
+        }
+        self.driven.store(true, Ordering::Release);
+        Ok(info)
+    }
+
+    /// The watchdog's hand-back (docs/AUTO-CONTROLS.md 2.7): the control goes to the camera's own Auto or to a
+    /// manual value, and the record follows (the control leaves Better Cam auto), under the write gate. For the
+    /// exposure the gain is handed back with its own call.
+    pub fn hand_back(&self, token: u64, key: ControlKey, to: HandBack) -> Result<ControlInfo, DriveError> {
+        let _gate = lock(&self.gate);
+        let (link, device) = self.attached_device(token).ok_or(DriveError::NotAttached)?;
+        let in_app = lock(&self.record)
+            .as_ref()
+            .filter(|r| same_camera(&r.device.symbolic_link, &link))
+            .is_some_and(|r| r.is_app(key) || (key == ControlKey::Gain && r.is_app(ControlKey::Exposure)));
+        if !in_app {
+            return Err(DriveError::NotApp);
+        }
+        let _call = Call::begin(&self.calls);
+        let info = match to {
+            HandBack::CameraAuto => device.set_auto(key, true),
+            HandBack::Manual(v) => device.set_value(key, v),
+        }
+        .map_err(DriveError::Control)?;
+        self.update_last(token, &info);
+        self.note(&link, &info);
+        self.bump(true);
+        Ok(info)
+    }
+
+    /// The list for `controls-changed` when the controller wrote or a mode changed since the last call (the poller
+    /// calls it at most four times a second, while the window is visible).
+    pub fn take_driven(&self) -> Option<Vec<ControlInfoDto>> {
+        if !self.driven.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        let (link, last) = {
+            let g = lock(&self.attached);
+            let a = g.as_ref().filter(|a| !a.last.is_empty())?;
+            (a.link.clone(), a.last.clone())
+        };
+        Some(self.annotate(&link, &last))
+    }
+
+    /// Read one control of the attached camera `token` (the controller's 1 Hz read-back), outside the write gate.
+    /// `Ok(None)`: no such control, or the camera is not the open one any more.
+    pub fn read_attached(&self, token: u64, key: ControlKey) -> Result<Option<ControlInfo>, ControlError> {
+        let Some((_, device)) = self.attached_device(token) else {
+            return Ok(None);
+        };
+        let _call = Call::begin(&self.calls);
+        device.read(key)
     }
 
     // ---- the poller
@@ -649,9 +1345,14 @@ impl ControlsHub {
         if !send {
             return None;
         }
-        let g = lock(&self.attached);
-        let a = g.as_ref().filter(|a| a.token == token && !a.last.is_empty())?;
-        Some(dtos(&a.last))
+        let (link, last) = {
+            let g = lock(&self.attached);
+            let a = g.as_ref().filter(|a| a.token == token && !a.last.is_empty())?;
+            (a.link.clone(), a.last.clone())
+        };
+        // This list says everything the driven one would.
+        self.driven.store(false, Ordering::Release);
+        Some(self.annotate(&link, &last))
     }
 }
 
@@ -1198,10 +1899,374 @@ mod tests {
             v,
             json!({
                 "key": "white_balance", "min": 2800, "max": 6500, "step": 1, "def": 4600,
-                "value": 4600, "auto": true, "can_auto": true, "can_manual": true
+                "value": 4600, "auto": true, "can_auto": true, "can_manual": true,
+                "mode": "camera", "app": null
             })
         );
         let list = serde_json::to_value(dtos(&[i])).unwrap();
         assert!(list.as_array().is_some_and(|a| a.len() == 1));
+    }
+
+    // ---- Better Cam auto (docs/AUTO-CONTROLS.md 5.1-5.3, 6.2 "Hub integration") ---------------------------------
+
+    use std::sync::atomic::AtomicBool as Flag;
+
+    /// A hub whose engine camera is attached and applied, with the record `entries` for it.
+    fn live(entries: Value) -> (ControlsHub, Arc<FakeControls>, u64) {
+        let (hub, cam, ..) = hub();
+        hub.set_record(Some(record(entries)));
+        let dev: Arc<dyn CameraControls> = cam.clone();
+        let token = hub.attach(LINK, dev.clone());
+        hub.apply_on_open(token, LINK, &dev, &Flag::new(false)).unwrap();
+        cam.clear_log();
+        (hub, cam, token)
+    }
+
+    fn row(rows: &[ControlInfoDto], key: ControlKey) -> &ControlInfoDto {
+        rows.iter().find(|r| r.key == key).unwrap()
+    }
+
+    #[test]
+    fn better_cam_auto_engages_through_the_gate_and_the_events_carry_the_mode() {
+        let (hub, cam, token) = live(json!({}));
+        assert!(hub.applied(token));
+        assert!(!hub.applied(token + 1));
+
+        let rows = hub.set_mode(LINK, ControlKey::Exposure, ControlMode::App).unwrap();
+        // exposure and gain together, written manual at the resume point (the camera's default, and the gain's minimum)
+        assert_eq!(cam.log(), ["value:exposure:-6", "value:gain:0"]);
+        assert!(!cam.get(ControlKey::Exposure).auto);
+        let (e, g) = (row(&rows, ControlKey::Exposure), row(&rows, ControlKey::Gain));
+        assert_eq!((e.mode, g.mode), (ControlMode::App, ControlMode::App));
+        assert_eq!(e.app, Some(AppOffer::Full));
+        assert_eq!(g.driven_by, Some(ControlKey::Exposure));
+        assert!(!e.auto, "the camera's Auto flag is off");
+        // what the controls were before, for a hand-back: exposure was on Camera auto, gain manual at 10
+        let snap = hub.auto_snapshot();
+        assert_eq!(snap.modes.exposure, ControlMode::App);
+        assert_eq!(snap.modes.prior.exposure, None);
+        assert_eq!(snap.modes.prior.gain, Some(10));
+        assert_eq!(snap.modes.resume.exposure, Some(-6));
+
+        // the loop's writes: the record's resume point follows, and the window is told
+        let generation = hub.auto_generation();
+        assert!(hub.take_driven().is_some(), "the mode change is sent");
+        assert!(hub.take_driven().is_none());
+        assert_eq!(hub.drive(token, ControlKey::Exposure, -5).unwrap().value, -5);
+        assert_eq!(hub.drive(token, ControlKey::Gain, 48).unwrap().value, 48);
+        assert_eq!(hub.auto_generation(), generation, "a drive is not a change for the controller");
+        let rec = hub.record().unwrap();
+        assert_eq!(rec.get(ControlKey::Exposure).unwrap().value, Some(-5));
+        assert_eq!(rec.get(ControlKey::Gain).unwrap().value, Some(48));
+        let sent = hub.take_driven().expect("the writes are sent");
+        assert_eq!(row(&sent, ControlKey::Exposure).mode, ControlMode::App);
+        assert_eq!(row(&sent, ControlKey::Exposure).value, -5);
+        assert_eq!(row(&sent, ControlKey::Gain).value, 48);
+        assert!(hub.take_driven().is_none());
+        assert_eq!(hub.auto_snapshot().modes.resume.gain, Some(48));
+
+        // only the controls in Better Cam auto, only the open camera
+        assert!(matches!(hub.drive(token, ControlKey::Brightness, 3), Err(DriveError::NotApp)));
+        assert!(matches!(hub.drive(token + 1, ControlKey::Exposure, -4), Err(DriveError::NotAttached)));
+        assert_eq!(cam.get(ControlKey::Exposure).value, -5);
+        // the serialised event has the mode
+        let v = serde_json::to_value(&sent).unwrap();
+        assert!(v.as_array().unwrap().iter().any(|r| r["key"] == "exposure" && r["mode"] == "app" && r["app"] == "full"));
+        assert!(v.as_array().unwrap().iter().any(|r| r["key"] == "gain" && r["driven_by"] == "exposure"));
+    }
+
+    #[test]
+    fn a_users_manual_mode_wins_and_keeps_the_last_driven_value() {
+        let (hub, cam, token) = live(json!({}));
+        hub.set_mode(LINK, ControlKey::Exposure, ControlMode::App).unwrap();
+        hub.drive(token, ControlKey::Exposure, -5).unwrap();
+        hub.drive(token, ControlKey::Gain, 48).unwrap();
+        cam.clear_log();
+
+        // the user's mode change comes between two writes of the loop
+        let rows = hub.set_mode(LINK, ControlKey::Exposure, ControlMode::Manual).unwrap();
+        assert!(cam.log().is_empty(), "no jump in the picture: {:?}", cam.log());
+        assert!(matches!(hub.drive(token, ControlKey::Exposure, -3), Err(DriveError::NotApp)));
+        assert!(matches!(hub.drive(token, ControlKey::Gain, 90), Err(DriveError::NotApp)));
+        assert_eq!((cam.get(ControlKey::Exposure).value, cam.get(ControlKey::Gain).value), (-5, 48));
+        assert!(cam.log().is_empty());
+        assert_eq!(row(&rows, ControlKey::Exposure).mode, ControlMode::Manual);
+        assert_eq!(row(&rows, ControlKey::Gain).mode, ControlMode::Manual);
+        let rec = hub.record().unwrap();
+        let (e, g) = (rec.get(ControlKey::Exposure).unwrap(), rec.get(ControlKey::Gain).unwrap());
+        assert_eq!((e.app, e.auto, e.value), (false, Some(false), Some(-5)));
+        assert_eq!((g.app, g.auto, g.value), (false, Some(false), Some(48)));
+        assert_eq!(hub.auto_snapshot().modes.exposure, ControlMode::Manual);
+
+        // the slider of the gain works again
+        assert_eq!(hub.set(LINK, "gain", 20, false).unwrap().value, 20);
+    }
+
+    #[test]
+    fn camera_auto_takes_the_exposure_back_and_leaves_the_gain_manual() {
+        let (hub, cam, token) = live(json!({}));
+        hub.set_mode(LINK, ControlKey::Exposure, ControlMode::App).unwrap();
+        hub.drive(token, ControlKey::Exposure, -4).unwrap();
+        hub.drive(token, ControlKey::Gain, 30).unwrap();
+        let rows = hub.set_mode(LINK, ControlKey::Exposure, ControlMode::Camera).unwrap();
+        assert!(cam.get(ControlKey::Exposure).auto);
+        assert_eq!(row(&rows, ControlKey::Exposure).mode, ControlMode::Camera);
+        assert_eq!(row(&rows, ControlKey::Gain).mode, ControlMode::Manual);
+        assert_eq!(cam.get(ControlKey::Gain).value, 30);
+        let rec = hub.record().unwrap();
+        assert!(rec.get(ControlKey::Exposure).is_none(), "the camera's own Auto is the default state");
+        assert_eq!(rec.get(ControlKey::Gain).unwrap().value, Some(30));
+        assert!(!rec.get(ControlKey::Gain).unwrap().app);
+        assert!(matches!(hub.drive(token, ControlKey::Exposure, -4), Err(DriveError::NotApp)));
+    }
+
+    #[test]
+    fn a_user_write_to_a_driven_control_ends_better_cam_auto_and_the_gain_is_not_set_by_hand() {
+        let (hub, cam, token) = live(json!({}));
+        hub.set_mode(LINK, ControlKey::Exposure, ControlMode::App).unwrap();
+        hub.drive(token, ControlKey::Gain, 44).unwrap();
+        assert!(hub.set(LINK, "gain", 5, false).unwrap_err().contains("Better Cam auto"));
+        assert_eq!(cam.get(ControlKey::Gain).value, 44);
+        let e = hub.set(LINK, "exposure", -9, false).unwrap();
+        assert_eq!((e.mode, e.value), (ControlMode::Manual, -9));
+        assert!(matches!(hub.drive(token, ControlKey::Exposure, -3), Err(DriveError::NotApp)));
+        assert!(!hub.record().unwrap().is_app(ControlKey::Gain));
+        // Reset all ends every mode and keeps the settings and what was learned
+        hub.set_auto_config(LINK, AutoCfg::default());
+        hub.store_learned(LINK, Learned { gain_stops: Some(2.5), ..Learned::default() });
+        hub.set_mode(LINK, ControlKey::Exposure, ControlMode::App).unwrap();
+        hub.reset(LINK).unwrap();
+        let rec = hub.record().unwrap();
+        assert!(rec.is_empty());
+        assert!(rec.auto.is_some());
+        assert_eq!(rec.learned.as_ref().unwrap().gain_stops, Some(2.5));
+        assert!(matches!(hub.drive(token, ControlKey::Exposure, -3), Err(DriveError::NotApp)));
+        assert!(cam.get(ControlKey::Exposure).auto);
+    }
+
+    #[test]
+    fn a_reopen_writes_the_resume_point_before_any_drive() {
+        let (hub, cam, ..) = hub();
+        hub.set_record(Some(record(json!({
+            "exposure": { "value": -5, "auto": false, "mode": "app" },
+            "gain": { "value": 48, "mode": "app" }
+        }))));
+        let rec = hub.record().unwrap();
+        assert!(rec.is_app(ControlKey::Exposure) && rec.is_app(ControlKey::Gain));
+        // the camera forgot everything: exposure is on Auto, gain at its default
+        let dev: Arc<dyn CameraControls> = cam.clone();
+        let token = hub.attach(LINK, dev.clone());
+        assert!(!hub.applied(token), "not before the stored values are written");
+        let (report, infos) = hub.apply_on_open(token, LINK, &dev, &Flag::new(false)).unwrap();
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        assert_eq!(cam.log(), ["auto:exposure:false", "value:exposure:-5", "value:gain:48"]);
+        assert!(hub.applied(token));
+        // the list the window gets says who drives
+        assert_eq!(row(&infos, ControlKey::Exposure).mode, ControlMode::App);
+        assert_eq!(row(&infos, ControlKey::Gain).mode, ControlMode::App);
+        // and only now does a drive go through
+        assert_eq!(hub.drive(token, ControlKey::Exposure, -4).unwrap().value, -4);
+        assert_eq!(cam.log().last().unwrap(), "value:exposure:-4");
+        let snap = hub.auto_snapshot();
+        assert_eq!(snap.modes.exposure, ControlMode::App);
+        assert_eq!(snap.modes.resume.exposure, Some(-4));
+        assert_eq!(snap.modes.resume.gain, Some(48));
+    }
+
+    #[test]
+    fn a_lease_stores_the_mode_and_the_seed_and_no_loop_can_drive() {
+        let (hub, cam, ..) = hub();
+        hub.set_record(Some(record(json!({
+            "exposure": { "value": -7, "auto": false },
+        }))));
+        // the camera is closed: the lease writes the seed (the stored value, gain at its minimum)
+        let rows = hub.set_mode(LINK, ControlKey::Exposure, ControlMode::App).unwrap();
+        assert!(hub.has_lease());
+        assert_eq!(cam.log(), ["value:exposure:-7", "value:gain:0"]);
+        assert_eq!(row(&rows, ControlKey::Exposure).mode, ControlMode::App);
+        let rec = hub.record().unwrap();
+        assert_eq!(rec.get(ControlKey::Exposure).map(|c| (c.app, c.value)), Some((true, Some(-7))));
+        assert!(rec.is_app(ControlKey::Gain));
+        // nothing is attached: the controller has nothing to drive
+        assert!(matches!(hub.drive(1, ControlKey::Exposure, -5), Err(DriveError::NotAttached)));
+        assert!(hub.take_driven().is_none(), "no camera, no list");
+        assert_eq!(hub.auto_snapshot().modes.exposure, ControlMode::App);
+        // an unknown mode and controls that have none are errors, not writes
+        cam.clear_log();
+        assert!(hub.set_mode(LINK, ControlKey::Gain, ControlMode::App).is_err());
+        assert!(hub.set_mode(LINK, ControlKey::Focus, ControlMode::App).is_err());
+        assert!(
+            hub.set_mode(LINK, ControlKey::WhiteBalance, ControlMode::App)
+                .unwrap_err()
+                .contains("no manual white balance")
+        );
+        assert!(cam.log().is_empty());
+    }
+
+    #[test]
+    fn the_watchdogs_hand_back_goes_through_the_gate_and_ends_the_mode() {
+        let (hub, cam, token) = live(json!({}));
+        hub.set_mode(LINK, ControlKey::Exposure, ControlMode::App).unwrap();
+        hub.drive(token, ControlKey::Exposure, -4).unwrap();
+        hub.drive(token, ControlKey::Gain, 30).unwrap();
+        let generation = hub.auto_generation();
+        let e = hub.hand_back(token, ControlKey::Exposure, HandBack::CameraAuto).unwrap();
+        assert!(e.auto);
+        assert!(hub.auto_generation() > generation, "the controller looks at the hub again");
+        // the gain goes to what it was before
+        let g = hub.hand_back(token, ControlKey::Gain, HandBack::Manual(10)).unwrap();
+        assert_eq!((g.value, g.auto), (10, false));
+        let snap = hub.auto_snapshot();
+        assert_eq!(snap.modes.exposure, ControlMode::Camera);
+        assert!(matches!(hub.drive(token, ControlKey::Exposure, -3), Err(DriveError::NotApp)));
+        assert!(matches!(
+            hub.hand_back(token, ControlKey::Exposure, HandBack::CameraAuto),
+            Err(DriveError::NotApp)
+        ));
+        let rows = hub.take_driven().unwrap();
+        assert_eq!(row(&rows, ControlKey::Exposure).mode, ControlMode::Camera);
+        assert_eq!(row(&rows, ControlKey::Gain).mode, ControlMode::Manual);
+        let _ = cam;
+    }
+
+    #[test]
+    fn a_camera_that_ignored_better_cam_auto_is_not_offered_until_try_again() {
+        let (hub, _cam, _token) = live(json!({}));
+        hub.store_learned(LINK, Learned { blocked: vec![ControlKey::Exposure], ..Learned::default() });
+        let rows = hub.get(LINK).unwrap();
+        let e = row(&rows, ControlKey::Exposure);
+        assert_eq!(e.app, None);
+        assert!(e.app_why.as_deref().unwrap().contains("ignored"));
+        assert!(hub
+            .set_mode(LINK, ControlKey::Exposure, ControlMode::App)
+            .unwrap_err()
+            .contains("ignored"));
+        // "Try again": clears blocked and tells the controller
+        let generation = hub.auto_generation();
+        hub.resume_auto(LINK, ControlKey::Exposure).unwrap();
+        assert!(hub.auto_generation() > generation);
+        assert_eq!(hub.take_resumes(), [ControlKey::Exposure]);
+        assert!(hub.take_resumes().is_empty());
+        let e = hub.get(LINK).unwrap();
+        assert_eq!(row(&e, ControlKey::Exposure).app, Some(AppOffer::Full));
+        assert!(hub.set_mode(LINK, ControlKey::Exposure, ControlMode::App).is_ok());
+        assert!(hub.resume_auto(LINK, ControlKey::Brightness).is_err());
+    }
+
+    #[test]
+    fn a_camera_without_a_usable_gain_works_in_whole_stops() {
+        let infos = vec![
+            fake::info(ControlKey::Exposure, -13, -1, -6, true),
+            fake::info(ControlKey::Gain, 0, 3, 0, false),
+            fake::info(ControlKey::WhiteBalance, 0, 100, 50, true),
+        ];
+        let support = AutoController::support(&infos, &Learned::default());
+        assert_eq!(support.exposure, Offer::Stops);
+        let (hub, ..) = hub();
+        let rows = hub.annotate(LINK, &infos);
+        assert_eq!(row(&rows, ControlKey::Exposure).app, Some(AppOffer::Stops));
+        // white balance 0..100 is not Kelvin
+        let wb = row(&rows, ControlKey::WhiteBalance);
+        assert_eq!(wb.app, None);
+        assert!(wb.app_why.as_deref().unwrap().contains("units"));
+        assert_eq!(row(&rows, ControlKey::Gain).app_why, None);
+    }
+
+    #[test]
+    fn parse_record_reads_the_better_cam_auto_fields_and_clamps_them() {
+        let r = parse_record(Some(&json!({
+            "id": LINK, "name": "W4GS",
+            "controls": {
+                "exposure": { "value": -5, "auto": true, "mode": "app" },
+                "gain": { "value": 48, "mode": "app" },
+                "white_balance": { "value": 4650, "mode": "app" },
+                "brightness": { "value": 3, "mode": "app" },
+                "focus": { "value": 0, "auto": true }
+            },
+            "auto": { "exposure": { "target": 5, "longest": -4, "max_gain": 60, "speed": "fast" },
+                      "white_balance": { "warmth": -3 } },
+            "learned": { "gain_stops": 99, "wb_alpha": 0.0001, "rate_caps": { "30": -6, "x": 2 },
+                         "blocked": ["white_balance", "brightness", "white_balance"] }
+        })))
+        .unwrap()
+        .unwrap();
+        let e = r.get(ControlKey::Exposure).unwrap();
+        assert!(e.app);
+        assert_eq!((e.auto, e.value), (Some(false), Some(-5)), "Better Cam auto is a manual value on the device");
+        assert!(r.is_app(ControlKey::Gain) && r.is_app(ControlKey::WhiteBalance));
+        assert!(!r.is_app(ControlKey::Brightness), "only exposure, white balance and gain have the mode");
+        assert_eq!(r.get(ControlKey::Focus).unwrap().auto, Some(true));
+        let cfg = r.auto.unwrap();
+        assert_eq!(cfg.exposure.target, 0.8, "clamped");
+        assert_eq!(cfg.exposure.longest, crate::auto_controls::Longest::Stop(-4));
+        assert_eq!(cfg.exposure.max_gain, Some(60));
+        assert_eq!(cfg.exposure.speed, crate::auto_controls::Speed::Fast);
+        assert_eq!(cfg.white_balance.warmth, -1.0);
+        let l = r.learned.unwrap();
+        assert_eq!(l.gain_stops, Some(6.0));
+        assert_eq!(l.wb_alpha, Some(0.002));
+        assert_eq!(l.blocked, [ControlKey::WhiteBalance]);
+        assert_eq!(l.rate_caps.len(), 1);
+
+        // the gain follows the exposure: alone it is a plain manual value
+        let r = record(json!({ "gain": { "value": 48, "mode": "app" }, "exposure": { "value": -5, "auto": false } }));
+        assert!(!r.is_app(ControlKey::Gain));
+        assert_eq!(r.get(ControlKey::Gain).unwrap().value, Some(48));
+        // old records load unchanged, and nonsense in the new fields is dropped, not an error
+        let old = record(json!({ "gain": { "value": 40, "auto": false } }));
+        assert!(old.auto.is_none() && old.learned.is_none());
+        let bad = parse_record(Some(&json!({
+            "id": LINK, "controls": {},
+            "auto": { "exposure": { "longest": "never" } }, "learned": "text"
+        })))
+        .unwrap()
+        .unwrap();
+        assert!(bad.auto.is_none() && bad.learned.is_none());
+        // and the new fields do not change what an old camera applies
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("app") && !json.contains("learned"), "{json}");
+    }
+
+    #[test]
+    fn the_gain_follows_the_exposure_even_when_the_record_does_not_say() {
+        // exposure alone is in the frontend's record: the camera has a gain, so the loop drives it too
+        let (driven, _cam, token) =
+            live(json!({ "exposure": { "value": -5, "auto": false, "mode": "app" } }));
+        assert!(driven.record().unwrap().is_app(ControlKey::Gain));
+        assert_eq!(driven.drive(token, ControlKey::Gain, 40).unwrap().value, 40);
+        let rows = driven.get(LINK).unwrap();
+        assert_eq!(row(&rows, ControlKey::Gain).mode, ControlMode::App);
+        // a camera whose gain is too coarse to use: no flag, the slider stays the user's
+        let infos = vec![
+            fake::info(ControlKey::Exposure, -13, -1, -6, true),
+            fake::info(ControlKey::Gain, 0, 3, 0, false),
+        ];
+        let (hub, ..) = hub();
+        hub.set_record(Some(record(json!({
+            "exposure": { "value": -5, "auto": false, "mode": "app" },
+            "gain": { "value": 2, "mode": "app" }
+        }))));
+        hub.normalize_app(LINK, &infos);
+        assert!(!hub.record().unwrap().is_app(ControlKey::Gain));
+        assert!(hub.record().unwrap().is_app(ControlKey::Exposure));
+        let rows = hub.annotate(LINK, &infos);
+        assert_eq!(row(&rows, ControlKey::Exposure).app, Some(AppOffer::Stops));
+        assert_eq!(row(&rows, ControlKey::Gain).mode, ControlMode::Manual);
+    }
+
+    #[test]
+    fn the_settings_are_stored_live_and_move_the_generation() {
+        let (hub, ..) = hub();
+        hub.set_record(Some(record(json!({}))));
+        let generation = hub.auto_generation();
+        let mut cfg = AutoCfg::default();
+        cfg.exposure.target = 0.6;
+        cfg.white_balance.warmth = 7.0;
+        hub.set_auto_config(LINK, cfg);
+        assert!(hub.auto_generation() > generation);
+        let snap = hub.auto_snapshot();
+        assert_eq!(snap.cfg.exposure.target, 0.6);
+        assert_eq!(snap.cfg.white_balance.warmth, 1.0, "clamped");
+        assert_eq!(snap.id, LINK);
     }
 }

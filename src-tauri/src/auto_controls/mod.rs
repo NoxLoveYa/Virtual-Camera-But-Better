@@ -41,10 +41,12 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::capture::controls::{ControlInfo, ControlKey};
+#[cfg(test)]
 use crate::fx::auto_adjust::Stats;
 
 pub mod exposure;
 pub mod meter;
+pub mod runner;
 pub mod status;
 pub mod watchdog;
 pub mod white_balance;
@@ -205,8 +207,11 @@ pub enum Mode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Resume {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exposure: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gain: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub white_balance: Option<i32>,
 }
 
@@ -236,17 +241,9 @@ pub struct Modes {
 // ---------------------------------------------------------------------------------------------------------------
 // Inputs and outputs (5.5, 5.6)
 
-/// One measurement of the camera picture before the filter chain (5.5).
-#[derive(Clone, Debug)]
-pub struct MeterSample {
-    /// The hub token of the camera session that produced it.
-    pub token: u64,
-    /// Capture time of the measured frame (QPC). The core takes the converted time in
-    /// [`AutoController::on_sample`]; the runner converts with `vcam_protocol`'s frequency.
-    pub capture_qpc: u64,
-    /// 16x16 linear means + coverage (`fx::auto_adjust::Stats`; phase A3 makes the meter share it).
-    pub stats: Stats,
-}
+/// One measurement of the camera picture before the filter chain (5.5): the engine's meter makes it. The core takes
+/// the capture time converted to its own clock in [`AutoController::on_sample`]; the runner converts the QPC time.
+pub use crate::meter::MeterSample;
 
 /// Read by the controller each tick (5.5). Differs from the doc in one point: `resumed_at` is on the controller's
 /// clock (seconds), not QPC, because the core's time is `f64` seconds.
@@ -396,12 +393,24 @@ pub struct WhiteBalanceStatus {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct AutoStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exposure: Option<ExposureStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub white_balance: Option<WhiteBalanceStatus>,
     /// Present on entering `holding` (at most once per 10 s): the store persists it.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub resume: Option<Resume>,
     /// Present when the learned values changed since the last emitted status: the store persists them.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub learned: Option<Learned>,
+}
+
+/// Where the engaged loops start (2.5.11): what the device must hold for [`Modes::seeded`] to be true.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Seeds {
+    /// Exposure and, when the loop uses gain, gain.
+    pub exposure: Option<(i32, Option<i32>)>,
+    pub white_balance: Option<i32>,
 }
 
 /// Whether Better Cam auto is offered for a loop, and how (2.3).
@@ -597,6 +606,24 @@ impl AutoController {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// The values the engaged loops write as their first action when the hub did not seed them (2.5.11), for a
+    /// session opened at `target_fps`: the runner reads the device and sets [`Modes::seeded`] when it already holds
+    /// them.
+    pub fn seeds(&self, target_fps: f64) -> Seeds {
+        Seeds {
+            exposure: self
+                .exposure
+                .as_ref()
+                .filter(|e| e.engaged())
+                .map(|e| e.seed(target_fps, &self.learned)),
+            white_balance: self
+                .white_balance
+                .as_ref()
+                .filter(|w| w.engaged())
+                .map(WhiteBalanceLoop::seed),
         }
     }
 

@@ -45,8 +45,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 // ---------------------------------------------------------------------------------------------------------------
 // Samples
 
-/// One measurement of the camera picture before the filter chain (5.5). Same shape as
-/// `auto_controls::MeterSample`, which the controller consumes.
+/// One measurement of the camera picture before the filter chain (5.5). `auto_controls::MeterSample` is this type.
 #[derive(Clone, Debug)]
 pub struct MeterSample {
     /// The hub token of the camera session that produced it (`0` when the session has no device controls).

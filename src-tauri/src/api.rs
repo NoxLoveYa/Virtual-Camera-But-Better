@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::Value;
 
+use crate::auto_controls::{AutoCfg, Mode as ControlMode};
 use crate::camera_controls::{parse_record, ControlInfoDto};
+use crate::capture::controls::ControlKey;
 use crate::config::{self, CameraDto, OutputCfg, SourceCfg};
 use crate::engine::{
     Engine, EngineEvent, EngineState, EventSink, ReadbackPolicy, ResumeState, Settings, SourceSpec,
@@ -440,8 +442,37 @@ impl Service {
     }
 
     /// `reset_camera_controls(id)`: the device's defaults, Auto on where the device has Auto; forgets the record.
+    /// Every Better Cam auto mode ends; its settings and what it learned are kept.
     pub fn reset_camera_controls(&self, id: &str) -> Result<Vec<ControlInfoDto>, String> {
         self.engine()?.controls().reset(id)
+    }
+
+    /// `set_control_mode(id, key, mode)`: who drives a control (`manual`, `camera`, `app`: Better Cam auto, see
+    /// docs/AUTO-CONTROLS.md 5.3). Returns the rows that changed (exposure together with gain).
+    pub fn set_control_mode(
+        &self,
+        id: &str,
+        key: &str,
+        mode: ControlMode,
+    ) -> Result<Vec<ControlInfoDto>, String> {
+        let key = ControlKey::from_key(key).ok_or_else(|| format!("unknown control '{key}'"))?;
+        self.engine()?.controls().set_mode(id, key, mode)
+    }
+
+    /// `set_auto_config(id, cfg)`: the camera's Better Cam auto settings (`{exposure: {target, longest, max_gain,
+    /// speed}, white_balance: {warmth, speed}}`); live. Values are clamped to their ranges; missing fields keep
+    /// their defaults.
+    pub fn set_auto_config(&self, id: &str, cfg: Value) -> Result<(), String> {
+        let cfg: AutoCfg = serde_json::from_value(cfg).map_err(|e| format!("auto config: {e}"))?;
+        self.engine()?.controls().set_auto_config(id, cfg);
+        Ok(())
+    }
+
+    /// `resume_auto(id, key)`: start Better Cam auto again after another program kept changing a control
+    /// (`conflict`), and clear `blocked` ("Try again" after the camera ignored it; set the mode again after).
+    pub fn resume_auto(&self, id: &str, key: &str) -> Result<(), String> {
+        let key = ControlKey::from_key(key).ok_or_else(|| format!("unknown control '{key}'"))?;
+        self.engine()?.controls().resume_auto(id, key)
     }
 
     /// `stop_engine`.

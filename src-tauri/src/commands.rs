@@ -1,4 +1,5 @@
 use better_cam::api::Service;
+use better_cam::auto_controls::Mode as ControlMode;
 use better_cam::camera_controls::ControlInfoDto;
 use better_cam::config::{CameraDto, OutputCfg, SourceCfg};
 use better_cam::file_dialog;
@@ -96,7 +97,7 @@ pub async fn set_camera_control(
     blocking(move || svc.set_camera_control(&id, &key, value, auto)).await
 }
 
-/// Every control back to the device's default, Auto on where the device has Auto.
+/// Every control back to the device's default, Auto on where the device has Auto. Every Better Cam auto mode ends.
 #[tauri::command]
 pub async fn reset_camera_controls(
     state: State<'_, AppState>,
@@ -104,6 +105,41 @@ pub async fn reset_camera_controls(
 ) -> Result<Vec<ControlInfoDto>, String> {
     let svc = state.service.clone();
     blocking(move || svc.reset_camera_controls(&id)).await
+}
+
+/// Who drives a control: `mode` is `manual`, `camera` (the camera's Auto flag) or `app` (Better Cam auto; exposure
+/// and white balance). Returns the rows that changed (exposure together with gain). Works while the camera is closed
+/// too: the mode and its resume point are stored and the loop starts at the next open.
+#[tauri::command]
+pub async fn set_control_mode(
+    state: State<'_, AppState>,
+    id: String,
+    key: String,
+    mode: ControlMode,
+) -> Result<Vec<ControlInfoDto>, String> {
+    let svc = state.service.clone();
+    blocking(move || svc.set_control_mode(&id, &key, mode)).await
+}
+
+/// The camera's Better Cam auto settings: `{exposure: {target, longest, max_gain, speed}, white_balance: {warmth,
+/// speed}}`. Live: the next decision uses them.
+#[tauri::command]
+pub async fn set_auto_config(
+    state: State<'_, AppState>,
+    id: String,
+    cfg: serde_json::Value,
+) -> Result<(), String> {
+    state.service.set_auto_config(&id, cfg)
+}
+
+/// Start Better Cam auto again after a `conflict`; also clears `blocked` ("Try again": set the mode again after).
+#[tauri::command]
+pub async fn resume_auto(
+    state: State<'_, AppState>,
+    id: String,
+    key: String,
+) -> Result<(), String> {
+    state.service.resume_auto(&id, &key)
 }
 
 #[tauri::command]

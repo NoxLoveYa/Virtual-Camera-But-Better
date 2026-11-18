@@ -54,6 +54,7 @@ use vcam_protocol::{qpc_to_hns, Format, Writer, WriterState};
 use windows::core::HRESULT;
 use windows::Win32::Media::MediaFoundation::{MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX};
 
+use crate::auto_controls::runner::{self, AutoStatusEvent};
 use crate::camera_controls::{
     CameraControls, ControlInfoDto, ControlsHub, ControlsOpener, DeviceOpener,
 };
@@ -598,6 +599,9 @@ pub enum EngineEvent {
     FormatFallback(FormatFallbackEvent),
     /// The pause flag changed (`engine-paused`).
     Paused(PausedEvent),
+    /// What Better Cam auto is doing for the camera's controls (`auto-status`, docs/AUTO-CONTROLS.md 5.4): on every
+    /// change of state, at most twice a second while the numbers move. Sent whether or not the window is visible.
+    AutoStatus(AutoStatusEvent),
 }
 
 /// Receives [`EngineEvent`]s on the control thread: return quickly.
@@ -776,6 +780,8 @@ pub struct Engine {
     control: Mutex<Option<JoinHandle<()>>>,
     /// Reads the controls that are on Auto once a second and closes an idle lease.
     poller: Mutex<Option<(Arc<AtomicBool>, JoinHandle<()>)>>,
+    /// The `controls auto` thread: runs Better Cam auto for the camera's controls (docs/AUTO-CONTROLS.md 2.8).
+    runner: Mutex<Option<(Arc<AtomicBool>, JoinHandle<()>)>>,
 }
 
 impl Engine {
@@ -856,6 +862,7 @@ impl Engine {
             snapshots: Default::default(),
         });
         let poller = spawn_poller(shared.clone()).map_err(|e| e.to_string())?;
+        let auto = runner::spawn(shared.clone()).map_err(|e| e.to_string())?;
         // The asset loader reports failed loads (and the clears) straight to the sink, from its own thread.
         let assets = {
             let shared = shared.clone();
@@ -913,6 +920,7 @@ impl Engine {
             writer,
             control: Mutex::new(Some(control)),
             poller: Mutex::new(Some(poller)),
+            runner: Mutex::new(Some(auto)),
         })
     }
 
@@ -1173,6 +1181,11 @@ impl Engine {
         }
         let poller = lock(&self.poller).take();
         if let Some((stop, h)) = poller {
+            stop.store(true, Ordering::Release);
+            let _ = h.join();
+        }
+        let runner = lock(&self.runner).take();
+        if let Some((stop, h)) = runner {
             stop.store(true, Ordering::Release);
             let _ = h.join();
         }
@@ -2894,8 +2907,32 @@ fn attach_controls(shared: &Arc<Shared>, source: &dyn Source) -> Option<Controls
     })
 }
 
+/// What the `controls auto` thread reads from the engine and where it reports (docs/AUTO-CONTROLS.md 5.5).
+impl runner::Host for Shared {
+    fn hub(&self) -> &Arc<ControlsHub> {
+        &self.hub
+    }
+
+    fn facts(&self) -> crate::meter::SessionFacts {
+        *lock(&self.facts)
+    }
+
+    fn sample(&self, timeout: Duration) -> Option<crate::meter::MeterSample> {
+        self.meter.wait(timeout)
+    }
+
+    fn set_metering(&self, on: bool) {
+        self.metering.store(on, Ordering::Release);
+    }
+
+    fn emit(&self, event: AutoStatusEvent) {
+        emit(self, EngineEvent::AutoStatus(event));
+    }
+}
+
 /// The engine's background thread for the controls: while the window is visible, every second the controls that are on
-/// Auto are read again and, when one moved, sent as `controls-changed` (so sliders follow the device); a hidden window
+/// Auto are read again and, when one moved, sent as `controls-changed` (so sliders follow the device), and the
+/// controls Better Cam auto drove (or whose mode changed) are sent at most four times a second; a hidden window
 /// costs no device reads and no events, and gets the list once when it is visible again. A lease that has been idle
 /// for a while is closed.
 fn spawn_poller(shared: Arc<Shared>) -> std::io::Result<(Arc<AtomicBool>, JoinHandle<()>)> {
@@ -2906,6 +2943,7 @@ fn spawn_poller(shared: Arc<Shared>) -> std::io::Result<(Arc<AtomicBool>, JoinHa
         .spawn(move || {
             ensure_com();
             let mut last_poll = Instant::now();
+            let mut last_driven = Instant::now();
             let mut was_visible = false;
             while !flag.load(Ordering::Acquire) {
                 std::thread::sleep(Duration::from_millis(100));
@@ -2921,7 +2959,15 @@ fn spawn_poller(shared: Arc<Shared>) -> std::io::Result<(Arc<AtomicBool>, JoinHa
                 was_visible = visible;
                 if visible && due {
                     last_poll = Instant::now();
+                    last_driven = last_poll;
                     if let Some(infos) = shared.hub.poll() {
+                        emit(&shared, EngineEvent::Controls(infos));
+                    }
+                }
+                // What Better Cam auto wrote: four times a second at most.
+                if visible && last_driven.elapsed() >= Duration::from_millis(250) {
+                    if let Some(infos) = shared.hub.take_driven() {
+                        last_driven = Instant::now();
                         emit(&shared, EngineEvent::Controls(infos));
                     }
                 }
@@ -4114,7 +4160,12 @@ mod tests {
         capture_errors: Mutex<VecDeque<(&'static str, u32)>>,
         /// The picture of the next opens is one flat grey (an 8-bit coded level, NV12) instead of the bars.
         flat: Mutex<Option<u8>>,
+        /// The picture of the next opens is a flat grey whose level this function gives for every frame (a camera
+        /// whose picture follows its exposure and gain).
+        live: Mutex<Option<LiveLevel>>,
     }
+
+    type LiveLevel = Arc<dyn Fn() -> u8 + Send + Sync>;
 
     /// The symbolic link the fake camera has.
     const FAKE_LINK: &str = "\\\\?\\usb#vid_0c45&pid_636d&mi_00#9&3171a958&0&0000#{e5323777-f976-4f5b-9b55-b94699c46e44}\\global";
@@ -4129,6 +4180,7 @@ mod tests {
         lose_device_with_error: Arc<AtomicBool>,
         gpu: Arc<GpuDevice>,
         alive: Arc<std::sync::atomic::AtomicU32>,
+        live: Option<LiveLevel>,
     }
 
     impl Drop for FakeSource {
@@ -4155,6 +4207,12 @@ mod tests {
                 return SourceEvent::Stopped(Failure::from_stop(StopReason::Error(HRESULT(
                     0xC00D_3E8C_u32 as i32,
                 ))));
+            }
+            if let Some(level) = self.live.as_ref().map(|f| f()) {
+                let (w, h) = (self.inner.spec.width, self.inner.spec.height);
+                let (space, range) = self.inner.spec.color.resolve(h);
+                let rgb = vec![level; w as usize * h as usize * 3];
+                self.inner.data = Arc::new(pattern::pack_nv12(&rgb, w, h, w as usize, h, space, range));
             }
             self.inner.next(timeout)
         }
@@ -4268,6 +4326,7 @@ mod tests {
                 lose_device_with_error: self.lose_device_with_error.clone(),
                 gpu: gpu.clone(),
                 alive: self.alive.clone(),
+                live: self.live.lock().unwrap().clone(),
             }))
         }
 
@@ -4329,6 +4388,7 @@ mod tests {
                 targets: Mutex::new(Vec::new()),
                 capture_errors: Mutex::new(VecDeque::new()),
                 flat: Mutex::new(None),
+                live: Mutex::new(None),
             });
             let opener = Arc::new(crate::camera_controls::fake::FakeOpener {
                 camera: fake.controls.clone(),
@@ -7990,5 +8050,176 @@ mod tests {
         let s = &l.samples.iter().skip(n).find(|(_, _, s)| s.token == new).unwrap().2;
         assert_grey(s, 128);
         assert_ne!(s.token, old);
+    }
+
+    // ---- Better Cam auto end to end (docs/AUTO-CONTROLS.md 2.8, phase A4) --------------------------------------------
+
+    use crate::auto_controls::runner::AutoStatusEvent;
+    use crate::auto_controls::{ExposureState, Mode as ControlMode};
+    use crate::capture::controls::ControlKey;
+    use std::sync::atomic::AtomicI32;
+
+    /// The camera's picture follows its controls: a flat grey that is the 18 % target when exposure plus the gain's
+    /// stops (3 stops over the whole range) reach `need` (thousandths of a stop).
+    fn live_level(cam: Arc<FakeControls>, need: Arc<AtomicI32>) -> LiveLevel {
+        Arc::new(move || {
+            let e = f64::from(cam.get(ControlKey::Exposure).value);
+            let g = f64::from(cam.get(ControlKey::Gain).value);
+            let x = e + 3.0 * g / 100.0 - f64::from(need.load(Ordering::SeqCst)) / 1000.0;
+            let lin = (0.1706 * 2f64.powf(x)).clamp(0.0, 1.0);
+            let coded = if lin <= 0.003_130_8 {
+                12.92 * lin
+            } else {
+                1.055 * lin.powf(1.0 / 2.4) - 0.055
+            };
+            (coded * 255.0).round() as u8
+        })
+    }
+
+    fn auto_record(exposure: i32, gain: i32) -> crate::capture::controls::ControlSnapshot {
+        crate::camera_controls::parse_record(Some(&serde_json::json!({
+            "id": FAKE_LINK,
+            "name": "W4GS",
+            "controls": {
+                "exposure": { "value": exposure, "auto": false, "mode": "app" },
+                "gain": { "value": gain, "mode": "app" }
+            }
+        })))
+        .unwrap()
+        .unwrap()
+    }
+
+    fn auto_statuses(rig: &Rig) -> Vec<AutoStatusEvent> {
+        rig.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(_, e)| match e {
+                EngineEvent::AutoStatus(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn exposure_state(s: &AutoStatusEvent) -> Option<ExposureState> {
+        s.status.exposure.as_ref().map(|e| e.state)
+    }
+
+    /// Wait for an `auto-status` after the first `after` ones whose exposure state is `state`.
+    fn wait_exposure_state(rig: &Rig, after: usize, state: ExposureState, secs: u64) -> Duration {
+        rig.wait(&format!("auto-status {state:?}"), Duration::from_secs(secs), |r| {
+            auto_statuses(r).iter().skip(after).any(|s| exposure_state(s) == Some(state))
+        })
+    }
+
+    #[test]
+    fn better_cam_auto_holds_a_live_camera_and_obeys_pause_reopen_and_the_user() {
+        let rig = Rig::new("auto-e2e.bin", fast());
+        let cam = rig.fake.controls.clone();
+        let hub = rig.engine.controls().clone();
+        let need = Arc::new(AtomicI32::new(-3500));
+        *rig.fake.live.lock().unwrap() = Some(live_level(cam.clone(), need.clone()));
+        // exposure and gain in Better Cam auto, resumed at a dark point: the loop must find -5 and about 1.5 stops
+        hub.set_record(Some(auto_record(-6, 0)));
+        rig.engine.set_window_visible(true);
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+
+        // the stored resume point is written before the loop's first write
+        rig.wait("the stored values", Duration::from_secs(5), |_| cam.log().len() >= 3);
+        assert_eq!(
+            cam.log()[..3],
+            ["auto:exposure:false", "value:exposure:-6", "value:gain:0"],
+            "{:?}",
+            cam.log()
+        );
+        // 1. engaged: holding within 5 s, the meter is on, the picture is where the target wants it
+        let took = wait_exposure_state(&rig, 0, ExposureState::Holding, 5);
+        eprintln!("[test] holding after {took:?}");
+        assert!(rig.engine.metering(), "the loop measures while it runs");
+        let s = auto_statuses(&rig).into_iter().rev().find_map(|s| s.status.exposure).unwrap();
+        assert_eq!(s.cap, -5, "30 fps: the longest exposure that fits the frame");
+        let (e, g) = (cam.get(ControlKey::Exposure).value, cam.get(ControlKey::Gain).value);
+        assert!(e <= -5, "exposure {e} is longer than the frame");
+        let x = f64::from(e) + 3.0 * f64::from(g) / 100.0;
+        assert!((x + 3.5).abs() <= 0.5, "exposure {e} gain {g}: {x} stops, wanted -3.5");
+        let ev = auto_statuses(&rig).pop().unwrap();
+        assert_eq!(ev.id, FAKE_LINK);
+        // the window hears of the controls and who drives them
+        rig.wait("controls-changed with the mode", Duration::from_secs(5), |r| {
+            r.events.lock().unwrap().iter().any(|(_, e)| {
+                matches!(e, EngineEvent::Controls(c)
+                    if c.iter().any(|i| i.key == ControlKey::Exposure && i.mode == ControlMode::App))
+            })
+        });
+
+        // 2. pause: no writes while the camera is paused, whatever the light does
+        rig.engine.set_pause(true);
+        rig.wait("the pause in the facts", Duration::from_secs(5), |r| r.engine.session_facts().paused);
+        std::thread::sleep(Duration::from_millis(300));
+        cam.clear_log();
+        need.store(-1000, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(cam.log().is_empty(), "writes while paused: {:?}", cam.log());
+        rig.engine.set_pause(false);
+        rig.wait("writes after the resume", Duration::from_secs(10), |_| !cam.log().is_empty());
+        need.store(-3500, Ordering::SeqCst);
+        let seen = auto_statuses(&rig).len();
+        rig.wait("the picture back at the target", Duration::from_secs(10), |_| {
+            let x = f64::from(cam.get(ControlKey::Exposure).value)
+                + 3.0 * f64::from(cam.get(ControlKey::Gain).value) / 100.0;
+            (x + 3.5).abs() <= 0.5
+        });
+        let _ = seen;
+
+        // 3. Stop and Start: the camera forgets its controls; the stored resume point is written first
+        rig.engine.stop();
+        assert!(rig.engine.wait_stopped(Duration::from_secs(10)));
+        let rec = hub.record().unwrap();
+        let (re, rg) = (
+            rec.get(ControlKey::Exposure).unwrap().value.unwrap(),
+            rec.get(ControlKey::Gain).unwrap().value.unwrap(),
+        );
+        let before = auto_statuses(&rig).len();
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("the stored values after the reopen", Duration::from_secs(5), |_| cam.log().len() >= 3);
+        assert_eq!(
+            cam.log()[..3],
+            [
+                "auto:exposure:false".to_string(),
+                format!("value:exposure:{re}"),
+                format!("value:gain:{rg}")
+            ],
+            "{:?}",
+            cam.log()
+        );
+        wait_exposure_state(&rig, before, ExposureState::Holding, 8);
+
+        // 4. the user picks Manual in the middle of it: the loop's next write finds the mode changed
+        need.store(-2000, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(300));
+        let rows = hub.set_mode(FAKE_LINK, ControlKey::Exposure, ControlMode::Manual).unwrap();
+        assert!(rows.iter().all(|r| r.mode == ControlMode::Manual));
+        let (e, g) = (cam.get(ControlKey::Exposure).value, cam.get(ControlKey::Gain).value);
+        let token = rig.engine.session_facts().token.expect("a camera session");
+        assert!(matches!(
+            hub.drive(token, ControlKey::Exposure, -3),
+            Err(crate::camera_controls::DriveError::NotApp)
+        ));
+        let after = auto_statuses(&rig).len();
+        cam.clear_log();
+        need.store(-3500, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(cam.log().is_empty(), "writes after the user's Manual: {:?}", cam.log());
+        assert_eq!((cam.get(ControlKey::Exposure).value, cam.get(ControlKey::Gain).value), (e, g));
+        let rec = hub.record().unwrap();
+        assert!(!rec.is_app(ControlKey::Exposure) && !rec.is_app(ControlKey::Gain));
+        assert_eq!(rec.get(ControlKey::Exposure).unwrap().value, Some(e), "the last driven value is the manual one");
+        // the loop ended: the status has no exposure part any more, and the meter is off
+        rig.wait("the end of the loop", Duration::from_secs(5), |r| {
+            auto_statuses(r).iter().skip(after).any(|s| s.status.exposure.is_none())
+        });
+        rig.wait("the meter off", Duration::from_secs(5), |r| !r.engine.metering());
     }
 }

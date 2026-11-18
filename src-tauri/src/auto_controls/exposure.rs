@@ -489,13 +489,18 @@ impl ExposureLoop {
     }
 
     fn limits(&self, learned: &Learned) -> Limits {
+        self.limits_at(self.f, learned)
+    }
+
+    /// The limits for a session at frame rate `f`.
+    fn limits_at(&self, f: f64, learned: &Learned) -> Limits {
         let s = learned.gain_stops.unwrap_or(S_INITIAL).clamp(S_MIN, S_MAX);
         let (mut e_cap, mut reason) = match self.cfg.longest {
-            super::Longest::Fit => (rate_limit(self.f), CapReason::Fps),
+            super::Longest::Fit => (rate_limit(f), CapReason::Fps),
             super::Longest::Stop(n) => (n, CapReason::User),
         };
         if self.cfg.longest == super::Longest::Fit {
-            if let Some(&l) = learned.rate_caps.get(&rate_key(self.f)) {
+            if let Some(&l) = learned.rate_caps.get(&rate_key(f)) {
                 if l < e_cap {
                     e_cap = l;
                     reason = CapReason::Learned;
@@ -831,19 +836,7 @@ impl ExposureLoop {
     /// 2.5.11: the seed. `E0 = min(E_cap, resume.exposure ?? device default)`, `G0 = resume.gain ?? G_min`. The
     /// device's reported value is never used (stale while Camera auto is on).
     fn start(&mut self, now: f64, lim: &Limits) -> Vec<Action> {
-        let e0 = lim
-            .e_cap
-            .min(self.resume.exposure.unwrap_or(self.caps.e_default))
-            .clamp(self.caps.e_min, self.caps.e_max);
-        let g0 = match self.caps.gain {
-            Some(gc) if lim.gain_usable => self
-                .resume
-                .gain
-                .unwrap_or(gc.min)
-                .clamp(gc.min, lim.g_cap),
-            Some(gc) => gc.min,
-            None => 0,
-        };
+        let (e0, g0) = self.seed_in(lim);
         self.started = true;
         self.state = ExposureState::Starting;
         self.band = Band::Adjusting;
@@ -859,6 +852,30 @@ impl ExposureLoop {
             writes.push((ControlKey::Gain, g0));
         }
         self.issue(writes, true)
+    }
+
+    /// `(E0, G0)` within `lim`.
+    fn seed_in(&self, lim: &Limits) -> (i32, i32) {
+        let e0 = lim
+            .e_cap
+            .min(self.resume.exposure.unwrap_or(self.caps.e_default))
+            .clamp(self.caps.e_min, self.caps.e_max);
+        let g0 = match self.caps.gain {
+            Some(gc) if lim.gain_usable => self
+                .resume
+                .gain
+                .unwrap_or(gc.min)
+                .clamp(gc.min, lim.g_cap),
+            Some(gc) => gc.min,
+            None => 0,
+        };
+        (e0, g0)
+    }
+
+    /// What `start` would write for a session at frame rate `f`: exposure and, when the loop has gain, gain.
+    pub fn seed(&self, f: f64, learned: &Learned) -> (i32, Option<i32>) {
+        let (e0, g0) = self.seed_in(&self.limits_at(f.max(1.0), learned));
+        (e0, self.caps.gain.map(|_| g0))
     }
 
     /// Record the writes as pending and believe them; the runner reports each result.

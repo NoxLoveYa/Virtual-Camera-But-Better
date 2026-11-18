@@ -838,14 +838,24 @@ pub struct StoredControl {
     /// The manual value to restore (`None`: the user never set one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<i32>,
+    /// Better Cam auto drives this control (docs/AUTO-CONTROLS.md 5.2): `value` is the resume point, written as a
+    /// manual value on open, and `auto` is `Some(false)`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub app: bool,
 }
 
 /// The values and Auto flags a user changed on one device, to be re-applied after every open. Storage on disk
 /// belongs to a later phase; this type only has to serialise.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ControlSnapshot {
     pub device: DeviceKey,
     pub controls: Vec<StoredControl>,
+    /// Better Cam auto settings of this camera (not written to the device).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto: Option<crate::auto_controls::AutoCfg>,
+    /// What Better Cam auto learned about this camera (not written to the device).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned: Option<crate::auto_controls::Learned>,
 }
 
 impl ControlSnapshot {
@@ -853,6 +863,8 @@ impl ControlSnapshot {
         ControlSnapshot {
             device,
             controls: Vec::new(),
+            auto: None,
+            learned: None,
         }
     }
 
@@ -883,6 +895,7 @@ impl ControlSnapshot {
                     key,
                     auto: None,
                     value: None,
+                    app: false,
                 });
                 self.controls.len() - 1
             }
@@ -890,18 +903,34 @@ impl ControlSnapshot {
         &mut self.controls[pos]
     }
 
-    /// The user flipped Auto.
+    /// The user flipped Auto. A control that was in Better Cam auto leaves it.
     pub fn record_auto(&mut self, key: ControlKey, auto: bool) {
-        self.entry(key).auto = Some(auto);
+        let e = self.entry(key);
+        e.auto = Some(auto);
+        e.app = false;
     }
 
-    /// The user set a manual value. Setting a value takes a control out of Auto.
+    /// The user set a manual value. Setting a value takes a control out of Auto (and out of Better Cam auto).
     pub fn record_value(&mut self, key: ControlKey, value: i32) {
         let e = self.entry(key);
         e.value = Some(value);
+        e.app = false;
         if e.auto == Some(true) {
             e.auto = Some(false);
         }
+    }
+
+    /// Better Cam auto drives this control; `value` is its resume point (written as a manual value on open).
+    pub fn record_app(&mut self, key: ControlKey, value: i32) {
+        let e = self.entry(key);
+        e.auto = Some(false);
+        e.value = Some(value);
+        e.app = true;
+    }
+
+    /// Whether Better Cam auto drives this control.
+    pub fn is_app(&self, key: ControlKey) -> bool {
+        self.get(key).is_some_and(|c| c.app)
     }
 
     /// Forget a control (reset to the device's own behaviour).
@@ -953,6 +982,12 @@ impl fmt::Display for SkipReason {
 pub struct ApplyReport {
     pub applied: Vec<AppliedControl>,
     pub skipped: Vec<(ControlKey, SkipReason)>,
+}
+
+/// Whether a control error says the camera itself is gone or shut down (the engine's reconnect path takes over),
+/// not just that this control refused.
+pub fn device_gone(e: &ControlError) -> bool {
+    matches!(e, ControlError::Capture(c) if c.hresult().is_some_and(is_fatal))
 }
 
 fn skip_reason(e: ControlError) -> Result<SkipReason, ControlError> {
@@ -1356,7 +1391,8 @@ mod tests {
             Some(&StoredControl {
                 key: ControlKey::Focus,
                 auto: Some(false),
-                value: Some(300)
+                value: Some(300),
+                app: false,
             })
         );
         s.record_value(ControlKey::Gain, 3);
@@ -1364,6 +1400,31 @@ mod tests {
         s.forget(ControlKey::Focus);
         assert!(s.get(ControlKey::Focus).is_none());
         assert_eq!(s.controls.len(), 1);
+    }
+
+    #[test]
+    fn a_control_in_better_cam_auto_is_a_manual_value_that_serialises_its_mode() {
+        let mut s = ControlSnapshot::new(DeviceKey::new("x", "y"));
+        s.record_app(ControlKey::Exposure, -5);
+        s.record_value(ControlKey::Brightness, 3);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"app\":true"), "{json}");
+        assert_eq!(json.matches("\"app\"").count(), 1, "only the driven control says so: {json}");
+        let back: ControlSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+        // the device is told a plain manual value: Auto flag off, then the resume point
+        let c = s.get(ControlKey::Exposure).unwrap();
+        assert_eq!((c.auto, c.value, c.app), (Some(false), Some(-5), true));
+        assert!(s.is_app(ControlKey::Exposure) && !s.is_app(ControlKey::Brightness));
+        // an older save has no such field
+        let old: StoredControl = serde_json::from_str(r#"{"key":"gain","value":4}"#).unwrap();
+        assert!(!old.app);
+        // the user's own write or Auto flag ends it
+        s.record_value(ControlKey::Exposure, -3);
+        assert!(!s.is_app(ControlKey::Exposure));
+        s.record_app(ControlKey::Exposure, -5);
+        s.record_auto(ControlKey::Exposure, true);
+        assert!(!s.is_app(ControlKey::Exposure));
     }
 
     #[test]

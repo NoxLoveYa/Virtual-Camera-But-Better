@@ -107,7 +107,7 @@ impl EventSink for LogSink {
                 "[t={t:7.3}] engine-paused {}",
                 serde_json::to_string(p).unwrap_or_default()
             ),
-            EngineEvent::Stats(_) | EngineEvent::Controls(_) => {}
+            EngineEvent::Stats(_) | EngineEvent::Controls(_) | EngineEvent::AutoStatus(_) => {}
         }
         self.0.events.lock().unwrap().push(Logged {
             at: Instant::now(),

@@ -489,12 +489,15 @@ impl WhiteBalanceLoop {
     }
 
     /// The seed: `K0 = resume.white_balance ?? device default`, written as a manual value (3).
-    fn start(&mut self, now: f64) -> Vec<Action> {
-        let k0 = self
-            .resume
+    pub fn seed(&self) -> i32 {
+        self.resume
             .white_balance
             .unwrap_or(self.caps.k_default)
-            .clamp(self.caps.k_min, self.caps.k_max);
+            .clamp(self.caps.k_min, self.caps.k_max)
+    }
+
+    fn start(&mut self, now: f64) -> Vec<Action> {
+        let k0 = self.seed();
         self.started = true;
         self.state = WhiteBalanceState::Starting;
         self.band = Band::Adjusting;

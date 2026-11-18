@@ -72,6 +72,7 @@ fn forward_events(app: &AppHandle) -> Arc<dyn better_cam::engine::EventSink> {
             EngineEvent::FilterStatus(s) => app.emit("filter-status", s),
             EngineEvent::FormatFallback(f) => app.emit("format-fallback", f),
             EngineEvent::Paused(p) => app.emit("engine-paused", p),
+            EngineEvent::AutoStatus(s) => app.emit("auto-status", s),
         };
     })
 }
@@ -180,6 +181,9 @@ fn main() {
             commands::get_camera_controls,
             commands::set_camera_control,
             commands::reset_camera_controls,
+            commands::set_control_mode,
+            commands::set_auto_config,
+            commands::resume_auto,
             commands::set_preview,
             commands::preview_ack,
             commands::get_autostart,
