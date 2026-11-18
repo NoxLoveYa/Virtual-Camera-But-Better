@@ -1,17 +1,21 @@
-import type { PointerEvent as ReactPointerEvent } from "react";
+import { memo, useCallback, type PointerEvent as ReactPointerEvent } from "react";
 import { useStore } from "../store";
 import { stripCodes } from "../camera/schema";
-import { defOf, extIdOf, extOf, isExtKind, labelOf, type ExtensionInfo, type FilterCfg } from "../filters/schema";
+import { defOf, extIdOf, extOf, isExtKind, labelOf, type ExtensionInfo, type ParamValue } from "../filters/schema";
 import { AddHere } from "./AddFilter";
 import { Icon } from "./Icon";
 import { ParamField } from "./ParamField";
-import { moveWithFocus, type Reorder } from "../ui/useChainDrag";
+import { moveWithFocus, type ChainHandlers, type DragView } from "../ui/useChainDrag";
 
+/**
+ * The props are the card's id, how it is being dragged (`null` for most cards) and the handlers (one object for the
+ * life of the chain): all stable while another card's slider moves. The card reads its own filter, its place and the
+ * rest from the store, so a change of another card's params does not render it.
+ */
 interface Props {
-  filter: FilterCfg;
-  index: number;
-  count: number;
-  reorder: Reorder;
+  id: string;
+  dragMode: DragView["mode"] | null;
+  reorder: ChainHandlers;
 }
 
 /** What a card of an extension says when the extension is not running: not installed, failed to load, or switched off. */
@@ -22,22 +26,30 @@ function extNoteOf(id: string, ext: ExtensionInfo | undefined) {
   return null;
 }
 
-export function FilterCard({ filter, index, count, reorder }: Props) {
-  const { toggleFilter, removeFilter, setParam, collapsed, toggleCollapsed } = useStore();
+// The actions never change: read them when used, so the card does not subscribe to them.
+const act = () => useStore.getState();
+
+export const FilterCard = memo(function FilterCard({ id, dragMode: mode, reorder }: Props) {
+  // A card that was just removed is still mounted until its parent renders again: it has nothing to show then.
+  const filter = useStore((s) => s.chain.find((f) => f.id === id));
+  const index = useStore((s) => s.chain.findIndex((f) => f.id === id));
+  const count = useStore((s) => s.chain.length);
   const extensions = useStore((s) => s.extensions);
   const extensionsRead = useStore((s) => s.extensionsRead);
+  const folded = useStore((s) => s.collapsed[id] === true);
+  const error = useStore((s) => s.filterErrors[id]);
+  const status = useStore((s) => s.filterStatus[id]);
+  const gpu = useStore((s) => s.gpu);
+  const gpuRead = useStore((s) => s.gpuRead);
+  const nvidia = useStore((s) => s.nvidia);
+  // One function for the life of the card, so the fields that did not change do not render.
+  const onChange = useCallback((key: string, value: ParamValue) => act().setParam(id, key, value), [id]);
+  if (!filter) return null;
   // `def` is missing for an extension that is not installed or failed to load: the card keeps its settings and says why.
   const def = defOf(filter.kind, extensions);
   const label = labelOf(filter.kind, extensions);
   const ext = extOf(filter.kind, extensions);
   const extNote = !isExtKind(filter.kind) || !extensionsRead ? null : extNoteOf(extIdOf(filter.kind), ext);
-  const folded = !!collapsed[filter.id];
-  const error = useStore((s) => s.filterErrors[filter.id]);
-  const status = useStore((s) => s.filterStatus[filter.id]);
-  const gpu = useStore((s) => s.gpu);
-  const gpuRead = useStore((s) => s.gpuRead);
-  const nvidia = useStore((s) => s.nvidia);
-  const openNvidiaPrompt = useStore((s) => s.openNvidiaPrompt);
   // What an NVIDIA filter needs before it can run, in the order of precedence: an RTX GPU, then the runtime. The app knows
   // both without the engine, so a card in a loaded preset says it before the first frame (the engine says the same
   // thing, and the picture is passed through meanwhile).
@@ -51,14 +63,13 @@ export function FilterCard({ filter, index, count, reorder }: Props) {
           : null;
 
   const movable = count > 1;
-  const mode = reorder.drag?.id === filter.id ? reorder.drag.mode : null;
-  const gripDown = (e: ReactPointerEvent<HTMLElement>) => reorder.onPointerDown(e, filter.id);
+  const gripDown = (e: ReactPointerEvent<HTMLElement>) => reorder.onPointerDown(e, id);
 
   return (
     <li
       className={`step${filter.enabled ? " on" : ""}${movable ? " movable" : ""}${mode === "pointer" ? " dragging" : ""}${mode === "keyboard" ? " lifted" : ""}`}
-      data-filter-id={filter.id}
-      onKeyDown={(e) => reorder.onCardKeyDown(e, filter.id)}
+      data-filter-id={id}
+      onKeyDown={(e) => reorder.onCardKeyDown(e, id)}
     >
       {/* The "+" of the gap above this card. It sits over the gap without taking room, and shows on hover and focus (always on touch). */}
       {index > 0 && (
@@ -80,13 +91,13 @@ export function FilterCard({ filter, index, count, reorder }: Props) {
             aria-pressed={mode === "keyboard"}
             aria-disabled={!movable}
             onPointerDown={gripDown}
-            onKeyDown={(e) => reorder.onGripKeyDown(e, filter.id)}
-            onBlur={() => reorder.onGripBlur(filter.id)}
+            onKeyDown={(e) => reorder.onGripKeyDown(e, id)}
+            onBlur={() => reorder.onGripBlur(id)}
           >
             <Icon name="grip" />
           </button>
           <h3 className={`card-title${folded ? " folded" : ""}`}>
-            <button aria-expanded={!folded} title={folded ? "Expand" : "Collapse"} onClick={() => toggleCollapsed(filter.id)}>
+            <button aria-expanded={!folded} title={folded ? "Expand" : "Collapse"} onClick={() => act().toggleCollapsed(id)}>
               <Icon name="chevron" />
               {label}
             </button>
@@ -110,9 +121,9 @@ export function FilterCard({ filter, index, count, reorder }: Props) {
             aria-label={`${label} enabled`}
             className="switch"
             title={filter.enabled ? "Bypass" : "Enable"}
-            onClick={() => toggleFilter(filter.id)}
+            onClick={() => act().toggleFilter(id)}
           />
-          <button className="ghost icon" onClick={() => removeFilter(filter.id)} title="Remove" aria-label="Remove">
+          <button className="ghost icon" onClick={() => act().removeFilter(id)} title="Remove" aria-label="Remove">
             <Icon name="close" />
           </button>
         </div>
@@ -120,7 +131,7 @@ export function FilterCard({ filter, index, count, reorder }: Props) {
           <p className="filter-error" role="alert">
             {needs.text}
             {needs.install && (
-              <button className="link" onClick={openNvidiaPrompt}>
+              <button className="link" onClick={() => act().openNvidiaPrompt()}>
                 Install it now
               </button>
             )}
@@ -148,11 +159,11 @@ export function FilterCard({ filter, index, count, reorder }: Props) {
         {def && def.params.length > 0 && !folded && (
           <div className={`params${def.layout ? ` layout-${def.layout}` : ""}`}>
             {def.params.map((p) => (
-              <ParamField key={p.key} def={p} params={filter.params} onChange={(key, value) => setParam(filter.id, key, value)} />
+              <ParamField key={p.key} def={p} params={filter.params} onChange={onChange} />
             ))}
           </div>
         )}
       </div>
     </li>
   );
-}
+});

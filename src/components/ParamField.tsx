@@ -1,4 +1,4 @@
-import { useId, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
+import { memo, useId, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
 import { isShown, type ParamDef, type ParamValue, type SliderDef } from "../filters/schema";
 import { formatValue, snap, toColorInt } from "../filters/values";
 import { ColorField } from "./ColorField";
@@ -16,7 +16,14 @@ interface Props {
 }
 
 /** One parameter of a filter card: a single switch on the definition's type. Renders nothing while its `showIf` says hidden. */
-export function ParamField({ def, params, onChange }: Props) {
+export const ParamField = memo(ParamFieldView, (a, b) => {
+  // The field reads its own value and the one its `showIf` names: a change of any other param of the card leaves it be.
+  const own = a.def.key;
+  const cond = a.def.showIf?.key;
+  return a.def === b.def && a.onChange === b.onChange && a.params[own] === b.params[own] && (cond === undefined || a.params[cond] === b.params[cond]);
+});
+
+function ParamFieldView({ def, params, onChange }: Props) {
   if (!isShown(def, params)) return null;
   const value = params[def.key] ?? def.def;
   const set = (v: ParamValue) => onChange(def.key, v);

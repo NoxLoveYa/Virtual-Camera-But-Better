@@ -1,4 +1,5 @@
 import { useEffect, useRef, type CSSProperties } from "react";
+import { useShallow } from "zustand/react/shallow";
 import { useStore } from "./store";
 import { finalIndex } from "./ui/chainDrag";
 import { useChainDrag } from "./ui/useChainDrag";
@@ -23,8 +24,10 @@ import { Toast } from "./components/Toast";
 import { VcamBanner } from "./components/VcamBanner";
 
 export default function App() {
-  const chain = useStore((s) => s.chain);
-  const collapsed = useStore((s) => s.collapsed);
+  // The ids and nothing else: a slider moving inside a card changes the chain but not this list, so the page does not
+  // render again (each card reads its own filter).
+  const ids = useStore(useShallow((s) => s.chain.map((f) => f.id)));
+  const allFolded = useStore((s) => s.chain.length > 0 && s.chain.every((f) => s.collapsed[f.id]));
   const error = useStore((s) => s.error);
   const state = useStore((s) => s.engine.state);
   const vcamBanner = useStore((s) => s.vcam?.state === "missing" || s.vcam?.state === "outdated" || !!s.vcam?.problem);
@@ -56,7 +59,6 @@ export default function App() {
     return () => ro.disconnect();
   }, []);
 
-  const allFolded = chain.length > 0 && chain.every((f) => collapsed[f.id]);
   const waiting = state === "reconnecting";
 
   return (
@@ -99,9 +101,9 @@ export default function App() {
 
             <ol className="chain" ref={reorder.chainRef}>
               <li className="terminal">Camera in</li>
-              {chain.length === 0 && <EmptyChain />}
-              {chain.map((f, i) => (
-                <FilterCard key={f.id} filter={f} index={i} count={chain.length} reorder={reorder} />
+              {ids.length === 0 && <EmptyChain />}
+              {ids.map((id) => (
+                <FilterCard key={id} id={id} dragMode={reorder.drag?.id === id ? reorder.drag.mode : null} reorder={reorder.handlers} />
               ))}
               <li className="terminal">Better Cam out</li>
             </ol>

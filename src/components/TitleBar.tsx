@@ -116,7 +116,9 @@ function ExtensionsRow({ onOpen }: { onOpen: () => void }) {
 }
 
 function Settings() {
-  const { autostart, closeToTray, setAutostart, setCloseToTray, setExtensionsOpen } = useStore();
+  const autostart = useStore((s) => s.autostart);
+  const closeToTray = useStore((s) => s.closeToTray);
+  const { setAutostart, setCloseToTray, setExtensionsOpen } = useStore.getState();
   const [open, setOpen] = useState(false);
 
   return (

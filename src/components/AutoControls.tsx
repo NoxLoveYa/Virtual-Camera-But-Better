@@ -130,13 +130,12 @@ function ResponseField({ value, onChange }: { value: Speed; onChange: (v: Speed)
 export function ExposureAuto({ info, ctx }: { info: ControlInfo; ctx: AutoCtx }) {
   const setAutoConfig = useStore((s) => s.setAutoConfig);
   const addFilter = useStore((s) => s.addFilter);
-  const chain = useStore((s) => s.chain);
+  // The filter's own target is the final say on brightness (3 of the document).
+  const adjust = useStore((s) => s.chain.find((f) => f.kind === "auto_adjust" && f.enabled && f.params.exposure === true));
   const cfg = ctx.cfg.exposure;
   const gain = ctx.infos.find((i) => i.key === "gain");
   const stops = info.app === "stops";
   const lowLight = ctx.infos.some((i) => i.key === "low_light_compensation");
-  // The filter's own target is the final say on brightness (3 of the document).
-  const adjust = chain.find((f) => f.kind === "auto_adjust" && f.enabled && f.params.exposure === true);
   const adjustTarget = adjust && typeof adjust.params.target === "number" ? adjust.params.target : DEFAULT_AUTO.exposure.target;
   const fps = ctx.exposure && ctx.exposure.target_fps > 0 ? ctx.exposure.target_fps : null;
 
@@ -200,10 +199,11 @@ export function ExposureAuto({ info, ctx }: { info: ControlInfo; ctx: AutoCtx })
 /** The settings, the hint and the status of Better Cam auto white balance, under the white balance row. */
 export function WhiteBalanceAuto({ ctx }: { ctx: AutoCtx }) {
   const setAutoConfig = useStore((s) => s.setAutoConfig);
-  const chain = useStore((s) => s.chain);
   const cfg = ctx.cfg.white_balance;
   // Auto Adjust's warmth wins when it measures too: the device warmth should then stay at 0.
-  const adjustWarm = chain.some((f) => f.kind === "auto_adjust" && f.enabled && f.params.white_balance === true && Number(f.params.temperature) !== 0);
+  const adjustWarm = useStore((s) =>
+    s.chain.some((f) => f.kind === "auto_adjust" && f.enabled && f.params.white_balance === true && Number(f.params.temperature) !== 0),
+  );
 
   return (
     <div className="ctl-sub" data-for="white_balance">

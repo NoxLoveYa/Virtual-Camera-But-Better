@@ -4,6 +4,7 @@ import { defOf, defaultChain, labelOf, makeFilter, type ExtensionInfo, type Filt
 import { normalizeChain, presetChain, refreshExtParams, signature } from "./filters/chain";
 import { presetNameFor, stemOf } from "./ui/fileDrop";
 import { DEFAULT_UI, normalizeUi, type UiState } from "./ui/layout";
+import { createSaver } from "./ui/saver";
 import {
   DEFAULT_OUTPUT,
   DEFAULT_SOURCE,
@@ -49,6 +50,8 @@ import {
 } from "./camera/schema";
 
 const STORAGE_KEY = "better-cam";
+/** The most often `localStorage` is written (see `persist`). */
+const SAVE_GAP_MS = 300;
 
 /** `npm run tauri dev` (the Vite dev server); false in a release build. The project has no `vite/client` types. */
 const IS_DEV_BUILD = (import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV === true;
@@ -298,7 +301,7 @@ interface State extends Saved {
 }
 
 export const useStore = create<State>((set, get) => {
-  const persist = () => {
+  const write = () => {
     const { source, output, controls, chain, closeToTray, autostartDefaulted, nvidiaPromptDismissed, activePreset, presetBaseline, wasRunning, previewOn, ui } = get();
     // Only the folded cards that still exist; entries of removed filters and "expanded" flags are not worth keeping.
     const folded = get().collapsed;
@@ -308,6 +311,23 @@ export const useStore = create<State>((set, get) => {
       JSON.stringify({ source, output, controls, chain, collapsed, closeToTray, autostartDefaulted, nvidiaPromptDismissed, activePreset, presetBaseline, wasRunning, previewOn, ui }),
     );
   };
+  // A slider drag changes the state many times a second and each save serialises everything: saves are folded into one
+  // write at most every SAVE_GAP_MS (it reads the state when it runs, so the stored value is the newest one).
+  const saver = createSaver(write, SAVE_GAP_MS);
+  /** For changes that come in bursts (sliders, colour pickers, the splitter, folding). */
+  const persist = saver.schedule;
+  /** For the rare ones that other code or the next launch relies on at once (the engine's run state, a saved preset). */
+  const persistNow = saver.now;
+  // The window going away, hidden or reloaded must not lose the save that is waiting. A quit from the tray menu or a
+  // hide to the tray fires none of these page events, so the app asks the page to save before it exits or hides
+  // (`flush-save`, answered when done; see `RunEvent::ExitRequested` in main.rs).
+  if (typeof window !== "undefined") {
+    window.addEventListener("beforeunload", saver.flush);
+    window.addEventListener("pagehide", saver.flush);
+    document.addEventListener("visibilitychange", () => document.visibilityState === "hidden" && saver.flush());
+    // Outside the app (plain browser, no Tauri) there is nobody to ask: the page events above are all there is.
+    api.onFlushSave(saver.flush).catch(() => {});
+  }
 
   const fail = (e: unknown) => set({ error: String(e) });
 
@@ -343,7 +363,8 @@ export const useStore = create<State>((set, get) => {
     setTimeout(go, 50);
   };
 
-  const setChain = (chain: FilterCfg[]) => {
+  /** `burst`: one of many changes a second (a slider drag), so the save may wait; any other edit is saved at once. */
+  const setChain = (chain: FilterCfg[], burst = false) => {
     const before = get().chain;
     const errors = get().filterErrors;
     // A failure message is about one version of one entry: it goes when the entry changes or is gone. Two exceptions:
@@ -373,7 +394,8 @@ export const useStore = create<State>((set, get) => {
       ...(Object.keys(kept).length !== Object.keys(errors).length && { filterErrors: kept }),
       ...(Object.keys(keptStatus).length !== Object.keys(statuses).length && { filterStatus: keptStatus }),
     });
-    persist();
+    if (burst) persist();
+    else persistNow();
     pushChain();
   };
 
@@ -442,7 +464,7 @@ export const useStore = create<State>((set, get) => {
       // camera is being changed: the engine is released then (the events said so) and starts when the change ends.
       if (!running() && !get().vcamBusy) set({ engine: { ...STOPPED, state: "standby", reason: "opening" } });
       set({ error: null, errorKind: null, paused: false, wasRunning: true, filterErrors: {} });
-      persist();
+      persistNow();
       return true;
     } catch (e) {
       // A rejected Start runs nothing: no "using the device default" panel for it.
@@ -576,7 +598,7 @@ export const useStore = create<State>((set, get) => {
       await api.stopEngine();
       set({ engine: STOPPED, paused: false, inUse: null, wasRunning: false });
       useStats.setState({ stats: null });
-      persist();
+      persistNow();
     } catch (e) {
       fail(e);
     }
@@ -630,7 +652,7 @@ export const useStore = create<State>((set, get) => {
 
     closeNvidiaPrompt: () => {
       set({ nvidiaPrompt: false, nvidiaPromptDismissed: true });
-      persist();
+      persistNow();
     },
 
     installNvidia: async () => {
@@ -713,7 +735,7 @@ export const useStore = create<State>((set, get) => {
         say(String(e));
       } finally {
         set((s) => ({ vcamBusy: null, vcamEpoch: s.vcamEpoch + 1, ...afterVcamRemoval(removed, s) }));
-        if (removed) persist();
+        if (removed) persistNow();
         await get().refreshVcam();
       }
     },
@@ -743,7 +765,7 @@ export const useStore = create<State>((set, get) => {
         // The `stopped` event with the error's kind follows this one.
         set({ error, errorKind: null, engine: STOPPED, paused: false, inUse: null, wasRunning: false });
         useStats.setState({ stats: null });
-        persist();
+        persistNow();
       });
       await api.onFormatFallback((f) => {
         say(`${f.asked} isn't available; using device default (${f.used}).`);
@@ -817,7 +839,7 @@ export const useStore = create<State>((set, get) => {
           }
         }
       }
-      persist();
+      persistNow();
 
       try {
         // Release builds start with Windows by default. A dev build is not installed anywhere, and its Run entry would
@@ -825,7 +847,7 @@ export const useStore = create<State>((set, get) => {
         if (!get().autostartDefaulted && !IS_DEV_BUILD) {
           await api.setAutostart(true);
           set({ autostartDefaulted: true });
-          persist();
+          persistNow();
         }
         set({ autostart: await api.getAutostart() });
         await api.setCloseToTray(get().closeToTray);
@@ -1069,7 +1091,7 @@ export const useStore = create<State>((set, get) => {
 
     setCloseToTray: (closeToTray) => {
       set({ closeToTray });
-      persist();
+      persistNow();
       api.setCloseToTray(closeToTray).catch(fail);
     },
 
@@ -1125,7 +1147,7 @@ export const useStore = create<State>((set, get) => {
     },
     toggleFilter: (id) => setChain(get().chain.map((f) => (f.id === id ? { ...f, enabled: !f.enabled } : f))),
     setParam: (id, key, value) =>
-      setChain(get().chain.map((f) => (f.id === id ? { ...f, params: { ...f.params, [key]: value } } : f))),
+      setChain(get().chain.map((f) => (f.id === id ? { ...f, params: { ...f.params, [key]: value } } : f)), true),
 
     toggleCollapsed: (id) => {
       set((s) => ({ collapsed: { ...s.collapsed, [id]: !s.collapsed[id] } }));
@@ -1171,7 +1193,7 @@ export const useStore = create<State>((set, get) => {
       try {
         await api.savePreset(name, chain);
         set({ activePreset: name, presetBaseline: signature(chain) });
-        persist();
+        persistNow();
         await get().refreshPresets();
         say(`Saved “${name}”`);
       } catch (e) {
@@ -1211,7 +1233,7 @@ export const useStore = create<State>((set, get) => {
         await api.deletePreset(name);
         if (get().activePreset === name) {
           set({ activePreset: null, presetBaseline: null });
-          persist();
+          persistNow();
         }
         await get().refreshPresets();
         say(`Deleted “${name}”`);

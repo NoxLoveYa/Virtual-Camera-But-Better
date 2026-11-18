@@ -393,7 +393,9 @@ export function useChainDrag() {
   // Leaving the page in the middle of a drag releases everything it holds.
   useEffect(() => api.cancel, [api]);
 
-  return { drag, lineTop, lift, announcement, chainRef, blockRef, liftRef, ...api };
+  // `handlers` is one object for the life of the component, so a memoised card does not re-render for it.
+  return { drag, lineTop, lift, announcement, chainRef, blockRef, liftRef, handlers: api };
 }
 
-export type Reorder = ReturnType<typeof useChainDrag>;
+/** The pointer and key handlers of a card; the same object on every render. */
+export type ChainHandlers = ReturnType<typeof useChainDrag>["handlers"];

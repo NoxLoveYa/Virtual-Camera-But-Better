@@ -9,7 +9,12 @@ const STATUS = {
 } as const;
 
 export function NvidiaPrompt() {
-  const { nvidiaPrompt, gpu, nvidia, nvidiaInstall, nvidiaError, installNvidia, closeNvidiaPrompt } = useStore();
+  const nvidiaPrompt = useStore((s) => s.nvidiaPrompt);
+  const gpu = useStore((s) => s.gpu);
+  const available = useStore((s) => s.nvidia?.available === true);
+  const nvidiaInstall = useStore((s) => s.nvidiaInstall);
+  const nvidiaError = useStore((s) => s.nvidiaError);
+  const { installNvidia, closeNvidiaPrompt } = useStore.getState();
   const busy = nvidiaInstall !== null;
 
   useEffect(() => {
@@ -20,7 +25,7 @@ export function NvidiaPrompt() {
   }, [nvidiaPrompt, busy, closeNvidiaPrompt]);
 
   // The runtime can show up while its installer is still open; the dialog stays until that one has closed.
-  if (!nvidiaPrompt || !gpu || (nvidia?.available && !busy)) return null;
+  if (!nvidiaPrompt || !gpu || (available && !busy)) return null;
 
   const downloading = nvidiaInstall?.stage === "download";
   const pct = downloading && nvidiaInstall.total > 0 ? (nvidiaInstall.done / nvidiaInstall.total) * 100 : 0;

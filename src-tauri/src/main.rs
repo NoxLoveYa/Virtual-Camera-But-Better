@@ -3,11 +3,11 @@
 mod commands;
 
 use better_cam::engine::EngineEvent;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
+use tauri::{AppHandle, Emitter, Listener, Manager, RunEvent, WindowEvent};
 use tauri_plugin_autostart::MacosLauncher;
 use windows::Win32::Foundation::HWND;
 
@@ -56,6 +56,54 @@ fn show_main(app: &AppHandle) {
         }
     }
     report_visibility(app);
+}
+
+/// How long an exit waits for the page to say it saved (`save-flushed`): a page that is gone or stuck must not hold the
+/// quit back.
+const SAVE_WAIT: std::time::Duration = std::time::Duration::from_millis(400);
+/// An exit has asked the page to save and waits for the answer.
+static SAVE_ASKED: AtomicBool = AtomicBool::new(false);
+/// The page answered (or the wait ran out): the exit that follows goes through.
+static SAVE_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Asks the page to write what it still holds (`flush-save`; the throttled save in `src/ui/saver.ts` can lag 300 ms
+/// behind the last change) and waits for its answer, at most `SAVE_WAIT`. Nothing the page fires on its own covers a
+/// quit from the tray or a hide to the tray.
+fn ask_page_to_save(app: &AppHandle) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let id = app.once("save-flushed", move |_| {
+        let _ = tx.send(());
+    });
+    if app.emit("flush-save", ()).is_ok() {
+        let _ = rx.recv_timeout(SAVE_WAIT);
+    }
+    app.unlisten(id);
+}
+
+/// The one place every exit passes (tray Quit, the window closing without close-to-tray, any `app.exit`): the first
+/// request is held back, the page saves, then the same exit is requested again and goes through. Worker thread: the
+/// event loop keeps running (the page's answer needs it).
+fn save_before_exit(app: &AppHandle, api: &tauri::ExitRequestApi, code: Option<i32>) {
+    if SAVE_DONE.load(Ordering::SeqCst) {
+        return;
+    }
+    api.prevent_exit();
+    if SAVE_ASKED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let app = app.clone();
+    let spawned = std::thread::Builder::new().name("save before exit".into()).spawn({
+        let app = app.clone();
+        move || {
+            ask_page_to_save(&app);
+            SAVE_DONE.store(true, Ordering::SeqCst);
+            app.exit(code.unwrap_or(0));
+        }
+    });
+    if spawned.is_err() {
+        SAVE_DONE.store(true, Ordering::SeqCst);
+        app.exit(code.unwrap_or(0));
+    }
 }
 
 /// Engine events to the webview (plan 5.6).
@@ -120,6 +168,7 @@ fn main() {
                 .on_menu_event(|app, e| match e.id.as_ref() {
                     "show" => show_main(app),
                     // The engine is shut down in `RunEvent::Exit` below: camera released, frames.bin closed.
+                    // `RunEvent::ExitRequested` holds the exit back until the page has saved.
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -166,10 +215,16 @@ fn main() {
         })
         .on_window_event(|window, event| match event {
             WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
                 if window.state::<commands::AppState>().close_to_tray.load(Ordering::Relaxed) {
-                    api.prevent_close();
+                    // A hidden page keeps its timers, but the save should not wait on them: asked here, no answer needed.
+                    let _ = window.emit("flush-save", ());
                     let _ = window.hide();
                     report_visibility(window.app_handle());
+                } else {
+                    // Closing the only window quits. Exit while the page is still there to save (the window would
+                    // be destroyed first otherwise): `RunEvent::ExitRequested` does the asking.
+                    window.app_handle().exit(0);
                 }
             }
             // Minimizing and restoring change the size and the focus; hiding and showing go through the code above.
@@ -223,9 +278,10 @@ fn main() {
         ])
         .build(context)
         .expect("error while building Better Cam")
-        .run(|app, event| {
-            if let RunEvent::Exit = event {
-                app.state::<commands::AppState>().service.shutdown();
-            }
+        .run(|app, event| match event {
+            // Every exit (the tray's Quit, the window closing, `app.exit`) is held back once for the page to save.
+            RunEvent::ExitRequested { api, code, .. } => save_before_exit(app, &api, code),
+            RunEvent::Exit => app.state::<commands::AppState>().service.shutdown(),
+            _ => {}
         });
 }

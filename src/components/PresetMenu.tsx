@@ -1,14 +1,27 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { useStore } from "../store";
 import { DEFAULT_SIGNATURE, PRESET_NAME, signature } from "../filters/chain";
+import type { FilterCfg } from "../filters/schema";
 import { Icon } from "./Icon";
 import { Popover } from "./Popover";
+
+// The selector runs on every store change, not only on a chain change: work out the fingerprint once per chain.
+let sigChain: FilterCfg[] | null = null;
+let sigValue = "";
+const signatureOf = (chain: FilterCfg[]) => {
+  if (chain !== sigChain) {
+    sigChain = chain;
+    sigValue = signature(chain);
+  }
+  return sigValue;
+};
 
 export function PresetMenu() {
   const presets = useStore((s) => s.presets);
   const activePreset = useStore((s) => s.activePreset);
-  const baseline = useStore((s) => s.presetBaseline);
-  const sig = useStore((s) => signature(s.chain));
+  // Two booleans, not the fingerprint: it changes with every step of a slider drag, they do not.
+  const isDefault = useStore((s) => signatureOf(s.chain) === DEFAULT_SIGNATURE);
+  const dirty = useStore((s) => (s.activePreset ? signatureOf(s.chain) !== s.presetBaseline : signatureOf(s.chain) !== DEFAULT_SIGNATURE));
   const { loadPreset, savePreset, saveActivePreset, deletePreset, resetChain } = useStore.getState();
 
   const [open, setOpen] = useState(false);
@@ -23,8 +36,7 @@ export function PresetMenu() {
     setConfirmDelete(null);
   }, []);
 
-  const dirty = activePreset ? sig !== baseline : sig !== DEFAULT_SIGNATURE;
-  const label = activePreset ?? (sig === DEFAULT_SIGNATURE ? "Default" : "Unsaved");
+  const label = activePreset ?? (isDefault ? "Default" : "Unsaved");
 
   // Save overwrites the active preset; with none active it asks for a name instead.
   const save = useCallback(() => {

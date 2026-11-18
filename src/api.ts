@@ -1,7 +1,8 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import type { ExtensionInfo, FilterCfg } from "./filters/schema";
 import { presetChain, presetFile } from "./filters/chain";
+import { answerFlushRequest } from "./ui/saver";
 import type { AutoCfg, AutoStatus, CameraInfo, ControlInfo, ControlKey, ControlMode, Learned, OutputCfg, SourceCfg, StoredControl } from "./camera/schema";
 
 /**
@@ -80,6 +81,8 @@ export interface VcamStatus {
   consumers: number;
   /** A sentence when the camera's data folder or frame file is encrypted (Windows EFS): the camera shows nothing whatever `state` says. `null` when there is nothing to say. */
   problem: string | null;
+  /** Repair can put `problem` right (`true` too when there is none). `false` when Windows' `ProgramData` itself is encrypted: only an administrator's step helps, so the window shows no Repair button. */
+  repairable: boolean;
 }
 
 /** `nvidia_status`: whether NVIDIA's Video Effects runtime is usable. `detail` says in plain words what is missing. */
@@ -215,6 +218,11 @@ export const api = {
   onExtensionsChanged: (cb: (list: ExtensionInfo[]) => void) => listen<ExtensionInfo[]>("extensions-changed", (e) => cb(e.payload)),
   onStats: (cb: (s: Stats) => void) => listen<Stats>("stats", (e) => cb(e.payload)),
   onDevicesChanged: (cb: () => void) => listen("devices-changed", () => cb()),
+  /**
+   * The app is about to exit (tray Quit, window close) or hide to the tray: `cb` saves what waits, then the page answers
+   * `save-flushed`. The app waits for that answer (at most 0.4 s) before it exits.
+   */
+  onFlushSave: (cb: () => void) => listen("flush-save", () => answerFlushRequest(cb, () => void emit("save-flushed"))),
   /**
    * About once a second while the camera is open and a control is on Auto, up to 4 times a second while Better Cam auto
    * writes, and after the stored values were re-applied. The entries carry `mode` and the other Better Cam auto fields.
