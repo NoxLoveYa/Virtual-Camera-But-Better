@@ -78,6 +78,8 @@ export interface VcamStatus {
   listed: boolean;
   /** 0 or 1: an app has the camera open right now. */
   consumers: number;
+  /** A sentence when the camera's data folder or frame file is encrypted (Windows EFS): the camera shows nothing whatever `state` says. `null` when there is nothing to say. */
+  problem: string | null;
 }
 
 /** `nvidia_status`: whether NVIDIA's Video Effects runtime is usable. `detail` says in plain words what is missing. */

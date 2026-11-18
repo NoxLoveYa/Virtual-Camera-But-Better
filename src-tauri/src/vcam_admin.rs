@@ -212,17 +212,34 @@ pub struct VcamStatus {
     pub listed: bool,
     /// 0 or 1: an app has the camera open right now.
     pub consumers: u32,
+    /// A sentence when the data folder or the frame file is encrypted (EFS): the camera service cannot read it, so
+    /// the camera is black whatever `state` says. Repair puts it right (except in an encrypted `%ProgramData%`, where
+    /// the sentence says what an administrator does). `null` when there is nothing to say.
+    pub problem: Option<String>,
+}
+
+/// The status for `facts` and the consumer count.
+pub fn status_from(facts: &vcam_install::Facts, consumers: u32) -> VcamStatus {
+    VcamStatus {
+        state: vcam_install::state_from(facts).as_str(),
+        listed: facts.listed,
+        consumers,
+        problem: facts.data_problem.clone(),
+    }
 }
 
 /// Read the state without elevation. Takes a moment (Media Foundation enumeration): call it off the UI thread.
 pub fn status() -> VcamStatus {
     let dll = locate_dll().ok();
     let facts = vcam_install::gather_facts(dll.as_deref());
-    VcamStatus {
-        state: vcam_install::state_from(&facts).as_str(),
-        listed: facts.listed,
-        consumers: vcam_install::consumers(),
-    }
+    let status = status_from(&facts, vcam_install::consumers());
+    // a debug build can show the banner of a problem without encrypting anything (screenshots of the window)
+    #[cfg(debug_assertions)]
+    let status = match std::env::var("BETTER_CAM_TEST_VCAM_PROBLEM") {
+        Ok(text) if !text.is_empty() => VcamStatus { problem: Some(text), ..status },
+        _ => status,
+    };
+    status
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -280,9 +297,11 @@ pub fn outcome_to_result(action: Action, outcome: &LaunchOutcome, log_tail: &[St
     outcome_to_result_or(action, outcome, log_tail, &|| None)
 }
 
-/// [`outcome_to_result`] that asks `no_log_reason` for a reason when an install failed and its log has no `ERROR:`
-/// line (the helper can fail before the log folder exists: on a fresh install into an encrypted `%ProgramData%` it
-/// refuses before `logs` is made, so nothing was written). Asked only then, and only for an install.
+/// [`outcome_to_result`] that asks `no_log_reason` for a note when an install failed and its log has no `ERROR:` line
+/// (the helper can fail before the log folder exists: on a fresh install into an encrypted `%ProgramData%` it
+/// refuses before `logs` is made, so nothing was written). The note is a fact the app can see (the data folder is
+/// encrypted), not a cause: it follows the exit code as a sentence of its own. Asked only then, and only for an
+/// install.
 pub fn outcome_to_result_or(
     action: Action,
     outcome: &LaunchOutcome,
@@ -310,14 +329,15 @@ pub fn outcome_to_result_or(
             }
             // Only the helper's own `ERROR:` line is a reason. The last line of the log is not: it is whatever the
             // helper happened to write before it stopped, and the real cause may never have reached the file.
-            let why = log_tail
-                .iter()
-                .rev()
-                .find(|l| l.contains("ERROR:"))
-                .map(|l| strip_stamp(l).to_string())
-                .or_else(|| (action == Action::Install).then(no_log_reason).flatten())
-                .map(|w| format!(": {w}"))
-                .unwrap_or_default();
+            let why = match log_tail.iter().rev().find(|l| l.contains("ERROR:")) {
+                Some(l) => format!(": {}", strip_stamp(l)),
+                // not a cause (the log has none): a fact about the data folder, in a sentence of its own
+                None => (action == Action::Install)
+                    .then(no_log_reason)
+                    .flatten()
+                    .map(|note| format!(". {note}"))
+                    .unwrap_or_default(),
+            };
             Err(format!("Could not {verb} the virtual camera (exit code {code}){why}"))
         }
         LaunchOutcome::Failed(why) => Err(format!("Could not start the administrator step to {verb} the virtual camera: {why}")),
@@ -344,9 +364,11 @@ pub fn run_action(launcher: &dyn Launcher, exe: &str, action: Action, user_sid: 
     } else {
         Vec::new()
     };
-    // unelevated and read-only (attributes only): the app can say what the helper could not write down
+    // unelevated and read-only (attributes only): the app can say what the helper could not write down. A data
+    // folder that is still encrypted after a failed install is one that Repair could not put right, so the note never
+    // says "run Repair" (see `encryption_after_failed_install`)
     let result = outcome_to_result_or(action, &outcome, &tail, &|| {
-        vcam_install::datadir::encryption_problem(&vcam_install::util::Paths::system())
+        vcam_install::datadir::encryption_after_failed_install(&vcam_install::util::Paths::system())
     });
     // a helper that failed leaves its reason in install.log; when a program of the user holds a lock on that file
     // neither the helper could write it nor can this read it: say that instead of showing no reason
@@ -633,8 +655,9 @@ mod tests {
     }
 
     /// A fresh install into an encrypted `%ProgramData%` is refused before `logs` exists, so there is no `ERROR:`
-    /// line: the sentence of the status check is the reason. An `ERROR:` line, when there is one, wins; the check is
-    /// not asked for it, nor for a removal, a success, a refused prompt or a busy lock.
+    /// line: what the app sees of the data folder follows the exit code, as a sentence of its own and not as the cause.
+    /// An `ERROR:` line, when there is one, wins; the check is not asked for it, nor for a removal, a success, a refused
+    /// prompt or a busy lock.
     #[test]
     fn a_failed_install_without_an_error_line_gives_the_encryption_sentence_when_there_is_one() {
         use std::cell::Cell;
@@ -645,7 +668,7 @@ mod tests {
         };
         let exited = LaunchOutcome::Exited(1);
         let e = outcome_to_result_or(Action::Install, &exited, &[], &sentence).unwrap_err();
-        assert_eq!(e, "Could not install the virtual camera (exit code 1): The folder X is encrypted (Windows EFS)");
+        assert_eq!(e, "Could not install the virtual camera (exit code 1). The folder X is encrypted (Windows EFS)");
         assert_eq!(asked.get(), 1);
         // nothing to say: as before
         let e = outcome_to_result_or(Action::Install, &exited, &[], &|| None).unwrap_err();
@@ -825,7 +848,40 @@ mod tests {
 
     #[test]
     fn the_status_names_match_the_command_contract() {
-        let json = serde_json::to_value(VcamStatus { state: "outdated", listed: true, consumers: 1 }).unwrap();
-        assert_eq!(json, serde_json::json!({ "state": "outdated", "listed": true, "consumers": 1 }));
+        let json = serde_json::to_value(VcamStatus { state: "outdated", listed: true, consumers: 1, problem: None }).unwrap();
+        assert_eq!(json, serde_json::json!({ "state": "outdated", "listed": true, "consumers": 1, "problem": null }));
+        let json = serde_json::to_value(VcamStatus { state: "ok", listed: true, consumers: 0, problem: Some("X".into()) }).unwrap();
+        assert_eq!(json["problem"], "X");
+    }
+
+    fn healthy_facts() -> vcam_install::Facts {
+        vcam_install::Facts {
+            registered: Some(vcam_install::registry::Registered {
+                dll_path: Some(r"C:\Program Files\Better Cam\vcam\better_cam_vcam_1.aaaaaaaa.dll".into()),
+                protocol: Some(1),
+                build: Some("aaaaaaaa".into()),
+            }),
+            clsid_present: true,
+            dll_present: true,
+            listed: true,
+            shipped_build: Some("aaaaaaaa".into()),
+            shipped_protocol: 1,
+            data_problem: None,
+        }
+    }
+
+    /// An installed camera whose data folder is encrypted is "ok" to the registry and black to the service: the
+    /// sentence reaches the window next to the state, and changes neither the state nor anything else.
+    #[test]
+    fn the_status_carries_the_data_problem_next_to_the_state() {
+        let ok = status_from(&healthy_facts(), 1);
+        assert_eq!(ok, VcamStatus { state: "ok", listed: true, consumers: 1, problem: None });
+        let sentence = "The folder X is encrypted (Windows EFS)".to_string();
+        let facts = vcam_install::Facts { data_problem: Some(sentence.clone()), ..healthy_facts() };
+        let with = status_from(&facts, 1);
+        assert_eq!(with, VcamStatus { state: "ok", listed: true, consumers: 1, problem: Some(sentence.clone()) });
+        // a camera that is not installed carries it too (a Repair would put it right)
+        let missing = vcam_install::Facts { registered: None, ..facts };
+        assert_eq!(status_from(&missing, 0), VcamStatus { state: "missing", listed: true, consumers: 0, problem: Some(sentence) });
     }
 }

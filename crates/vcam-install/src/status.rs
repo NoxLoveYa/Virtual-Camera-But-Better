@@ -43,7 +43,8 @@ pub struct Facts {
     pub shipped_protocol: u32,
     /// A plain sentence when the data folder or the frame file is encrypted (EFS): the camera service cannot read
     /// it, so the camera shows nothing whatever else is right. `None` when it is fine or not there yet. It does not
-    /// change [`state_from`]; the report shows it next to the state.
+    /// change [`state_from`]; the app's status (`VcamStatus::problem`) carries it next to the state, and the window
+    /// shows it with a Repair button.
     pub data_problem: Option<String>,
 }
 
@@ -125,31 +126,6 @@ mod tests {
             shipped_build: Some("aaaaaaaa".into()),
             shipped_protocol: 1,
             data_problem: None,
-        }
-    }
-
-    #[test]
-    fn an_encrypted_data_folder_is_reported_next_to_the_state_and_does_not_change_it() {
-        let problem = Some("The folder X is encrypted".to_string());
-        let unregistered = Facts {
-            registered: None,
-            clsid_present: false,
-            dll_present: false,
-            listed: false,
-            ..healthy()
-        };
-        // the same facts with and without the sentence give the same state, whatever that state is
-        for (without, expect) in [
-            (healthy(), VcamState::Ok),
-            (unregistered, VcamState::Missing),
-        ] {
-            let with = Facts {
-                data_problem: problem.clone(),
-                ..without.clone()
-            };
-            assert_eq!(state_from(&without), expect);
-            assert_eq!(state_from(&with), expect);
-            assert_eq!(with.data_problem, problem);
         }
     }
 

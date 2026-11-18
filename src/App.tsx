@@ -27,7 +27,7 @@ export default function App() {
   const collapsed = useStore((s) => s.collapsed);
   const error = useStore((s) => s.error);
   const state = useStore((s) => s.engine.state);
-  const vcamBanner = useStore((s) => s.vcam?.state === "missing" || s.vcam?.state === "outdated");
+  const vcamBanner = useStore((s) => s.vcam?.state === "missing" || s.vcam?.state === "outdated" || !!s.vcam?.problem);
   const split = useStore((s) => s.ui.split);
   const { setAllCollapsed } = useStore.getState();
   const colsRef = useRef<HTMLDivElement>(null);

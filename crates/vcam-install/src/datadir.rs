@@ -38,11 +38,14 @@
 //! * the data folder is held with listing, attribute and permission rights, so another program that has it open
 //!   without sharing writing cannot make the open fail; the wider rights that clearing its compressed state needs are
 //!   asked for in a second handle, only when the folder is compressed (see [`clear_folder_compression`]);
-//! * an object that is encrypted (EFS) is never decrypted and never kept: the camera service cannot read a file that
-//!   is encrypted for somebody else's key. A data folder, `logs` or a frame file that is encrypted is moved aside and
-//!   made again like any other that is not what it must be (the new one is plain when the folder around it is). Only
-//!   a data folder that is encrypted *when it is new*, because `%ProgramData%` itself is, is refused, with a sentence
-//!   that says what an administrator can do about `%ProgramData%` (see [`encryption_refusal`]).
+//! * an object that is encrypted (EFS) is never decrypted and kept only when it cannot be moved: the camera service
+//!   cannot read a file that is encrypted for somebody else's key. A data folder, `logs` or a frame file that is
+//!   encrypted is moved aside and made again like any other that is not what it must be (the new one is plain when the
+//!   folder around it is). Two things are kept: a `logs` folder that is in use and cannot be moved is emptied in
+//!   place (with a line of the log that it is still encrypted), and a data folder that is encrypted while
+//!   `%ProgramData%` is too (a new one would be encrypted as well, so replacing it would only lose its logs) is kept
+//!   and refused. Only a data folder that is encrypted after this run is refused, with a sentence that says what an
+//!   administrator can do (see [`encryption_refusal`]).
 //!
 //! Nothing is ever left with the permissions it would inherit: a new object is created with its final security
 //! descriptor in the create call, and the order is the data folder first (its permissions are replaced before
@@ -177,6 +180,26 @@ pub fn decide(obj: Object, facts: Option<&Facts>) -> Plan {
         return Plan::Replace("it has other permissions than expected".into());
     }
     Plan::Keep
+}
+
+/// [`decide`] for an object whose parent folder is known to be encrypted or not. A data folder that is encrypted in a
+/// `%ProgramData%` that is encrypted too would be made again encrypted, and `prepare` refuses that: replacing it
+/// would only move its logs aside and delete them for nothing. So when encryption is the *only* thing wrong with it,
+/// it is kept (and refused after it is locked, see [`refuse_if_encrypted`]).
+pub fn decide_below(obj: Object, facts: Option<&Facts>, parent_encrypted: bool) -> Plan {
+    let plan = decide(obj, facts);
+    if let (Plan::Replace(_), Some(f), true, Object::DataDir) =
+        (&plan, facts, parent_encrypted, obj)
+    {
+        let plain = Facts {
+            encrypted: false,
+            ..f.clone()
+        };
+        if f.encrypted && decide(obj, Some(&plain)) == Plan::Keep {
+            return Plan::Keep;
+        }
+    }
+    plan
 }
 
 fn path_of(paths: &Paths, obj: Object) -> PathBuf {
@@ -648,11 +671,28 @@ fn open_checked(paths: &Paths, obj: Object) -> Res<OwnedHandle> {
                 Some(ms) => std::thread::sleep(Duration::from_millis(*ms)),
                 None => return Err(locked_message(&path)),
             },
+            Err(e) if obj == Object::DataDir && is_sharing_violation(&e) => {
+                return Err(not_shared_message(&path))
+            }
             Err(e) => return Err(werr(&format!("open {}", path.display()), e)),
         }
     };
     verify_opened(paths, obj, &h)?;
     Ok(h)
+}
+
+/// `ERROR_SHARING_VIOLATION`: another program has the object open and did not share it.
+fn is_sharing_violation(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(32)
+}
+
+/// The sentence for a data folder that another program has open without sharing it. The standard user can list the
+/// folder, so a program of theirs can hold it with share mode 0, and then even a listing right is refused.
+fn not_shared_message(path: &Path) -> String {
+    format!(
+        "Another program has {} open without sharing it. Close it or restart Windows, then run Repair again.",
+        path.display()
+    )
 }
 
 /// Create the *new* `obj` with its final security descriptor in the create call (so it never exists with the
@@ -696,10 +736,11 @@ fn ensure_exists(
     stop_service: &mut dyn FnMut() -> bool,
     log: &mut dyn Log,
     ledger: &mut dyn Ledger,
+    parent_encrypted: bool,
 ) -> Res<OwnedHandle> {
     let path = path_of(paths, obj);
     let facts = inspect(paths, obj, p)?;
-    let plan = decide(obj, facts.as_ref());
+    let plan = decide_below(obj, facts.as_ref(), parent_encrypted);
     match plan {
         Plan::Keep => {
             let h = open_checked(paths, obj)?;
@@ -752,10 +793,24 @@ fn replace(
             log.line(&format!("{e}; emptying and resetting it in place instead"));
             let h = open_checked(paths, obj)?;
             empty_in_place(&h, &path, log);
+            // a folder that is replaced for being encrypted and is in use stays that way: what the helper makes in it
+            // (`install.log`) is encrypted too, which is no worse than before but is worth a line
+            if secure::kind(secure::raw(&h)).is_ok_and(|k| k.attributes & ATTRIBUTE_ENCRYPTED != 0)
+            {
+                log.line(&still_encrypted_message(&path));
+            }
             Ok(h)
         }
         Err(e) => Err(e),
     }
+}
+
+/// The line of the log for a `logs` folder that stays encrypted because it could not be moved.
+fn still_encrypted_message(logs: &Path) -> String {
+    format!(
+        "{} is still encrypted because it is in use; close the camera apps and run Repair again",
+        logs.display()
+    )
 }
 
 /// The length of the file behind `h`.
@@ -913,9 +968,9 @@ fn reopen_for_compression(paths: &Paths, held: &OwnedHandle) -> Res<OwnedHandle>
     }
 }
 
-/// The sentence for a data folder that is encrypted although the helper has just made it new, which can only mean
+/// The sentence for a data folder that is encrypted after the helper has made it new or kept it, which can only mean
 /// that something around it hands the flag down (an encrypted `%ProgramData%`: NTFS encrypts a new child of an
-/// encrypted folder). The camera service (Frame Server, LocalService) cannot read what is encrypted with EFS for
+/// encrypted folder), or that it could not be replaced. The camera service (Frame Server, LocalService) cannot read what is encrypted with EFS for
 /// somebody else's key, so the camera would show nothing and nothing would say why. The helper does not decrypt
 /// anything (that works by path, and the helper is not whoever encrypted it), and it cannot make a plain folder inside
 /// an encrypted one, so it stops and says what to do about the folder around it. `parent_attributes` are those of
@@ -940,19 +995,18 @@ pub fn encryption_refusal(
         )
         } else {
             format!(
-            "The folder {data} is encrypted (Windows EFS) although Repair just made it new, so something on this PC encrypts new folders in {parent}. The camera service cannot read encrypted files, so the virtual camera would show nothing. Ask an administrator to turn off encryption for it (run cipher /d \"{data}\" in an administrator command prompt), then run Repair again."
+            "The folder {data} is encrypted (Windows EFS) after this run, so something on this PC encrypts new folders in {parent}. The camera service cannot read encrypted files, so the virtual camera would show nothing. Ask an administrator to turn off encryption for it (run cipher /d \"{data}\" in an administrator command prompt), then run Repair again."
         )
         },
     )
 }
 
-/// Refuse (with [`encryption_refusal`]) when the data folder behind `h`, just made or kept, is still encrypted: the
-/// helper replaces an encrypted one ([`decide`]), so what is left is a new folder that inherited the flag.
-fn refuse_if_encrypted(h: &OwnedHandle, paths: &Paths) -> Res<()> {
-    let attributes = secure::kind(secure::raw(h))
-        .map_err(|e| werr(&format!("look at {}", paths.data.display()), e))?
-        .attributes;
-    match encryption_refusal(paths, attributes, attributes_of_path(&paths.program_data)) {
+/// Refuse (with [`encryption_refusal`]) when the data folder, just made or kept, is still encrypted (`attributes`, read
+/// on the held handle; `parent_attributes` those of `%ProgramData%`): the helper replaces an encrypted one
+/// ([`decide_below`]), so what is left is a new folder that inherited the flag, or one kept because replacing it
+/// would give the same.
+fn refuse_if_encrypted(paths: &Paths, attributes: u32, parent_attributes: Option<u32>) -> Res<()> {
+    match encryption_refusal(paths, attributes, parent_attributes) {
         Some(sentence) => Err(sentence),
         None => Ok(()),
     }
@@ -963,27 +1017,66 @@ fn attributes_of_path(p: &Path) -> Option<u32> {
     attributes(p).ok()
 }
 
+fn is_encrypted(attributes: Option<u32>) -> bool {
+    attributes.is_some_and(|a| a & ATTRIBUTE_ENCRYPTED != 0)
+}
+
+/// What the app can say about a failed install whose log has no reason: the sentence of [`encryption_refusal`] when
+/// the data folder is still encrypted, else `None`. A folder that is still encrypted after a failed install is one
+/// that Repair could not put right (it replaces an encrypted folder first), so this never says "run Repair" the way
+/// [`encryption_problem`] does for a folder nobody has tried to replace. For the app, which reads attributes only.
+pub fn encryption_after_failed_install(paths: &Paths) -> Option<String> {
+    encryption_after_failed_install_from(
+        paths,
+        attributes_of_path(&paths.data),
+        attributes_of_path(&paths.program_data),
+    )
+}
+
+fn encryption_after_failed_install_from(
+    paths: &Paths,
+    data: Option<u32>,
+    parent: Option<u32>,
+) -> Option<String> {
+    encryption_refusal(paths, data?, parent)
+}
+
 /// Whether the data folder or the frame file is encrypted right now, as the sentence that says so and what to do. For
 /// the status report: it needs no elevation and changes nothing. `None` when neither is encrypted or not there.
 ///
 /// An encrypted data folder or frame file is something Repair puts right (it replaces it with a new one that is
 /// not encrypted), so the sentence says "run Repair"; except when `%ProgramData%` itself is encrypted, where Repair
-/// cannot help and the sentence is [`encryption_refusal`]'s.
+/// cannot help and the sentence is [`encryption_refusal`]'s. A data folder that is encrypted without its files being
+/// so (`cipher /e` without `/s` encrypts what is made in it from then on) says so: only new files are affected.
 pub fn encryption_problem(paths: &Paths) -> Option<String> {
     // attributes only, no link followed, nothing opened for data (no lock of another program is broken or waited for)
-    let data = attributes_of_path(&paths.data);
+    encryption_problem_from(
+        paths,
+        attributes_of_path(&paths.data),
+        attributes_of_path(&paths.program_data),
+        attributes_of_path(&paths.frames()),
+    )
+}
+
+/// [`encryption_problem`] from the attributes of the data folder, `%ProgramData%` and the frame file (`None`: not
+/// there or not readable).
+fn encryption_problem_from(
+    paths: &Paths,
+    data: Option<u32>,
+    parent: Option<u32>,
+    frames_attributes: Option<u32>,
+) -> Option<String> {
     if let Some(a) = data.filter(|a| a & ATTRIBUTE_ENCRYPTED != 0) {
-        let parent = attributes_of_path(&paths.program_data);
-        if parent.is_some_and(|a| a & ATTRIBUTE_ENCRYPTED != 0) {
+        if is_encrypted(parent) {
             return encryption_refusal(paths, a, parent);
         }
         return Some(format!(
-            "The folder {} is encrypted (Windows EFS), so the camera service cannot read the files in it and the virtual camera would show nothing. Run Repair: it replaces the folder with a new one that is not encrypted.",
+            "The folder {} is encrypted (Windows EFS): new files made in it are encrypted too, and the camera service cannot read an encrypted file, so the virtual camera may show nothing. Run Repair: it replaces the folder with a new one that is not encrypted.",
             paths.data.display()
         ));
     }
     let frames = paths.frames();
-    attributes_of_path(&frames)
+    frames_attributes
         .filter(|a| a & ATTRIBUTE_ENCRYPTED != 0)
         .map(|_| {
             format!(
@@ -1405,34 +1498,87 @@ pub fn prepare_recording(
     log: &mut dyn Log,
     ledger: &mut dyn Ledger,
 ) -> Res<()> {
+    prepare_reading(
+        paths,
+        p,
+        stop_service,
+        log,
+        ledger,
+        &|| attributes_of_path(&paths.program_data),
+        &|h| {
+            secure::kind(secure::raw(h))
+                .map(|k| k.attributes)
+                .map_err(|e| werr(&format!("look at {}", paths.data.display()), e))
+        },
+    )
+}
+
+/// [`prepare_recording`] with the attributes it reads of `%ProgramData%` and of the held data folder given, so that a
+/// test can say what an encrypted `%ProgramData%` makes of the folder without encrypting anything.
+fn prepare_reading(
+    paths: &Paths,
+    p: &Principals,
+    stop_service: &mut dyn FnMut() -> bool,
+    log: &mut dyn Log,
+    ledger: &mut dyn Ledger,
+    parent_attributes: &dyn Fn() -> Option<u32>,
+    folder_attributes: &dyn Fn(&OwnedHandle) -> Res<u32>,
+) -> Res<()> {
     // a log file of ours inside `logs` would keep the folder from being moved: close it, lines wait meanwhile
     log.release_folder();
     std::fs::create_dir_all(&paths.program_data)
         .map_err(|e| werr(&format!("create {}", paths.program_data.display()), e))?;
     // 1. the folder: held (no delete sharing) until the end, and locked right away: from here the user can neither
-    // create nor rename anything in it, and what it hands down to new children is only what the helper wants
-    let data = ensure_exists(paths, Object::DataDir, p, stop_service, log, ledger)?;
+    // create nor rename anything in it, and what it hands down to new children is only what the helper wants. Read
+    // before anything is replaced: a folder that is encrypted in an encrypted `%ProgramData%` is kept, not replaced
+    // (a new one would be encrypted too, and its logs would be gone for nothing)
+    let parent = parent_attributes();
+    let data = ensure_exists(
+        paths,
+        Object::DataDir,
+        p,
+        stop_service,
+        log,
+        ledger,
+        is_encrypted(parent),
+    )?;
     // (a folder made inside a compressed `%ProgramData%` is compressed, and would hand that on to what is made in it)
     clear_folder_compression(paths, &data, log);
     lock(&data, Object::DataDir, p, log)?;
-    // an encrypted folder was replaced above ([`decide`]); one that is encrypted all the same is a new folder in an
-    // encrypted `%ProgramData%`. After the lock (so that the permissions an older version left are gone whatever
-    // happens next), before anything is made in it: a child of an encrypted folder is encrypted too, and the camera
-    // service could not read it
-    refuse_if_encrypted(&data, paths)?;
+    // an encrypted folder was replaced above ([`decide_below`]); one that is encrypted all the same is a new folder in
+    // an encrypted `%ProgramData%`, or one that was kept for that reason. After the lock (so that the permissions an
+    // older version left are gone whatever happens next), before anything is made in it: a child of an encrypted
+    // folder is encrypted too, and the camera service could not read it
+    refuse_if_encrypted(paths, folder_attributes(&data)?, parent_attributes())?;
     // 2. the folder's children, each with a protected DACL of its own
-    let logs = ensure_exists(paths, Object::LogsDir, p, stop_service, log, ledger)?;
+    let logs = ensure_exists(paths, Object::LogsDir, p, stop_service, log, ledger, false)?;
     lock(&logs, Object::LogsDir, p, log)?;
     let mut trusted = p.trusted_owners.clone();
     trusted.extend([p.system.clone(), p.admins.clone(), p.local_service.clone()]);
     sweep_logs(paths, &trusted, log);
-    let frames = ensure_exists(paths, Object::FramesFile, p, stop_service, log, ledger)?;
+    let frames = ensure_exists(
+        paths,
+        Object::FramesFile,
+        p,
+        stop_service,
+        log,
+        ledger,
+        false,
+    )?;
     finish_frame_file(&frames, log)?;
     lock(&frames, Object::FramesFile, p, log)?;
     // (no look at the encrypted flag here: an encrypted frame file was replaced above, and the new one is made in a
     // data folder that was just found not encrypted, so it is plain)
     // the helper's own log: a DACL of its own, so the service's inheritable modify right on `logs` stops short of it
-    let install_log = ensure_exists(paths, Object::InstallLog, p, stop_service, log, ledger)?;
+    let install_log = ensure_exists(
+        paths,
+        Object::InstallLog,
+        p,
+        stop_service,
+        log,
+        ledger,
+        false,
+    )?;
     lock(&install_log, Object::InstallLog, p, log)?;
     let left = sweep(paths, log);
     if left > 0 {

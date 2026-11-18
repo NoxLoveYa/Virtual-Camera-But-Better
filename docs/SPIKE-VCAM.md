@@ -1341,3 +1341,33 @@ match the slate, PASS.
   browser or the Windows Camera app were not run against this build.
 * The perf runs shared the PC with other agents' work (machine busy 17 to 42 %); and another agent's dev app took the lock file
   away once during the feed check, which was then redone under a new lock.
+# P-hardening 8: EFS tests and the second review of the data-folder encryption changes
+
+## Running the EFS tests
+
+The tests that encrypt something with `cipher.exe` run only when asked for, and change the machine they run on: **the first
+`cipher /e` of a user makes an EFS certificate and key for that user** (`Cert:\CurrentUser\My`, "Encrypting File System"),
+which nothing here removes. List the certificates before and after to see whether yours exists:
+
+```
+Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.EnhancedKeyUsageList.ObjectId -contains '1.3.6.1.4.1.311.10.3.4' }
+$env:BETTER_CAM_EFS_TESTS=1; cargo test -p vcam-install encrypted
+```
+
+Without `BETTER_CAM_EFS_TESTS=1` those tests print "skipped" and pass. They need an NTFS temp folder with EFS on (else they
+print "EFS is not available here" and return). The default run has tests for the same logic that encrypt nothing: the
+decision (`decide_below`), `prepare` refusing a data folder whose attributes are injected (`prepare_reading`), both
+branches of `encryption_problem` and of `encryption_after_failed_install` from injected attributes, and a data folder held
+with share mode 0.
+
+## What the second review changed
+
+| Finding | Fix | Tests |
+|---|---|---|
+| status never showed `data_problem` | `VcamStatus.problem` (a string or `null`, in `src/api.ts`); a warning banner with a Repair button (`VcamBanner`) | `vcam_admin::tests::the_status_carries_the_data_problem_next_to_the_state`, the JSON test |
+| a failed fresh install said "Run Repair" and gave the encryption sentence as the cause | `datadir::encryption_after_failed_install`: the refusal sentence when the folder is still encrypted, never "Run Repair"; it follows the exit code as a sentence of its own | `a_failed_install_says_the_refusal_when_the_data_folder_is_encrypted_and_never_run_repair`, `a_failed_install_without_an_error_line_gives_the_encryption_sentence_when_there_is_one` |
+| encrypted folder in an encrypted `%ProgramData%` was moved aside and deleted, then refused | `decide_below`: kept (then locked, then refused) when encryption is the only thing wrong with it | `an_encrypted_data_folder_in_an_encrypted_program_data_is_kept_not_replaced`, gated `..._is_refused_with_its_logs_in_place`, `prepare_refuses_a_data_folder_that_is_encrypted_after_it_is_locked_and_before_anything_is_made_in_it` |
+| a program holding the data folder with share mode 0 gave "os error 32" | "Another program has <data> open without sharing it. Close it or restart Windows, then run Repair again." | `a_data_folder_another_program_holds_without_sharing_is_said_so` |
+| a held, encrypted `logs` stayed encrypted with no line | one line of the log; module doc says "kept only when it cannot be moved" | `a_logs_folder_that_stays_encrypted_says_so_and_what_to_do`, gated `an_encrypted_logs_folder_that_is_in_use_is_emptied_in_place_and_the_log_says_it_is_still_encrypted` |
+| status wording overstated a folder-only encryption | "new files made in it are encrypted too" | `the_status_sentence_is_for_the_folder_around_it_or_for_repair` |
+| "although Repair just made it new" | "is encrypted (Windows EFS) after this run" | `prepare_refuses_a_data_folder_...` |
