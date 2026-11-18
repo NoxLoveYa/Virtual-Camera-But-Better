@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useStore } from "./store";
 import { AddFilter } from "./components/AddFilter";
 import { ControlsCard } from "./components/ControlsCard";
+import { EngineBanner } from "./components/EngineBanner";
 import { FilterCard } from "./components/FilterCard";
 import { NvidiaPrompt } from "./components/NvidiaPrompt";
 import { OutputPanel } from "./components/OutputPanel";
@@ -18,9 +19,8 @@ export default function App() {
   const collapsed = useStore((s) => s.collapsed);
   const error = useStore((s) => s.error);
   const state = useStore((s) => s.engine.state);
-  const reason = useStore((s) => s.engine.reason);
   const vcamBanner = useStore((s) => s.vcam?.state === "missing" || s.vcam?.state === "outdated");
-  const { setAllCollapsed, moveFilter, dismissError } = useStore.getState();
+  const { setAllCollapsed, moveFilter } = useStore.getState();
   const [dragFrom, setDragFrom] = useState<number | null>(null);
   const init = useRef(false);
 
@@ -57,19 +57,7 @@ export default function App() {
           {(error || waiting || vcamBanner) && (
             <div className="banners">
               <VcamBanner />
-              {error && (
-                <div className="banner error" onClick={dismissError}>
-                  {error}
-                </div>
-              )}
-              {waiting && (
-                <div className="banner warn" role="status">
-                  <span>
-                    {reason ? reason.charAt(0).toUpperCase() + reason.slice(1) : "Waiting for the camera"}. Better Cam keeps
-                    trying and goes live as soon as the camera is available.
-                  </span>
-                </div>
-              )}
+              <EngineBanner />
             </div>
           )}
 

@@ -90,6 +90,32 @@ impl fmt::Display for GpuError {
 
 impl std::error::Error for GpuError {}
 
+/// `DXGI_ERROR_DEVICE_REMOVED`, `_HUNG`, `_RESET` or `_DRIVER_INTERNAL_ERROR`, and `D3DDDIERR_DEVICEREMOVED`: the
+/// device is gone (a driver update or reset, a timeout detection and recovery) and everything made on it is dead.
+pub fn is_device_lost_hr(hr: windows::core::HRESULT) -> bool {
+    use windows::Win32::Graphics::Dxgi::{
+        DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
+        DXGI_ERROR_DRIVER_INTERNAL_ERROR,
+    };
+    const D3DDDIERR_DEVICEREMOVED: windows::core::HRESULT =
+        windows::core::HRESULT(0x876C_0001_u32 as i32);
+    [
+        DXGI_ERROR_DEVICE_REMOVED,
+        DXGI_ERROR_DEVICE_HUNG,
+        DXGI_ERROR_DEVICE_RESET,
+        DXGI_ERROR_DRIVER_INTERNAL_ERROR,
+        D3DDDIERR_DEVICEREMOVED,
+    ]
+    .contains(&hr)
+}
+
+impl GpuError {
+    /// The call failed because the device was removed or reset (see [`is_device_lost_hr`]).
+    pub fn is_device_lost(&self) -> bool {
+        matches!(self, GpuError::Api(e) if is_device_lost_hr(e.code()))
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -197,6 +223,17 @@ impl GpuDevice {
                 video_support,
             })
         }
+    }
+}
+
+impl GpuDevice {
+    /// Why the device was removed (`GetDeviceRemovedReason`), or `None` while it works. Cheap: the engine asks every
+    /// frame.
+    pub fn removed_reason(&self) -> Option<windows::core::HRESULT> {
+        // SAFETY: plain COM call on the live device.
+        unsafe { self.device.GetDeviceRemovedReason() }
+            .err()
+            .map(|e| e.code())
     }
 }
 

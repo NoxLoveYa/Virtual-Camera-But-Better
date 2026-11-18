@@ -556,7 +556,8 @@ pub fn resolve_camera(cap: &CaptureCfg, output_fps: Option<u32>) -> Result<Camer
     } else {
         Vec::new()
     };
-    let request = resolve_request(cap, output_fps, &formats).map_err(Failure::Fatal)?;
+    // What the camera does not offer is a format problem (the engine falls back to the device default once).
+    let request = resolve_request(cap, output_fps, &formats).map_err(Failure::Format)?;
     Ok(CameraSpec {
         link: key.symbolic_link.clone(),
         request,

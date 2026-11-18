@@ -17,8 +17,25 @@ fn report_visibility(app: &AppHandle) {
     let Some(w) = app.get_webview_window("main") else {
         return;
     };
-    let visible = w.is_visible().unwrap_or(false) && !w.is_minimized().unwrap_or(false);
-    app.state::<commands::AppState>().service.set_window_visible(visible);
+    // Either call may fail while the window is being created or destroyed: then the last report stands.
+    let (Ok(shown), Ok(minimized)) = (w.is_visible(), w.is_minimized()) else {
+        return;
+    };
+    let visible = shown && !minimized;
+    if app.state::<commands::AppState>().service.set_window_visible(visible) {
+        eprintln!("[window] {}", if visible { "visible" } else { "hidden or minimized" });
+    }
+}
+
+/// Not every change of the window comes with an event the app sees: a window hidden or shown by something else
+/// (`ShowWindow` from another program, a tray helper) sends neither a size nor a focus event, and then the engine
+/// would keep the camera on for a hidden window, or close it under a visible one. So the state is also read twice a
+/// second. The report only does anything when the state differs from the last one.
+fn watch_visibility(app: AppHandle) {
+    let _ = std::thread::Builder::new().name("window visibility".into()).spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        report_visibility(&app);
+    });
 }
 
 /// Every path that surfaces the main window (start-up, tray, second launch) goes through here. With the debug-only
@@ -51,6 +68,7 @@ fn forward_events(app: &AppHandle) -> Arc<dyn better_cam::engine::EventSink> {
             EngineEvent::Controls(c) => app.emit("controls-changed", c),
             EngineEvent::FilterError(e) => app.emit("filter-error", e),
             EngineEvent::FilterStatus(s) => app.emit("filter-status", s),
+            EngineEvent::FormatFallback(f) => app.emit("format-fallback", f),
         };
     })
 }
@@ -121,6 +139,7 @@ fn main() {
             } else {
                 show_main(app.handle());
             }
+            watch_visibility(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| match event {
@@ -134,6 +153,11 @@ fn main() {
             // Minimizing and restoring change the size and the focus; hiding and showing go through the code above.
             WindowEvent::Resized(_) | WindowEvent::Focused(_) | WindowEvent::Moved(_) => {
                 report_visibility(window.app_handle());
+                // Back in front: a camera that was waited for (Windows privacy settings changed, the other app closed)
+                // is tried at once.
+                if matches!(event, WindowEvent::Focused(true)) {
+                    window.state::<commands::AppState>().service.retry_now();
+                }
             }
             _ => {}
         })
@@ -158,6 +182,7 @@ fn main() {
             commands::save_preset,
             commands::load_preset,
             commands::delete_preset,
+            commands::open_camera_settings,
             commands::vcam_status,
             commands::vcam_install,
             commands::vcam_uninstall,

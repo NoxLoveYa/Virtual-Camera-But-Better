@@ -63,9 +63,11 @@ export type VcamAction = "install" | "update" | "repair" | "remove";
 export interface EngineInfo {
   state: EngineState["state"];
   reason: string | null;
+  /** What kind of problem `reason` is (see `EngineState.kind`): the banner picks its text and button by it. */
+  kind: string | null;
 }
 
-const STOPPED: EngineInfo = { state: "stopped", reason: null };
+const STOPPED: EngineInfo = { state: "stopped", reason: null, kind: null };
 const isRunning = (e: EngineInfo) => e.state !== "stopped";
 
 const loadSaved = (): Saved => {
@@ -120,6 +122,8 @@ interface State extends Saved {
   /** Pause is not an engine state and no event reports it: the store keeps the flag; Start and Stop clear it. */
   paused: boolean;
   error: string | null;
+  /** The `kind` the engine gave the stop that `error` is about (`format`: the camera lacks the format asked for). */
+  errorKind: string | null;
   notice: string | null;
   /** Bumped on every toast so repeating the same message restarts its timer. */
   noticeSeq: number;
@@ -337,9 +341,10 @@ export const useStore = create<State>((set, get) => {
     const { source, output, chain } = get();
     try {
       await api.startEngine(source, output, chain, record());
-      // The events may already have said more than "standby"; only fill in when they have not.
-      if (!running()) set({ engine: { state: "standby", reason: "opening" } });
-      set({ error: null, paused: false, wasRunning: true, filterErrors: {} });
+      // The events may already have said more than "standby"; only fill in when they have not. Not while the virtual
+      // camera is being changed: the engine is released then (the events said so) and starts when the change ends.
+      if (!running() && !get().vcamBusy) set({ engine: { state: "standby", reason: "opening", kind: null } });
+      set({ error: null, errorKind: null, paused: false, wasRunning: true, filterErrors: {} });
       persist();
       return true;
     } catch (e) {
@@ -439,6 +444,7 @@ export const useStore = create<State>((set, get) => {
     engine: STOPPED,
     paused: false,
     error: null,
+    errorKind: null,
     notice: null,
     noticeSeq: 0,
     undo: null,
@@ -512,11 +518,11 @@ export const useStore = create<State>((set, get) => {
     runVcam: async (action) => {
       if (get().vcamBusy) return;
       // The backend lets go of the frame file before it asks for administrator rights (the helper may have to replace
-      // it), so a running engine stops; it starts again afterwards. The prompt may stay open as long as it likes: the
-      // buttons stay disabled until the helper has exited, and nothing else in the window waits for it.
-      const resume = running();
-      set({ vcamBusy: action, ...(resume && { engine: STOPPED, paused: false }) });
-      if (resume) useStats.setState({ stats: null });
+      // it): the engine stops (an `engine-state` event says so, so the window shows what is true), and the backend
+      // starts a new one with the state the old one had when the change ends, whether it worked or not. The prompt
+      // may stay open as long as it likes: the buttons stay disabled until the helper has exited, and nothing else in
+      // the window waits for it.
+      set({ vcamBusy: action });
       try {
         const result = await api.vcamInstall();
         // A Start that was refused for want of the camera left its error up; it is no longer true.
@@ -534,7 +540,6 @@ export const useStore = create<State>((set, get) => {
       } finally {
         set((s) => ({ vcamBusy: null, vcamEpoch: s.vcamEpoch + 1 }));
         await get().refreshVcam();
-        if (resume && get().vcam?.state !== "missing") await begin();
       }
     },
 
@@ -561,14 +566,30 @@ export const useStore = create<State>((set, get) => {
 
     init: async () => {
       await api.onEngineState((e) => {
-        set({ engine: { state: e.state, reason: e.reason ?? null }, ...(e.state === "stopped" && { paused: false, filterStatus: {} }) });
+        set({
+          engine: { state: e.state, reason: e.reason ?? null, kind: e.kind ?? null },
+          // The kind of a stop that has an error says what the error is about (`format`).
+          ...(e.state === "stopped" && { paused: false, filterStatus: {}, ...(e.kind && { errorKind: e.kind }) }),
+        });
         if (e.state === "stopped") useStats.setState({ stats: null });
       });
       await api.onEngineError((error) => {
         api.stopEngine().catch(() => {});
-        set({ error, engine: STOPPED, paused: false, wasRunning: false });
+        // The `stopped` event with the error's kind follows this one.
+        set({ error, errorKind: null, engine: STOPPED, paused: false, wasRunning: false });
         useStats.setState({ stats: null });
         persist();
+      });
+      await api.onFormatFallback(({ asked, used, width, height, interval }) => {
+        say(`${asked} isn't available; using device default (${used}).`);
+        // The fields show what runs now: the device default, at the size and rate the camera delivers. The engine
+        // already runs with these settings, so nothing is sent (it would not change anything).
+        const prev = get().source;
+        const next: SourceCfg = { ...prev, res_type: "preferred", video_format: "any", resolution: `${width}x${height}`, frame_interval: interval };
+        if (JSON.stringify(next) !== JSON.stringify(prev)) {
+          set({ source: next });
+          persist();
+        }
       });
       await api.onFilterError(({ id, message }) => {
         // An empty message clears the card's line (the file loaded, or its path was cleared).
@@ -800,7 +821,7 @@ export const useStore = create<State>((set, get) => {
       persist();
     },
 
-    dismissError: () => set({ error: null, notice: null, undo: null }),
+    dismissError: () => set({ error: null, errorKind: null, notice: null, undo: null }),
     dismissNotice: () => set({ notice: null, undo: null }),
     undoChain: () => {
       const u = get().undo;

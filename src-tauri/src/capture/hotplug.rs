@@ -298,6 +298,40 @@ mod tests {
         assert!(super::super::links_match(ev.link(), USB_LINK));
     }
 
+    /// Media Foundation's link ends in `\global`; a configuration manager notification may or may not carry it, and
+    /// differs in case. Removal and arrival must find the camera either way.
+    #[test]
+    fn notification_links_match_with_and_without_the_reference_string() {
+        use super::super::links_match;
+        let upper_bare = "\\\\?\\USB#VID_0C45&PID_636D&MI_00#9&3171A958&0&0000#{E5323777-F976-4F5B-9B55-B94699C46E44}";
+        let upper_global = format!("{upper_bare}\\GLOBAL");
+        assert!(links_match(USB_LINK, upper_bare));
+        assert!(links_match(USB_LINK, &upper_global));
+        assert!(links_match(upper_bare, USB_LINK));
+        // another interface of the same device, or another device, does not match
+        let other_port = "\\\\?\\usb#vid_0c45&pid_636d&mi_00#6&bbbb&0&0001#{e5323777-f976-4f5b-9b55-b94699c46e44}";
+        assert!(!links_match(USB_LINK, other_port));
+        let other_class = "\\\\?\\usb#vid_0c45&pid_636d&mi_00#9&3171a958&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}";
+        assert!(!links_match(USB_LINK, other_class));
+
+        // through the mapping of the notification: what the callback sends is what the engine compares
+        for link in [upper_bare.to_string(), upper_global.clone()] {
+            let removed = map_notification(CM_NOTIFY_ACTION_DEVICEINTERFACEREMOVAL, &link).unwrap();
+            assert!(links_match(removed.link(), USB_LINK), "{link}");
+        }
+
+        // an arrival is the camera being waited for by its link (either form) or by vendor and product (new port)
+        use crate::config::arrival_matches;
+        assert!(arrival_matches(Some(USB_LINK), upper_bare));
+        assert!(arrival_matches(Some(USB_LINK), &upper_global));
+        assert!(arrival_matches(Some(USB_LINK), other_port), "same vid/pid on another port");
+        assert!(!arrival_matches(
+            Some(USB_LINK),
+            "\\\\?\\usb#vid_046d&pid_085e&mi_00#6&aaaa&0&0003#{e5323777-f976-4f5b-9b55-b94699c46e44}"
+        ));
+        assert!(arrival_matches(None, other_class), "no camera chosen: any arrival");
+    }
+
     #[test]
     fn watcher_registers_and_unregisters() {
         let (watcher, rx) = HotplugWatcher::start().expect("register");

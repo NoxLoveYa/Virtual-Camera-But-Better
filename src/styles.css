@@ -204,6 +204,9 @@ button.ghost:hover:not(:disabled) { color: var(--text); box-shadow: none; border
 .banner.error { border-left-color: var(--danger); cursor: pointer; }
 .banner.warn { border-left-color: var(--warn); display: flex; align-items: center; gap: 16px; justify-content: space-between; color: var(--dim); }
 .banner.warn button { flex-shrink: 0; }
+/* P15: an error banner with a button ("Use device default") lays out like the warning one. */
+.banner.error.with-action { display: flex; align-items: center; gap: 16px; justify-content: space-between; }
+.banner.error.with-action button { flex-shrink: 0; }
 
 /* ---------- panels ---------- */
 .panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 16px; }

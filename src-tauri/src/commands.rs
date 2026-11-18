@@ -147,6 +147,13 @@ pub fn preview_ack(state: State<AppState>, frame: u32) {
     state.service.preview_ack(frame);
 }
 
+/// Open Windows Settings on the camera privacy page (`ms-settings:privacy-webcam`), for the banner that says Windows
+/// keeps desktop apps from the camera. Returns at once.
+#[tauri::command]
+pub fn open_camera_settings() -> Result<(), String> {
+    better_cam::capture::privacy::open_settings()
+}
+
 /// What the virtual camera needs (plan 5.5): `{state: "missing" | "outdated" | "ok", listed, consumers}`. No elevation.
 #[tauri::command]
 pub async fn vcam_status() -> Result<VcamStatus, String> {

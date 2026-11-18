@@ -9,10 +9,28 @@ export type ControlsRecord = { id: string; name: string; controls: Record<string
 
 export type EngineStateName = "stopped" | "standby" | "live" | "reconnecting";
 
-/** `engine-state`. Reasons: standby = opening | reopening | idle; reconnecting = what is wrong; stopped = error or none. */
+/**
+ * `engine-state`. Reasons: standby = opening | reopening | idle; reconnecting = what is wrong; stopped = error,
+ * `vcam-change` (the virtual camera is being installed, repaired or removed) or none.
+ */
 export interface EngineState {
   state: EngineStateName;
   reason?: string | null;
+  /**
+   * What kind of problem `reason` describes: `in_use`, `disconnected`, `not_found`, `privacy` or `error` while
+   * reconnecting; `format` on the stop of a start that failed for want of a format.
+   */
+  kind?: string | null;
+}
+
+/** `format-fallback`: the camera lacks the saved format; the device default runs. Both are for a sentence, e.g. `1920×1080 YUY2 60 fps`. */
+export interface FormatFallback {
+  asked: string;
+  used: string;
+  /** The picture size and the frame interval (100 ns units) that run, for the fields. */
+  width: number;
+  height: number;
+  interval: number;
 }
 
 export interface Stats {
@@ -81,6 +99,8 @@ export const api = {
     return invoke<void>("set_preview", { on, width, height, channel });
   },
   previewAck: (frame: number) => invoke<void>("preview_ack", { frame }),
+  /** Opens Windows Settings on the camera privacy page (`ms-settings:privacy-webcam`). */
+  openCameraSettings: () => invoke<void>("open_camera_settings"),
   /** No elevation; takes a moment (Media Foundation enumeration). */
   vcamStatus: () => invoke<VcamStatus>("vcam_status"),
   /**
@@ -119,6 +139,8 @@ export const api = {
   deletePreset: (name: string) => invoke<void>("delete_preset", { name }),
   onEngineState: (cb: (s: EngineState) => void) => listen<EngineState>("engine-state", (e) => cb(e.payload)),
   onEngineError: (cb: (msg: string) => void) => listen<string>("engine-error", (e) => cb(e.payload)),
+  /** The camera lacks the saved format and the device default was opened instead (the engine already runs with it). */
+  onFormatFallback: (cb: (f: FormatFallback) => void) => listen<FormatFallback>("format-fallback", (e) => cb(e.payload)),
   /**
    * A filter failed and is bypassed until it recovers (not fatal), or a file it reads could not be loaded
    * (`could not load <file>: <reason>`). `id` is the card's id. An **empty `message`** means the problem is gone: the

@@ -10,6 +10,7 @@
 
 pub mod controls;
 pub mod hotplug;
+pub mod privacy;
 pub mod reader;
 
 use std::fmt;

@@ -347,7 +347,8 @@ const LOG_LOCKED: &str =
 
 /// [`run_action`] under the claim on the virtual camera: one change at a time, the engine (and its handle on
 /// `frames.bin`, which the helper may have to replace) released first. The claim is dropped when the helper has
-/// exited, not before, so a second action is refused for as long as a helper (or its prompt) is alive.
+/// exited, not before, so a second action is refused for as long as a helper (or its prompt) is alive. Dropping it
+/// brings the engine back to what it was doing (not after a removal).
 pub fn run_claimed(
     svc: &Service,
     launcher: &dyn Launcher,
@@ -355,7 +356,11 @@ pub fn run_claimed(
     action: Action,
     user_sid: &str,
 ) -> Result<ActionDone, String> {
-    let _change = svc.begin_vcam_change(true)?;
+    let mut change = svc.begin_vcam_change(true)?;
+    if action == Action::Uninstall {
+        // The virtual camera goes away: the engine has nothing to write to and stays released.
+        change.keep_engine_released();
+    }
     run_action(launcher, exe, action, user_sid)
 }
 
@@ -366,6 +371,7 @@ pub fn install(svc: &Service, launcher: &dyn Launcher) -> Result<ActionDone, Str
     // no SID, no helper: the message says so (see `run_action`); nothing is released or started before that
     let sid = vcam_install::current_user_sid().unwrap_or_default();
     helper_args(Action::Install, &sid)?;
+    // Dropped at the end of this function: the engine comes back by itself, after a success and after a refusal.
     let _change = svc.begin_vcam_change(true)?;
     locate_dll()?;
     run_action(launcher, &exe.to_string_lossy(), Action::Install, &sid)

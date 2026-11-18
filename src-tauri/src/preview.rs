@@ -419,6 +419,13 @@ impl PreviewTap {
 }
 
 impl FrameTap for PreviewTap {
+    /// The engine rebuilt its GPU device: the staging ring and the downscale constants belong to the old one.
+    fn device_changed(&mut self) {
+        self.ring = None;
+        self.down = Downscaler::new();
+        self.pacer.reset();
+    }
+
     fn on_frame(&mut self, renderer: &Renderer, frame: &RgbaTexture, _capture_qpc: u64) {
         if self.hidden.load(Ordering::Relaxed) || self.shared.is_closed() {
             // Nobody sees the picture: no GPU work, and the frames in the ring would be stale on return.
