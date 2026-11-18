@@ -32,7 +32,9 @@ export function SourcePanel() {
   // The fields show what runs: while the camera cannot deliver the saved format that is the device default, and the
   // saved format is named under them (it stays saved; the next Start, or the button, tries it again).
   const source = effectiveSource(saved, inUse);
-  const [advanced, setAdvanced] = useState(false);
+  const open = useStore((s) => s.ui.camera);
+  const advanced = useStore((s) => s.ui.advanced);
+  const { setUi } = useStore.getState();
   const [scanning, setScanning] = useState(false);
 
   const cam = cameras ? findCamera(cameras, source.video_device_id) : null;
@@ -73,112 +75,121 @@ export function SourcePanel() {
 
   return (
     <section className="panel source" aria-label="Camera">
-      <span className="label panel-title">Camera</span>
-      <div className="devices">
-        <Field label="Device">
-          <Select
-            value={cam?.id ?? source.video_device_id ?? ""}
-            options={deviceOptions}
-            onChange={(id) => patchSource({ video_device_id: id })}
-            placeholder={cameras ? "No camera found" : "Loading…"}
-          />
-        </Field>
-        <button onClick={rescan} disabled={scanning} title="Rescan cameras" aria-label="Refresh cameras">
-          <Icon name="reset" />
-          <span className="btn-text">Refresh</span>
-        </button>
-      </div>
-
-      <div className="fields">
-        <Field label="Resolution/FPS type" className="wide">
-          <Select
-            value={source.res_type}
-            options={RES_TYPE_OPTIONS}
-            disabled={!known}
-            onChange={(v) => patchSource({ res_type: v as SourceCfg["res_type"] })}
-          />
-        </Field>
-      </div>
-      <div className="fields three rates">
-        <Field label="Resolution">
-          <Select
-            value={source.resolution}
-            options={sizes.map((v) => ({ value: v, label: v }))}
-            disabled={!editable}
-            onChange={(v) => patchSource({ resolution: v })}
-          />
-        </Field>
-        <Field label="FPS">
-          <Select
-            value={String(source.frame_interval)}
-            options={rateOptions}
-            disabled={!editable}
-            onChange={(v) => patchSource({ frame_interval: Number(v) })}
-          />
-        </Field>
-        <Field label="Video format">
-          <Select
-            value={source.video_format}
-            options={formatOptions}
-            disabled={!known}
-            onChange={(v) => patchSource({ video_format: v as SourceCfg["video_format"] })}
-          />
-        </Field>
-      </div>
-      {inUse && (
-        <div className="format-in-use" role="status">
-          <span className="format-in-use-text" title={`The camera does not deliver ${inUse.asked}. It stays your saved choice.`}>
-            <b>Using the device default</b>
-            <small>Saved: {inUse.asked}</small>
-          </span>
-          <button onClick={trySavedFormat} title="Open the camera with the saved format again">
-            Try saved format
-          </button>
-        </div>
-      )}
-
-      <h3 className={`card-title fold${advanced ? "" : " folded"}`}>
-        <button aria-expanded={advanced} onClick={() => setAdvanced(!advanced)}>
+      <h3 className={`card-title fold panel-fold${open ? "" : " folded"}`}>
+        <button aria-expanded={open} title={open ? "Collapse" : "Expand"} onClick={() => setUi({ camera: !open })}>
           <Icon name="chevron" />
-          Advanced
+          <span className="label">Camera</span>
         </button>
       </h3>
-      {advanced && (
-        <>
-          <div className="fields three">
-            <Field label="Color space">
+      {open && (
+        <div className="panel-body">
+          <div className="devices">
+            <Field label="Device">
               <Select
-                value={source.color_space}
-                options={COLOR_SPACE_OPTIONS}
-                onChange={(v) => patchSource({ color_space: v as SourceCfg["color_space"] })}
+                value={cam?.id ?? source.video_device_id ?? ""}
+                options={deviceOptions}
+                onChange={(id) => patchSource({ video_device_id: id })}
+                placeholder={cameras ? "No camera found" : "Loading…"}
               />
             </Field>
-            <Field label="Color range">
+            <button onClick={rescan} disabled={scanning} title="Rescan cameras" aria-label="Refresh cameras">
+              <Icon name="reset" />
+              <span className="btn-text">Refresh</span>
+            </button>
+          </div>
+
+          <div className="fields">
+            <Field label="Resolution/FPS type" className="wide">
               <Select
-                value={source.color_range}
-                options={COLOR_RANGE_OPTIONS}
-                onChange={(v) => patchSource({ color_range: v as SourceCfg["color_range"] })}
-              />
-            </Field>
-            <Field label="Buffering">
-              <Select
-                value={source.buffering}
-                options={BUFFERING_OPTIONS}
-                onChange={(v) => patchSource({ buffering: v as SourceCfg["buffering"] })}
+                value={source.res_type}
+                options={RES_TYPE_OPTIONS}
+                disabled={!known}
+                onChange={(v) => patchSource({ res_type: v as SourceCfg["res_type"] })}
               />
             </Field>
           </div>
-          <div className="toggles">
-            <ToggleRow label="Flip vertically" on={source.flip_vertically} onChange={flag("flip_vertically")} />
-            <ToggleRow label="Apply rotation data from camera" on={source.autorotation} onChange={flag("autorotation")} />
-            <ToggleRow label="Use hardware decoding when available" on={source.hw_decode} onChange={flag("hw_decode")} />
-            <ToggleRow
-              label="Turn off camera when no app is using Better Cam"
-              on={source.deactivate_when_not_showing}
-              onChange={flag("deactivate_when_not_showing")}
-            />
+          <div className="fields three rates">
+            <Field label="Resolution">
+              <Select
+                value={source.resolution}
+                options={sizes.map((v) => ({ value: v, label: v }))}
+                disabled={!editable}
+                onChange={(v) => patchSource({ resolution: v })}
+              />
+            </Field>
+            <Field label="FPS">
+              <Select
+                value={String(source.frame_interval)}
+                options={rateOptions}
+                disabled={!editable}
+                onChange={(v) => patchSource({ frame_interval: Number(v) })}
+              />
+            </Field>
+            <Field label="Video format">
+              <Select
+                value={source.video_format}
+                options={formatOptions}
+                disabled={!known}
+                onChange={(v) => patchSource({ video_format: v as SourceCfg["video_format"] })}
+              />
+            </Field>
           </div>
-        </>
+          {inUse && (
+            <div className="format-in-use" role="status">
+              <span className="format-in-use-text" title={`The camera does not deliver ${inUse.asked}. It stays your saved choice.`}>
+                <b>Using the device default</b>
+                <small>Saved: {inUse.asked}</small>
+              </span>
+              <button onClick={trySavedFormat} title="Open the camera with the saved format again">
+                Try saved format
+              </button>
+            </div>
+          )}
+
+          <h3 className={`card-title fold${advanced ? "" : " folded"}`}>
+            <button aria-expanded={advanced} onClick={() => setUi({ advanced: !advanced })}>
+              <Icon name="chevron" />
+              Advanced
+            </button>
+          </h3>
+          {advanced && (
+            <>
+              <div className="fields three">
+                <Field label="Color space">
+                  <Select
+                    value={source.color_space}
+                    options={COLOR_SPACE_OPTIONS}
+                    onChange={(v) => patchSource({ color_space: v as SourceCfg["color_space"] })}
+                  />
+                </Field>
+                <Field label="Color range">
+                  <Select
+                    value={source.color_range}
+                    options={COLOR_RANGE_OPTIONS}
+                    onChange={(v) => patchSource({ color_range: v as SourceCfg["color_range"] })}
+                  />
+                </Field>
+                <Field label="Buffering">
+                  <Select
+                    value={source.buffering}
+                    options={BUFFERING_OPTIONS}
+                    onChange={(v) => patchSource({ buffering: v as SourceCfg["buffering"] })}
+                  />
+                </Field>
+              </div>
+              <div className="toggles">
+                <ToggleRow label="Flip vertically" on={source.flip_vertically} onChange={flag("flip_vertically")} />
+                <ToggleRow label="Apply rotation data from camera" on={source.autorotation} onChange={flag("autorotation")} />
+                <ToggleRow label="Use hardware decoding when available" on={source.hw_decode} onChange={flag("hw_decode")} />
+                <ToggleRow
+                  label="Turn off camera when no app is using Better Cam"
+                  on={source.deactivate_when_not_showing}
+                  onChange={flag("deactivate_when_not_showing")}
+                />
+              </div>
+            </>
+          )}
+        </div>
       )}
     </section>
   );

@@ -3,6 +3,7 @@ import { api, type EngineState, type NvidiaGpu, type NvidiaInstallProgress, type
 import { FILTERS, defaultChain, makeFilter, type FilterCfg, type FilterKind, type ParamValue } from "./filters/schema";
 import { normalizeChain, presetChain, signature } from "./filters/chain";
 import { presetNameFor, stemOf } from "./ui/fileDrop";
+import { DEFAULT_UI, normalizeUi, type UiState } from "./ui/layout";
 import {
   DEFAULT_OUTPUT,
   DEFAULT_SOURCE,
@@ -59,6 +60,8 @@ interface Saved {
   wasRunning: boolean;
   /** The live preview in the window; off saves the IPC and the CPU it costs. */
   previewOn: boolean;
+  /** The column split and which panels are open (Camera, Camera controls, Output, Advanced). */
+  ui: UiState;
 }
 
 /** What "Undo" restores after loading a preset or resetting. */
@@ -100,6 +103,7 @@ const loadSaved = (): Saved => {
     presetBaseline: null,
     wasRunning: false,
     previewOn: true,
+    ui: DEFAULT_UI,
   };
   try {
     const s = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "");
@@ -119,6 +123,7 @@ const loadSaved = (): Saved => {
         presetBaseline: typeof s.presetBaseline === "string" ? s.presetBaseline : null,
         wasRunning: s.wasRunning === true,
         previewOn: s.previewOn !== false,
+        ui: normalizeUi(s.ui),
       };
     }
   } catch {
@@ -216,6 +221,8 @@ interface State extends Saved {
   setAutostart: (on: boolean) => Promise<void>;
   setCloseToTray: (on: boolean) => void;
   setPreviewOn: (on: boolean) => void;
+  /** Remembers the column split or a panel's fold (see `Saved.ui`). */
+  setUi: (patch: Partial<UiState>) => void;
   dismissError: () => void;
   dismissNotice: () => void;
   undoChain: () => void;
@@ -249,13 +256,13 @@ interface State extends Saved {
 
 export const useStore = create<State>((set, get) => {
   const persist = () => {
-    const { source, output, controls, chain, closeToTray, autostartDefaulted, nvidiaPromptDismissed, activePreset, presetBaseline, wasRunning, previewOn } = get();
+    const { source, output, controls, chain, closeToTray, autostartDefaulted, nvidiaPromptDismissed, activePreset, presetBaseline, wasRunning, previewOn, ui } = get();
     // Only the folded cards that still exist; entries of removed filters and "expanded" flags are not worth keeping.
     const folded = get().collapsed;
     const collapsed = Object.fromEntries(chain.filter((f) => folded[f.id]).map((f) => [f.id, true]));
     localStorage.setItem(
       STORAGE_KEY,
-      JSON.stringify({ source, output, controls, chain, collapsed, closeToTray, autostartDefaulted, nvidiaPromptDismissed, activePreset, presetBaseline, wasRunning, previewOn }),
+      JSON.stringify({ source, output, controls, chain, collapsed, closeToTray, autostartDefaulted, nvidiaPromptDismissed, activePreset, presetBaseline, wasRunning, previewOn, ui }),
     );
   };
 
@@ -890,6 +897,10 @@ export const useStore = create<State>((set, get) => {
 
     setPreviewOn: (previewOn) => {
       set({ previewOn });
+      persist();
+    },
+    setUi: (patch) => {
+      set((s) => ({ ui: normalizeUi({ ...s.ui, ...patch }) }));
       persist();
     },
 

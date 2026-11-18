@@ -217,18 +217,36 @@ button.ghost:hover:not(:disabled) { color: var(--text); box-shadow: none; border
 .devices > button { display: inline-flex; align-items: center; gap: 6px; flex: none; }
 
 /* ---------- two-column body ---------- */
-/* Each column scrolls on its own. They reuse .scroll and .app (padding, gap), so the right column's content still lines
-   up with the toolbar and footer. Below 1100 px the columns dissolve into one scroll: camera, output, then the chain,
-   with the banners pulled to the top. */
-.cols { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(440px, 6fr) minmax(0, 7fr); grid-template-rows: minmax(0, 1fr); }
+/* The left column is the preview, pinned, above its own scroll (camera, controls, output); the right column scrolls the
+   chain. Both scrolls reuse .scroll and .app (padding, gap), so the content still lines up with the toolbar and footer.
+   --split (the saved ratio, set by the splitter) is the left share of the body, kept between 440 px for the left column
+   and 420 px for the right one. Below 1100 px the columns dissolve into one scroll under a sticky preview band: camera,
+   output, then the chain, with the banners pulled to the top. */
+.cols {
+  position: relative; flex: 1; min-height: 0; display: grid;
+  --left: clamp(440px, calc(var(--split, 0.4615) * 100%), calc(100% - 420px));
+  grid-template-columns: var(--left) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr);
+}
 .col { min-width: 0; min-height: 0; }
 .col-right { border-left: 1px solid var(--line); }
+/* The column is a size container so the preview can be capped at half of its height (cqh). */
+.col-left { display: flex; flex-direction: column; container-type: size; }
+/* The right padding mirrors the scrollbar gutter below it, so the preview lines up with the panels. */
+.preview-pin { flex: none; padding: 20px 40px 0 28px; }
+/* The width is a whole number of pixels (round), so the box and the picture the backend sizes for it agree to the pixel. */
+.panel.preview { width: min(100%, calc((50cqh - 2px) * 16 / 9 + 2px)); width: round(down, min(100%, calc((50cqh - 2px) * 16 / 9 + 2px)), 1px); margin: 0 auto; }
+
+/* Splitter: an 8 px grab zone centred on the right column's border line, which turns accent on hover, drag and focus. */
+.splitter { position: absolute; top: 0; bottom: 0; left: calc(var(--left) - 4px); width: 8px; z-index: 6; cursor: col-resize; touch-action: none; }
+.splitter::after { content: ""; position: absolute; top: 0; bottom: 0; left: 4px; width: 1px; transition: background 0.15s, box-shadow 0.15s; }
+.splitter:hover::after, .splitter.dragging::after, .splitter:focus-visible::after { background: var(--accent); box-shadow: var(--glow-soft); }
+.splitter:focus-visible { outline: none; }
+body.col-resizing, body.col-resizing * { cursor: col-resize !important; user-select: none; }
 .banners { display: flex; flex-direction: column; gap: 10px; }
 .chain-block { display: flex; flex-direction: column; gap: 20px; }
 
 /* ---------- camera and output panels ---------- */
 .source, .output { display: flex; flex-direction: column; gap: 14px; }
-.panel-title { display: block; }
 .field { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
 .fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 16px; }
 .fields.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -236,6 +254,11 @@ button.ghost:hover:not(:disabled) { color: var(--text); box-shadow: none; border
 .fields .wide { grid-column: 1 / -1; }
 .source .devices { align-items: flex-end; }
 .source .card-title.fold { margin: 0 0 -4px -4px; }
+/* Camera, Camera controls and Output fold like Advanced; the caption keeps the small uppercase style. */
+.panel > .card-title.panel-fold { margin: -6px 0 -6px -8px; }
+.card-title .label { transition: color 0.15s; }
+.card-title button:hover:not(:disabled) .label { color: var(--accent); }
+.panel-body { display: flex; flex-direction: column; gap: 14px; }
 /* P15 review: the format that runs when the camera cannot deliver the saved one, with the saved one named. */
 .format-in-use { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 8px 12px; border: 1px solid var(--line); border-left: 2px solid var(--warn); border-radius: var(--r); }
 .format-in-use-text { display: flex; flex-direction: column; min-width: 0; }
@@ -502,29 +525,28 @@ button.link:hover:not(:disabled) { box-shadow: none; text-decoration: underline;
 
 /* ---------- narrow windows: the columns stack ---------- */
 @media (max-width: 1099px) {
-  .cols { display: flex; flex-direction: column; gap: 20px; padding: 20px 28px 40px; overflow-y: auto; scrollbar-gutter: stable; }
-  .col { display: contents; }
+  .cols { --pt: 20px; display: flex; flex-direction: column; gap: 20px; padding: var(--pt) 28px 40px; overflow-y: auto; scrollbar-gutter: stable; container-type: size; }
+  .cols { scroll-padding-top: calc(var(--band, 0px) + 8px); }
+  .col, .left-scroll { display: contents; }
+  .splitter { display: none; }
   .banners { order: -1; }
   .chain-block { order: 1; }
+  /* The preview is a frosted band that sticks to the top of the scroll; it spans the full width, so nothing shows beside it.
+     Its height is capped at 40 % of the scroll area (the width follows from 16:9). */
+  .preview-pin {
+    order: -2; position: sticky; top: calc(-1 * var(--pt)); z-index: 8; /* sticky measures from the padding's inner edge */
+    margin: calc(-1 * var(--pt)) -28px 0; padding: 10px 28px;
+    /* The --pop tint, but dense enough that the content scrolling underneath does not read through it. */
+    background: rgba(16, 20, 26, 0.92); backdrop-filter: var(--blur); border-bottom: 1px solid var(--line);
+  }
+  .panel.preview { width: min(100%, calc((40cqh - 2px) * 16 / 9 + 2px)); width: round(down, min(100%, calc((40cqh - 2px) * 16 / 9 + 2px)), 1px); }
 }
 
-/* ---------- small windows (the window can't go below 720x520) ---------- */
-@media (max-width: 860px) {
-  .app { padding-left: 20px; padding-right: 20px; }
-  .cols { padding-left: 20px; padding-right: 20px; }
-  .toolbar { padding: 8px 32px 8px 20px; }
-  .devices { gap: 12px; }
-  .devices .btn-text { display: none; }
-  .devices > button { width: 32px; padding: 0; justify-content: center; }
-  .preset-trigger { width: 200px; }
-  .footer { padding-left: 20px; padding-right: 32px; }
-}
-@media (max-width: 760px) {
-  .toolbar { flex-wrap: wrap; }
-}
+/* ---------- small windows (the window can't go below 900x600) ---------- */
 @media (max-height: 640px) {
   .app { padding-top: 12px; gap: 12px; }
-  .cols { padding-top: 12px; gap: 12px; }
+  .cols { --pt: 12px; }
+  .preview-pin { padding-top: 12px; }
   .panel { padding: 12px; }
   .devices label { gap: 6px; }
   .toolbar { padding-top: 6px; padding-bottom: 6px; }
@@ -532,6 +554,10 @@ button.link:hover:not(:disabled) { box-shadow: none; text-decoration: underline;
   .footer .meters { gap: 4px; }
   .meter.scale { display: none; }
   .track { height: 10px; }
+}
+/* The stacked scroll tightens its gap with the rest; in two columns a gap would push the right column off the splitter. */
+@media (max-height: 640px) and (max-width: 1099px) {
+  .cols { gap: 12px; }
 }
 
 /* Preview */

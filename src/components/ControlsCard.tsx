@@ -1,4 +1,4 @@
-import { useEffect, useState, type CSSProperties, type KeyboardEvent } from "react";
+import { useEffect, type CSSProperties, type KeyboardEvent } from "react";
 import { useStore } from "../store";
 import { CONTROL_LABELS, controlKind, controlValueText, findCamera, powerlineOptions, type ControlInfo } from "../camera/schema";
 import { Icon } from "./Icon";
@@ -13,8 +13,9 @@ export function ControlsCard() {
   const error = useStore((s) => s.controlsError);
   const resetting = useStore((s) => s.controlsResetting);
   const state = useStore((s) => s.engine.state);
-  const { refreshControls, resetAllControls } = useStore.getState();
-  const [open, setOpen] = useState(true);
+  // Remembered across launches (`Saved.ui`); a folded card does not read the camera.
+  const open = useStore((s) => s.ui.controls);
+  const { refreshControls, resetAllControls, setUi } = useStore.getState();
 
   const cam = cameras ? findCamera(cameras, deviceId) : null;
   const shown = cam && controlsFor === cam.id ? infos : null;
@@ -52,9 +53,9 @@ export function ControlsCard() {
     <section className="card controls" aria-label="Camera controls">
       <div className="card-head">
         <h3 className={`card-title${open ? "" : " folded"}`}>
-          <button aria-expanded={open} title={open ? "Collapse" : "Expand"} onClick={() => setOpen(!open)}>
+          <button aria-expanded={open} title={open ? "Collapse" : "Expand"} onClick={() => setUi({ controls: !open })}>
             <Icon name="chevron" />
-            Camera controls
+            <span className="label">Camera controls</span>
           </button>
         </h3>
         <span className="fill" />

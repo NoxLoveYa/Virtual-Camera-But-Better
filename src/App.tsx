@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type CSSProperties } from "react";
 import { useStore } from "./store";
 import { finalIndex } from "./ui/chainDrag";
 import { useChainDrag } from "./ui/useChainDrag";
@@ -14,6 +14,7 @@ import { OutputPanel } from "./components/OutputPanel";
 import { PresetMenu } from "./components/PresetMenu";
 import { Preview } from "./components/Preview";
 import { SourcePanel } from "./components/SourcePanel";
+import { Splitter } from "./components/Splitter";
 import { Stats } from "./components/Stats";
 import { TitleBar } from "./components/TitleBar";
 import { Toast } from "./components/Toast";
@@ -25,7 +26,9 @@ export default function App() {
   const error = useStore((s) => s.error);
   const state = useStore((s) => s.engine.state);
   const vcamBanner = useStore((s) => s.vcam?.state === "missing" || s.vcam?.state === "outdated");
+  const split = useStore((s) => s.ui.split);
   const { setAllCollapsed } = useStore.getState();
+  const colsRef = useRef<HTMLDivElement>(null);
   const reorder = useChainDrag();
   const fileDrop = useFileDrop();
   const init = useRef(false);
@@ -34,6 +37,17 @@ export default function App() {
     if (init.current) return;
     init.current = true;
     useStore.getState().init();
+  }, []);
+
+  // Stacked, the preview band covers the top of the scroll. Its height is the scroll's top padding for scrollIntoView and
+  // focus, so a control that is scrolled to lands below the band, not under it (`--band`, used by styles.css).
+  useEffect(() => {
+    const cols = colsRef.current;
+    const pin = cols?.querySelector<HTMLElement>(".preview-pin");
+    if (!cols || !pin) return;
+    const ro = new ResizeObserver(() => cols.style.setProperty("--band", `${pin.offsetHeight}px`));
+    ro.observe(pin);
+    return () => ro.disconnect();
   }, []);
 
   const allFolded = chain.length > 0 && chain.every((f) => collapsed[f.id]);
@@ -50,14 +64,21 @@ export default function App() {
         </button>
         <AddFilter />
       </div>
-      {/* Two columns that scroll on their own; below 1100 px they stack (camera, output, then the chain) in one scroll. */}
-      <div className="cols">
-        <div className="scroll app col col-left">
-          <Preview />
-          <SourcePanel />
-          <ControlsCard />
-          <OutputPanel />
+      {/* Two columns. The left one holds the pinned preview above its own scroll (Camera, controls, Output); the right one
+          scrolls the chain; --split sets the left width. Below 1100 px the columns stack in one scroll under a sticky preview
+          band (camera, output, then the chain) and the splitter is hidden. */}
+      <div className="cols" ref={colsRef} style={{ "--split": split } as CSSProperties}>
+        <div className="col col-left">
+          <div className="preview-pin">
+            <Preview />
+          </div>
+          <div className="scroll app left-scroll">
+            <SourcePanel />
+            <ControlsCard />
+            <OutputPanel />
+          </div>
         </div>
+        <Splitter colsRef={colsRef} />
 
         <div className="scroll app col col-right">
           {(error || waiting || vcamBanner) && (
