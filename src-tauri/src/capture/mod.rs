@@ -477,6 +477,7 @@ impl Ratio {
 }
 
 impl fmt::Display for Ratio {
+    #[allow(clippy::manual_is_multiple_of)] // MSRV 1.87: unsigned `is_multiple_of` is stable only from 1.90
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.den == 1 || (self.den != 0 && self.num % self.den == 0) {
             write!(f, "{}", self.num / self.den.max(1))

@@ -114,6 +114,7 @@ impl Shared {
     /// # Safety
     /// `base` must be valid for reads (and writes when `writable`) of `len` bytes for as long as the `Shared` is used,
     /// and aligned to 8 bytes. Returns `None` when `len` is smaller than the header or `base` is misaligned.
+    #[allow(clippy::manual_is_multiple_of)] // MSRV 1.87: unsigned `is_multiple_of` is stable only from 1.90
     pub unsafe fn new(base: *mut u8, len: usize, writable: bool) -> Option<Shared> {
         if base.is_null() || len < HEADER_SIZE || base as usize % 8 != 0 {
             return None;
@@ -135,11 +136,13 @@ impl Shared {
         self.writable
     }
 
+    #[allow(clippy::manual_is_multiple_of)] // MSRV 1.87: unsigned `is_multiple_of` is stable only from 1.90
     fn a32(&self, off: usize) -> &AtomicU32 {
         debug_assert!(off % 4 == 0 && off + 4 <= HEADER_SIZE);
         // SAFETY: `off` is a header offset (< HEADER_SIZE <= len), 4-aligned from an 8-aligned base.
         unsafe { AtomicU32::from_ptr(self.base.add(off) as *mut u32) }
     }
+    #[allow(clippy::manual_is_multiple_of)] // MSRV 1.87: unsigned `is_multiple_of` is stable only from 1.90
     fn a64(&self, off: usize) -> &AtomicU64 {
         debug_assert!(off % 8 == 0 && off + 8 <= HEADER_SIZE);
         // SAFETY: as in `a32`, 8-aligned.
@@ -449,6 +452,7 @@ impl Shared {
 
     /// Overwrite a header u32 (tests: corrupt the file while a reader runs). Ignored on a read-only view.
     #[doc(hidden)]
+    #[allow(clippy::manual_is_multiple_of)] // MSRV 1.87: unsigned `is_multiple_of` is stable only from 1.90
     pub fn poke32(&self, offset: usize, value: u32) {
         if self.writable && offset % 4 == 0 && offset + 4 <= HEADER_SIZE {
             self.a32(offset).store(value, Ordering::SeqCst);
@@ -457,6 +461,7 @@ impl Shared {
 
     /// Overwrite a header u64 (tests). Ignored on a read-only view.
     #[doc(hidden)]
+    #[allow(clippy::manual_is_multiple_of)] // MSRV 1.87: unsigned `is_multiple_of` is stable only from 1.90
     pub fn poke64(&self, offset: usize, value: u64) {
         if self.writable && offset % 8 == 0 && offset + 8 <= HEADER_SIZE {
             self.a64(offset).store(value, Ordering::SeqCst);

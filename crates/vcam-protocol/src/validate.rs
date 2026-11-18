@@ -146,6 +146,7 @@ pub fn validate_advertised(h: &RawHeader) -> Vec<Format> {
 }
 
 /// Dimensions and subtype of a frame.
+#[allow(clippy::manual_is_multiple_of)] // MSRV 1.87: unsigned `is_multiple_of` is stable only from 1.90
 pub fn validate_format(width: u32, height: u32, subtype: u32) -> Result<(), FormatError> {
     if width == 0 || height == 0 {
         return Err(FormatError::ZeroSize);

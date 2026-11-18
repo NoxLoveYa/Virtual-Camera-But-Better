@@ -372,6 +372,7 @@ pub fn log(msg: &str) {
 }
 
 /// Rate-limited log for hot paths: logs the first 5 calls and then every `every`-th call of counter `slot`.
+#[allow(clippy::manual_is_multiple_of)] // MSRV 1.87: unsigned `is_multiple_of` is stable only from 1.90
 pub fn log_sampled(slot: usize, every: u64, msg: impl FnOnce() -> String) {
     let n = COUNTERS[slot % COUNTERS.len()].fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % every == 0 {

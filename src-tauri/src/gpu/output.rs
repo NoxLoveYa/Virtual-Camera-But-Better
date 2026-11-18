@@ -292,6 +292,7 @@ impl Encoder {
         let mut packed = false;
         let planes = match format {
             EncodeFormat::Nv12 => {
+                #[allow(clippy::manual_is_multiple_of)] // MSRV 1.87: unsigned `is_multiple_of` is stable only from 1.90
                 if w % 2 != 0 || h % 2 != 0 {
                     return Err(GpuError::Invalid(format!(
                         "NV12 needs an even size, got {w}x{h}"

@@ -926,6 +926,7 @@ struct LiveTap {
 }
 
 impl crate::engine::FrameTap for LiveTap {
+    #[allow(clippy::manual_is_multiple_of)] // MSRV 1.87: unsigned `is_multiple_of` is stable only from 1.90
     fn on_frame(&mut self, r: &Renderer, frame: &crate::gpu::RgbaTexture, _capture_qpc: u64) {
         self.count += 1;
         self.arrivals.lock().unwrap().push(Instant::now());

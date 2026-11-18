@@ -145,6 +145,7 @@ struct HeaderLayout {
 }
 
 // The offsets above are the contract; the compiler checks them against the struct.
+#[allow(clippy::manual_is_multiple_of)] // MSRV 1.87: unsigned `is_multiple_of` is stable only from 1.90
 const _: () = {
     assert!(offset_of!(HeaderLayout, magic) == off::MAGIC);
     assert!(offset_of!(HeaderLayout, protocol) == off::PROTOCOL);

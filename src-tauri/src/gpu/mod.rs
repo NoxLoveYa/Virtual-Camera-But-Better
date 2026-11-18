@@ -896,6 +896,7 @@ pub struct ConstantBuffer {
 
 impl ConstantBuffer {
     /// `size` is the size of the HLSL `cbuffer` and must be a multiple of 16.
+    #[allow(clippy::manual_is_multiple_of)] // MSRV 1.87: unsigned `is_multiple_of` is stable only from 1.90
     pub fn new(device: &ID3D11Device, size: usize) -> GpuResult<ConstantBuffer> {
         if size == 0 || size % 16 != 0 {
             return Err(GpuError::Invalid(format!(

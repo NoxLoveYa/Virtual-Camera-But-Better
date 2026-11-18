@@ -422,6 +422,7 @@ fn open_inner(args: &[String]) -> Result<u8, Failure> {
                     }
                     FrameData::Cpu(_) => {}
                 }
+                #[allow(clippy::manual_is_multiple_of)] // MSRV 1.87: unsigned `is_multiple_of` is stable only from 1.90
                 if frames % 30 == 0 || now >= end {
                     last_luma = luma_of(&frame, gpu.as_deref()).or(last_luma);
                 }

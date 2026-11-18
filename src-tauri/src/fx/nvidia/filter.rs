@@ -127,6 +127,7 @@ pub fn settings(p: &Params) -> Settings {
 
 /// `processing_counter % processing_interval == 0` of OBS: whether the segmentation runs on this frame. The counter
 /// is the filter's own; the first frame always runs.
+#[allow(clippy::manual_is_multiple_of)] // MSRV 1.87: unsigned `is_multiple_of` is stable only from 1.90
 pub fn interval_due(counter: &mut u32, interval: u32) -> bool {
     if *counter % interval.max(1) == 0 {
         *counter = 1;

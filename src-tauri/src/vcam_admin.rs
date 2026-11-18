@@ -229,7 +229,7 @@ pub fn status_from(facts: &vcam_install::Facts, consumers: u32) -> VcamStatus {
         listed: facts.listed,
         consumers,
         problem: facts.data_problem.as_ref().map(|p| p.text.clone()),
-        repairable: facts.data_problem.as_ref().map_or(true, |p| p.repairable),
+        repairable: facts.data_problem.as_ref().is_none_or(|p| p.repairable),
     }
 }
 

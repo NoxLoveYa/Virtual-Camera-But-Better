@@ -154,6 +154,7 @@ impl<'a> Budget<'a> {
     }
 
     /// One step of work done; `true` when the time is up.
+    #[allow(clippy::manual_is_multiple_of)] // MSRV 1.87: unsigned `is_multiple_of` is stable only from 1.90
     fn over(&mut self) -> bool {
         if !self.over {
             self.steps += 1;

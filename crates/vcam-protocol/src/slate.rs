@@ -78,6 +78,7 @@ fn rle_encode(data: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(&body);
 }
 
+#[allow(clippy::manual_is_multiple_of)] // MSRV 1.87: unsigned `is_multiple_of` is stable only from 1.90
 fn rle_decode(bytes: &[u8], pos: &mut usize, expect: usize) -> Result<Vec<u8>, SlateError> {
     let len_bytes = bytes.get(*pos..*pos + 4).ok_or(SlateError::Truncated)?;
     let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
@@ -154,6 +155,7 @@ pub fn decode(bytes: &[u8]) -> Result<Slate, SlateError> {
 
 impl Slate {
     /// Nearest-neighbour scale to `width` x `height` (both even), tight NV12.
+    #[allow(clippy::manual_is_multiple_of)] // MSRV 1.87: unsigned `is_multiple_of` is stable only from 1.90
     pub fn scale_nv12(&self, width: u32, height: u32) -> Vec<u8> {
         assert!(width % 2 == 0 && height % 2 == 0 && width > 0 && height > 0);
         let (sw, sh) = (self.width as usize, self.height as usize);

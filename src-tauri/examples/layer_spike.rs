@@ -600,7 +600,7 @@ impl CapCfg {
 
 impl CapSpec {
     fn new(cfg: CapCfg) -> CapSpec {
-        let mut rng = Lcg(0x5EED_E2);
+        let mut rng = Lcg(0x005E_EDE2);
         let base = "The quick brown fox jumps over the lazy dog 0123456789 ";
         let base: Vec<char> = base.chars().collect();
         let mut texts = Vec::new();

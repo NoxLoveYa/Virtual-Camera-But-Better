@@ -35,6 +35,7 @@ pub fn slot_from_x(x: u32) -> u32 {
     (x + STRIPE_STEP / 2) / STRIPE_STEP
 }
 
+#[allow(clippy::manual_is_multiple_of)] // MSRV 1.87: unsigned `is_multiple_of` is stable only from 1.90
 fn is_dark_cell(col: u32, row: u32) -> bool {
     (col / CELL + row / CELL) % 2 == 0
 }

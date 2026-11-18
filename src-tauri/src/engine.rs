@@ -792,6 +792,7 @@ struct Shared {
     #[cfg(test)]
     file_looks_replaced: std::sync::atomic::AtomicU32,
     #[cfg(test)]
+    #[allow(clippy::type_complexity)] // a one-use test hook; a type alias would only move the same type elsewhere
     before_file_look: Mutex<Option<Box<dyn FnMut(u32) + Send>>>,
     /// Test hook: the control thread takes this at the top of every pass, so a test that holds it keeps messages
     /// queued and unprocessed.

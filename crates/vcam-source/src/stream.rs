@@ -380,6 +380,7 @@ fn pump_loop_with(
                         prev_ts = ts;
                         src.finish_emit(emit, vcam_protocol::qpc_now());
                         let n = frames_out.fetch_add(1, Ordering::Relaxed) + 1;
+                        #[allow(clippy::manual_is_multiple_of)] // MSRV 1.87: unsigned `is_multiple_of` is stable only from 1.90
                         if n <= 3 || n % 900 == 0 {
                             vlog!("sample #{n} {:?} ts={ts}", emit.kind);
                         }

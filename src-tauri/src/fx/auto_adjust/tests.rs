@@ -1556,6 +1556,7 @@ fn auto_adjust_everything_on_does_not_flicker_on_a_noisy_static_scene() {
         // the test sees is the filter, not the luck of the noise.
         let out = rig.frame(1.0 / 30.0, SMALL, |x, y| {
             let i = (y * SMALL.0 + x) as usize;
+            #[allow(clippy::manual_is_multiple_of)] // MSRV 1.87: unsigned `is_multiple_of` is stable only from 1.90
             let n = if i % 2 == 0 { noise[i] } else { -noise[i - 1] };
             let base = busy(x, y);
             let c = |v: u8| (i32::from(v) + n).clamp(0, 255) as u8;
