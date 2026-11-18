@@ -1245,10 +1245,22 @@ impl Drop for Assets {
         lock(&self.inner.state).shutdown = true;
         self.inner.wake.notify_all();
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            // A loader that is inside the read of a file that hangs (a share that does not answer) must not hold up
+            // whoever drops this (a quit, a rebuild of the device): it sees the flag when the read returns and ends by
+            // itself, and keeps `Inner` (the device) alive until then.
+            let until = Instant::now() + LOADER_JOIN_CAP;
+            while !t.is_finished() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+            }
         }
     }
 }
+
+/// How long dropping [`Assets`] waits for the loader thread to end before it leaves the thread behind.
+const LOADER_JOIN_CAP: Duration = Duration::from_secs(2);
 
 /// Makes [`AssetHandle`]s. Cheap to clone; does not keep the loader thread alive.
 #[derive(Clone)]

@@ -472,7 +472,8 @@ impl Writer {
     /// The writable view of the mapping. A write through it bypasses the write gate ([`Writer::retire`]), so it is
     /// not public: other crates read with [`Writer::header`] and [`Writer::slot_meta`] and write with the writer's own
     /// methods. Only the tests of other crates, which set up a file's contents directly (`poke`, a consumer's fields),
-    /// get it, with the `test-support` feature; no product build enables that.
+    /// get it, with the `test-support` feature. The ship builds (`npm run vcam:build`, `npm run tauri build`) never
+    /// enable that feature; a `cargo test` build can (other crates ask for it in their `dev-dependencies`).
     #[cfg(not(feature = "test-support"))]
     pub(crate) fn shared(&self) -> &Shared {
         self.map.shared()

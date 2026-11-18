@@ -680,6 +680,21 @@ const SESSION_END_CAP: Duration = Duration::from_secs(30);
 /// helper that replaces the file cannot have.)
 const SHUTDOWN_END_CAP: Duration = Duration::from_secs(3);
 
+/// A camera that has delivered a picture and then sends none for [`silent_slate_after`] shows the "starting" slate on the
+/// file; after [`SILENT_RECONNECT_AFTER`] without a frame its session ends with a retry (the engine reconnects).
+const SILENT_SLATE_MIN: Duration = Duration::from_secs(1);
+const SILENT_RECONNECT_AFTER: Duration = Duration::from_secs(5);
+
+/// How long a live camera may send nothing before the file stops showing its last picture: a second, or three frame
+/// periods of a camera that is slower than that.
+fn silent_slate_after(fps: f64) -> Duration {
+    if fps.is_finite() && fps > 0.0 {
+        SILENT_SLATE_MIN.max(Duration::from_secs_f64(3.0 / fps).min(SILENT_RECONNECT_AFTER))
+    } else {
+        SILENT_SLATE_MIN
+    }
+}
+
 /// How often [`Control::end_session`] looks whether the render thread has ended (and beats the file's heartbeat).
 const SESSION_END_POLL: Duration = Duration::from_millis(5);
 
@@ -743,6 +758,9 @@ struct Shared {
     facts: Mutex<Arc<Mutex<crate::meter::SessionFacts>>>,
     /// The app is quitting ([`Engine::close_for_exit`]): the end of a session is waited for [`SHUTDOWN_END_CAP`] at most.
     exiting: AtomicBool,
+    /// When the quit is over, whatever is still running ([`Engine::close_for_exit`] sets it, [`SHUTDOWN_END_CAP`] from
+    /// the call): every wait of the quit, the control thread's included, ends by then, and what is left is left behind.
+    exit_deadline: Mutex<Option<Instant>>,
     /// Test hook: frames that fail with `DXGI_ERROR_DEVICE_REMOVED` before they render. The first one also marks the
     /// current device removed, as a real loss would.
     #[cfg(test)]
@@ -788,19 +806,32 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// How long the end of a session (and, at exit, of the threads around it) is waited for: [`SESSION_END_CAP`], and
-/// [`SHUTDOWN_END_CAP`] once the app is quitting.
-fn end_cap(shared: &Shared) -> Duration {
-    let exiting = shared.exiting.load(Ordering::Acquire);
+/// How much longer the end of a session that began to be waited for at `started` is waited for: what is left of
+/// [`SESSION_END_CAP`], and never more than what is left of the quit once the app is quitting
+/// ([`Shared::exit_deadline`]). `ZERO` means: leave it behind now.
+fn end_cap(shared: &Shared, started: Instant) -> Duration {
+    #[allow(unused_mut)]
+    let mut cap = SESSION_END_CAP;
+    #[cfg(test)]
+    if let Some(test_cap) = *lock(&shared.session_end_cap) {
+        cap = test_cap;
+    }
+    let mut left = cap.saturating_sub(started.elapsed());
+    if let Some(deadline) = *lock(&shared.exit_deadline) {
+        left = left.min(deadline.saturating_duration_since(Instant::now()));
+    }
+    left
+}
+
+/// How long a quit may take from the call of [`Engine::close_for_exit`]: [`SHUTDOWN_END_CAP`] (a test may shorten it with
+/// its `session_end_cap`).
+fn exit_budget(shared: &Shared) -> Duration {
     #[cfg(test)]
     if let Some(cap) = *lock(&shared.session_end_cap) {
-        return if exiting { cap.min(SHUTDOWN_END_CAP) } else { cap };
+        return cap.min(SHUTDOWN_END_CAP);
     }
-    if exiting {
-        SHUTDOWN_END_CAP
-    } else {
-        SESSION_END_CAP
-    }
+    let _ = shared;
+    SHUTDOWN_END_CAP
 }
 
 fn emit(shared: &Shared, event: EngineEvent) {
@@ -855,6 +886,8 @@ pub struct Engine {
     poller: Mutex<Option<(Arc<AtomicBool>, JoinHandle<()>)>>,
     /// The `controls auto` thread: runs Better Cam auto for the camera's controls (docs/AUTO-CONTROLS.md 2.8).
     runner: Mutex<Option<(Arc<AtomicBool>, JoinHandle<()>)>>,
+    /// [`Engine::close`] has run (or is running): a second call (the `Drop` after an explicit close) returns at once.
+    closed: AtomicBool,
 }
 
 impl Engine {
@@ -926,6 +959,7 @@ impl Engine {
             meter: crate::meter::Mailbox::default(),
             facts: Mutex::new(Arc::new(Mutex::new(crate::meter::SessionFacts::CLOSED))),
             exiting: AtomicBool::new(false),
+            exit_deadline: Mutex::new(None),
             #[cfg(test)]
             gpu_faults: Default::default(),
             #[cfg(test)]
@@ -1013,6 +1047,7 @@ impl Engine {
             control: Mutex::new(Some(control)),
             poller: Mutex::new(Some(poller)),
             runner: Mutex::new(Some(auto)),
+            closed: AtomicBool::new(false),
         })
     }
 
@@ -1266,19 +1301,40 @@ impl Engine {
         self.close();
     }
 
-    /// [`Engine::close`] for an app that is quitting: the render thread is waited for [`SHUTDOWN_END_CAP`] at most (3 s),
-    /// not [`SESSION_END_CAP`] (30 s): the exit frees the camera, so a driver that never answers must not hold it up.
+    /// [`Engine::close`] for an app that is quitting: the whole quit takes [`SHUTDOWN_END_CAP`] (3 s) at most, not the
+    /// [`SESSION_END_CAP`] (30 s) of other stops and not one wait after the other: the exit frees the camera, so a
+    /// driver (or a lock that a command holds while it opens a camera for the controls) that never answers must not hold
+    /// it up. What does not end by then (the control thread, the poller, the auto runner) is left behind, and the file
+    /// says `Closed` whatever it does.
     pub fn close_for_exit(&self) {
+        *lock(&self.shared.exit_deadline) = Some(Instant::now() + exit_budget(&self.shared));
         self.shared.exiting.store(true, Ordering::Release);
         self.close();
     }
 
-    /// [`Engine::shutdown`] for a shared handle.
+    /// [`Engine::shutdown`] for a shared handle. Only the first call does anything (the `Drop` after an explicit close
+    /// returns at once, not after a second wait).
     pub fn close(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let exiting = self.shared.exiting.load(Ordering::Acquire);
+        let mut left_behind = false;
         let handle = lock(&self.control).take();
         if let Some(h) = handle {
             let _ = self.tx.send(Msg::Shutdown);
-            let _ = h.join();
+            if exiting {
+                // The control thread can be in a call that does not return (the hub's lease lock, the loader's join, a
+                // Start that opens a camera): it gets until the deadline of the quit.
+                if wait_until_exit_deadline(&self.shared, || h.is_finished()) {
+                    let _ = h.join();
+                } else {
+                    eprintln!("[engine] the control thread did not end within the quit: leaving it behind");
+                    left_behind = true;
+                }
+            } else {
+                let _ = h.join();
+            }
         }
         let poller = lock(&self.poller).take();
         let runner = lock(&self.runner).take();
@@ -1294,34 +1350,52 @@ impl Engine {
             }
             shared.hub.release_lease();
         };
-        if !self.shared.exiting.load(Ordering::Acquire) {
+        if !exiting {
             tail();
             return;
         }
         // Quitting: a camera driver that does not answer can hold the poller (a read of the controls), the auto runner
         // (a write, under the hub's gate) and the release of the lease. The exit frees the camera anyway, so they get
-        // [`SHUTDOWN_END_CAP`] and are left behind after that (the app is about to end).
-        let helper = std::thread::Builder::new()
+        // what is left of the quit and are left behind after that (the app is about to end).
+        match std::thread::Builder::new()
             .name("engine close".into())
-            .spawn(tail);
-        let Ok(helper) = helper else {
-            eprintln!("[engine] cannot start the thread that ends the controls: they are left running");
-            return;
-        };
-        let started = Instant::now();
-        let cap = end_cap(&self.shared);
-        while !helper.is_finished() {
-            if started.elapsed() >= cap {
-                eprintln!(
-                    "[engine] the controls did not stop within {:.0} s of the quit: leaving them behind",
-                    cap.as_secs_f32()
-                );
-                return;
+            .spawn(tail)
+        {
+            Ok(helper) => {
+                if wait_until_exit_deadline(&self.shared, || helper.is_finished()) {
+                    let _ = helper.join();
+                } else {
+                    eprintln!("[engine] the controls did not stop within the quit: leaving them behind");
+                }
             }
-            std::thread::sleep(SESSION_END_POLL);
+            Err(e) => {
+                eprintln!("[engine] cannot start the thread that ends the controls ({e}): they are left running");
+            }
         }
-        let _ = helper.join();
+        // The file says closed whatever the control thread did or is still doing. Under the lock the render thread goes
+        // live under, which it does not do once the app is quitting, so nothing writes `Live` after this.
+        {
+            let _live = lock(&self.shared.live_gen);
+            self.writer.close();
+        }
+        if left_behind {
+            // A control thread that is stuck writes its slate when the call it is in returns: it writes nothing now.
+            self.writer.retire();
+        }
     }
+}
+
+/// Wait until `done` says so or the quit is over ([`Shared::exit_deadline`]); `false` when the deadline came first.
+fn wait_until_exit_deadline(shared: &Shared, done: impl Fn() -> bool) -> bool {
+    while !done() {
+        let left = lock(&shared.exit_deadline)
+            .map_or(Duration::ZERO, |d| d.saturating_duration_since(Instant::now()));
+        if left.is_zero() {
+            return false;
+        }
+        std::thread::sleep(SESSION_END_POLL.min(left));
+    }
+    true
 }
 
 impl Drop for Engine {
@@ -1469,7 +1543,9 @@ impl Control {
             #[cfg(test)]
             let _gate = lock(&gate_owner.control_gate);
             while let Some(m) = next.take() {
-                if matches!(m, Msg::Shutdown) {
+                // A command that was queued before the quit began is not run: it would open a camera (and wait for the
+                // end of it) for an app that is leaving.
+                if matches!(m, Msg::Shutdown) || self.shared.exiting.load(Ordering::Acquire) {
                     self.shutdown();
                     return;
                 }
@@ -1787,7 +1863,8 @@ impl Control {
     // ---- sessions
 
     fn open_session(&mut self, mode: OpenMode) {
-        if self.cfg.is_none() {
+        // No camera is opened for an app that is quitting (the quit finishes with what is open).
+        if self.cfg.is_none() || self.shared.exiting.load(Ordering::Acquire) {
             return;
         }
         // A reopen keeps the last picture while the camera closes (for a second at most); the other opens show the slate.
@@ -1824,6 +1901,11 @@ impl Control {
         let (source, readback) = (cfg.source.clone(), cfg.readback);
         // A lease on the camera (a control call while no camera was open) makes way for the engine.
         self.shared.hub.release_lease();
+        // The lease may have been waited for for a long time (a command that opens a camera for the controls holds it):
+        // a quit that began meanwhile does not get a session.
+        if self.shared.exiting.load(Ordering::Acquire) {
+            return;
+        }
         self.gen += 1;
         let (stop, removed, abandoned) = (
             Arc::new(AtomicBool::new(false)),
@@ -1917,11 +1999,10 @@ impl Control {
                 }
                 // Looked at on every pass: a quit ([`Engine::close_for_exit`]) that comes while this wait runs
                 // shortens it.
-                let cap = end_cap(&self.shared);
-                if started.elapsed() >= cap {
+                if end_cap(&self.shared, started).is_zero() {
                     eprintln!(
-                        "[engine] the render thread did not end within {:.0} s of the stop: leaving it behind",
-                        cap.as_secs_f32()
+                        "[engine] the render thread did not end within {:.1} s of the stop: leaving it behind",
+                        started.elapsed().as_secs_f32()
                     );
                     self.abandon(&s);
                     return;
@@ -2010,7 +2091,8 @@ impl Control {
         if !self.note_gpu_loss(&why) {
             return;
         }
-        self.reopening_since = Some(Instant::now());
+        // (A reopen that was already running keeps its start: the slate comes `gpu_slate_delay` after the first loss.)
+        self.reopening_since.get_or_insert_with(Instant::now);
         // The window and the log say what is going on while the device is rebuilt (the last frame stays on the file).
         self.set_phase(EngineState::Standby, Some("reopening".into()));
         self.open_session(OpenMode::Reopen);
@@ -3794,6 +3876,10 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
     }
 
     let mut published_any = false;
+    // When the camera last delivered a frame, and whether the file shows the "starting" slate for a camera that has
+    // been silent since ([`silent_slate_after`]).
+    let mut last_frame = Instant::now();
+    let mut silent_slated = false;
     // The consumer rate the pacer last saw; a change starts it over.
     let mut pacer = Pacer::default();
     let mut paced_for: Option<Format> = None;
@@ -3832,7 +3918,8 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
         let mut live = lock(&shared.live_gen);
         // A session that is being stopped does not go live: the control thread sets the stop flag first and writes the
         // slate under this lock, so a first frame that comes late cannot put `Live` back over the slate.
-        if stop.load(Ordering::Acquire) {
+        // (Nor once the app is quitting: [`Engine::close`] writes `Closed` under this lock after it set the flag.)
+        if stop.load(Ordering::Acquire) || shared.exiting.load(Ordering::Acquire) {
             return;
         }
         *live = ctx.gen;
@@ -3850,8 +3937,19 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
             }
         }
         let _live = lock(&shared.live_gen);
-        if !stop.load(Ordering::Acquire) {
+        if !stop.load(Ordering::Acquire) && !shared.exiting.load(Ordering::Acquire) {
             writer.set_state(WriterState::Paused);
+        }
+    };
+    // The "starting" slate for a camera that went silent while live, under the same lock and with the same looks: a
+    // stop, a quit or a pause that came first wrote its own state, which this must not replace.
+    let write_starting = || {
+        let _live = lock(&shared.live_gen);
+        if !stop.load(Ordering::Acquire)
+            && !shared.exiting.load(Ordering::Acquire)
+            && !shared.paused.load(Ordering::Acquire)
+        {
+            writer.set_state(WriterState::Starting);
         }
     };
 
@@ -3892,6 +3990,8 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
             } else {
                 // Resumed: the writer leaves `Paused` with the first frame published from here on.
                 published_any = false;
+                last_frame = Instant::now();
+                silent_slated = false;
             }
         }
         facts.update(
@@ -3909,7 +4009,8 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                 break Ok(());
             }
             match event {
-                SourceEvent::Frame(_) | SourceEvent::Timeout => {}
+                SourceEvent::Frame(_) => last_frame = Instant::now(),
+                SourceEvent::Timeout => {}
                 SourceEvent::Stopped(f) => break Err(gpu_check(f)),
             }
             maybe_publish_stats(
@@ -3956,11 +4057,30 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
             break Ok(());
         }
         let frame = match event {
-            SourceEvent::Frame(f) => f,
+            SourceEvent::Frame(f) => {
+                last_frame = Instant::now();
+                silent_slated = false;
+                f
+            }
             SourceEvent::Timeout => {
                 if last_heartbeat.elapsed() >= Duration::from_millis(100) {
                     writer.heartbeat();
                     last_heartbeat = Instant::now();
+                }
+                // A camera that went silent while live (the driver stopped sending, the stream is stuck): the file
+                // shows "starting" instead of the last picture for good, the next frame goes live again, and after a
+                // while the session ends so that the engine reconnects.
+                let silent = last_frame.elapsed();
+                if published_any && !silent_slated && silent >= silent_slate_after(source.info().fps) {
+                    write_starting();
+                    published_any = false;
+                    silent_slated = true;
+                }
+                if silent_slated && silent >= SILENT_RECONNECT_AFTER {
+                    break Err(Failure::Retry(
+                        RetryKind::NoFrames,
+                        "the camera stopped sending pictures".into(),
+                    ));
                 }
                 maybe_publish_stats(
                     shared,
@@ -4105,7 +4225,12 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                 },
             )?;
             if let Some(tap) = lock(&shared.tap).as_mut() {
-                tap.on_frame(renderer, &fitted, capture_qpc);
+                // Looked at under the tap's lock, which a rebuild of the device takes to hand the tap its new renderer
+                // ([`Control::rebuild_gpu`]): a thread that was left behind and wakes in the middle of this frame must
+                // not call a tap that has the next device's renderer.
+                if !stop.load(Ordering::Acquire) {
+                    tap.on_frame(renderer, &fitted, capture_qpc);
+                }
             }
             if skip.is_none() {
                 output.submit(
@@ -4133,11 +4258,17 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
             }
         }
         // Filters that failed this frame were bypassed; each failure is reported once (the chain keeps count).
+        // (A session that is being stopped says nothing more: the next one reports for itself.)
+        let stopping = stop.load(Ordering::Acquire);
         for e in chain.take_errors() {
-            emit(shared, EngineEvent::FilterError(e));
+            if !stopping {
+                emit(shared, EngineEvent::FilterError(e));
+            }
         }
         for s in chain.take_status() {
-            emit(shared, EngineEvent::FilterStatus(s));
+            if !stopping {
+                emit(shared, EngineEvent::FilterStatus(s));
+            }
         }
         match rendered_frame {
             Ok(()) => {
@@ -4710,6 +4841,9 @@ mod tests {
         /// The flag the sources opened from now on stall on: while it is set, their `next` does not return (a read
         /// that is stuck in the driver, and does not look at the stop flag).
         stall: Mutex<Arc<Stall>>,
+        /// While set, open sources deliver no frame and answer every read with a timeout (a camera whose driver stopped
+        /// sending while the stream stays open).
+        silent: Arc<AtomicBool>,
         /// An open that has this many steps of this length, each only begun when the session is not stopped.
         open_steps: Mutex<(u32, Duration)>,
         /// The steps of `open_steps` that were begun.
@@ -4766,6 +4900,7 @@ mod tests {
         live: Option<LiveLevel>,
         close_delay: Arc<Mutex<Duration>>,
         stall: Arc<Stall>,
+        silent: Arc<AtomicBool>,
     }
 
     /// A read that is stuck in the driver: while `on` is set the source's `next` does not return, and it does not
@@ -4820,6 +4955,10 @@ mod tests {
             }
             if self.gone.load(Ordering::SeqCst) {
                 return SourceEvent::Stopped(Failure::disconnected(None));
+            }
+            if self.silent.load(Ordering::SeqCst) {
+                std::thread::sleep(timeout);
+                return SourceEvent::Timeout;
             }
             if self.stream_error.load(Ordering::SeqCst) || self.stream_error_once.swap(false, Ordering::SeqCst) {
                 if self.lose_device_with_error.swap(false, Ordering::SeqCst) {
@@ -4965,6 +5104,7 @@ mod tests {
                 live: self.live.lock().unwrap().clone(),
                 close_delay: self.close_delay.clone(),
                 stall: self.stall.lock().unwrap().clone(),
+                silent: self.silent.clone(),
             }))
         }
 
@@ -4998,6 +5138,22 @@ mod tests {
 
     impl Rig {
         fn new(name: &str, timings: Timings) -> Rig {
+            Rig::with_opener(name, timings, |fake| {
+                Arc::new(crate::camera_controls::fake::FakeOpener {
+                    camera: fake.controls.clone(),
+                    link: FAKE_LINK.into(),
+                    opened: Default::default(),
+                    closed: Default::default(),
+                })
+            })
+        }
+
+        /// [`Rig::new`] with the opener of the camera controls' leases made by `make_opener`.
+        fn with_opener(
+            name: &str,
+            timings: Timings,
+            make_opener: impl FnOnce(&Arc<Fake>) -> Arc<dyn ControlsOpener>,
+        ) -> Rig {
             let gpu = Arc::new(GpuDevice::new(AdapterKind::Warp).expect("WARP"));
             let path = temp_file(name);
             let _ = std::fs::remove_file(&path);
@@ -5016,6 +5172,7 @@ mod tests {
                 open_delay: Mutex::new(Duration::ZERO),
                 close_delay: Arc::new(Mutex::new(Duration::ZERO)),
                 stall: Mutex::new(Arc::default()),
+                silent: Arc::new(AtomicBool::new(false)),
                 open_steps: Mutex::new((0, Duration::ZERO)),
                 steps_taken: Default::default(),
                 nominal_fps: Mutex::new(None),
@@ -5033,12 +5190,7 @@ mod tests {
                 flat: Mutex::new(None),
                 live: Mutex::new(None),
             });
-            let opener = Arc::new(crate::camera_controls::fake::FakeOpener {
-                camera: fake.controls.clone(),
-                link: FAKE_LINK.into(),
-                opened: Default::default(),
-                closed: Default::default(),
-            });
+            let opener = make_opener(&fake);
             let probe = writer.clone();
             let engine = Engine::build(gpu.clone(), writer, timings, fake.clone(), opener).unwrap();
             let events: Arc<Mutex<Vec<(Instant, EngineEvent)>>> = Arc::default();
@@ -9396,9 +9548,198 @@ mod tests {
             quit.join().unwrap();
         });
         let took = t0.elapsed();
-        assert!(took >= Duration::from_millis(2500) && took < Duration::from_secs(6), "the quit took {took:?}");
+        assert!(took >= Duration::from_millis(2500) && took < Duration::from_secs(4), "the quit took {took:?}");
         assert_eq!(rig.writer_state(), CLOSED);
         stall.release();
+    }
+
+    /// Opens leases like the fake opener, but an open waits while `hold` is set (a command that opens the camera for
+    /// the controls and is slow to get its answer, with the lease lock in its hand).
+    struct HoldingOpener {
+        inner: crate::camera_controls::fake::FakeOpener,
+        hold: Arc<AtomicBool>,
+        inside: Arc<AtomicBool>,
+    }
+
+    impl ControlsOpener for HoldingOpener {
+        fn open(&self, id: &str) -> Result<crate::camera_controls::Leased, String> {
+            if self.hold.load(Ordering::SeqCst) {
+                self.inside.store(true, Ordering::SeqCst);
+                while self.hold.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                self.inside.store(false, Ordering::SeqCst);
+            }
+            self.inner.open(id)
+        }
+
+        fn key_of(&self, link: &str) -> Option<crate::capture::DeviceKey> {
+            self.inner.key_of(link)
+        }
+    }
+
+    /// A rig whose controls' opener can be held ([`HoldingOpener`]): `(rig, hold, inside)`.
+    fn rig_with_holding_opener(name: &str) -> (Rig, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let (hold, inside) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (h, i) = (hold.clone(), inside.clone());
+        let rig = Rig::with_opener(name, fast(), move |fake| {
+            Arc::new(HoldingOpener {
+                inner: crate::camera_controls::fake::FakeOpener {
+                    camera: fake.controls.clone(),
+                    link: FAKE_LINK.into(),
+                    opened: Default::default(),
+                    closed: Default::default(),
+                },
+                hold: h,
+                inside: i,
+            })
+        });
+        (rig, hold, inside)
+    }
+
+    /// M1: the control thread is in `open_session`, waiting in `release_lease` for the lease lock that a command holds
+    /// while it opens a camera for the controls. The quit does not wait for it for ever (the old `join` did): it is over
+    /// 3 s after it began, the file says closed, and the thread, left behind, writes nothing when it wakes.
+    #[test]
+    fn quitting_does_not_wait_for_ever_for_a_control_thread_stuck_on_the_lease() {
+        let (rig, hold, inside) = rig_with_holding_opener("m1-quit-lease.bin");
+        *rig.engine.shared.session_end_cap.lock().unwrap() = Some(Duration::from_secs(30));
+        // no camera is open: a call for the controls opens a lease, and the open does not return
+        hold.store(true, Ordering::SeqCst);
+        let hub = rig.engine.controls().clone();
+        let (took, finished) = std::thread::scope(|s| {
+            let call = s.spawn(|| {
+                let _ = hub.get(FAKE_LINK);
+            });
+            rig.wait("the command is inside the open", Duration::from_secs(5), |_| {
+                inside.load(Ordering::SeqCst)
+            });
+            // a Start: the control thread comes to release the lease before it opens the camera, and waits for the lock
+            rig.engine.start(settings(bars(30), false));
+            std::thread::sleep(Duration::from_millis(300));
+            assert_eq!(rig.opens(), 0, "setup: the camera was opened without the lease");
+            let t0 = Instant::now();
+            let quit = s.spawn(|| rig.engine.close_for_exit());
+            while !quit.is_finished() && t0.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let (took, finished) = (t0.elapsed(), quit.is_finished());
+            // whatever happened, let the command go so that the scope can end
+            hold.store(false, Ordering::SeqCst);
+            let _ = call.join();
+            (took, finished)
+        });
+        assert!(finished, "the quit never ended");
+        assert!(took >= Duration::from_millis(2500) && took < Duration::from_millis(3500), "the quit took {took:?}");
+        assert_eq!(rig.writer_state(), CLOSED);
+        // the control thread wakes now: no session, no slate over the closed file
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(rig.opens(), 0, "the thread that was left behind opened a camera");
+        assert_eq!(rig.writer_state(), CLOSED);
+    }
+
+    /// M2: a second `close` (the `Drop` after the quit) does nothing and returns at once, whatever is still stuck.
+    #[test]
+    fn a_second_close_returns_at_once_and_does_nothing() {
+        let (rig, hold, inside) = rig_with_holding_opener("m2-second-close.bin");
+        *rig.engine.shared.session_end_cap.lock().unwrap() = Some(Duration::from_secs(30));
+        hold.store(true, Ordering::SeqCst);
+        let hub = rig.engine.controls().clone();
+        std::thread::scope(|s| {
+            let call = s.spawn(|| {
+                let _ = hub.get(FAKE_LINK);
+            });
+            rig.wait("the command is inside the open", Duration::from_secs(5), |_| {
+                inside.load(Ordering::SeqCst)
+            });
+            // the release of the lease (the end of the quit) is stuck on the lock of the command: left behind
+            rig.engine.close_for_exit();
+            assert_eq!(rig.writer_state(), CLOSED);
+            // what a second close would write
+            rig.engine.writer().set_state(WriterState::Paused);
+            let t0 = Instant::now();
+            rig.engine.close();
+            let took = t0.elapsed();
+            hold.store(false, Ordering::SeqCst);
+            let _ = call.join();
+            assert!(took < Duration::from_millis(200), "the second close took {took:?}");
+        });
+        assert_eq!(rig.writer_state(), PAUSED, "the second close ran again");
+    }
+
+    /// M1: a Start that was queued before the quit does not open a camera (and wait for its end) for an app that
+    /// is leaving.
+    #[test]
+    fn a_command_queued_before_the_quit_is_not_run() {
+        let rig = Rig::new("m1-queued.bin", fast());
+        let gate = lock(&rig.engine.shared.control_gate);
+        rig.engine.start(settings(bars(30), false));
+        std::thread::scope(|s| {
+            let quit = s.spawn(|| rig.engine.close_for_exit());
+            // the quit is under way (the flag is set first thing), the control thread is held at the top of its pass
+            std::thread::sleep(Duration::from_millis(300));
+            drop(gate);
+            quit.join().unwrap();
+        });
+        assert_eq!(rig.opens(), 0, "the queued Start opened a camera");
+        assert_eq!(rig.writer_state(), CLOSED);
+    }
+
+    /// M3: a camera that stops sending while the stream stays open: the file shows the "starting" slate after a second
+    /// (not the last picture for good), the next frame goes live again, and a camera that stays silent is reconnected.
+    #[test]
+    fn a_camera_that_stops_sending_frames_shows_the_slate_goes_live_again_and_is_reconnected() {
+        let rig = Rig::new("m3-silent.bin", fast());
+        let _consumer = rig.consumer("m3-silent.bin");
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("video", Duration::from_secs(10), |r| r.writer_state() == LIVE);
+
+        rig.fake.silent.store(true, Ordering::SeqCst);
+        let t0 = Instant::now();
+        rig.wait("the slate", Duration::from_secs(3), |r| r.writer_state() == STARTING);
+        let after = t0.elapsed();
+        assert!(after >= Duration::from_millis(800), "the slate came after {after:?}");
+        assert_eq!(rig.engine.state(), EngineState::Live, "the session ended too early");
+
+        // the camera sends again: live again, and the slate does not come back
+        rig.fake.silent.store(false, Ordering::SeqCst);
+        rig.wait("video again", Duration::from_secs(5), |r| r.writer_state() == LIVE);
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(rig.writer_state(), LIVE);
+        assert_eq!(rig.engine.state(), EngineState::Live);
+
+        // silent for good: the slate, then the session ends and the engine reconnects
+        rig.fake.silent.store(true, Ordering::SeqCst);
+        let t1 = Instant::now();
+        rig.wait_state(EngineState::Reconnecting, Duration::from_secs(9));
+        assert!(t1.elapsed() >= Duration::from_millis(4500), "reconnecting after {:?}", t1.elapsed());
+        assert_eq!(rig.writer_state(), STARTING);
+        let opens = rig.opens();
+        rig.fake.silent.store(false, Ordering::SeqCst);
+        rig.wait("live after the reconnect", Duration::from_secs(10), |r| r.writer_state() == LIVE);
+        assert!(rig.opens() > opens, "the camera was not opened again");
+        rig.wait_state(EngineState::Live, Duration::from_secs(5));
+    }
+
+    /// A writer that was retired wrote nothing, so the record of what the file advertises says nothing is known (the
+    /// next writer writes its list again).
+    #[test]
+    fn the_advertised_record_stays_unknown_for_a_retired_writer() {
+        let path = temp_file("m-advertised-retired.bin");
+        let _ = std::fs::remove_file(&path);
+        let writer = Writer::create(&path).unwrap();
+        let mut record = None;
+        write_advertised(&writer, &mut record, (320, 180, 30, false));
+        assert_eq!(record, Some((320, 180, 30, false)));
+        let lease = writer.lease();
+        lease.retire();
+        let mut record = None;
+        write_advertised(&lease, &mut record, (640, 360, 30, false));
+        assert_eq!(record, None, "a list that was not written was recorded");
+        // a writer that is not retired records what it wrote
+        write_advertised(&writer, &mut record, (640, 360, 30, false));
+        assert_eq!(record, Some((640, 360, 30, false)));
     }
 
     /// M-2: a render thread that is left behind writes nothing to the file, however long it lives: not when it comes
