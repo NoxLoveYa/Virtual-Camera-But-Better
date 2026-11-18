@@ -64,7 +64,7 @@ interface Saved {
   closeToTray: boolean;
   /** Whether the "launch on startup" default has been applied once; after that the OS entry is the truth. */
   autostartDefaulted: boolean;
-  /** Set once the NVIDIA install prompt was closed, so it does not come back on every launch. */
+  /** Set once the NVIDIA install prompt was closed, so adding another NVIDIA filter does not ask again. */
   nvidiaPromptDismissed: boolean;
   /** The preset the chain was last loaded from or saved as, and what it looked like then (see `signature`). */
   activePreset: string | null;
@@ -797,14 +797,10 @@ export const useStore = create<State>((set, get) => {
       // (a repair by hand, or `vcam-tool`, shows up without a restart).
       const vcamRead = get().refreshVcam();
       window.addEventListener("focus", () => void get().refreshVcam());
-      // NVIDIA's runtime is read at startup (the install dialog opens from this, once: "Not now" is remembered), after an
-      // install and whenever the window gets focus back, so installing it by hand shows up without a restart.
-      void get()
-        .refreshNvidia()
-        .then(() => {
-          const { gpu, nvidia, nvidiaPromptDismissed } = get();
-          if (gpu && nvidia && !nvidia.available && !nvidiaPromptDismissed) set({ nvidiaPrompt: true });
-        });
+      // NVIDIA's runtime is read at startup, after an install and whenever the window gets focus back, so installing it by
+      // hand shows up without a restart. The install dialog does not open from here: `addFilter` opens it the first time
+      // an NVIDIA filter is added, and a card's "Install it now" opens it later.
+      void get().refreshNvidia();
       window.addEventListener("focus", () => void get().refreshNvidia());
       await Promise.all([get().refreshCameras(), get().refreshPresets()]).catch(fail);
 
@@ -1107,6 +1103,10 @@ export const useStore = create<State>((set, get) => {
       const index = at == null ? prev.chain.length : Math.max(0, Math.min(prev.chain.length, at));
       setChain([...prev.chain.slice(0, index), filter, ...prev.chain.slice(index)]);
       say(`Added ${labelOf(kind, extensions)} as step ${index + 1}`, prev);
+      // The first NVIDIA filter on an RTX machine without the runtime: offer the install now ("Not now" is remembered; the
+      // card keeps its "Install it now"). A preset or a file drop that carries one does not ask.
+      const { gpu, nvidia, nvidiaPromptDismissed } = get();
+      if (defOf(kind, extensions)?.rtx && gpu && nvidia && !nvidia.available && !nvidiaPromptDismissed) get().openNvidiaPrompt();
     },
     removeFilter: (id) => {
       const prev = snapshot();

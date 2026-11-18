@@ -114,6 +114,7 @@ body {
   color: var(--dim); text-align: left; background: none; border: 0; border-radius: 2px;
 }
 .pm-item:hover:not(:disabled) { color: var(--text); background: rgba(255, 255, 255, 0.05); box-shadow: none; }
+.add-menu .pm-item { touch-action: pan-y; }
 .pm-item.two { height: auto; flex-direction: column; align-items: flex-start; gap: 2px; padding: 8px 10px; color: var(--text); }
 .pm-item.two b { font-weight: 500; }
 .pm-item.two small { color: var(--faint); font-size: 11px; }
@@ -682,6 +683,29 @@ body.reordering, body.reordering * { cursor: grabbing !important; user-select: n
 .drop-line { position: absolute; left: 6px; right: 0; height: 2px; border-radius: 1px; background: var(--accent); box-shadow: var(--glow); pointer-events: none; z-index: 5; }
 .drop-line::before { content: ""; position: absolute; left: 6px; top: -3px; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
 .drop-line.noop { opacity: 0.4; box-shadow: none; }
+
+/* The "+" in the gap above a card (components/AddFilter.tsx, AddHere): a strip over the 12px gap, so no card moves when the
+   button shows. It shows on hover of the gap, on keyboard focus and while its menu is open; it is always in the tab order
+   (opacity, not display), and always visible where there is no hover (touch). */
+.gap-add { position: absolute; left: 0; right: 0; top: -6px; height: 12px; z-index: 3; }
+/* On the rail, 8px above the gap's middle, so it clears the number badge of the card below (the rail column holds no card). */
+.gap-add .pop { position: absolute; left: 5px; top: 50%; width: 21px; height: 21px; margin-top: -18.5px; }
+button.gap-btn {
+  width: 21px; height: 21px; min-width: 0; padding: 0; display: grid; place-items: center;
+  color: var(--accent); background: var(--surface); border: 1px solid rgba(46, 230, 214, 0.55); border-radius: 50%;
+  opacity: 0; pointer-events: none; transition: opacity 0.12s;
+}
+.gap-add:hover button.gap-btn, button.gap-btn:focus-visible, button.gap-btn[aria-expanded="true"] { opacity: 1; pointer-events: auto; }
+button.gap-btn:hover:not(:disabled) { background: var(--accent-soft); }
+body.reordering .gap-add { visibility: hidden; }
+@media (hover: none) {
+  button.gap-btn { opacity: 0.85; pointer-events: auto; }
+}
+
+/* The chip that follows the pointer while a filter is dragged out of the Add menu. */
+.reorder-lift.insert-lift { min-height: 0; max-width: 260px; padding: 6px 12px; transform: translateY(-50%); white-space: nowrap; }
+.reorder-lift.insert-lift[data-over="false"] { opacity: 0.6; border-left-color: var(--line-strong); }
+.reorder-lift.insert-lift[data-over="false"] svg { color: var(--dim); }
 
 /* The copy that follows the pointer: the header row only. */
 .reorder-lift {

@@ -2,6 +2,7 @@ import { useEffect, useRef, type CSSProperties } from "react";
 import { useStore } from "./store";
 import { finalIndex } from "./ui/chainDrag";
 import { useChainDrag } from "./ui/useChainDrag";
+import { cancelInsertDrag, useInsertView } from "./ui/insertDragSession";
 import { useFileDrop } from "./ui/useFileDrop";
 import { AddFilter } from "./components/AddFilter";
 import { ControlsCard } from "./components/ControlsCard";
@@ -32,7 +33,11 @@ export default function App() {
   const colsRef = useRef<HTMLDivElement>(null);
   const reorder = useChainDrag();
   const fileDrop = useFileDrop();
+  const insert = useInsertView((s) => s.view);
   const init = useRef(false);
+
+  // Leaving the page in the middle of a drag out of the Add menu releases everything it holds.
+  useEffect(() => cancelInsertDrag, []);
 
   useEffect(() => {
     if (init.current) return;
@@ -108,6 +113,7 @@ export default function App() {
               />
             )}
             {fileDrop.lineTop !== null && <div className="drop-line file-line" style={{ top: fileDrop.lineTop }} aria-hidden />}
+            {insert?.lineTop != null && <div className="drop-line insert-line" style={{ top: insert.lineTop }} aria-hidden />}
           </div>
         </div>
       </div>
@@ -117,6 +123,17 @@ export default function App() {
           <Icon name="grip" />
           <span className="lift-title">{reorder.lift.label}</span>
           {reorder.lift.bypassed && <span className="tag">Bypassed</span>}
+        </div>
+      )}
+      {insert && (
+        <div
+          className="reorder-lift insert-lift"
+          data-over={insert.lineTop !== null}
+          style={{ left: Math.max(0, Math.min(insert.x + 14, window.innerWidth - 270)), top: insert.y }}
+          aria-hidden
+        >
+          <Icon name="plus" />
+          <span className="lift-title">{insert.label}</span>
         </div>
       )}
       <div className="reorder-live" role="status" aria-live="polite" aria-atomic="true">

@@ -60,11 +60,14 @@ const FOCUSABLE = "button, input, select, textarea, a[href], [tabindex]";
 
 const cardOf = (id: string) => document.querySelector<HTMLElement>(`[data-filter-id="${CSS.escape(id)}"]`);
 
+/** The card's own controls, without the "+" of the gap above it (the first card has none, so counting it would shift the index when a card moves to or from the top). */
+const focusablesOf = (card: HTMLElement) => Array.from(card.querySelectorAll<HTMLElement>(FOCUSABLE)).filter((el) => !el.closest(".gap-add"));
+
 function captureFocus(): FocusSpot | null {
   const el = document.activeElement as HTMLElement | null;
   const card = el?.closest<HTMLElement>("[data-filter-id]");
-  if (!el || !card?.dataset.filterId) return null;
-  return { id: card.dataset.filterId, index: Array.from(card.querySelectorAll<HTMLElement>(FOCUSABLE)).indexOf(el), act: el.dataset.act };
+  if (!el || !card?.dataset.filterId || el.closest(".gap-add")) return null;
+  return { id: card.dataset.filterId, index: focusablesOf(card).indexOf(el), act: el.dataset.act };
 }
 
 /** After the next frame, focuses the same control of the same card. A "Move up" that became disabled hands over to "Move down" (and the reverse). */
@@ -73,7 +76,7 @@ function restoreFocus(spot: FocusSpot | null) {
   requestAnimationFrame(() => {
     const card = cardOf(spot.id);
     if (!card) return;
-    let target: HTMLElement | null = Array.from(card.querySelectorAll<HTMLElement>(FOCUSABLE))[spot.index] ?? null;
+    let target: HTMLElement | null = focusablesOf(card)[spot.index] ?? null;
     if (!target || (target as HTMLButtonElement).disabled) {
       const other = spot.act === "up" ? "down" : spot.act === "down" ? "up" : "grip";
       target = card.querySelector<HTMLElement>(`[data-act="${other}"]:not(:disabled)`) ?? card.querySelector<HTMLElement>('[data-act="grip"]');
@@ -90,7 +93,7 @@ export function moveWithFocus(from: number, to: number) {
 }
 
 /** The nearest ancestor that scrolls (`.col-right` in two columns, `.cols` when stacked: there `.col` is `display: contents`). */
-function findScroller(from: HTMLElement | null): HTMLElement {
+export function findScroller(from: HTMLElement | null): HTMLElement {
   for (let p = from?.parentElement; p; p = p.parentElement) {
     const o = getComputedStyle(p).overflowY;
     if ((o === "auto" || o === "scroll") && p.clientHeight > 0) return p;

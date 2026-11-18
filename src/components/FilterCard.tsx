@@ -2,6 +2,7 @@ import type { PointerEvent as ReactPointerEvent } from "react";
 import { useStore } from "../store";
 import { stripCodes } from "../camera/schema";
 import { defOf, extIdOf, extOf, isExtKind, labelOf, type ExtensionInfo, type FilterCfg } from "../filters/schema";
+import { AddHere } from "./AddFilter";
 import { Icon } from "./Icon";
 import { ParamField } from "./ParamField";
 import { moveWithFocus, type Reorder } from "../ui/useChainDrag";
@@ -59,6 +60,12 @@ export function FilterCard({ filter, index, count, reorder }: Props) {
       data-filter-id={filter.id}
       onKeyDown={(e) => reorder.onCardKeyDown(e, filter.id)}
     >
+      {/* The "+" of the gap above this card. It sits over the gap without taking room, and shows on hover and focus (always on touch). */}
+      {index > 0 && (
+        <div className="gap-add">
+          <AddHere at={index} />
+        </div>
+      )}
       <span className="num" title={`Step ${index + 1} of ${count}`}>
         {String(index + 1).padStart(2, "0")}
       </span>

@@ -15,6 +15,8 @@ interface Props {
   label?: string;
   /** Move the focus into the panel when it opens (its first switch, else its first button), and back to the anchor on Escape. */
   autoFocusFirst?: boolean;
+  /** Open upwards when the room above the anchor is larger than the room below (an anchor low in the window). */
+  flip?: boolean;
   className?: string;
 }
 
@@ -23,7 +25,7 @@ interface Props {
  * It is positioned against the window and capped to the room below the anchor, and rendered at the top of the page,
  * so a scrolling or dimmed parent can neither clip it nor affect its backdrop blur.
  */
-export function Popover({ open, onClose, anchor, children, align = "left", matchWidth, role = "menu", label, autoFocusFirst, className = "" }: Props) {
+export function Popover({ open, onClose, anchor, children, align = "left", matchWidth, role = "menu", label, autoFocusFirst, flip, className = "" }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const menu = useRef<HTMLDivElement>(null);
   const close = useRef(onClose);
@@ -35,13 +37,16 @@ export function Popover({ open, onClose, anchor, children, align = "left", match
   useLayoutEffect(() => {
     if (!open || !ref.current) return;
     const r = ref.current.getBoundingClientRect();
+    const below = window.innerHeight - r.bottom - 14;
+    const above = r.top - 14;
+    const up = flip === true && below < 300 && above > below;
     setPlace({
-      top: r.bottom + 6,
+      ...(up ? { bottom: window.innerHeight - r.top + 6 } : { top: r.bottom + 6 }),
       ...(align === "left" ? { left: r.left } : { right: window.innerWidth - r.right }),
-      maxHeight: Math.max(120, window.innerHeight - r.bottom - 14),
+      maxHeight: Math.max(120, up ? above : below),
       ...(matchWidth && { minWidth: r.width }),
     });
-  }, [open, align, matchWidth]);
+  }, [open, align, matchWidth, flip]);
 
   useEffect(() => {
     if (!open || !autoFocusFirst) return;
