@@ -1,9 +1,12 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { useStore } from "./store";
+import { finalIndex } from "./ui/chainDrag";
+import { useChainDrag } from "./ui/useChainDrag";
 import { AddFilter } from "./components/AddFilter";
 import { ControlsCard } from "./components/ControlsCard";
 import { EngineBanner } from "./components/EngineBanner";
 import { FilterCard } from "./components/FilterCard";
+import { Icon } from "./components/Icon";
 import { NvidiaPrompt } from "./components/NvidiaPrompt";
 import { OutputPanel } from "./components/OutputPanel";
 import { PresetMenu } from "./components/PresetMenu";
@@ -20,8 +23,8 @@ export default function App() {
   const error = useStore((s) => s.error);
   const state = useStore((s) => s.engine.state);
   const vcamBanner = useStore((s) => s.vcam?.state === "missing" || s.vcam?.state === "outdated");
-  const { setAllCollapsed, moveFilter } = useStore.getState();
-  const [dragFrom, setDragFrom] = useState<number | null>(null);
+  const { setAllCollapsed } = useStore.getState();
+  const reorder = useChainDrag();
   const init = useRef(false);
 
   useEffect(() => {
@@ -61,28 +64,35 @@ export default function App() {
             </div>
           )}
 
-          <div className="chain-block">
+          <div className="chain-block" ref={reorder.blockRef}>
             <span className="label chain-label">Filter chain · applied top to bottom</span>
 
-            <ol className="chain">
+            <ol className="chain" ref={reorder.chainRef}>
               <li className="terminal">Camera in</li>
               {chain.map((f, i) => (
-                <FilterCard
-                  key={f.id}
-                  filter={f}
-                  index={i}
-                  count={chain.length}
-                  onDragStart={() => setDragFrom(i)}
-                  onDrop={() => {
-                    if (dragFrom !== null && dragFrom !== i) moveFilter(dragFrom, i);
-                    setDragFrom(null);
-                  }}
-                />
+                <FilterCard key={f.id} filter={f} index={i} count={chain.length} reorder={reorder} />
               ))}
               <li className="terminal">Better Cam out</li>
             </ol>
+            {reorder.drag && (
+              <div
+                className={`drop-line${finalIndex(reorder.drag.from, reorder.drag.k) === reorder.drag.from ? " noop" : ""}`}
+                style={{ top: reorder.lineTop }}
+                aria-hidden
+              />
+            )}
           </div>
         </div>
+      </div>
+      {reorder.lift && (
+        <div className="reorder-lift" ref={reorder.liftRef} style={{ left: reorder.lift.left, width: Math.min(reorder.lift.width, 300) }} aria-hidden>
+          <Icon name="grip" />
+          <span className="lift-title">{reorder.lift.label}</span>
+          {reorder.lift.bypassed && <span className="tag">Bypassed</span>}
+        </div>
+      )}
+      <div className="reorder-live" role="status" aria-live="polite" aria-atomic="true">
+        {reorder.announcement}
       </div>
       <footer className="footer">
         <Toast />

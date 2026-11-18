@@ -903,9 +903,13 @@ export const useStore = create<State>((set, get) => {
       if (gone) say(`Removed ${FILTERS[gone.kind].label}`, prev);
     },
     moveFilter: (from, to) => {
-      const chain = [...get().chain];
+      const prev = snapshot();
+      const moved = prev.chain[from];
+      if (!moved || from === to || to < 0 || to >= prev.chain.length) return;
+      const chain = [...prev.chain];
       chain.splice(to, 0, chain.splice(from, 1)[0]);
       setChain(chain);
+      say(`Moved ${FILTERS[moved.kind].label} to step ${to + 1}`, prev);
     },
     toggleFilter: (id) => setChain(get().chain.map((f) => (f.id === id ? { ...f, enabled: !f.enabled } : f))),
     setParam: (id, key, value) =>

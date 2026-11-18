@@ -1,18 +1,19 @@
+import type { PointerEvent as ReactPointerEvent } from "react";
 import { useStore } from "../store";
 import { FILTERS, type FilterCfg } from "../filters/schema";
 import { Icon } from "./Icon";
 import { ParamField } from "./ParamField";
+import { moveWithFocus, type Reorder } from "../ui/useChainDrag";
 
 interface Props {
   filter: FilterCfg;
   index: number;
   count: number;
-  onDragStart: () => void;
-  onDrop: () => void;
+  reorder: Reorder;
 }
 
-export function FilterCard({ filter, index, count, onDragStart, onDrop }: Props) {
-  const { toggleFilter, removeFilter, moveFilter, setParam, collapsed, toggleCollapsed } = useStore();
+export function FilterCard({ filter, index, count, reorder }: Props) {
+  const { toggleFilter, removeFilter, setParam, collapsed, toggleCollapsed } = useStore();
   const def = FILTERS[filter.kind];
   const folded = !!collapsed[filter.id];
   const error = useStore((s) => s.filterErrors[filter.id]);
@@ -33,16 +34,35 @@ export function FilterCard({ filter, index, count, onDragStart, onDrop }: Props)
           ? { text: nvidia.detail, install: true }
           : null;
 
+  const movable = count > 1;
+  const mode = reorder.drag?.id === filter.id ? reorder.drag.mode : null;
+  const gripDown = (e: ReactPointerEvent<HTMLElement>) => reorder.onPointerDown(e, filter.id);
+
   return (
-    <li className={`step${filter.enabled ? " on" : ""}`} onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
+    <li
+      className={`step${filter.enabled ? " on" : ""}${movable ? " movable" : ""}${mode === "pointer" ? " dragging" : ""}${mode === "keyboard" ? " lifted" : ""}`}
+      data-filter-id={filter.id}
+      onKeyDown={(e) => reorder.onCardKeyDown(e, filter.id)}
+    >
       <span className="num" title={`Step ${index + 1} of ${count}`}>
         {String(index + 1).padStart(2, "0")}
       </span>
       <div className="card">
         <div className="card-head">
-          <span className="grip" title="Drag to reorder" draggable onDragStart={onDragStart}>
+          <button
+            type="button"
+            className="grip"
+            data-act="grip"
+            title="Drag to reorder. From the keyboard: Space lifts the card, the arrow keys move it, Space drops it, Escape cancels."
+            aria-label={`Move ${def.label}, step ${index + 1} of ${count}`}
+            aria-pressed={mode === "keyboard"}
+            aria-disabled={!movable}
+            onPointerDown={gripDown}
+            onKeyDown={(e) => reorder.onGripKeyDown(e, filter.id)}
+            onBlur={() => reorder.onGripBlur(filter.id)}
+          >
             <Icon name="grip" />
-          </span>
+          </button>
           <h3 className={`card-title${folded ? " folded" : ""}`}>
             <button aria-expanded={!folded} title={folded ? "Expand" : "Collapse"} onClick={() => toggleCollapsed(filter.id)}>
               <Icon name="chevron" />
@@ -50,11 +70,11 @@ export function FilterCard({ filter, index, count, onDragStart, onDrop }: Props)
             </button>
           </h3>
           {!filter.enabled && <span className="tag">Bypassed</span>}
-          <span className="fill" />
-          <button className="ghost icon" disabled={index === 0} onClick={() => moveFilter(index, index - 1)} title="Apply earlier" aria-label="Move up">
+          <span className="fill" onPointerDown={gripDown} />
+          <button className="ghost icon" data-act="up" disabled={index === 0} onClick={() => moveWithFocus(index, index - 1)} title="Apply earlier" aria-label="Move up">
             <Icon name="up" />
           </button>
-          <button className="ghost icon" disabled={index === count - 1} onClick={() => moveFilter(index, index + 1)} title="Apply later" aria-label="Move down">
+          <button className="ghost icon" data-act="down" disabled={index === count - 1} onClick={() => moveWithFocus(index, index + 1)} title="Apply later" aria-label="Move down">
             <Icon name="down" />
           </button>
           <button
