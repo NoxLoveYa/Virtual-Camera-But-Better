@@ -88,8 +88,10 @@ pub struct SimCfg {
     pub s_true: f64,
     /// DB-linear to the middle of the range, twice as steep after (the total stays `s_true`).
     pub bent: bool,
-    /// The camera lowers its rate when `tau > 0.8 / F`.
+    /// The camera lowers its rate when `tau > rate_drop_fill / F`.
     pub rate_drop: bool,
+    /// The part of the frame time an exposure may fill before the camera slows down (W4GS at 60 fps: 0.86).
+    pub rate_drop_fill: f64,
     /// The camera never exceeds this rate, whatever the exposure.
     pub fps_cap: Option<f64>,
     /// The first write to exposure (and white balance) after "open" takes 0.5 s.
@@ -115,6 +117,7 @@ impl Default for SimCfg {
             s_true: 3.0,
             bent: false,
             rate_drop: false,
+            rate_drop_fill: 0.8,
             fps_cap: None,
             slow_first_write: true,
             flicker: None,
@@ -696,7 +699,7 @@ impl Sim {
         self.max_e_applied = self.max_e_applied.max(self.eff_e);
         let tau = f64::from(self.eff_e).exp2();
         let mut interval = (1.0 / self.cfg.fps).max(if self.cfg.rate_drop {
-            tau / 0.8
+            tau / self.cfg.rate_drop_fill
         } else {
             tau + 0.001
         });

@@ -1,14 +1,15 @@
 # Better Cam Auto — software auto for the camera's own controls
 
-Status: design, no code yet. Date: 2026-11-18. Covers two owner requests: "auto also drives the camera itself" and
-"per-control targets in Camera controls". The third request (more targets in the Auto Adjust filter) is built
-separately and is only referenced here.
+Status: built (phases A1-A5) and live-tested on the owner's W4GS (A6, 2026-11-19: section 9). Date: 2026-11-18. Covers
+two owner requests: "auto also drives the camera itself" and "per-control targets in Camera controls". The third
+request (more targets in the Auto Adjust filter) is built separately and is only referenced here. A6 found the room
+dark (see 9): checks that need light are listed there as owed to the owner.
 
 **Owner decision recorded (2026-11-18), reverses part of PLAN 9.3 item 1.** PLAN 9.3 item 1 said "Software never
 drives the device controls". The owner now wants software to drive them. New rule: Better Cam may write a camera's
 exposure, gain and white balance, but only for a control the user switched to **Better Cam auto**. Nothing changes
 for users who never pick it. PLAN.md 9.3, 5.5, 5.6, 6.2 and the header of `capture/controls.rs` ("Software never
-computes control values") are updated in phase A6 (this session touches only this file).
+computes control values") were updated in phase A6 (2026-11-19).
 
 Terms used below:
 
@@ -259,8 +260,9 @@ decoded values, so the error is exact only for an sRGB-like camera curve; the sa
 
 #### 2.5.8 Frame-rate guard (learned cap)
 
-With Longest exposure = `fit`, `E == E_cap`, no write in the last 1 s, and the 2-second capture rate `< 0.9 · F` for
-3 s: set `E_learned[F] = E_cap − 1` (not below `E_min`); the next decision applies it as a constraint. If the rate
+With Longest exposure = `fit`, `E == E_cap`, no write in the last 1 s, and the 2-second capture rate `< 0.95 · F` for
+3 s (**A6: constant changed, old → new: `0.9 · F` → `0.95 · F`**; live on W4GS at 60 fps, 1/64 s gives 55.1 fps = 92 %
+of the request, so `0.9` never fired and the rate stayed short of 59; see 9.2): set `E_learned[F] = E_cap - 1` (not below `E_min`); the next decision applies it as a constraint. If the rate
 recovers to `≥ 0.95 · F` within 3 s, keep it (stored per camera and frame rate). If not, the cause is not exposure:
 remove it, and do not learn again in this session. Status text: "The camera dropped to 24 fps at 1/32 s, so Better
 Cam keeps exposure at 1/64 s or shorter."
@@ -878,6 +880,8 @@ A3 engine meter (parallel with A1, A2) ─────────────�
 - **Depends on:** A4, A5.
 - **Check:** every item of 6.3 recorded with its measured value in a new section "Live results" of this document;
   items 1-7 meet their criteria, or the gap is listed as a follow-up with the owner's agreement.
+- **Done 2026-11-19 (section 9).** One constant changed (9.4). The room was dark, so checks 2-5 and 10 and the gain
+  curve are owed to the owner with exact steps (9.6); the follow-ups F1-F6 (9.5) wait for the owner's agreement.
 
 ---
 
@@ -892,6 +896,146 @@ A3 engine meter (parallel with A1, A2) ─────────────�
 | 5 | **Hand-back target** when the watchdog gives up: Camera auto, or your last manual value? | Camera auto where the camera has it: a correct picture at a lower frame rate beats a frozen wrong one. |
 | 6 | Should the default for a **new camera** become Better Cam auto exposure? | No (brief: nothing changes until you pick it). Reconsider after A6 shows it beats Camera auto on W4GS. |
 | 7 | Mode labels: "Manual / Camera auto / Better Cam auto"? | Yes. "Auto" alone becomes ambiguous once there are two. |
-| 8 | Feed-forward from the device loop into Auto Adjust (so Auto Adjust does not follow each device step for 0.5 s)? | Not in v1. Build it only if live check 10 shows visible double movement. |
+| 8 | Feed-forward from the device loop into Auto Adjust (so Auto Adjust does not follow each device step for 0.5 s)? | Not in v1. Build it only if live check 10 shows visible double movement. **A6: undecided, check 10 is owed (it needs a lit scene); nothing seen so far argues for it.** |
 | 9 | Finer exposure: try the Windows extended exposure control (100 µs units) to escape whole stops and mains banding? | Later, as a spike. Whether UVC cameras on the inbox driver expose it is **unverified**. |
 | 10 | Should Better Cam auto also be offered for **focus** (software contrast autofocus)? | No. Camera auto focus exists on W4GS; a software focus sweep is a separate feature with visible hunting by design. |
+
+---
+
+## 9. Live results (A6, 2026-11-19)
+
+Debug build of `main` at 8349a5c (the first runs) and with the one A6 change of 9.4 (the last run), W4GS (`vid_0c45&pid_636d`), 1280×720 MJPEG at 30 fps as the
+owner had it set (6.3 says 1080p; the owner's saved format was kept), `better-cam.exe` in test mode, driven through
+the webview only. Everything the run changed on the camera and in the saved settings was put back (9.7).
+
+### 9.1 The light, and what it means for the checks
+
+The scene was **dark**. The picture at any exposure from 1/8192 s to 1/32 s and gain 0 is one flat value: display luma
+**8.00** (the camera's black level, 0.00243 linear) in every frame, no signal (frame-to-frame and pixel-to-pixel
+difference ≈ 0.003-0.04). With the camera's own Auto (as found) the picture is luma 9.6-10.5 with a faint red-tinged
+speckle. Either the lens was covered or the room was dark, as in A4's run. That decides what can be measured:
+
+- Better Cam auto exposure can never reach its target here (a black picture needs far more light than E = -5 with
+  gain 75 gives): it always ends in `limit_gain`. Checks that need the loop to *hold* a picture, or to react to light, are **owed**.
+- The exposure meter never has confidence (`conf < 0.2`), so nothing was ever learned: `learned` stayed empty.
+
+### 9.2 Checks 1-10 of 6.3
+
+| # | Check | Measured | Verdict |
+|---|---|---|---|
+| 1 | Frame rate, 30 fps | Footer/stats capture fps over 300 s with Better Cam auto: **min 31.73, mean 31.97** (the camera runs at its exposure-limited 32 fps at 1/32 s). First 60 s: min 31.73, mean 31.97. Camera auto in the same room: 15.8-16.7 (mean 16.7). | **Pass** (≥ 29.5) |
+| 1 | Frame rate, 60 fps | Before A6: E = -6 (1/64 s, the 60 fps cap) gave **55.1 fps (min 54.55)** for 60 s: **fail** (< 59). The learned cap never fired: 55.1 is 92 % of 60, the guard waited for < 90 %. After the constant change (9.4): the cap `60 → -7` was learned 6.7 s after the camera opened (the last gain write ended at ≈ 2.6 s; the guard needs 1 s without writes and 3 s of low rate, plus the 0.7 s exposure write), `auto-status` carried `learned: {rate_caps: {"60": -7}}`, and the rate was **61.46 fps (min 60.52)** over the next 20 s. | **Pass after the change** (the cap engages about 4 s after the guard may act, which is its own 1 + 3 s, plus the write itself) |
+| 2 | Convergence from Manual -9 | In this room the band cannot be reached. Time to the limits: E: -9 → -5 and gain 0 → 75 in **3.9 s** (7 stops at one stop per decision, 0.55 s each: 250 ms gap + 0.15 s + 1 frame to apply); `limit_gain` shown at **5.4 s** (3 s of saturation, `LIMIT_AFTER`); picture luma 8.76 (Manual -9) → 17.6 (limits). First decision was a gain write (G 33), then E -8, -7, -6, -5, then G 66, 75. | **Not measurable here**; owed with light |
+| 3 | No hunting, 5 min | **0 writes in 300 s** (log) and luma constant 17.0-17.6, fps 31.7-32.0 the whole time. Trivial: the loop sat at its limit. | **Pass, but not a holding test**; owed with light |
+| 4 | Light switch | Not produced (needs the room light). | **Owed**: see 9.6 |
+| 5 | White balance, warm lamp | Better Cam auto white balance engaged on the card: `starting` → `holding · 4600 K` in 0.9 s, **no write ever**, K stayed 4600. Honest but empty: gray world has nothing to measure in a black picture (it holds when `conf_wb < 0.3`). | **Owed**: see 9.6 |
+| 6 | Reopen (Stop → Start) | Through the card, exposure + white balance in Better Cam auto: LIVE again in **0.76 s**; the log shows `[engine] stored controls applied after open: exposure=-6, gain=0, white_balance=4600` **before** the first `[auto]` write; the mode survived (`get_camera_controls`: `mode: app` for exposure, gain and white balance). The stored resume point was the seed (-6, 0), because the loop was never in `holding` (see 9.5, F2): the loop climbed again to -5 / 75 in 1.7 s and showed `limit_gain` 4.6 s after the click. Without a stored record (camera keeps its values) no frame was more than 25 % off the pre-stop luma (272 frames, first frame 702 ms after the click). A flash cannot be judged on a black picture. | **Pass for the write order and the mode; flash owed with light** |
+| 7 | Mode changes | Better Cam auto → Manual: returned in 59 ms, device E -5 and gain 75 kept as Manual values, luma 17.03 → 17.03 (linear 0.00562 → 0.00563), fps 32.0: **the picture is kept**. → Camera auto: Auto flag on, fps fell to **16.6** as expected, gain stays at its last driven value (75) as Manual, luma 18.5 with speckle. | **Pass** |
+| 8 | Noise cost | See 9.3. | Described |
+| 9 | First-write latency | The runner logs decision writes only: 2-27 ms at 30 fps. The writes of `apply_on_open` are not timed in the log. Indirectly, after a Start click at 30 fps: first `controls-changed` at 0.75 s (open), the second, after the stored controls were applied, at **1.72 s** (≈ 1.0 s after LIVE for the exposure, gain and white balance writes together). No decision write came before the `stored controls applied` line (log order on the Stop → Start run). At 60 fps the gain writes right after a reopen took **259-669 ms** (two runs; 2-27 ms at 30 fps), the exposure write that set the learned cap 680 ms; later manual gain writes 3-4 ms. A manual write batch (gain, then exposure) at 60 fps took 0.83-1.09 s for E = -7, -6, -5 but 30-33 ms for -9 and -4. | **Partly measured**; a per-write time for the first write after open needs a log line (follow-up F5) |
+| 10 | With Auto Adjust, step the light | Not run: needs light, and a dark picture gives Auto Adjust nothing to measure either. | **Owed**; open question 8 is therefore **undecided** (nothing seen argues for feed-forward; do not build it before check 10) |
+
+### 9.3 W4GS gain curve and noise cost
+
+**Gain curve (`S`).** Not measurable in this room. At E = -5 the manual gain steps give luma 8.00, 11.02, 14.02, 17.02,
+20.03 at G = 0, 25, 50, 75, 100: a straight **+0.12 display-luma per gain unit** lift of the black level, with no
+signal to amplify; the exposure steps E = -13 … -5 at G = 0 gave an identical 8.00. That is a pedestal, not a gain
+curve (it would read as 1.5 stops over the range in linear terms, which means nothing). The controller's `S` stays at
+its **initial 3.0, unverified**; the gain model never learned (`conf` never reached 0.8). To estimate it, run in a lit
+scene: Manual exposure at a fixed value, gain 0 / 25 / 50 / 75 / 100, mean linear luma of the preview for each, `S` =
+log2(signal at 100 / signal at 0) (steps in 9.6).
+
+**Noise cost (screenshots, same scene).** Better Cam auto at 30 fps (E -5, gain 75, 31.7 fps) against Camera auto
+(≈ 16.6 fps, gain 0) in the dark scene:
+
+| | Better Cam auto, 30 fps | Camera auto, ≈ 16.6 fps |
+|---|---|---|
+| picture | flat dark gray, luma 17.0-17.6, no visible grain | black with a faint red-tinged speckle, luma 9.6-10.5 |
+| pixel-to-pixel difference (mean abs. of neighbours, 0-255) | 0.09-0.11 (preview frames), 0.39 (screenshot) | 0.74-0.82 |
+
+So in the dark scene Better Cam auto was **not noisier**: its picture is a lifted flat black (gain 75 lifts the black
+level from 8 to 17 of 255) while the camera's own auto shows grain from its own processing at about 1/16 s. The
+"1.4-2× the noise" of section 1 point 5 is **unmeasured**, because there is no signal to put noise on; it needs the lit
+scene of 9.6. Screenshots are kept by the A6 session (`a6\s1-a-camera-auto.png`, `a6\s1-c-bettercam-30fps.png` under
+the session temp folder), not committed.
+
+### 9.4 Constant changed
+
+| Constant | Old → new | Why |
+|---|---|---|
+| `GUARD_LOW` (`exposure.rs`, 2.5.8): capture rate below which the frame-rate guard counts | `0.9 · F` → `0.95 · F` | W4GS at 60 fps: the camera's frame time is about **1.16 × the exposure** (1/64 s gives 55.2 fps, 1/32 s 27.6, 1/16 s 13.8; 1/128 s gives 61.5 and 1/512 s 61.3). `E_rate = floor(log2(0.95 / F))` allows 1/64 s, which holds only 92 % of 60. At 30 fps the frame time is the exposure itself (1/32 s gives 31.7-32.2 fps), so `E_rate` is right there. `0.9` never fired at 55 fps and the rate stayed short of 59; `0.95` learns the cap `-7` in about 5 s and gives 61.5 fps (9.2, check 1). Recovery stays at `≥ 0.95 · F`. A camera sitting at 0.94 · F for another reason costs one try: one stop less exposure for at most 3 s, then the cap is removed and not tried again (case 9). Test: `case_08b_rate_a_little_low_still_learns_a_cap` (sim now has `rate_drop_fill`; it fails with 0.9). |
+
+No other constant is contradicted by the live data. `E_rate`'s `0.95` stays (changing it would cost a stop of light at
+30 fps for nothing).
+
+### 9.5 Follow-ups found (not constants, not done in A6)
+
+- **F1, Most gain "Off".** With Most gain at its minimum the loop switches to whole stops, but the device gain stays at
+  its last driven value (75 here) instead of going to its minimum, and the status says "this camera has no gain"
+  (`limit_exposure`), which is wrong for a camera that has one. 2.5.2 says Off means gain at its minimum; the text of
+  4.2 is for cameras without a gain control. Needs a gain write to `G_min` on the change and its own text.
+- **F2, resume point in limit states.** The resume point is stored only on entering `holding` (2.5.11), so a camera
+  that is at a limit (dark room, `limit_gain`) reopens from the seed (-6, 0) and climbs again for about 2 s. Store it
+  in the limit states too.
+- **F3, option text.** "1/16 s (camera drops to ≈ 15 fps)" measured **16.2 fps** (min 15.9); `1/exposure` is 16.
+- **F4, white balance in a black picture** says `Holding · 4600 K` (it holds when `conf_wb < 0.3`). A4 saw `starting`.
+  Harmless; a "nothing to measure" text would be more honest.
+- **F5, log line for the apply.** `apply_on_open` writes are not timed. One log line with each write's milliseconds
+  would let check 9 be read directly.
+- **F6, camera facts for the owner.** Camera auto at **60 fps requested** gives **14.3 fps** in this room; at 30 fps
+  16.5. W4GS answers an exposure write at 60 fps in 0.8-1.1 s for some values (the loop copes: `gap` grows with the
+  write time, 2.9).
+
+**A5's card, checked live (all as designed unless noted).**
+
+| Item | Result |
+|---|---|
+| Three modes on exposure and white balance | Manual / Camera auto / Better Cam auto, all enabled; focus and gain have no mode select (focus keeps its Auto switch) |
+| Optimistic state, then the backend's answer | Choosing Better Cam auto showed `mode: app`, the disabled slider and "Adjusting…" at **110 ms**; the backend's seed (1/64 s) followed at 160 ms and `auto-status` `starting` at 170 ms. After a Start: "Starts when the camera opens." (grey) → "Adjusting…" at 762 ms. The first write after open was not slow in this run (30 fps), so the optimistic gap was short |
+| Gain follows exposure | Gain row disabled, value 0 → 33 → 66 → 75 in step with the log, hint "Set by Better Cam auto exposure" |
+| Persistence | Record in `localStorage`: `exposure {value -6, auto false, mode "app"}`, `gain {…, mode "app"}`, `white_balance {value 4600, mode "app"}` and `auto {exposure {target .45, longest "fit", max_gain 75, speed "normal"}, white_balance {warmth 0, speed "normal"}}`; after Stop → Start the log wrote `exposure=-6, gain=0, white_balance=4600` and the modes were still `app` |
+| Status line and dot | Neutral (teal) while adjusting, grey when closed, **warning (amber, `rgb(255,184,77)`)** at `limit_gain` with the text "Gain at its maximum (75). Add light, allow more gain, or allow a longer exposure." The dot colour follows the text with a fade of about 0.3 s. Error colour not produced (no hand-back without a faulty camera) |
+| Limit markers | Exposure tick "30 fps limit" at 0.667 of the range (E -5 of -13…-1), range beyond shaded; gain tick "Most gain: 75" at 0.75. With Longest exposure 1/16 s the exposure tick reads "Your limit" at 0.75 and the camera ran at 16.2 fps |
+| Longest exposure options | "Fit the frame rate (1/32 s at 30 fps)", 1/8192 s … 1/64 s "(sharper motion, more gain)", "1/32 s (the frame-rate limit)", "1/16 s (camera drops to ≈ 15 fps)", 1/8 s ≈ 8 fps, 1/4 s ≈ 4 fps, 1/2 s ≈ 2 fps (see F3) |
+| Most gain "Off" | Shows "Off" at the minimum; behaviour wrong, see F1. Double-click resets it to 75 |
+| Reset all | Exposure, gain and white balance went back to Camera auto / manual 0 / Camera auto, every Better Cam auto mode ended, `controls` values cleared, **`auto` kept** with the changed `max_gain`; `learned` did not exist to keep (nothing was learned) |
+| Not produced | `conflict`, `ignored`, `no_response`, `not_answering`, `hunting` (need a faulty camera or another program meddling); the sim covers them (6.2 cases 18-22) |
+
+### 9.6 Owed to the owner (needs light or a real-world action)
+
+Run with the camera in the lit room, preview visible, Better Cam auto exposure on, Auto Adjust off unless stated. The
+log lines are `[auto] t=… exposure -5 -> -5 (… ms)` in the app's stderr.
+
+1. **Check 2/3 (convergence, no hunting):** with the room lit (a normal evening lamp), set exposure to Manual -9 in the
+   card, then pick Better Cam auto. Expect `holding` within 3 s. Leave it 5 minutes; count the `[auto]` lines
+   (≤ 30) and watch the preview for pumping.
+2. **Check 4 (light switch):** while it holds, switch the room light off and on again, twice. Expect the status to go
+   to `adjusting` and back to `holding` in ≤ 2 s each way, and no frame fully black or white for more than 0.5 s
+   (record the screen).
+3. **Check 5 (white balance):** exposure and white balance both on Better Cam auto, a warm desk lamp moved into the
+   scene. Expect `holding` at a lower Kelvin in ≤ 6 s with no colour swinging.
+4. **Check 10:** add Auto Adjust with exposure and white balance on, repeat steps 2 and 3, and note any visible double
+   movement (the picture moving twice for one light change). That decides open question 8.
+5. **Gain curve `S` and the noise cost:** in the lit scene, Manual exposure -5, gain 0 / 25 / 50 / 75 / 100, a few
+   seconds each, a screenshot of each; `S` = log2 of the brightness ratio between gain 100 and 0 in linear light (or let
+   Better Cam auto run: after about 20 gain moves `learned.gain_stops` is in `localStorage["better-cam"]`). Compare a
+   screenshot at 30 fps Better Cam auto with one in Camera auto (≈ 15 fps) for grain.
+6. **Check 6 flash:** with the lit scene, Stop → Start and look for a flash longer than 1 s.
+
+### 9.7 What the run changed, and how it was put back
+
+Exposure and white balance were left in Camera auto (as found: exposure Auto on, white balance Auto on at 4600 K, focus
+Auto on), gain back to Manual 0, every other control untouched (read back after each segment: all 12 controls
+matched the "before" list by value, Auto flag and mode; focus is the camera's own autofocus and moves by itself).
+`localStorage["better-cam"]` was written back to the saved 787-byte string and read back identical in a fresh launch.
+The presets folder was empty and stayed empty. FPS was set to 60 for two runs and back to 30.
+
+### 9.8 Auto Adjust's contrast on hard-edged pictures: known limit, not fixed
+
+Auto Adjust's contrast lands short of its target on hard-edged pictures (0.478 for a target of 0.50, measured live
+earlier). The cause is in the design, not a constant: the filter predicts the spread from the **16 × 16 cell means**,
+and detail inside a cell (hard edges, texture) makes the curve act weaker on the real pixels (about two thirds of the
+predicted effect on flat areas with hard edges, as `fx/auto_adjust.rs` documents) while the loop deliberately does not
+look at its own output. A fix is not small and clear: scaling the aim by a constant would overshoot soft pictures,
+and measuring the filter's output is a second statistics pass and a closed loop (the design says no). The 0.022
+residual is inside what the slider's step shows; left as a known limit. No change to `fx/auto_adjust.rs`.

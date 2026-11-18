@@ -675,6 +675,7 @@ Budget per 1080p60 frame (16.7 ms): decode ≤ 3 ms (HW), convert + 4 filters + 
 | Camera in use by another app | Open or first read fails (`MF_E_VIDEO_RECORDING_DEVICE_LOCKED`/`E_ACCESSDENIED`-class errors, exact codes **(unverified)**) | State Reconnecting, banner "Camera is in use by another app. Close it or pick another camera.", retry every 3 s; DLL shows "Starting camera…" slate |
 | Camera access blocked by Windows privacy settings | `E_ACCESSDENIED` on open with privacy off | Banner with button opening `ms-settings:privacy-webcam`; no retry loop |
 | Device unplugged | `OnReadSample` error / `MF_SOURCE_READERF_ERROR`, hot-plug removal notification | Close reader, Reconnecting, wait for arrival of the same device key (or VID/PID + name), reopen, reapply controls |
+| Camera stays attached but goes silent | No frame for 1 s (more for a slow camera: 2.5 × its longest recent gap) | "Starting camera…" slate (also over a pause), session ends after 5 s (twice the slate time if longer) and reconnects; failed reopens count toward the 30 s `error_cap` like any generic error, then a fatal stop with a plain message (kept on purpose: an endless silent Reconnecting is worse than the message) |
 | Format not supported | Chosen type missing after reconnect, or `SetCurrentMediaType` fails | Fall back to device default (`res_type = preferred`), toast "1920×1080 MJPEG isn't available; using device default", keep the user's setting stored |
 | Decoder failure (H264/HEVC) | Reader error after type set | Retry once with `hw_decode` off, then fall back to the next raw format; toast |
 | Frame Server restarts | Consumers lose the stream; app's own reader errors (it also goes through Frame Server) | App reopens the camera through the Reconnecting path; DLL re-maps `frames.bin` on the next activation; nothing to re-register |
@@ -779,10 +780,13 @@ Default chain for a fresh install: empty. (Better Mic ships its "Fifine" chain; 
 | Command | Args | Returns | Notes |
 |---|---|---|---|
 | `list_cameras` | — | `CameraInfo[]` `{id, name, formats: {format, width, height, intervals: number[]}[]}` | Excludes Better Cam |
-| `get_camera_controls` | `id` | `ControlInfo[]` `{key, min, max, step, def, value, auto, can_auto, can_manual}` | Opens the device briefly if not Live |
-| `set_camera_control` | `id, key, value, auto` | `ControlInfo` (read back) | Applied immediately |
-| `reset_camera_controls` | `id` | `ControlInfo[]` | Device defaults, auto where supported by default |
-| `start_engine` | `source, output, controls, chain` | — | Enters Standby or Live |
+| `get_camera_controls` | `id` | `ControlInfo[]` `{key, min, max, step, def, value, auto, can_auto, can_manual, mode: "manual"\|"camera"\|"app", app: "full"\|"stops"\|null, app_why?, driven_by?: "exposure"}` | Opens the device briefly if not Live. `app` says whether and how Better Cam auto is offered, `app_why` why not, `driven_by` marks the gain the exposure loop sets |
+| `set_camera_control` | `id, key, value, auto` | `ControlInfo` (read back) | Applied immediately (manual value or the camera's Auto flag) |
+| `set_control_mode` | `id, key, mode` | `ControlInfo[]` (the rows that changed: exposure with gain) | Who drives a control: `manual`, `camera` (Auto flag) or `app` (Better Cam auto, exposure and white balance only). Works on a closed camera too: the mode and its resume value are stored, the loop starts at the next open |
+| `set_auto_config` | `id, cfg` | — | Better Cam auto settings per camera: `{exposure: {target, longest, max_gain, speed}, white_balance: {warmth, speed}}`. Live: the next decision uses them |
+| `resume_auto` | `id, key` | — | After a `conflict`; also clears `blocked` ("Try again") |
+| `reset_camera_controls` | `id` | `ControlInfo[]` | Device defaults, auto where supported by default; every Better Cam auto mode ends |
+| `start_engine` | `source, output, controls, chain` | — | Enters Standby or Live. The `controls` record carries each control's mode (`app` with its resume value), the Better Cam auto settings and what the controller learned |
 | `stop_engine` | — | — | Stopped; DLL shows paused slate |
 | `set_source` | `source` | — | Reopens the device only when a capture field changed |
 | `set_output` | `output` | — | Live; advertised types update for the next consumer activation |
@@ -809,7 +813,8 @@ Default chain for a fresh install: empty. (Better Mic ships its "Fifine" chain; 
 | `filter-error` | `{id, message}` (card shows it; not fatal) |
 | `stats` (4 Hz) | `{capture: {width, height, format, fps, decode: "hw"\|"sw"\|"none"}, output: {width, height, fps}, gpu_ms, dropped, repeated, latency_p95_ms, consumers}` |
 | `devices-changed` | — (store calls `list_cameras`) |
-| `controls-changed` | `ControlInfo[]` (1 Hz while any Auto is on, so sliders follow the device) |
+| `controls-changed` | `ControlInfo[]` (1 Hz while any Auto is on, so sliders follow the device; at most 4 Hz while Better Cam auto writes; also once after the stored controls were applied at open) |
+| `auto-status` | `{id, exposure?: {state, exposure, gain, cap, cap_reason, max_gain, fps, target_fps, message, handed_back?}, white_balance?: {state, kelvin, message, handed_back?}, learned?, resume?}` (on every state change, at most 2 Hz while adjusting; `learned` and `resume` only when they changed, the store persists them) |
 | `nvidia-install` | Copied unchanged |
 
 ---
@@ -874,8 +879,21 @@ reports the auto flag as supported.
 | `focus` | Focus | CameraControl 6 | Auto common |
 | `low_light_compensation` | Low light compensation | KS CameraControl 19 (auto exposure priority) **(unverified id/mapping)** | Switch |
 
-Each row: label, value, slider (device min/max/step), Auto switch, double-click resets to the device default.
-"Reset all" button in the card head. When Auto is on, the slider is disabled and follows `controls-changed`.
+Each row: label, value, slider (device min/max/step), double-click resets to the device default. "Reset all" button in
+the card head (every control back to the camera's defaults: every Better Cam auto mode ends; the Better Cam auto
+settings and what was learned stay). When the camera, or Better Cam, sets the value, the slider is disabled and
+follows `controls-changed`.
+
+**Modes (owner decision 2026-11-18, 9.3 item 1; design in `docs/AUTO-CONTROLS.md`).** A control has up to three modes:
+**Manual** (the user's value, the camera's Auto flag off), **Camera auto** (the camera's own Auto flag) and **Better
+Cam auto** (Better Cam's controller writes the value; only `exposure` and `white_balance`, and `gain` follows
+exposure). A control whose only choice is Manual or Camera auto (focus) keeps the Auto switch; exposure and white
+balance show the three-way `Select` instead. Better Cam auto is listed disabled, with the reason as tooltip, when the
+camera cannot do it safely (no manual exposure or white balance, units it does not know, writes it ignored). Under the
+row it shows its settings (exposure: target brightness, longest exposure, most gain, response; white balance: warmth,
+response) and one status line; exposure never gets longer than one frame time unless the user allows it, gain makes
+up the rest up to Most gain. Brightness, contrast, hue, saturation, sharpness, gamma and the other controls are never
+driven by software.
 
 ### 6.3 Output (Better Cam)
 
@@ -1460,7 +1478,11 @@ Video Effects 0.7.6 is the current release for RTX 20–50 on NVIDIA's resources
 ### 9.3 Owner decisions (2026-11-17)
 
 1. **Auto mode:** v1 ships the camera's own Auto switches. The software "Auto adjust" filter (P16) is built right
-   after v1 core. Software never drives the device controls.
+   after v1 core. ~~Software never drives the device controls.~~ **Reversed by the owner on 2026-11-18** (see
+   `docs/AUTO-CONTROLS.md`): Better Cam may write a camera's exposure, gain and white balance, but only for a control
+   the user switched to **Better Cam auto** (a third mode next to Manual and Camera auto). Nothing else is ever
+   written by software, and nothing changes for a user who never picks that mode. Auto Adjust stays a filter on the
+   picture; it never touches the device.
 2. **Licence:** Better Cam is GPL-2.0-or-later. OBS shaders and filter logic are ported directly (4.7).
 3. **Install scope:** for all users (AllUsers).
 4. **Presets:** store the filter chain only, not device controls.

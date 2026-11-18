@@ -63,7 +63,7 @@ const LEARN_RHO: (f64, f64) = (0.25, 4.0);
 const LEARN_CLAMP: (f64, f64) = (0.7, 1.4);
 const LEARN_EXPONENT: f64 = 0.3;
 /// The frame-rate guard (2.5.8).
-const GUARD_LOW: f64 = 0.9;
+const GUARD_LOW: f64 = 0.95;
 const GUARD_RECOVERED: f64 = 0.95;
 const GUARD_QUIET: f64 = 1.0;
 const GUARD_LOW_FOR: f64 = 3.0;

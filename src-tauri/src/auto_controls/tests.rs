@@ -346,6 +346,34 @@ fn case_08_rate_drop_learns_a_cap() {
     assert!(settled_at(&sim, 8.0, 14.0, 0.33).is_some());
 }
 
+/// Live on W4GS at 60 fps (A6): 1/64 s gives 55 fps, 92 % of the request, so the guard must trigger above 90 %.
+#[test]
+fn case_08b_rate_a_little_low_still_learns_a_cap() {
+    let cfg = SimCfg {
+        fps: 60.0,
+        rate_drop: true,
+        rate_drop_fill: 0.86,
+        start_e: -6,
+        start_g: 33,
+        ..SimCfg::default()
+    };
+    let mut sim = Sim::new(cfg, dim(-5.0));
+    let mut ctrl = engage(&sim, resume(-6, 33), true);
+    let mut learned_at = None;
+    while sim.t < 14.0 {
+        sim.run(&mut ctrl, sim.t + 0.1);
+        if learned_at.is_none() && ctrl.learned().rate_caps.contains_key("60") {
+            learned_at = Some(sim.t);
+        }
+    }
+    let fps_before = sim.fps_between(0.5, 3.0);
+    assert!((0.9 * 60.0..0.95 * 60.0).contains(&fps_before), "{fps_before} fps before the cap");
+    let at = learned_at.expect("no cap learned at 55 fps");
+    assert!(at <= 5.0, "cap learned at {at}");
+    assert_eq!(ctrl.learned().rate_caps.get("60"), Some(&-7));
+    assert!(sim.fps_between(8.0, 14.0) >= 59.0);
+}
+
 #[test]
 fn case_09_rate_low_for_another_reason() {
     let cfg = SimCfg {

@@ -23,7 +23,11 @@
 //! source: drop it before or together with the [`CaptureReader`] it came from. After `CaptureReader::close` every
 //! call fails with a device error.
 //!
-//! "Auto" is always the device's own Auto flag. Software never computes control values.
+//! This module only reads and writes what it is told: its "Auto" is the device's own Auto flag. Who decides the values
+//! is the layer above (`camera_controls`): the user, the camera's Auto, or **Better Cam auto**, the one case where
+//! software computes values (owner decision 2026-11-18, plan 9.3 item 1, `docs/AUTO-CONTROLS.md`). Better Cam may write
+//! exposure, gain and white balance, and only for a control the user switched to Better Cam auto; every other control
+//! is written only on the user's own change.
 
 use std::fmt;
 use std::sync::atomic::{AtomicU8, Ordering};
