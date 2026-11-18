@@ -71,6 +71,10 @@ pub const NVIDIA_VENDOR_ID: u32 = 0x10DE;
 pub const LOADING: &str = "Loading model…";
 /// How often a filter that waits for the runtime to be installed looks again.
 const RETRY_EVERY: Duration = Duration::from_secs(3);
+/// A filter that is not asked to render for this long was switched off (the chain does not call a bypassed filter) or the
+/// engine stood still. When it comes back, a failure it was showing is tried again: switching a failed filter off and on
+/// is how the user asks for another go. Frames come every 33 ms or so, so a gap this long is no hiccup of the camera.
+const RETRY_AFTER_GAP: Duration = Duration::from_millis(250);
 
 /// The settings of one filter.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -149,6 +153,12 @@ static RESIDENT: OnceLock<Arc<Runtime>> = OnceLock::new();
 
 fn build(job: &BuildJob) -> Built {
     let fail = |message: String, retry: bool| Built { gen: job.gen, result: Err(message), retry };
+    // Debug builds only: while the file `BETTER_CAM_TEST_NV_FAIL` names exists every build fails, to look at a failed
+    // card and at the retry without breaking NVIDIA's runtime.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("BETTER_CAM_TEST_NV_FAIL").is_some_and(|p| std::path::Path::new(&p).exists()) {
+        return fail("Test failure: the model could not be loaded (BETTER_CAM_TEST_NV_FAIL).".into(), false);
+    }
     // Precedence of the messages: no RTX GPU, runtime missing or too old (both `Runtime::open`), the wrong adapter, the
     // picture size, then NVIDIA's own errors.
     let rt = match Runtime::open() {
@@ -266,6 +276,8 @@ pub struct NvFilter {
     notes: Vec<Note>,
     constants: Option<ConstantBuffer>,
     stats: Stats,
+    /// When `render` was last called ([`RETRY_AFTER_GAP`]).
+    last_render: Option<Instant>,
 }
 
 pub fn make_removal() -> Box<dyn GpuFilter> {
@@ -294,6 +306,7 @@ impl NvFilter {
             notes: Vec::new(),
             constants: None,
             stats: Stats::default(),
+            last_render: None,
         }
     }
 
@@ -527,6 +540,12 @@ impl GpuFilter for NvFilter {
 
     fn render(&mut self, r: &Renderer, input: &RgbaTexture, output: &RgbaTexture) -> GpuResult<()> {
         self.stats.frames += 1;
+        let now = Instant::now();
+        if self.last_render.is_some_and(|t| now.duration_since(t) > RETRY_AFTER_GAP) {
+            // Switched off and on again: forget the failure, so `ensure` builds once more.
+            self.failed = None;
+        }
+        self.last_render = Some(now);
         self.collect();
         if self.skipped() {
             self.sync_notes();

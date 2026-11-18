@@ -286,6 +286,79 @@ fn nvidia_removal_runs_100_frames_and_cuts_out_the_person() {
     assert!(rig.f.failure().is_none());
 }
 
+/// The colour question of P13c: one identical picture through the chain and the output stage, with Background Removal
+/// bypassed and enabled. Where the removal leaves a pixel fully opaque, the two results must be identical in every
+/// channel (the filter changes alpha only); a translucent pixel is only counted.
+#[test]
+fn nvidia_removal_leaves_the_colour_of_opaque_pixels_alone() {
+    use crate::gpu::output::{FitMode, OutputParams, OutputStage};
+    let _g = exclusive();
+    let name = "nvidia_removal_leaves_the_colour_of_opaque_pixels_alone";
+    let Some((r, _rt)) = hardware(name) else { return };
+    let Some(pic) = Picture::load(name) else { return };
+    let (w, h) = (pic.w, pic.h);
+    let stage = OutputStage::new(r.clone()).expect("output stage");
+    let params = OutputParams { width: w, height: h, fit: FitMode::Fit, background: [0.0, 1.0, 0.0] };
+
+    // Bypassed: what the unfiltered picture looks like after the output stage.
+    let mut chain = Chain::new();
+    chain.apply(&r, &[FilterCfg { enabled: false, ..cfg("a", "nv_greenscreen_filter", json!({})) }]);
+    let chain_off = read_rgba(&r, &chain.run(&r, pic.upload(&r)).expect("run"));
+    let out_off = read_rgba(&r, &stage.run(&chain.run(&r, pic.upload(&r)).expect("run"), &params).expect("output"));
+    assert_eq!(chain_off, pic.rgba, "a bypassed filter hands the picture on untouched");
+
+    // Enabled: frames until the model is loaded and the background is cut out, then a few more.
+    chain.apply(&r, &[cfg("a", "nv_greenscreen_filter", json!({}))]);
+    let started = Instant::now();
+    let mut cut_out = None;
+    while started.elapsed() < Duration::from_secs(120) {
+        let out = chain.run(&r, pic.upload(&r)).expect("run");
+        let buf = read_rgba(&r, &out);
+        if px(&buf, w, h, BACKGROUND[0])[3] < 13 {
+            cut_out = Some(out);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    let mut chain_on = cut_out.expect("the model never produced a cut-out");
+    for _ in 0..5 {
+        chain_on = chain.run(&r, pic.upload(&r)).expect("run");
+    }
+    let chain_buf = read_rgba(&r, &chain_on);
+    let out_on = read_rgba(&r, &stage.run(&chain_on, &params).expect("output"));
+
+    let (mut opaque, mut translucent, mut clear) = (0u32, 0u32, 0u32);
+    // Per channel: sum and max of |filtered - unfiltered| over the opaque pixels, in the chain and after the output stage.
+    let (mut chain_sum, mut chain_max, mut out_sum, mut out_max) = ([0u64; 3], [0u8; 3], [0u64; 3], [0u8; 3]);
+    for i in (0..(w * h) as usize).map(|p| p * 4) {
+        match chain_buf[i + 3] {
+            255 => {
+                opaque += 1;
+                for c in 0..3 {
+                    let d = chain_buf[i + c].abs_diff(pic.rgba[i + c]);
+                    chain_sum[c] += d as u64;
+                    chain_max[c] = chain_max[c].max(d);
+                    let d = out_on[i + c].abs_diff(out_off[i + c]);
+                    out_sum[c] += d as u64;
+                    out_max[c] = out_max[c].max(d);
+                }
+            }
+            0 => clear += 1,
+            _ => translucent += 1,
+        }
+    }
+    assert!(opaque > 20_000 && clear > 20_000, "the picture needs a person and a background: {opaque} opaque, {clear} clear");
+    let mean = |s: [u64; 3]| s.map(|v| v as f64 / opaque as f64);
+    eprintln!(
+        "{opaque} opaque, {translucent} translucent, {clear} clear pixels of {}; mean |filtered - unfiltered| of the opaque pixels (R, G, B): in the chain {:.4?} (max {chain_max:?}), after the output stage {:.4?} (max {out_max:?})",
+        w * h,
+        mean(chain_sum),
+        mean(out_sum)
+    );
+    assert_eq!(chain_max, [0; 3], "the chain changed the colour of an opaque pixel");
+    assert_eq!(out_max, [0; 3], "the output stage changed the colour of an opaque pixel");
+}
+
 #[test]
 fn nvidia_every_mode_loads_and_works() {
     let _g = exclusive();
@@ -895,4 +968,54 @@ fn nvidia_a_render_adapter_that_is_not_nvidia_passes_through_and_says_why() {
     // On this PC the runtime is installed, so the adapter is what is wrong; without it the runtime or GPU message comes first.
     assert!(message.contains("rendered on the NVIDIA GPU") || message.contains("NVIDIA") || message.contains("RTX"), "{message}");
     assert!(f.failure().is_some());
+}
+
+/// A failure stays on the card and is not retried while frames keep coming; a filter that was not asked to render for a
+/// while (switched off, then on again) tries once more, with the "Loading model…" line and a cleared error.
+#[test]
+fn nvidia_a_failed_filter_tries_again_when_it_comes_back_from_being_off() {
+    let _g = exclusive();
+    let r = warp();
+    let mut f = NvFilter::new(Kind::Removal);
+    f.update(&r, &Params::new());
+    let input = r.texture(640, 360).unwrap();
+    fill_rgba(&r, &input, |x, y| [(x % 251) as u8, (y % 241) as u8, 77, 255]);
+    let frame = |f: &mut NvFilter| {
+        let out = r.texture(640, 360).unwrap();
+        f.render(&r, &input, &out).unwrap();
+    };
+    let loading = |notes: &[Note]| notes.iter().filter(|n| **n == Note::Status("Loading model…".into())).count();
+    let mut notes: Vec<Note> = Vec::new();
+    let started = Instant::now();
+    while f.failure().is_none() {
+        assert!(started.elapsed() < Duration::from_secs(20), "no failure: {notes:?}");
+        frame(&mut f);
+        std::thread::sleep(Duration::from_millis(10));
+        f.take_notes(&mut notes);
+    }
+    assert_eq!(loading(&notes), 1, "{notes:?}");
+
+    // Frames at the normal pace: nothing happens again.
+    notes.clear();
+    for _ in 0..30 {
+        frame(&mut f);
+        std::thread::sleep(Duration::from_millis(10));
+        f.take_notes(&mut notes);
+    }
+    assert!(notes.is_empty() && f.failure().is_some(), "a failure is not retried while the filter renders: {notes:?}");
+
+    // Off for a moment, then on: the card clears the error, says it is loading, and builds again (and fails again here).
+    std::thread::sleep(Duration::from_millis(400));
+    frame(&mut f);
+    f.take_notes(&mut notes);
+    assert_eq!(notes.first(), Some(&Note::Status("Loading model…".into())), "{notes:?}");
+    assert!(notes.contains(&Note::Error(String::new())), "the old error is cleared: {notes:?}");
+    let started = Instant::now();
+    while f.failure().is_none() {
+        assert!(started.elapsed() < Duration::from_secs(20), "no second failure: {notes:?}");
+        frame(&mut f);
+        std::thread::sleep(Duration::from_millis(10));
+        f.take_notes(&mut notes);
+    }
+    assert!(notes.iter().any(|n| matches!(n, Note::Error(m) if !m.is_empty())), "{notes:?}");
 }
