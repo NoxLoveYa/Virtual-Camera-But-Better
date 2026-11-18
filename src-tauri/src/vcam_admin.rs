@@ -385,7 +385,7 @@ pub fn run_action(launcher: &dyn Launcher, exe: &str, action: Action, user_sid: 
     // folder that is still encrypted after a failed install is one that Repair could not put right, so the note never
     // says "run Repair" (see `encryption_after_failed_install`)
     let result = outcome_to_result_or(action, &outcome, &tail, &|| {
-        vcam_install::datadir::encryption_after_failed_install(&vcam_install::util::Paths::system())
+        vcam_install::datadir::encryption_after_failed_install(&vcam_install::util::Paths::system(), started)
     });
     // a helper that failed leaves its reason in install.log; when a program of the user holds a lock on that file
     // neither the helper could write it nor can this read it: say that instead of showing no reason

@@ -1381,12 +1381,21 @@ with share mode 0.
 | the note after a failed install said "after this run, so something on this PC encrypts new folders" with a plain `%ProgramData%`, which can be false (the install failed for another reason with the folder encrypted before) | the refusal sentence only when `%ProgramData%` is encrypted; else the fact: "The folder X is encrypted (Windows EFS); this run did not replace it." | `a_failed_install_says_the_refusal_when_the_data_folder_is_encrypted_and_never_run_repair` |
 | "os error 32" dropped from the sharing-violation sentence | "Another program has X open without sharing it (os error 32). Close it or restart Windows, then run Repair again." | `a_data_folder_another_program_holds_without_sharing_is_said_so` |
 | an encrypted `logs` emptied in place gets an `install.log` encrypted for the account that approved the run (the app, as another account, cannot read it later) | the log line says so: "...install.log is encrypted for the account that approved this run, so the app may not be able to show later errors..." | `a_logs_folder_that_stays_encrypted_says_so_and_what_to_do` |
-| `%ProgramData%` attributes read twice in `prepare` | read once, reused for the refusal | (no behaviour change) |
+| `%ProgramData%` attributes read twice in `prepare` | read once, reused for the refusal | no behaviour change unless `%ProgramData%` changes during the run (then only the wording of the refusal can differ; it is not re-read) |
 | two banners at once (install/update and the problem), both with a button that repairs | the problem banner drops its Repair button while the install/update banner shows | looked at in a screenshot |
 | the Keep path for a really encrypted data folder was covered only by the gated EFS test | `inspect` takes the attributes through a hook (`Reading.seen`, like `parent` and `folder`), so a default-run test reaches `decide_below` through `prepare` | `prepare_keeps_an_encrypted_data_folder_in_an_encrypted_program_data_and_refuses_it` |
 | the Install/Update button (banner) and Settings → Repair/Update opened a prompt that was refused again while `%ProgramData%` is encrypted | both are disabled when `repairable` is false, with the reason next to the banner button and in the title of the Settings button | screenshots with `BETTER_CAM_TEST_VCAM_REPAIRABLE=0` |
 | the problem banner said "Run Repair" with no Repair button while the install/update banner shows | the window rewrites "Run Repair" to "Use “Install/Update virtual camera” above" then (Rust sentences unchanged) | screenshots with `BETTER_CAM_TEST_VCAM_STATE=outdated` |
 | after an administrator's `cipher /d` the Repair button stayed hidden until the window got focus | while a problem is shown, `vcam_status` is read again every 10 s (not while the window is hidden; stopped when the problem clears) | status reads counted over 25 s: 3 with a problem, 0 without |
+
+## What the final review changed
+
+| Finding | Fix | Tests |
+|---|---|---|
+| the note after a failed install always said "...this run did not replace it.", false when the helper replaced the folder and something on the PC encrypted the new one (the refusal fires before `logs` exists, so no ERROR line) | `encryption_after_failed_install(paths, started)`: a data folder created at or after the start of the run (`symlink_metadata().created()`) gets `encryption_refusal`'s sentence; an older one keeps the current sentence | `a_data_folder_made_in_this_run_and_encrypted_says_the_refusal_not_that_it_was_not_replaced`, `a_folder_is_made_since_when_it_was_created_at_or_after_the_start`, `a_failed_install_says_the_refusal_when_the_data_folder_is_encrypted_and_never_run_repair` |
+| the status poll ran for any problem, could overlap a focus read, and an old answer could replace a newer one | poll only while `problem` is set and `repairable` is `false` (`wantsVcamPoll`); a tick is skipped while a read is pending; reads carry a sequence number and an older answer is dropped (`createReadGate`, `src/ui/vcamPoll.ts`) | `src/ui/vcamPoll.test.ts` (`npm run test:ui`) |
+| an encrypted `logs` folder was not in the status | `encryption_problem` says so (repairable: Repair replaces the folder), after the data folder's sentence and before the frame file's | `the_status_sentence_is_for_the_folder_around_it_or_for_repair` |
+| the empty-preview Install button ignored `repairable` | disabled with the banner's reason as its title when `repairable` is `false` | not run in the app (read from the code) |
 
 ## A standard user may be able to encrypt `%ProgramData%` itself (not verified)
 
@@ -1396,7 +1405,8 @@ follows from it:
 
 * A user who encrypts `%ProgramData%` makes every new folder in it encrypted, so a fresh install, or a Repair that has to
   replace the data folder, is refused (the sentence names `cipher /d` for an administrator; the window shows it without a
-  Repair button). That is a denial of service on installing and replacing, and it existed before this work.
+  Repair button; on a fresh install the window shows that sentence only after the first refused install, because the
+  data folder does not exist before it). That is a denial of service on installing and replacing, and it existed before this work.
 * There is no gain in privilege. The Keep path (an encrypted data folder in an encrypted `%ProgramData%` is kept, not
   replaced) needs the data folder itself to be encrypted, and the data folder is locked: the user gets only
   `READ_TRAVERSE` on it. An encrypted data folder that is kept is refused, never used.

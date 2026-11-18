@@ -1,7 +1,7 @@
 import { useStore } from "../store";
 
 /** Why the install/update/repair button is off while `%ProgramData%` itself is encrypted (the problem's sentence says what to do). */
-const BLOCKED_REASON = "An administrator must turn off encryption first (see below).";
+export const BLOCKED_REASON = "An administrator must turn off encryption first (see below).";
 
 /**
  * Shown while the virtual camera is not installed or is older than the one this app ships (plan 7.2), and, apart,

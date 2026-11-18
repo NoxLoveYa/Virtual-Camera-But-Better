@@ -5,6 +5,7 @@ import { normalizeChain, presetChain, refreshExtParams, signature } from "./filt
 import { presetNameFor, stemOf } from "./ui/fileDrop";
 import { DEFAULT_UI, normalizeUi, type UiState } from "./ui/layout";
 import { createSaver } from "./ui/saver";
+import { createReadGate, wantsVcamPoll } from "./ui/vcamPoll";
 import {
   DEFAULT_OUTPUT,
   DEFAULT_SOURCE,
@@ -56,6 +57,8 @@ const SAVE_GAP_MS = 300;
 const VCAM_PROBLEM_POLL_MS = 10_000;
 /** The timer of that poll (one for the page, whatever number of times `init` runs). */
 let vcamTimer: number | undefined;
+/** The status reads that are pending or done, for the poll and the focus read (one for the page). */
+const vcamReads = createReadGate();
 
 /** `npm run tauri dev` (the Vite dev server); false in a release build. The project has no `vite/client` types. */
 const IS_DEV_BUILD = (import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV === true;
@@ -681,14 +684,17 @@ export const useStore = create<State>((set, get) => {
 
     refreshVcam: async () => {
       if (get().vcamBusy) return;
+      // A focus read and a tick can overlap: an answer older than one already shown is dropped (see `createReadGate`).
+      const read = vcamReads.begin();
+      let vcam: VcamStatus | null = null;
       try {
-        const vcam = await api.vcamStatus();
-        if (get().vcamBusy) return;
-        const changed = get().vcam?.state !== vcam.state;
-        set((s) => ({ vcam, ...(changed && { vcamEpoch: s.vcamEpoch + 1 }) }));
+        vcam = await api.vcamStatus();
       } catch {
         /* the banner keeps what it showed; the next focus asks again */
       }
+      if (!vcamReads.end(read, vcam !== null) || vcam === null || get().vcamBusy) return;
+      const changed = get().vcam?.state !== vcam.state;
+      set((s) => ({ vcam, ...(changed && { vcamEpoch: s.vcamEpoch + 1 }) }));
     },
 
     runVcam: async (action) => {
@@ -823,13 +829,16 @@ export const useStore = create<State>((set, get) => {
       // (a repair by hand, or `vcam-tool`, shows up without a restart).
       const vcamRead = get().refreshVcam();
       window.addEventListener("focus", () => void get().refreshVcam());
-      // While a problem is shown (its Repair button is hidden until an administrator has run `cipher /d`), the status is
-      // read again every 10 s, so the button comes back without a click on the window. The timer exists only while a
-      // problem is shown, and a tick does nothing while the window is hidden (the focus read covers the way back).
+      // While a problem is shown whose Repair button is hidden (an administrator has to run `cipher /d`), the status is
+      // read again every 10 s, so the button comes back without a click on the window. The timer exists only then, and
+      // a tick does nothing while the window is hidden (the focus read covers the way back) or a read is pending.
       const watchVcamProblem = () => {
-        const want = !!get().vcam?.problem;
+        const want = wantsVcamPoll(get().vcam);
         if (want && vcamTimer === undefined) {
-          vcamTimer = window.setInterval(() => document.visibilityState === "visible" && void get().refreshVcam(), VCAM_PROBLEM_POLL_MS);
+          vcamTimer = window.setInterval(
+            () => document.visibilityState === "visible" && !vcamReads.busy() && void get().refreshVcam(),
+            VCAM_PROBLEM_POLL_MS,
+          );
         } else if (!want && vcamTimer !== undefined) {
           window.clearInterval(vcamTimer);
           vcamTimer = undefined;

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { CAPTURE_KEYS, effectiveSource, problemText } from "../camera/schema";
 import { useStore } from "../store";
+import { BLOCKED_REASON } from "./VcamBanner";
 
 /** The preview frame of `src-tauri/src/preview.rs`: 16 header bytes (four little-endian u32), then RGBA pixels. */
 const HEADER_BYTES = 16;
@@ -106,7 +107,7 @@ interface Placeholder {
   text: string;
   title?: string;
   spinner?: boolean;
-  action?: { label: string; onClick: () => void; primary?: boolean; disabled?: boolean };
+  action?: { label: string; onClick: () => void; primary?: boolean; disabled?: boolean; title?: string };
 }
 
 /** The live picture: frames from the engine over a Tauri Channel, drawn on a canvas. */
@@ -121,6 +122,8 @@ export function Preview() {
   const deviceId = useStore((s) => s.source.video_device_id);
   const vcamMissing = useStore((s) => s.vcam?.state === "missing");
   const vcamBusy = useStore((s) => s.vcamBusy);
+  // an install does what Repair does, so it is refused the same way while `%ProgramData%` is encrypted (as in `VcamBanner`)
+  const vcamBlocked = useStore((s) => s.vcam?.repairable === false);
   const noCamera = useStore((s) => s.cameras !== null && s.cameras.length === 0);
   const { setPreviewOn, toggleRun, runVcam, refreshCameras } = useStore.getState();
   const visible = usePageVisible();
@@ -294,7 +297,12 @@ export function Preview() {
     if (vcamMissing) {
       ph = {
         text: "Install the virtual camera to start",
-        action: { label: "Install", onClick: () => void runVcam("install"), disabled: vcamBusy !== null },
+        action: {
+          label: "Install",
+          onClick: () => void runVcam("install"),
+          disabled: vcamBusy !== null || vcamBlocked,
+          title: vcamBlocked ? BLOCKED_REASON : undefined,
+        },
       };
     } else if (noCamera) ph = { text: "No camera found", action: { label: "Refresh", onClick: refresh } };
     else ph = { text: "Camera stopped", action: { label: "Start", onClick: () => void toggleRun(), primary: true } };
@@ -330,7 +338,7 @@ export function Preview() {
                 {ph.text}
               </span>
               {ph.action && (
-                <button type="button" className={ph.action.primary ? "primary" : undefined} disabled={ph.action.disabled} onClick={ph.action.onClick}>
+                <button type="button" className={ph.action.primary ? "primary" : undefined} disabled={ph.action.disabled} title={ph.action.title} onClick={ph.action.onClick}>
                   {ph.action.label}
                 </button>
               )}

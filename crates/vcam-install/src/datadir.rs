@@ -57,7 +57,7 @@
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::OwnedHandle;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use vcam_protocol::secure::{self, DISP_CREATE_NEW, DISP_OPEN_EXISTING};
 use windows::Win32::Foundation::HANDLE;
@@ -1057,21 +1057,35 @@ fn is_encrypted(attributes: Option<u32>) -> bool {
 /// encrypted, and what to do about it). With a plain one only the fact is known: the run may have failed for another
 /// reason (a held `install.log`, a helper that crashed) with the folder encrypted before and never replaced, so no
 /// cause is claimed.
-pub fn encryption_after_failed_install(paths: &Paths) -> Option<String> {
+///
+/// `started` is when the run began. A data folder that was made at or after it is one the helper made new in this run
+/// (an encrypted one is replaced, never kept, unless `%ProgramData%` is encrypted), so it came out encrypted because
+/// something on the PC encrypts new folders, and the sentence of [`encryption_refusal`] is the cause. (That refusal
+/// fires before `logs` exists, so the log has no line for it.) A folder made earlier was not replaced.
+pub fn encryption_after_failed_install(paths: &Paths, started: SystemTime) -> Option<String> {
     encryption_after_failed_install_from(
         paths,
         attributes_of_path(&paths.data),
         attributes_of_path(&paths.program_data),
+        made_since(&paths.data, started),
     )
+}
+
+/// Whether `p` (not followed if it is a link) was created at or after `since`; `false` when that cannot be read.
+fn made_since(p: &Path, since: SystemTime) -> bool {
+    std::fs::symlink_metadata(p)
+        .and_then(|m| m.created())
+        .is_ok_and(|created| created >= since)
 }
 
 fn encryption_after_failed_install_from(
     paths: &Paths,
     data: Option<u32>,
     parent: Option<u32>,
+    made_this_run: bool,
 ) -> Option<String> {
     let data = data.filter(|a| a & ATTRIBUTE_ENCRYPTED != 0)?;
-    if is_encrypted(parent) {
+    if is_encrypted(parent) || made_this_run {
         return encryption_refusal(paths, data, parent);
     }
     Some(format!(
@@ -1094,7 +1108,7 @@ pub struct DataProblem {
 /// Whether the data folder or the frame file is encrypted right now, as the sentence that says so and what to do. For
 /// the status report: it needs no elevation and changes nothing. `None` when neither is encrypted or not there.
 ///
-/// An encrypted data folder or frame file is something Repair puts right (it replaces it with a new one that is
+/// An encrypted data folder, `logs` folder or frame file is something Repair puts right (it replaces it with a new one that is
 /// not encrypted), so the sentence says "run Repair"; except when `%ProgramData%` itself is encrypted, where Repair
 /// cannot help and the sentence is [`encryption_refusal`]'s ([`DataProblem::repairable`] is `false`). A data folder
 /// that is encrypted without its files being so (`cipher /e` without `/s` encrypts what is made in it from then on)
@@ -1105,16 +1119,18 @@ pub fn encryption_problem(paths: &Paths) -> Option<DataProblem> {
         paths,
         attributes_of_path(&paths.data),
         attributes_of_path(&paths.program_data),
+        attributes_of_path(&paths.logs()),
         attributes_of_path(&paths.frames()),
     )
 }
 
-/// [`encryption_problem`] from the attributes of the data folder, `%ProgramData%` and the frame file (`None`: not
-/// there or not readable).
+/// [`encryption_problem`] from the attributes of the data folder, `%ProgramData%`, the `logs` folder and the frame file
+/// (`None`: not there or not readable).
 fn encryption_problem_from(
     paths: &Paths,
     data: Option<u32>,
     parent: Option<u32>,
+    logs_attributes: Option<u32>,
     frames_attributes: Option<u32>,
 ) -> Option<DataProblem> {
     if let Some(a) = data.filter(|a| a & ATTRIBUTE_ENCRYPTED != 0) {
@@ -1128,6 +1144,15 @@ fn encryption_problem_from(
             text: format!(
                 "The folder {} is encrypted (Windows EFS): new files made in it are encrypted too, and the camera service cannot read an encrypted file, so the virtual camera may show nothing. Run Repair: it replaces the folder with a new one that is not encrypted.",
                 paths.data.display()
+            ),
+            repairable: true,
+        });
+    }
+    if is_encrypted(logs_attributes) {
+        return Some(DataProblem {
+            text: format!(
+                "The folder {} is encrypted (Windows EFS), so install.log and the other logs in it are encrypted for one account and the app may not be able to show later errors. Run Repair: it replaces the folder with a new one that is not encrypted.",
+                paths.logs().display()
             ),
             repairable: true,
         });
@@ -1623,7 +1648,8 @@ fn prepare_reading(
     // an encrypted `%ProgramData%`, or one that was kept for that reason. After the lock (so that the permissions an
     // older version left are gone whatever happens next), before anything is made in it: a child of an encrypted
     // folder is encrypted too, and the camera service could not read it
-    // (`%ProgramData%` is not read a second time: the helper holds the machine-wide lock and nothing above changed it)
+    // (`%ProgramData%` is not read a second time: the helper holds the machine-wide lock; there is no behaviour change
+    // unless `%ProgramData%` changes during the run, and then only the wording of the refusal can differ)
     refuse_if_encrypted(paths, (reading.folder)(&data)?, parent)?;
     // 2. the folder's children, each with a protected DACL of its own
     let logs = ensure_exists(

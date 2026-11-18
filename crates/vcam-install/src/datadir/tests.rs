@@ -3421,12 +3421,18 @@ fn the_status_sentence_is_for_the_folder_around_it_or_for_repair() {
     );
     let (plain, enc) = (Some(0x10), Some(0x10 | ATTRIBUTE_ENCRYPTED));
     // nothing encrypted, or nothing there
-    assert_eq!(encryption_problem_from(&paths, plain, plain, plain), None);
-    assert_eq!(encryption_problem_from(&paths, None, enc, None), None);
-    assert_eq!(encryption_problem_from(&paths, plain, enc, plain), None);
+    assert_eq!(
+        encryption_problem_from(&paths, plain, plain, plain, plain),
+        None
+    );
+    assert_eq!(encryption_problem_from(&paths, None, enc, None, None), None);
+    assert_eq!(
+        encryption_problem_from(&paths, plain, enc, plain, plain),
+        None
+    );
     // encrypted and the folder around it is too: Repair cannot help, the administrator's step is the sentence, and
     // the window shows no Repair button for it
-    let around = encryption_problem_from(&paths, enc, enc, plain).unwrap();
+    let around = encryption_problem_from(&paths, enc, enc, plain, plain).unwrap();
     assert_eq!(
         Some(around.text.clone()),
         encryption_refusal(&paths, ATTRIBUTE_ENCRYPTED, enc)
@@ -3438,7 +3444,7 @@ fn the_status_sentence_is_for_the_folder_around_it_or_for_repair() {
     );
     // encrypted alone: Repair puts it right, and the sentence says that only what is made in it is affected
     for around_it in [plain, None] {
-        let alone = encryption_problem_from(&paths, enc, around_it, plain).unwrap();
+        let alone = encryption_problem_from(&paths, enc, around_it, plain, plain).unwrap();
         assert!(
             alone.text.starts_with(&format!("The folder {data} is encrypted (Windows EFS): new files made in it are encrypted too"))
                 && alone.text.contains("Run Repair")
@@ -3448,7 +3454,7 @@ fn the_status_sentence_is_for_the_folder_around_it_or_for_repair() {
         );
     }
     // a frame file that is encrypted in a folder that is not
-    let frames = encryption_problem_from(&paths, plain, plain, enc).unwrap();
+    let frames = encryption_problem_from(&paths, plain, plain, plain, enc).unwrap();
     assert!(
         frames.text.contains("frames.bin")
             && frames.text.contains("Run Repair")
@@ -3456,10 +3462,33 @@ fn the_status_sentence_is_for_the_folder_around_it_or_for_repair() {
         "{frames:?}"
     );
     // the folder's own sentence comes first
-    assert!(encryption_problem_from(&paths, enc, plain, enc)
+    assert!(encryption_problem_from(&paths, enc, plain, enc, enc)
         .unwrap()
         .text
         .contains("The folder"));
+    // an encrypted `logs` folder: Repair replaces it, and the sentence says why the log may be missing
+    let logs = paths.logs().display().to_string();
+    for frames_attributes in [plain, enc] {
+        let said = encryption_problem_from(&paths, plain, plain, enc, frames_attributes).unwrap();
+        assert!(
+            said.text
+                .starts_with(&format!("The folder {logs} is encrypted (Windows EFS)"))
+                && said.text.contains("Run Repair")
+                && said.repairable,
+            "{said:?}"
+        );
+    }
+    // the data folder's sentence comes before the one for `logs`
+    assert!(encryption_problem_from(&paths, enc, plain, enc, plain)
+        .unwrap()
+        .text
+        .starts_with(&format!("The folder {data} is encrypted")));
+    // `logs` is inside the data folder, so an encrypted `%ProgramData%` does not stop Repair from replacing it
+    assert!(
+        encryption_problem_from(&paths, plain, enc, enc, plain)
+            .unwrap()
+            .repairable
+    );
 }
 
 /// What the app says after an install that failed with nothing in its log: only a data folder that is encrypted, and
@@ -3471,13 +3500,18 @@ fn a_failed_install_says_the_refusal_when_the_data_folder_is_encrypted_and_never
     // not encrypted, not there: nothing to say, whatever the folder around it is
     for (data, parent) in [(plain, plain), (plain, enc), (None, enc), (None, None)] {
         assert_eq!(
-            encryption_after_failed_install_from(&paths, data, parent),
+            encryption_after_failed_install_from(&paths, data, parent, false),
+            None,
+            "{data:?} {parent:?}"
+        );
+        assert_eq!(
+            encryption_after_failed_install_from(&paths, data, parent, true),
             None,
             "{data:?} {parent:?}"
         );
     }
     // encrypted in an encrypted `%ProgramData%`: the refusal (that is why, and what an administrator does)
-    let said = encryption_after_failed_install_from(&paths, enc, enc).unwrap();
+    let said = encryption_after_failed_install_from(&paths, enc, enc, false).unwrap();
     assert_eq!(
         Some(said.clone()),
         encryption_refusal(&paths, ATTRIBUTE_ENCRYPTED, enc)
@@ -3489,7 +3523,7 @@ fn a_failed_install_says_the_refusal_when_the_data_folder_is_encrypted_and_never
     // encrypted with a plain (or unreadable) `%ProgramData%`: the install may have failed for another reason with the
     // folder encrypted before and never replaced, so only the fact is said, never "something encrypts new folders"
     for parent in [plain, None] {
-        let said = encryption_after_failed_install_from(&paths, enc, parent).unwrap();
+        let said = encryption_after_failed_install_from(&paths, enc, parent, false).unwrap();
         assert_eq!(
             said,
             format!(
@@ -3503,10 +3537,52 @@ fn a_failed_install_says_the_refusal_when_the_data_folder_is_encrypted_and_never
         );
     }
     // the status report, for a folder nobody has tried to replace, does say so
-    assert!(encryption_problem_from(&paths, enc, plain, plain)
+    assert!(encryption_problem_from(&paths, enc, plain, plain, plain)
         .unwrap()
         .text
         .contains("Run Repair"));
+}
+
+/// A data folder the helper made in this run, that came out encrypted with a plain `%ProgramData%` (or one that cannot
+/// be read), is the refusal's sentence: something on the PC encrypts new folders, and the run did not "not replace" it.
+#[test]
+fn a_data_folder_made_in_this_run_and_encrypted_says_the_refusal_not_that_it_was_not_replaced() {
+    let paths = paths_at(r"C:\x");
+    let (plain, enc) = (Some(0x10), Some(0x10 | ATTRIBUTE_ENCRYPTED));
+    for parent in [plain, None] {
+        let said = encryption_after_failed_install_from(&paths, enc, parent, true).unwrap();
+        assert_eq!(
+            Some(said.clone()),
+            encryption_refusal(&paths, ATTRIBUTE_ENCRYPTED, parent)
+        );
+        assert!(
+            said.contains("so something on this PC encrypts new folders")
+                && !said.contains("did not replace"),
+            "{said}"
+        );
+    }
+}
+
+/// `made_since` is what tells a folder of this run from an older one.
+#[test]
+fn a_folder_is_made_since_when_it_was_created_at_or_after_the_start() {
+    let dir = std::env::temp_dir().join(format!("bc-made-since-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let hour = Duration::from_secs(3600);
+    let now = SystemTime::now();
+    assert!(
+        made_since(&dir, now - hour),
+        "created after an earlier start"
+    );
+    assert!(
+        !made_since(&dir, now + hour),
+        "created before a later start"
+    );
+    assert!(
+        !made_since(&dir.join("missing"), now - hour),
+        "a folder that is not there was not made"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// A standard user can list the data folder, so a program of theirs can hold it with share mode 0: the open of the
