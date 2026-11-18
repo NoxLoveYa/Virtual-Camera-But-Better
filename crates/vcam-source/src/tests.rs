@@ -811,6 +811,97 @@ fn restart_after_stop_reports_updated_stream() {
 }
 
 #[test]
+fn a_restart_with_another_format_gives_whole_samples_of_the_new_format_from_a_new_pool() {
+    init();
+    let path = test_file("reformat.bin");
+    let feeder = Feeder::start(&path, 1920, 1080, 30);
+    let (_a, source) = activate_source();
+    let src_gen: IMFMediaEventGenerator = source.cast().unwrap();
+    let mut stream: Option<IMFMediaStream2> = None;
+    // 720p NV12, small NV12, RGB32, and back to the first: every start is a new pump with a new pool
+    for (round, (pixel, w, h)) in [
+        (PixelFormat::Nv12, 1280u32, 720u32),
+        (PixelFormat::Nv12, 640, 360),
+        (PixelFormat::Rgb32, 1280, 720),
+        (PixelFormat::Nv12, 1280, 720),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let pd = unsafe { source.CreatePresentationDescriptor().unwrap() };
+        let mut selected = windows_core::BOOL(0);
+        let mut desc = None;
+        unsafe {
+            pd.GetStreamDescriptorByIndex(0, &mut selected, &mut desc)
+                .unwrap()
+        };
+        let handler = unsafe { desc.unwrap().GetMediaTypeHandler().unwrap() };
+        let count = unsafe { handler.GetMediaTypeCount().unwrap() };
+        let (mt, fmt) = (0..count)
+            .map(|i| unsafe { handler.GetMediaTypeByIndex(i).unwrap() })
+            .map(|t| {
+                let f = FrameFormat::from_media_type(&t).unwrap();
+                (t, f)
+            })
+            .find(|(_, f)| (f.pixel, f.width, f.height) == (pixel, w, h))
+            .unwrap_or_else(|| panic!("{pixel:?} {w}x{h} not advertised"));
+        unsafe { handler.SetCurrentMediaType(&mt).unwrap() };
+        unsafe {
+            source
+                .Start(&pd, std::ptr::null(), &PROPVARIANT::default())
+                .unwrap()
+        };
+        for _ in 0..2 {
+            let e = next_event(&src_gen, Duration::from_secs(5));
+            if event_type(&e) == MENewStream.0 as u32
+                || event_type(&e)
+                    == windows::Win32::Media::MediaFoundation::MEUpdatedStream.0 as u32
+            {
+                stream = Some(event_unknown(&e).cast().unwrap());
+            }
+        }
+        let stream = stream.clone().expect("the stream");
+        let sgen: IMFMediaEventGenerator = stream.cast().unwrap();
+        assert_eq!(
+            event_type(&next_event(&sgen, Duration::from_secs(5))),
+            MEStreamStarted.0 as u32,
+            "round {round}"
+        );
+        let began = Instant::now();
+        let mut live = 0;
+        while live < 5 {
+            unsafe { stream.RequestSample(None).unwrap() };
+            let e = next_event(&sgen, Duration::from_secs(5));
+            assert_eq!(event_type(&e), MEMediaSample.0 as u32);
+            let s: IMFSample = event_unknown(&e).cast().unwrap();
+            let a = analyse_sample(&s, &fmt);
+            if a.slot().is_some() {
+                assert!(
+                    a.board_ok && !a.torn(),
+                    "round {round} {pixel:?} {w}x{h}: {a:?}"
+                );
+                live += 1;
+            }
+            assert!(
+                began.elapsed() < Duration::from_secs(6),
+                "round {round} {pixel:?} {w}x{h}: no live frames"
+            );
+        }
+        unsafe { source.Stop().unwrap() };
+        assert_eq!(
+            event_type(&next_event(&src_gen, Duration::from_secs(5))),
+            MESourceStopped.0 as u32
+        );
+        assert_eq!(
+            event_type(&next_event(&sgen, Duration::from_secs(5))),
+            MEStreamStopped.0 as u32
+        );
+    }
+    assert_eq!(feeder.writer.shared().header().consumer_active, 0);
+    unsafe { source.Shutdown().unwrap() };
+    set_test_path(None);
+}
+#[test]
 fn sample_timestamps_share_the_mf_system_time_base() {
     // Samples are stamped from QPC (the writer's capture time); consumers compare them with MF's clock.
     use windows::Win32::Media::MediaFoundation::MFGetSystemTime;

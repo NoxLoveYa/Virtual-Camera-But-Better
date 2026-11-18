@@ -392,6 +392,12 @@ pub mod slot {
     pub const HEADER_INVALID: usize = 2;
     pub const SLOT_INVALID: usize = 3;
     pub const FILE_REFUSED: usize = 4;
+    /// A sample buffer that cannot hold a frame.
+    pub const SINK_BUFFER: usize = 5;
+    /// A sample made outside the pool (the pool was empty or could not be made).
+    pub const POOL_FALLBACK: usize = 6;
+    /// A sample that could not be made at all.
+    pub const SAMPLE_FAILED: usize = 7;
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ pub mod frames;
 pub mod guard;
 pub mod log;
 pub mod mediatype;
+pub mod samples;
 pub mod source;
 pub mod stream;
 

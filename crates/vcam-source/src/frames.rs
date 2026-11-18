@@ -14,6 +14,12 @@
 //! | writer `starting`, or live but no usable frame yet | slate "Starting cameraâ€¦" |
 //! | live, new frame of the negotiated size | the frame (never scaled) |
 //! | live, no new frame within 1.5 frame durations | the last frame again (counted in `repeated`) |
+//!
+//! One copy per frame: the pixels go from the slot of the shared file straight into the buffer a [`FrameSink`]
+//! hands out (in the stream: the buffer of the sample that is about to be posted), and only then is the slot's
+//! sequence number checked. A copy the check rejects is never delivered. The source keeps no frame of its own: a
+//! repeat copies the slot of the last frame again (or, when the writer has reused it for something else of the
+//! right size, that); when no slot holds a frame of the negotiated size any more it shows the "starting" slate.
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -21,7 +27,7 @@ use std::sync::{Mutex, OnceLock};
 use vcam_protocol::slate::{Slate, SlateKind};
 use vcam_protocol::{
     is_stale, qpc_frequency, validate_header, Access, Disposition, Format, MappedFile, Read,
-    ReadError, ValidHeader, WriterState,
+    ReadError, SlotData, ValidHeader, WriterState,
 };
 
 use crate::mediatype::{FrameFormat, PixelFormat};
@@ -97,6 +103,87 @@ thread_local! {
     static COPY_HOOK: std::cell::RefCell<Option<CopyHook>> = const { std::cell::RefCell::new(None) };
 }
 
+// ---- where the pixels go ---------------------------------------------------------------------------------------
+
+/// The buffer one frame is copied into: rows of `pitch` bytes, `PixelFormat::rows` of them (NV12: the UV rows follow
+/// the Y rows at the same pitch).
+pub struct FrameBuf<'a> {
+    pub data: &'a mut [u8],
+    pub pitch: usize,
+}
+
+/// Where [`FrameSource::poll`] puts the pixels of an emission.
+pub trait FrameSink {
+    /// The buffer for the frame that is about to be copied, or `None` when there is none (the poll then emits
+    /// nothing and is asked again). It is called again after a copy that was thrown away (a torn read) and must give
+    /// the same buffer back until the owner has taken the frame. A buffer returned for a `Poll::Ready` holds the
+    /// whole frame.
+    fn buffer(&mut self) -> Option<FrameBuf<'_>>;
+}
+
+/// Rows and row width of the negotiated format, as the copies need them.
+#[derive(Clone, Copy)]
+struct Layout {
+    w: usize,
+    h: usize,
+    row_bytes: usize,
+    rows: usize,
+}
+
+impl Layout {
+    fn of(f: &FrameFormat) -> Layout {
+        Layout {
+            w: f.width as usize,
+            h: f.height as usize,
+            row_bytes: f.pixel.stride(f.width) as usize,
+            rows: f.pixel.rows(f.height) as usize,
+        }
+    }
+}
+
+/// The sink's buffer, if it can hold a frame of `l`. A sink that hands out a short buffer is a bug there; the frame
+/// is not copied rather than written past the end.
+fn dest<'a>(sink: &'a mut dyn FrameSink, l: &Layout) -> Option<FrameBuf<'a>> {
+    let b = sink.buffer()?;
+    let fits = b.pitch >= l.row_bytes && b.pitch.checked_mul(l.rows)? <= b.data.len();
+    if !fits {
+        crate::log::log_sampled(crate::log::slot::SINK_BUFFER, 600, || {
+            format!(
+                "frames: the sample buffer ({} bytes, pitch {}) is too small for a frame",
+                b.data.len(),
+                b.pitch
+            )
+        });
+        return None;
+    }
+    Some(b)
+}
+
+/// Copy the frame in `data` (rows of `stride` bytes) into `dst`: one `memcpy` when both have the same pitch.
+fn copy_slot(data: &SlotData<'_>, stride: usize, l: &Layout, dst: &mut FrameBuf<'_>) {
+    let p = dst.pitch;
+    if stride == p && l.rows * p <= data.len() && l.rows * p <= dst.data.len() {
+        data.copy_to(0, &mut dst.data[..l.rows * p]);
+    } else {
+        for r in 0..l.rows {
+            data.copy_to(r * stride, &mut dst.data[r * p..r * p + l.row_bytes]);
+        }
+    }
+}
+
+/// Copy a tight frame (`l.rows` rows of `l.row_bytes`) into `dst`.
+fn copy_tight(src: &[u8], l: &Layout, dst: &mut FrameBuf<'_>) {
+    let p = dst.pitch;
+    if p == l.row_bytes {
+        dst.data[..src.len()].copy_from_slice(src);
+    } else {
+        for r in 0..l.rows {
+            dst.data[r * p..r * p + l.row_bytes]
+                .copy_from_slice(&src[r * l.row_bytes..(r + 1) * l.row_bytes]);
+        }
+    }
+}
+
 // ---- slates --------------------------------------------------------------------------------------------------
 
 static EMBEDDED: [&[u8]; 3] = [
@@ -162,7 +249,7 @@ pub enum Kind {
     Slate(SlateKind),
 }
 
-/// One frame to emit; its pixels are [`FrameSource::data`].
+/// One frame to emit; its pixels are in the [`FrameSink`] buffer the poll filled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Emit {
     pub kind: Kind,
@@ -210,6 +297,18 @@ enum ReadResult {
     Invalid,
 }
 
+/// What a repeat found.
+enum RepeatResult {
+    /// The frame is in the sink.
+    Copied,
+    /// The copy was torn, or there was no buffer to copy into: try again at the next poll.
+    Retry,
+    /// No slot holds a frame of the negotiated size any more.
+    Lost,
+    /// The slot descriptor was stable but invalid.
+    Invalid,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Shown {
     Nothing,
@@ -237,20 +336,19 @@ pub struct FrameSource {
     header_ok: bool,
 
     live_since: u64,
-    /// The last confirmed live frame (what a repeat shows).
-    frame: Vec<u8>,
-    /// Copy target of a read; swapped into `frame` only when the sequence check confirmed the copy.
-    scratch: Vec<u8>,
+    /// A live frame has been emitted and its slot (`last_id`) can still be shown again.
     have_frame: bool,
+    /// (slot, writer pid, seq) of the last live frame taken: what a repeat copies again, and what is not taken twice.
     last_id: Option<(u32, u32, u64)>,
     last_new_seen: u64,
     /// Capture time (QPC) of the last live frame emitted: the next one must be captured a frame period later.
     last_capture: Option<u64>,
     last_emit: u64,
 
+    /// The slate scaled to the negotiated size, kept while a slate is shown (a slate is shown every frame period)
+    /// and freed as soon as a live frame is.
     slate_kind: Option<SlateKind>,
     slate_buf: Vec<u8>,
-    showing_slate: bool,
 
     lat: Vec<u32>,
     lat_next: usize,
@@ -276,8 +374,6 @@ impl FrameSource {
             running: false,
             header_ok: false,
             live_since: 0,
-            frame: vec![0; fmt.pixel.frame_bytes(fmt.width, fmt.height) as usize],
-            scratch: vec![0; fmt.pixel.frame_bytes(fmt.width, fmt.height) as usize],
             have_frame: false,
             last_id: None,
             last_new_seen: 0,
@@ -285,7 +381,6 @@ impl FrameSource {
             last_emit: 0,
             slate_kind: None,
             slate_buf: Vec::new(),
-            showing_slate: false,
             lat: Vec::with_capacity(LAT_RING),
             lat_next: 0,
             delivered: 0,
@@ -328,15 +423,6 @@ impl FrameSource {
             self.delivered,
             self.repeated
         );
-    }
-
-    /// Pixels of the emission returned by the last [`poll`](Self::poll): a tight frame of the negotiated format.
-    pub fn data(&self) -> &[u8] {
-        if self.showing_slate {
-            &self.slate_buf
-        } else {
-            &self.frame
-        }
     }
 
     pub fn delivered(&self) -> u64 {
@@ -471,10 +557,14 @@ impl FrameSource {
         }
     }
 
-    fn slate_poll(&mut self, kind: SlateKind, now: u64) -> Poll {
+    fn slate_poll(&mut self, kind: SlateKind, now: u64, sink: &mut dyn FrameSink) -> Poll {
         if self.last_emit != 0 && now < self.last_emit + self.period {
             return Poll::Wait(Wait::Until(self.last_emit + self.period));
         }
+        let l = Layout::of(&self.fmt);
+        let Some(mut dst) = dest(sink, &l) else {
+            return Poll::Wait(Wait::Soon);
+        };
         if self.slate_kind != Some(kind) {
             let s = decoded_slate(kind);
             self.slate_buf = match self.fmt.pixel {
@@ -483,7 +573,7 @@ impl FrameSource {
             };
             self.slate_kind = Some(kind);
         }
-        self.showing_slate = true;
+        copy_tight(&self.slate_buf, &l, &mut dst);
         self.note_shown(Shown::Slate(kind));
         Poll::Ready(Emit {
             kind: Kind::Slate(kind),
@@ -492,23 +582,28 @@ impl FrameSource {
         })
     }
 
-    fn try_read(&mut self, v: &ValidHeader, now: u64) -> ReadResult {
+    /// A live frame is on its way: the scaled slate is not needed until the next slate.
+    fn drop_slate_cache(&mut self) {
+        if self.slate_kind.take().is_some() {
+            self.slate_buf = Vec::new();
+        }
+    }
+
+    fn try_read(&mut self, v: &ValidHeader, now: u64, sink: &mut dyn FrameSink) -> ReadResult {
         let Some(map) = &self.map else {
             return ReadResult::Nothing;
         };
-        let (w, h) = (self.fmt.width as usize, self.fmt.height as usize);
+        let l = Layout::of(&self.fmt);
         let subtype = self.fmt.pixel.protocol_subtype();
-        let nv12 = self.fmt.pixel == PixelFormat::Nv12;
         let last_id = self.last_id;
         let last_capture = self.last_capture;
         let min_gap = self.min_capture_gap();
         let freq = self.freq;
         let pid = v.writer_pid;
-        // The copy goes to a scratch buffer: a read the sequence check then rejects must not leave a mixed frame
-        // in `self.frame`, where a later repeat would show it.
-        let frame = &mut self.scratch;
+        // The slot is copied straight into the sink's buffer and the sequence check follows: a read it rejects
+        // leaves a mixed frame in a buffer that no sample has been made of, and that the next copy overwrites.
         let r = map.shared().read_latest(v, |m, data| {
-            if m.width as usize != w || m.height as usize != h || m.subtype != subtype {
+            if m.width as usize != l.w || m.height as usize != l.h || m.subtype != subtype {
                 return Disposition::Skip;
             }
             if Some((m.index, pid, m.seq)) == last_id {
@@ -521,40 +616,21 @@ impl FrameSource {
                     return Disposition::Skip;
                 }
             }
+            let Some(mut dst) = dest(&mut *sink, &l) else {
+                return Disposition::Skip;
+            };
             #[cfg(test)]
             COPY_HOOK.with(|h| {
                 if let Some(f) = h.borrow_mut().as_mut() {
                     f();
                 }
             });
-            let s = m.stride as usize;
-            if nv12 {
-                if s == w {
-                    data.copy_to(0, &mut frame[..w * h * 3 / 2]);
-                } else {
-                    for r in 0..h {
-                        data.copy_to(r * s, &mut frame[r * w..(r + 1) * w]);
-                    }
-                    for r in 0..h / 2 {
-                        data.copy_to(
-                            s * h + r * s,
-                            &mut frame[w * h + r * w..w * h + (r + 1) * w],
-                        );
-                    }
-                }
-            } else if s == w * 4 {
-                data.copy_to(0, &mut frame[..w * h * 4]);
-            } else {
-                for r in 0..h {
-                    data.copy_to(r * s, &mut frame[r * w * 4..(r + 1) * w * 4]);
-                }
-            }
+            copy_slot(data, m.stride as usize, &l, &mut dst);
             Disposition::Taken
         });
         match r {
             Ok(Read::Taken(m)) => {
-                // confirmed by an unchanged even seq: only now the copy becomes the current frame
-                std::mem::swap(&mut self.frame, &mut self.scratch);
+                // confirmed by an unchanged even seq
                 self.last_id = Some((m.index, pid, m.seq));
                 ReadResult::New(clamp_capture(m.capture_qpc, now, freq))
             }
@@ -568,28 +644,81 @@ impl FrameSource {
         }
     }
 
-    /// Decide what to emit at QPC `now`. A panic inside is contained: the file is dropped and the "not running"
-    /// slate is shown.
-    pub fn poll(&mut self, now: u64) -> Poll {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.poll_inner(now))) {
+    /// Copy the last frame again: the slot of `last_id` while it still holds a frame of the negotiated size (the
+    /// writer reuses a slot only for a newer frame, so that is then the newest we can show), else the newest slot.
+    fn try_repeat(&mut self, v: &ValidHeader, sink: &mut dyn FrameSink) -> RepeatResult {
+        let (Some(map), Some((slot, _, _))) = (&self.map, self.last_id) else {
+            return RepeatResult::Lost;
+        };
+        let l = Layout::of(&self.fmt);
+        let subtype = self.fmt.pixel.protocol_subtype();
+        let pid = v.writer_pid;
+        let no_buffer = std::cell::Cell::new(false);
+        let mut copy = |m: &vcam_protocol::SlotMeta, data: &SlotData<'_>| {
+            if m.width as usize != l.w || m.height as usize != l.h || m.subtype != subtype {
+                return Disposition::Skip;
+            }
+            let Some(mut dst) = dest(&mut *sink, &l) else {
+                no_buffer.set(true);
+                return Disposition::Skip;
+            };
+            #[cfg(test)]
+            COPY_HOOK.with(|h| {
+                if let Some(f) = h.borrow_mut().as_mut() {
+                    f();
+                }
+            });
+            copy_slot(data, m.stride as usize, &l, &mut dst);
+            Disposition::Taken
+        };
+        let shared = map.shared();
+        let mut r = shared.read_slot(slot as usize, v, &mut copy);
+        if matches!(r, Ok(Read::Skipped(_)) | Ok(Read::NoFrame)) && !no_buffer.get() {
+            r = shared.read_latest(v, &mut copy);
+        }
+        match r {
+            Ok(Read::Taken(m)) => {
+                // what was shown is now what the slot holds: it is not a new frame when it comes round again
+                self.last_id = Some((m.index, pid, m.seq));
+                RepeatResult::Copied
+            }
+            // no sample to copy into right now: the same as a torn copy, ask again
+            Ok(_) if no_buffer.get() => RepeatResult::Retry,
+            Err(ReadError::Torn) => RepeatResult::Retry,
+            Ok(_) => RepeatResult::Lost,
+            Err(ReadError::Invalid(e)) => {
+                crate::log::log_sampled(crate::log::slot::SLOT_INVALID, 600, || {
+                    format!("frames: slot invalid: {e:?}")
+                });
+                RepeatResult::Invalid
+            }
+        }
+    }
+
+    /// Decide what to emit at QPC `now`; the pixels of an emission are in `sink` when this returns `Ready`. A panic
+    /// inside is contained: the file is dropped and the "not running" slate is shown.
+    pub fn poll(&mut self, now: u64, sink: &mut dyn FrameSink) -> Poll {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.poll_inner(now, &mut *sink)
+        })) {
             Ok(p) => p,
             Err(_) => {
                 vlog!("PANIC contained in FrameSource::poll");
                 self.map = None;
                 self.leave_live();
                 self.not_running = true;
-                self.slate_poll(SlateKind::NotRunning, now)
+                self.slate_poll(SlateKind::NotRunning, now, sink)
             }
         }
     }
 
-    fn poll_inner(&mut self, now: u64) -> Poll {
+    fn poll_inner(&mut self, now: u64, sink: &mut dyn FrameSink) -> Poll {
         self.ensure_map(now);
         let v = match self.status(now) {
             Status::Slate(kind) => {
                 self.not_running = kind == SlateKind::NotRunning;
                 self.leave_live();
-                return self.slate_poll(kind, now);
+                return self.slate_poll(kind, now, sink);
             }
             Status::Live(v) => v,
         };
@@ -608,12 +737,12 @@ impl FrameSource {
             None => 0,
         };
         if now >= next_ok {
-            match self.try_read(&v, now) {
+            match self.try_read(&v, now, &mut *sink) {
                 ReadResult::New(capture_qpc) => {
                     self.have_frame = true;
                     self.last_capture = Some(capture_qpc);
                     self.last_new_seen = now;
-                    self.showing_slate = false;
+                    self.drop_slate_cache();
                     self.note_shown(Shown::Live);
                     return Poll::Ready(Emit {
                         kind: Kind::Live,
@@ -623,7 +752,7 @@ impl FrameSource {
                 }
                 ReadResult::Invalid => {
                     self.not_running = true;
-                    return self.slate_poll(SlateKind::NotRunning, now);
+                    return self.slate_poll(SlateKind::NotRunning, now, sink);
                 }
                 ReadResult::Nothing => {}
             }
@@ -631,16 +760,28 @@ impl FrameSource {
         if self.have_frame {
             // live but late: the last frame again
             if now >= self.last_new_seen + period * 3 / 2 && now >= self.last_emit + period {
-                self.showing_slate = false;
-                return Poll::Ready(Emit {
-                    kind: Kind::Repeat,
-                    capture_qpc: 0,
-                    at: now,
-                });
+                match self.try_repeat(&v, &mut *sink) {
+                    RepeatResult::Copied => {
+                        self.drop_slate_cache();
+                        return Poll::Ready(Emit {
+                            kind: Kind::Repeat,
+                            capture_qpc: 0,
+                            at: now,
+                        });
+                    }
+                    RepeatResult::Retry => {}
+                    RepeatResult::Invalid => {
+                        self.not_running = true;
+                        return self.slate_poll(SlateKind::NotRunning, now, sink);
+                    }
+                    // the picture is gone from the file: what a stream that never had a frame shows
+                    RepeatResult::Lost => self.have_frame = false,
+                }
             }
-        } else if now >= self.live_since + period * 3 / 2 {
+        }
+        if !self.have_frame && now >= self.live_since + period * 3 / 2 {
             // live, but nothing usable yet (no frame, or frames of another size)
-            return self.slate_poll(SlateKind::Starting, now);
+            return self.slate_poll(SlateKind::Starting, now, sink);
         }
         Poll::Wait(if now >= next_ok {
             Wait::Soon
@@ -735,8 +876,93 @@ mod tests {
         }
     }
 
+    /// A frame buffer owned by the test, `pitch` bytes per row. It keeps whatever was last written, like a sample
+    /// that is reused: what a test checks is what a ready emission leaves in it.
+    struct VecSink {
+        buf: Vec<u8>,
+        pitch: usize,
+        /// `buffer()` says "none" this many more times (a pool that has nothing right now).
+        refuse: usize,
+    }
+
+    impl FrameSink for VecSink {
+        fn buffer(&mut self) -> Option<FrameBuf<'_>> {
+            if self.refuse > 0 {
+                self.refuse -= 1;
+                return None;
+            }
+            Some(FrameBuf {
+                data: &mut self.buf,
+                pitch: self.pitch,
+            })
+        }
+    }
+
+    /// A [`FrameSource`] with its sink: what the pump is, minus the samples.
+    struct Rig {
+        src: FrameSource,
+        sink: VecSink,
+        fmt: FrameFormat,
+    }
+
+    impl std::ops::Deref for Rig {
+        type Target = FrameSource;
+        fn deref(&self) -> &FrameSource {
+            &self.src
+        }
+    }
+
+    impl std::ops::DerefMut for Rig {
+        fn deref_mut(&mut self) -> &mut FrameSource {
+            &mut self.src
+        }
+    }
+
+    impl Rig {
+        fn new(path: PathBuf, fmt: FrameFormat) -> Rig {
+            let pitch = fmt.pixel.stride(fmt.width) as usize;
+            Rig::with_pitch(path, fmt, pitch)
+        }
+
+        fn with_pitch(path: PathBuf, fmt: FrameFormat, pitch: usize) -> Rig {
+            let rows = fmt.pixel.rows(fmt.height) as usize;
+            Rig {
+                src: FrameSource::new(path, fmt),
+                // a poisoned start: nothing may rely on the buffer being clean
+                sink: VecSink {
+                    buf: vec![0xA5; pitch * rows],
+                    pitch,
+                    refuse: 0,
+                },
+                fmt,
+            }
+        }
+
+        fn poll(&mut self, now: u64) -> Poll {
+            self.src.poll(now, &mut self.sink)
+        }
+
+        /// The frame of the last ready emission (a rig with a tight pitch).
+        fn data(&self) -> &[u8] {
+            assert_eq!(
+                self.sink.pitch,
+                self.fmt.pixel.stride(self.fmt.width) as usize
+            );
+            &self.sink.buf
+        }
+
+        /// The frame of the last ready emission with the padding of each row cut out.
+        fn tight(&self) -> Vec<u8> {
+            let rb = self.fmt.pixel.stride(self.fmt.width) as usize;
+            let rows = self.fmt.pixel.rows(self.fmt.height) as usize;
+            (0..rows)
+                .flat_map(|r| self.sink.buf[r * self.sink.pitch..r * self.sink.pitch + rb].to_vec())
+                .collect()
+        }
+    }
+
     /// Poll until something is ready (at most `limit`), sleeping 1 ms between polls like the pump does.
-    fn next_ready(src: &mut FrameSource, limit: Duration) -> Emit {
+    fn next_ready(src: &mut Rig, limit: Duration) -> Emit {
         let began = Instant::now();
         loop {
             match src.poll(qpc_now()) {
@@ -765,7 +991,7 @@ mod tests {
         .unwrap();
     }
 
-    fn slate_diff(src: &FrameSource, kind: SlateKind, w: u32, h: u32) -> f64 {
+    fn slate_diff(src: &Rig, kind: SlateKind, w: u32, h: u32) -> f64 {
         let want = decoded_slate(kind).scale_nv12(w, h);
         let got = src.data();
         vcam_protocol::slate::mean_luma_diff(
@@ -815,7 +1041,7 @@ mod tests {
     fn missing_file_shows_the_not_running_slate() {
         let path = temp_path("missing.bin");
         let _ = std::fs::remove_file(&path);
-        let mut src = FrameSource::new(path, nv12(640, 360, 30));
+        let mut src = Rig::new(path, nv12(640, 360, 30));
         src.start();
         let e = next_ready(&mut src, Duration::from_secs(1));
         assert_eq!(e.kind, Kind::Slate(SlateKind::NotRunning));
@@ -835,7 +1061,7 @@ mod tests {
         let path = temp_path("states.bin");
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
-        let mut src = FrameSource::new(path, nv12(320, 180, 30));
+        let mut src = Rig::new(path, nv12(320, 180, 30));
         src.start();
         for (state, kind) in [
             (WriterState::Closed, SlateKind::NotRunning),
@@ -856,7 +1082,7 @@ mod tests {
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
         let (fw, fh) = (640u32, 360u32);
-        let mut src = FrameSource::new(path, nv12(fw, fh, 30));
+        let mut src = Rig::new(path, nv12(fw, fh, 30));
         src.start();
         // live but no frame yet: after 1.5 frame durations the "starting" slate
         let e = next_ready(&mut src, Duration::from_secs(1));
@@ -910,7 +1136,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
-        let mut src = FrameSource::new(path, nv12(320, 180, 30));
+        let mut src = Rig::new(path, nv12(320, 180, 30));
         src.start();
         publish_pattern(&w, 320, 180, 1);
         assert_eq!(
@@ -944,7 +1170,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
-        let mut src = FrameSource::new(path.clone(), nv12(320, 180, 30));
+        let mut src = Rig::new(path.clone(), nv12(320, 180, 30));
         src.start();
         let sh = w.shared();
         publish_pattern(&w, 320, 180, 1);
@@ -953,7 +1179,7 @@ mod tests {
             Kind::Live
         );
 
-        let expect_slate = |src: &mut FrameSource| {
+        let expect_slate = |src: &mut Rig| {
             for _ in 0..40 {
                 let e = next_ready(src, Duration::from_secs(2));
                 if e.kind == Kind::Slate(SlateKind::NotRunning) {
@@ -1040,7 +1266,7 @@ mod tests {
                 }
             })
         };
-        let mut src = FrameSource::new(path, nv12(fw, fh, consumer_fps));
+        let mut src = Rig::new(path, nv12(fw, fh, consumer_fps));
         src.start();
         let mut slots = Vec::new();
         let mut began = None;
@@ -1091,7 +1317,7 @@ mod tests {
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
         let (fw, fh) = (320u32, 180u32);
-        let mut src = FrameSource::new(
+        let mut src = Rig::new(
             path,
             FrameFormat {
                 pixel: PixelFormat::Rgb32,
@@ -1143,7 +1369,7 @@ mod tests {
 
     /// Run a source against `path` for a short time the way the pump does: start, poll for about `ms`, stop.
     fn run_source_for(path: &std::path::Path, ms: u64) -> Vec<Kind> {
-        let mut src = FrameSource::new(path.to_path_buf(), nv12(320, 180, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(320, 180, 30));
         src.start();
         let began = Instant::now();
         let mut kinds = Vec::new();
@@ -1215,7 +1441,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
         w.shared().poke32(vcam_protocol::off::MAGIC, 0);
-        let mut src = FrameSource::new(path, nv12(320, 180, 30));
+        let mut src = Rig::new(path, nv12(320, 180, 30));
         src.start();
         let e = next_ready(&mut src, Duration::from_secs(1));
         assert_eq!(e.kind, Kind::Slate(SlateKind::NotRunning));
@@ -1328,7 +1554,7 @@ mod tests {
             set_test_path(Some(p.clone()));
             let adv = advertised();
             let advertised_took = t.elapsed();
-            let mut src = FrameSource::new(p, nv12(320, 180, 30));
+            let mut src = Rig::new(p, nv12(320, 180, 30));
             src.start();
             let t = Instant::now();
             let mut kinds = Vec::new();
@@ -1370,7 +1596,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
-        let mut src = FrameSource::new(path, nv12(320, 180, 30));
+        let mut src = Rig::new(path, nv12(320, 180, 30));
         src.start();
         let freq = qpc_frequency();
         let hostile = [
@@ -1462,14 +1688,14 @@ mod tests {
     }
 
     #[test]
-    fn a_torn_copy_never_reaches_the_last_frame_buffer() {
+    fn a_torn_copy_never_reaches_a_delivered_frame() {
         use vcam_protocol::{off, slot_off};
         let path = temp_path("torn.bin");
         let _ = std::fs::remove_file(&path);
         let w = std::rc::Rc::new(Writer::create(&path).unwrap());
         w.set_state(WriterState::Live);
         let (fw, fh) = (320u32, 180u32);
-        let mut src = FrameSource::new(path, nv12(fw, fh, 30));
+        let mut src = Rig::new(path, nv12(fw, fh, 30));
         src.start();
         publish_pattern(&w, fw, fh, 5);
         assert_eq!(
@@ -1503,7 +1729,8 @@ mod tests {
                 sh.poke64(slot_off(slot) + off::SLOT_SEQ, meta.seq + 2);
             }))
         });
-        // no new frame can be taken now; after 1.5 frame durations the last frame is repeated
+        // no new frame can be taken now; after 1.5 frame durations the last frame is repeated. The torn copy went
+        // into the same buffer, which the repeat then overwrote whole
         let e = next_ready(&mut src, Duration::from_secs(1));
         assert_eq!(e.kind, Kind::Repeat);
         assert!(
@@ -1529,7 +1756,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
-        let mut src = FrameSource::new(path, nv12(320, 180, 30));
+        let mut src = Rig::new(path, nv12(320, 180, 30));
         src.start();
         publish_pattern(&w, 320, 180, 1);
         let _ = next_ready(&mut src, Duration::from_secs(1));
@@ -1548,5 +1775,291 @@ mod tests {
         assert_eq!(h.consumer_active, 0);
         assert_eq!(h.delivered, 1);
         assert!(h.latency_p95_us < 1_000_000);
+    }
+
+    /// The frame `n` as the pattern writes it, for a frame of `w` x `h`: what a delivered frame must equal.
+    fn pattern_frame(n: u64, w: u32, h: u32) -> Vec<u8> {
+        let mut v = vec![0u8; (w * h * 3 / 2) as usize];
+        pattern::fill_nv12(n, w, h, &mut v, w as usize);
+        v
+    }
+
+    #[test]
+    fn a_frame_lands_whole_in_a_buffer_with_a_padded_pitch_whatever_the_slot_stride() {
+        // sink pitch = slot stride (one copy of everything) and sink pitch != slot stride (row by row), NV12 and RGB32
+        for (pixel, slot_pad, sink_pad) in [
+            (PixelFormat::Nv12, 0usize, 0usize),
+            (PixelFormat::Nv12, 64, 64),
+            (PixelFormat::Nv12, 64, 32),
+            (PixelFormat::Nv12, 0, 96),
+            (PixelFormat::Rgb32, 0, 0),
+            (PixelFormat::Rgb32, 128, 128),
+            (PixelFormat::Rgb32, 64, 192),
+        ] {
+            let (fw, fh) = (320u32, 180u32);
+            let path = temp_path(&format!("pitch-{pixel:?}-{slot_pad}-{sink_pad}.bin"));
+            let _ = std::fs::remove_file(&path);
+            let w = Writer::create(&path).unwrap();
+            w.set_state(WriterState::Live);
+            let fmt = FrameFormat {
+                pixel,
+                width: fw,
+                height: fh,
+                fps: 30,
+            };
+            let rb = pixel.stride(fw) as usize;
+            let mut src = Rig::with_pitch(path, fmt, rb + sink_pad);
+            src.start();
+            let stride = (rb + slot_pad) as u32;
+            let (subtype, rows) = match pixel {
+                PixelFormat::Nv12 => (SUBTYPE_NV12, (fh * 3 / 2) as usize),
+                PixelFormat::Rgb32 => (SUBTYPE_RGB32, fh as usize),
+            };
+            // the frame in tight rows, then written with the slot's stride
+            let mut tight = vec![0u8; rb * rows];
+            match pixel {
+                PixelFormat::Nv12 => pattern::fill_nv12(9, fw, fh, &mut tight, rb),
+                PixelFormat::Rgb32 => pattern::fill_bgrx(9, fw, fh, &mut tight, rb),
+            }
+            w.publish(
+                SlotFormat {
+                    width: fw,
+                    height: fh,
+                    stride,
+                    subtype,
+                },
+                qpc_now(),
+                |d| {
+                    for r in 0..rows {
+                        d[r * stride as usize..r * stride as usize + rb]
+                            .copy_from_slice(&tight[r * rb..(r + 1) * rb]);
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                next_ready(&mut src, Duration::from_secs(1)).kind,
+                Kind::Live
+            );
+            assert!(
+                src.tight() == tight,
+                "{pixel:?} slot padding {slot_pad} sink padding {sink_pad}"
+            );
+            // the same frame again as a repeat
+            assert_eq!(
+                next_ready(&mut src, Duration::from_secs(1)).kind,
+                Kind::Repeat
+            );
+            assert!(
+                src.tight() == tight,
+                "{pixel:?} repeat, slot padding {slot_pad} sink padding {sink_pad}"
+            );
+        }
+    }
+
+    #[test]
+    fn slates_fill_a_buffer_at_every_size_and_subtype_whatever_its_pitch() {
+        for (pixel, w, h, pad) in [
+            (PixelFormat::Nv12, 320u32, 180u32, 0usize),
+            (PixelFormat::Nv12, 640, 360, 64),
+            (PixelFormat::Nv12, 1280, 720, 0),
+            (PixelFormat::Nv12, 1920, 1080, 0),
+            (PixelFormat::Nv12, 3840, 2160, 128),
+            (PixelFormat::Rgb32, 320, 180, 0),
+            (PixelFormat::Rgb32, 1280, 720, 64),
+            (PixelFormat::Rgb32, 1920, 1080, 0),
+        ] {
+            let path = temp_path("slates-nowhere.bin");
+            let _ = std::fs::remove_file(&path);
+            let fmt = FrameFormat {
+                pixel,
+                width: w,
+                height: h,
+                fps: 30,
+            };
+            let mut src = Rig::with_pitch(path, fmt, pixel.stride(w) as usize + pad);
+            src.start();
+            let e = next_ready(&mut src, Duration::from_secs(2));
+            assert_eq!(e.kind, Kind::Slate(SlateKind::NotRunning));
+            let want = match pixel {
+                PixelFormat::Nv12 => decoded_slate(SlateKind::NotRunning).scale_nv12(w, h),
+                PixelFormat::Rgb32 => decoded_slate(SlateKind::NotRunning).scale_bgrx(w, h),
+            };
+            assert!(
+                src.tight() == want,
+                "{pixel:?} {w}x{h} pitch +{pad}: not the slate"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scaled_slate_is_freed_once_a_live_frame_is_on_its_way() {
+        let path = temp_path("slate-free.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        let mut src = Rig::new(path, nv12(640, 360, 30));
+        src.start();
+        let e = next_ready(&mut src, Duration::from_secs(1));
+        assert_eq!(e.kind, Kind::Slate(SlateKind::Starting));
+        assert_eq!(src.slate_buf.len(), 640 * 360 * 3 / 2);
+        publish_pattern(&w, 640, 360, 4);
+        assert_eq!(
+            next_ready(&mut src, Duration::from_secs(1)).kind,
+            Kind::Live
+        );
+        assert_eq!(src.slate_buf.capacity(), 0, "the slate was kept");
+        // and a later slate is made again, right
+        w.set_state(WriterState::Paused);
+        let e = next_ready(&mut src, Duration::from_secs(1));
+        assert_eq!(e.kind, Kind::Slate(SlateKind::Paused));
+        assert_eq!(slate_diff(&src, SlateKind::Paused, 640, 360), 0.0);
+    }
+
+    #[test]
+    fn a_repeat_shows_the_last_good_picture_also_when_the_writer_sent_other_sizes_into_its_slots() {
+        let path = temp_path("repeat-lost.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        let (fw, fh) = (640u32, 360u32);
+        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        src.start();
+        publish_pattern(&w, fw, fh, 5);
+        assert_eq!(
+            next_ready(&mut src, Duration::from_secs(1)).kind,
+            Kind::Live
+        );
+        let good = pattern_frame(5, fw, fh);
+        assert!(src.data() == good.as_slice());
+        // one frame of another size: the slot of the good frame is not the newest, and still holds it
+        publish_pattern(&w, 320, 180, 6);
+        for _ in 0..3 {
+            let e = next_ready(&mut src, Duration::from_secs(1));
+            assert_eq!(e.kind, Kind::Repeat);
+            assert!(
+                src.data() == good.as_slice(),
+                "the repeat is not the last frame"
+            );
+        }
+        assert_eq!(src.repeated(), 3);
+        // a second one reuses the slot of the good frame: the picture is gone from the file. The source says
+        // so with the "starting" slate, never with bytes of the other size
+        publish_pattern(&w, 320, 180, 7);
+        let e = next_ready(&mut src, Duration::from_secs(1));
+        assert_eq!(e.kind, Kind::Slate(SlateKind::Starting));
+        assert_eq!(slate_diff(&src, SlateKind::Starting, fw, fh), 0.0);
+        assert_eq!(src.repeated(), 3, "a slate is not a repeat");
+        // the right size again: live
+        publish_pattern(&w, fw, fh, 8);
+        let e = next_ready(&mut src, Duration::from_secs(1));
+        assert_eq!(e.kind, Kind::Live);
+        assert!(src.data() == pattern_frame(8, fw, fh).as_slice());
+    }
+
+    #[test]
+    fn a_repeat_that_is_torn_delivers_nothing_and_the_next_one_is_whole() {
+        use vcam_protocol::{off, slot_off};
+        let path = temp_path("repeat-torn.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = std::rc::Rc::new(Writer::create(&path).unwrap());
+        w.set_state(WriterState::Live);
+        let (fw, fh) = (320u32, 180u32);
+        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        src.start();
+        publish_pattern(&w, fw, fh, 5);
+        assert_eq!(
+            next_ready(&mut src, Duration::from_secs(1)).kind,
+            Kind::Live
+        );
+        // the "writer" scribbles over the slot of the last frame while the repeat copies it, and finishes
+        // another frame there (seq changes): the sequence check rejects every copy
+        let w2 = w.clone();
+        COPY_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let sh = w2.shared();
+                let slot = sh.header().latest_slot as usize;
+                let meta = sh.slot_meta(slot);
+                sh.poke_bytes(meta.data_offset as usize, &vec![0xEE; (fw * fh) as usize]);
+                sh.poke64(slot_off(slot) + off::SLOT_SEQ, meta.seq + 2);
+            }))
+        });
+        let began = Instant::now();
+        while began.elapsed() < Duration::from_millis(300) {
+            w.heartbeat();
+            if let Poll::Ready(e) = src.poll(qpc_now()) {
+                panic!("{:?} was delivered from a torn copy", e.kind);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        COPY_HOOK.with(|h| *h.borrow_mut() = None);
+        // the slot now holds a settled frame (all 0xEE luma): it is shown whole
+        w.heartbeat();
+        let e = next_ready(&mut src, Duration::from_secs(1));
+        assert!(matches!(e.kind, Kind::Repeat | Kind::Live), "{:?}", e.kind);
+        let luma = &src.data()[..(fw * fh) as usize];
+        assert!(luma.iter().all(|&b| b == 0xEE), "a mix of two frames");
+    }
+
+    #[test]
+    fn a_sink_without_a_buffer_costs_no_frame() {
+        let path = temp_path("no-buffer.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        let (fw, fh) = (320u32, 180u32);
+        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        src.start();
+        publish_pattern(&w, fw, fh, 3);
+        // the pool has nothing for the next few asks: the frame stays in the file, nothing is emitted
+        src.sink.refuse = 5;
+        for _ in 0..5 {
+            assert!(matches!(src.poll(qpc_now()), Poll::Wait(_)));
+        }
+        assert_eq!(src.sink.refuse, 0);
+        let e = next_ready(&mut src, Duration::from_secs(1));
+        assert_eq!(e.kind, Kind::Live);
+        assert!(src.data() == pattern_frame(3, fw, fh).as_slice());
+        assert_eq!(src.delivered(), 1);
+        // a repeat that finds no buffer is asked again, and is not counted until it was copied
+        src.sink.refuse = 4;
+        let e = next_ready(&mut src, Duration::from_secs(1));
+        assert_eq!(e.kind, Kind::Repeat);
+        assert_eq!(src.sink.refuse, 0, "the four refusals were not met");
+        assert_eq!(src.repeated(), 1);
+        assert!(src.data() == pattern_frame(3, fw, fh).as_slice());
+    }
+
+    #[test]
+    fn a_sink_with_a_buffer_that_is_too_short_gets_nothing_written_past_its_end() {
+        struct Short(Vec<u8>);
+        impl FrameSink for Short {
+            fn buffer(&mut self) -> Option<FrameBuf<'_>> {
+                Some(FrameBuf {
+                    data: &mut self.0,
+                    pitch: 320,
+                })
+            }
+        }
+        let path = temp_path("short.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        let mut src = FrameSource::new(path, nv12(320, 180, 30));
+        src.start();
+        publish_pattern(&w, 320, 180, 3);
+        let mut sink = Short(vec![7u8; 320 * 180]); // a Y plane, no UV rows
+        let began = Instant::now();
+        while began.elapsed() < Duration::from_millis(200) {
+            assert!(
+                matches!(src.poll(qpc_now(), &mut sink), Poll::Wait(_)),
+                "an emission into a buffer that cannot hold the frame"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            sink.0.iter().all(|&b| b == 7),
+            "the short buffer was written"
+        );
     }
 }

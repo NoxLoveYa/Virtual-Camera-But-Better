@@ -77,6 +77,14 @@ impl PixelFormat {
             PixelFormat::Rgb32 => w * 4,
         }
     }
+    /// Rows of one frame at a common pitch: the Y rows and the UV rows of NV12 count as `h * 3 / 2` rows of the
+    /// luma pitch.
+    pub fn rows(self, h: u32) -> u32 {
+        match self {
+            PixelFormat::Nv12 => h * 3 / 2,
+            PixelFormat::Rgb32 => h,
+        }
+    }
 }
 
 /// Format, size and frame rate of a stream, read back from an `IMFMediaType`.

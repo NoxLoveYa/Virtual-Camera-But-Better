@@ -349,22 +349,44 @@ impl Shared {
     /// Read the newest frame. `f` is called with the validated descriptor and the slot data after the descriptor was
     /// confirmed by an unchanged even `seq`; the sequence is checked again afterwards and the whole read retried
     /// once when it changed.
-    pub fn read_latest<F>(&self, v: &ValidHeader, mut f: F) -> Result<Read, ReadError>
+    pub fn read_latest<F>(&self, v: &ValidHeader, f: F) -> Result<Read, ReadError>
+    where
+        F: FnMut(&SlotMeta, &SlotData<'_>) -> Disposition,
+    {
+        self.read_impl(None, v, f)
+    }
+
+    /// Like [`read_latest`](Self::read_latest) for slot `slot` instead of the newest one (a repeat of the frame
+    /// that was shown last, which sits in a slot that is no longer the newest when the writer sent something the
+    /// reader does not use). Same rules: the descriptor is validated, `f` runs only on a stable even `seq`, and the
+    /// result is `Taken` only when `seq` is unchanged after `f` returned. A slot the writer has not filled yet is
+    /// `NoFrame`; a `slot` past the last one is `NoFrame` too.
+    pub fn read_slot<F>(&self, slot: usize, v: &ValidHeader, f: F) -> Result<Read, ReadError>
+    where
+        F: FnMut(&SlotMeta, &SlotData<'_>) -> Disposition,
+    {
+        self.read_impl(Some(slot.min(SLOT_COUNT) as u32), v, f)
+    }
+
+    fn read_impl<F>(&self, fixed: Option<u32>, v: &ValidHeader, mut f: F) -> Result<Read, ReadError>
     where
         F: FnMut(&SlotMeta, &SlotData<'_>) -> Disposition,
     {
         let mut result = Err(ReadError::Torn);
         for _ in 0..2 {
-            let latest = self.a32(off::LATEST_SLOT).load(Ordering::Acquire);
-            if latest as usize >= SLOT_COUNT {
+            let index = match fixed {
+                Some(s) => s,
+                None => self.a32(off::LATEST_SLOT).load(Ordering::Acquire),
+            };
+            if index as usize >= SLOT_COUNT {
                 result = Ok(Read::NoFrame);
                 break;
             }
-            let slot = latest as usize;
+            let slot = index as usize;
             let so = slot_off(slot);
             if self.writable {
                 // hint for the writer: do not reuse this slot while we copy
-                self.a32(off::READER_SLOT).store(latest, Ordering::SeqCst);
+                self.a32(off::READER_SLOT).store(index, Ordering::SeqCst);
             }
             let seq = self.a64(so + off::SLOT_SEQ);
             let s1 = seq.load(Ordering::Acquire);
@@ -558,6 +580,80 @@ mod tests {
         s.publish(fmt, 1, 1, |d| d.fill(1)).unwrap();
         let r = s.read_latest(&v, |_, _| Disposition::Skip).unwrap();
         assert!(matches!(r, Read::Skipped(_)));
+        assert_eq!(s.header().reader_slot, NO_SLOT);
+    }
+
+    #[test]
+    fn a_chosen_slot_is_read_with_the_same_rules_as_the_newest() {
+        let (_h, s) = fresh();
+        let v = valid(&s);
+        let fmt = SlotFormat {
+            width: 16,
+            height: 16,
+            stride: 16,
+            subtype: SUBTYPE_NV12,
+        };
+        // nothing published: no frame, whichever slot is asked for
+        assert_eq!(
+            s.read_slot(0, &v, |_, _| panic!("no frame")),
+            Ok(Read::NoFrame)
+        );
+        assert_eq!(
+            s.read_slot(7, &v, |_, _| panic!("no slot")),
+            Ok(Read::NoFrame)
+        );
+        s.publish(fmt, 11, 1, |d| d.fill(1)).unwrap();
+        let first = s.header().latest_slot as usize;
+        s.publish(fmt, 22, 2, |d| d.fill(2)).unwrap();
+        let second = s.header().latest_slot as usize;
+        assert_ne!(first, second);
+        // the older slot still holds the older frame
+        let mut got = vec![0u8; 16 * 24];
+        let r = s
+            .read_slot(first, &v, |m, data| {
+                assert_eq!((m.index as usize, m.capture_qpc), (first, 11));
+                data.copy_to(0, &mut got);
+                Disposition::Taken
+            })
+            .unwrap();
+        assert!(matches!(r, Read::Taken(m) if m.index as usize == first));
+        assert!(got.iter().all(|&b| b == 1));
+        assert_eq!(s.header().reader_slot, NO_SLOT, "the mark is released");
+        // while it is read, the writer is told to keep away from it
+        let mut marked = None;
+        s.read_slot(first, &v, |_, _| {
+            marked = Some(s.header().reader_slot);
+            Disposition::Skip
+        })
+        .unwrap();
+        assert_eq!(marked, Some(first as u32));
+        // a slot the writer has not filled yet
+        let empty = (0..3).find(|&i| i != first && i != second).unwrap();
+        assert_eq!(
+            s.read_slot(empty, &v, |_, _| panic!("empty")),
+            Ok(Read::NoFrame)
+        );
+        // the writer reuses the slot while the callback runs, on the retry too: the copy is rejected
+        let so = slot_off(first);
+        let mut seq = 100;
+        let r = s.read_slot(first, &v, |_, _| {
+            seq += 2;
+            s.poke64(so + off::SLOT_SEQ, seq);
+            Disposition::Taken
+        });
+        assert_eq!(r, Err(ReadError::Torn));
+        // a write in progress (odd seq) is torn too, and a damaged descriptor is invalid
+        s.poke64(so + off::SLOT_SEQ, 5);
+        assert_eq!(
+            s.read_slot(first, &v, |_, _| panic!("odd")),
+            Err(ReadError::Torn)
+        );
+        s.poke64(so + off::SLOT_SEQ, 6);
+        s.poke32(so + off::SLOT_WIDTH, 15);
+        assert!(matches!(
+            s.read_slot(first, &v, |_, _| panic!("invalid")),
+            Err(ReadError::Invalid(_))
+        ));
         assert_eq!(s.header().reader_slot, NO_SLOT);
     }
 

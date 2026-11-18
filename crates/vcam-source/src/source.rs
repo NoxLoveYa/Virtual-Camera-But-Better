@@ -387,7 +387,7 @@ impl IMFSampleAllocatorControl_Impl for MediaSource_Impl {
             vlog!("Source::GetAllocatorUsage stream {dwoutputstreamid} -> UsesCustomAllocator");
             unsafe {
                 *pdwinputstreamid = dwoutputstreamid;
-                // the source makes its own samples with MFCreateSample + MFCreate2DMediaBuffer
+                // the source makes its own samples, from its own pool (`samples::SamplePool`)
                 *peusage = MFSampleAllocatorUsage_UsesCustomAllocator;
             }
             Ok(())

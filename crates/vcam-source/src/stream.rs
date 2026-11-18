@@ -1,9 +1,10 @@
 //! `MediaStream`: `IMFMediaStream2` + `IKsControl` (+ `IMFAttributes` through an inner store).
 //!
 //! Frames come from a [`FrameSource`] (the shared file, or a slate). `RequestSample` queues a token; one pump thread
-//! per stream waits until the source has something to emit, copies it into a `MFCreateSample` +
-//! `MFCreate2DMediaBuffer` sample (system memory, always) and posts `MEMediaSample`. The thread exists only while the
-//! stream runs; creating the source or its presentation descriptor starts nothing.
+//! per stream waits until the source has something to emit, which it copies once, straight from the shared file into
+//! the buffer of a sample from the stream's [`SamplePool`](crate::samples::SamplePool) (system memory, always), and
+//! posts `MEMediaSample`. The thread exists only while the stream runs, and the pool with it; creating the source or
+//! its presentation descriptor starts nothing.
 
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -13,20 +14,18 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use windows::Win32::Foundation::{CloseHandle, E_POINTER, E_UNEXPECTED, HANDLE, S_OK};
+use windows::Win32::Foundation::{CloseHandle, E_UNEXPECTED, HANDLE, S_OK};
 use windows::Win32::Media::timeBeginPeriod;
 use windows::Win32::Media::timeEndPeriod;
 use windows::Win32::Media::KernelStreaming::{
     IKsControl, IKsControl_Impl, KSIDENTIFIER, PINNAME_VIDEO_CAPTURE,
 };
 use windows::Win32::Media::MediaFoundation::{
-    IMF2DBuffer2, IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFMediaEvent,
-    IMFMediaEventGenerator_Impl, IMFMediaEventQueue, IMFMediaSource, IMFMediaStream2,
-    IMFMediaStream2_Impl, IMFMediaStream_Impl, IMFMediaType, IMFSample, IMFStreamDescriptor,
-    MEError, MEMediaSample, MEStreamStarted, MEStreamStopped, MF2DBuffer_LockFlags_Write,
-    MFCreate2DMediaBuffer, MFCreateAttributes, MFCreateEventQueue, MFCreateSample,
-    MFCreateStreamDescriptor, MFFrameSourceTypes_Color, MFGetSystemTime,
-    MFSampleExtension_CleanPoint, MFSampleExtension_Token, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS,
+    IMFAsyncCallback, IMFAsyncResult, IMFAttributes, IMFMediaEvent, IMFMediaEventGenerator_Impl,
+    IMFMediaEventQueue, IMFMediaSource, IMFMediaStream2, IMFMediaStream2_Impl, IMFMediaStream_Impl,
+    IMFMediaType, IMFSample, IMFStreamDescriptor, MEError, MEMediaSample, MEStreamStarted,
+    MEStreamStopped, MFCreateAttributes, MFCreateEventQueue, MFCreateStreamDescriptor,
+    MFFrameSourceTypes_Color, MFGetSystemTime, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS,
     MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES, MF_DEVICESTREAM_FRAMESERVER_SHARED,
     MF_DEVICESTREAM_STREAM_CATEGORY, MF_DEVICESTREAM_STREAM_ID, MF_E_INVALIDMEDIATYPE,
     MF_E_INVALID_STATE_TRANSITION, MF_E_SHUTDOWN, MF_STREAM_STATE, MF_STREAM_STATE_PAUSED,
@@ -43,6 +42,7 @@ use crate::attrs::delegate_attributes;
 use crate::frames::{FrameSource, Poll, Wait};
 use crate::guard::{guard, LockExt};
 use crate::mediatype::{advertised_types, FrameFormat, PixelFormat};
+use crate::samples::{PoolStats, SampleSink};
 use crate::{object_created, object_dropped, pump_thread_spawned, vlog};
 
 /// Media Foundation event queues and sample tokens are free-threaded (they are handed to arbitrary MF work
@@ -313,6 +313,19 @@ fn pump_loop(
     frames_out: &AtomicU64,
     path: PathBuf,
 ) {
+    // the samples of this stream, recycled; the pool ends with the pump, so a stop or a format change frees them all
+    pump_loop_with(shared, queue, fmt, frames_out, path, SampleSink::new(fmt));
+}
+
+/// The pump with its sink given (tests keep a handle on the pool). Returns what the pool did.
+fn pump_loop_with(
+    shared: &PumpShared,
+    queue: &IMFMediaEventQueue,
+    fmt: FrameFormat,
+    frames_out: &AtomicU64,
+    path: PathBuf,
+    mut sink: SampleSink,
+) -> PoolStats {
     let _period = TimerPeriod::begin();
     let timer = HiResTimer::new();
     let freq = vcam_protocol::qpc_frequency();
@@ -343,7 +356,7 @@ fn pump_loop(
                 break 'outer;
             }
             let now = vcam_protocol::qpc_now();
-            match src.poll(now) {
+            match src.poll(now, &mut sink) {
                 Poll::Ready(e) => break e,
                 Poll::Wait(Wait::Soon) => timer.wait_1ms(),
                 Poll::Wait(Wait::Until(t)) => {
@@ -356,7 +369,7 @@ fn pump_loop(
             }
         };
         let ts = next_timestamp(emit.sample_qpc(), prev_ts);
-        match make_sample(&fmt, src.data(), ts, token.map(|t| t.0)) {
+        match sink.finish(ts, token.map(|t| t.0)) {
             Ok(sample) => {
                 #[cfg(test)]
                 run_before_post_hook(shared);
@@ -378,90 +391,19 @@ fn pump_loop(
                 }
             }
             Err(e) => {
-                vlog!("make_sample failed: {e}");
+                vlog!("sample failed: {e}");
                 // keep going: the next token gets another try
             }
         }
     }
     src.stop();
+    let stats = sink.stats();
     vlog!(
-        "pump stop after {} samples",
-        frames_out.load(Ordering::Relaxed)
+        "pump stop after {} samples, {:?}",
+        frames_out.load(Ordering::Relaxed),
+        stats
     );
-}
-
-/// Copy a tight frame (`data`, NV12 or BGRX of `fmt`) into a fresh MF sample stamped `ts` (100 ns units).
-pub fn make_sample(
-    fmt: &FrameFormat,
-    data: &[u8],
-    ts: i64,
-    token: Option<IUnknown>,
-) -> Result<IMFSample> {
-    let (w, h) = (fmt.width as usize, fmt.height as usize);
-    if data.len() != fmt.pixel.frame_bytes(fmt.width, fmt.height) as usize {
-        return Err(Error::from(MF_E_INVALIDMEDIATYPE));
-    }
-    unsafe {
-        let sample = MFCreateSample()?;
-        let buffer =
-            MFCreate2DMediaBuffer(fmt.width, fmt.height, fmt.pixel.buffer_fourcc(), false)?;
-        let b2: IMF2DBuffer2 = buffer.cast()?;
-
-        let mut scan0: *mut u8 = std::ptr::null_mut();
-        let mut pitch: i32 = 0;
-        let mut start: *mut u8 = std::ptr::null_mut();
-        let mut len: u32 = 0;
-        b2.Lock2DSize(
-            MF2DBuffer_LockFlags_Write,
-            &mut scan0,
-            &mut pitch,
-            &mut start,
-            &mut len,
-        )?;
-        let copied = (|| -> Result<()> {
-            if scan0.is_null() || pitch <= 0 {
-                return Err(Error::from(E_POINTER));
-            }
-            let pitch = pitch as usize;
-            let row_bytes = match fmt.pixel {
-                PixelFormat::Nv12 => w,
-                PixelFormat::Rgb32 => w * 4,
-            };
-            let rows = match fmt.pixel {
-                PixelFormat::Nv12 => h * 3 / 2,
-                PixelFormat::Rgb32 => h,
-            };
-            let needed = pitch * rows;
-            if pitch < row_bytes || (len as usize) < needed || start != scan0 {
-                return Err(Error::from(MF_E_INVALIDMEDIATYPE));
-            }
-            let dst = std::slice::from_raw_parts_mut(scan0, len as usize);
-            if pitch == row_bytes {
-                dst[..data.len()].copy_from_slice(data);
-            } else {
-                // rows of both planes are `row_bytes` wide in `data`; the UV plane follows the Y plane at the
-                // same pitch in the buffer
-                for r in 0..rows {
-                    dst[r * pitch..r * pitch + row_bytes]
-                        .copy_from_slice(&data[r * row_bytes..(r + 1) * row_bytes]);
-                }
-            }
-            Ok(())
-        })();
-        let unlocked = b2.Unlock2D();
-        copied?;
-        unlocked?;
-        let contiguous = b2.GetContiguousLength()?;
-        buffer.SetCurrentLength(contiguous)?;
-        sample.AddBuffer(&buffer)?;
-        sample.SetSampleTime(ts)?;
-        sample.SetSampleDuration(fmt.frame_duration())?;
-        sample.SetUINT32(&MFSampleExtension_CleanPoint, 1)?;
-        if let Some(t) = token {
-            sample.SetUnknown(&MFSampleExtension_Token, &t)?;
-        }
-        Ok(sample)
-    }
+    stats
 }
 
 struct StreamState {
@@ -1068,6 +1010,92 @@ mod tests {
             let ts = next_timestamp(q, prev);
             assert!(ts > prev || ts == i64::MAX, "{q}: {prev} -> {ts}");
             prev = ts;
+        }
+    }
+
+    /// A consumer that takes every sample at once and lets it go: the pump's pool must then keep recycling.
+    #[test]
+    fn a_pump_answers_a_hundred_requests_from_one_buffer_and_frees_the_pool_at_the_end() {
+        use crate::samples::{PoolStats, PoolWatch, SamplePool};
+        unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL).unwrap() };
+        let q = queue();
+        let fmt = FrameFormat {
+            pixel: PixelFormat::Nv12,
+            width: 1920,
+            height: 1080,
+            fps: 120, // slates come every 8 ms: the test does not wait long
+        };
+        let watch: Arc<Mutex<Option<PoolWatch>>> = Arc::new(Mutex::new(None));
+        let stats: Arc<Mutex<Option<PoolStats>>> = Arc::new(Mutex::new(None));
+        let (w2, s2) = (watch.clone(), stats.clone());
+        let mut pump = Pump::spawn_with(q.clone(), move |shared, queue| {
+            let sink = SampleSink::with_pool(SamplePool::new(fmt), fmt);
+            *w2.lock().unwrap() = Some(sink.pool().watch());
+            let st = pump_loop_with(
+                shared,
+                queue,
+                fmt,
+                &AtomicU64::new(0),
+                std::env::temp_dir()
+                    .join("bettercam-test-no-such-dir")
+                    .join("frames.bin"),
+                sink,
+            );
+            *s2.lock().unwrap() = Some(st);
+        })
+        .unwrap();
+        let mut addresses = std::collections::HashSet::new();
+        for _ in 0..100 {
+            pump.add_token(None);
+            let e = wait_for(&q, MEMediaSample.0 as u32, Duration::from_secs(5))
+                .expect("a sample for the request");
+            let v: PROPVARIANT = unsafe { e.GetValue().unwrap() };
+            let sample: IMFSample = IUnknown::try_from(&v).unwrap().cast().unwrap();
+            let b2: windows::Win32::Media::MediaFoundation::IMF2DBuffer2 =
+                unsafe { sample.GetBufferByIndex(0).unwrap() }
+                    .cast()
+                    .unwrap();
+            let (mut p, mut pitch) = (std::ptr::null_mut::<u8>(), 0i32);
+            let (mut start, mut len) = (std::ptr::null_mut::<u8>(), 0u32);
+            unsafe {
+                b2.Lock2DSize(
+                    windows::Win32::Media::MediaFoundation::MF2DBuffer_LockFlags_Read,
+                    &mut p,
+                    &mut pitch,
+                    &mut start,
+                    &mut len,
+                )
+                .unwrap();
+                b2.Unlock2D().unwrap();
+            }
+            addresses.insert(p as usize);
+            drop((sample, b2, v, e));
+            // the sample goes back to the pool on a work queue; the next request comes a few ms later
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        pump.stop_within(Duration::from_secs(2));
+        let st = (*stats.lock().unwrap()).expect("the pump ended with its numbers");
+        assert_eq!(st.plain, 0, "samples were made outside the pool: {st:?}");
+        assert!(
+            st.created <= 3,
+            "{} buffers were allocated for 100 samples: {st:?}",
+            st.created
+        );
+        assert_eq!(st.created + st.reused, 100, "{st:?}");
+        assert!(
+            addresses.len() <= 3,
+            "{} different buffers for 100 samples",
+            addresses.len()
+        );
+        // the pump ended and the consumer let go of everything: nothing of the pool is left
+        let began = Instant::now();
+        let watch = watch.lock().unwrap().take().expect("a pool");
+        while watch.alive() {
+            assert!(
+                began.elapsed() < Duration::from_secs(3),
+                "the pool outlived its pump"
+            );
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 }

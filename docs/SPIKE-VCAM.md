@@ -1220,3 +1220,124 @@ fails with "still private after a Repair" (`protected: true`, SYSTEM and the adm
 flush was called". **L3b**: with `delete_registration` deleting the state key whatever is in it, `deleting_the_registration_keeps_the_record_and_its_key`
 and `a_status_read_with_only_the_record_left_says_not_installed` fail ("the state key goes with the record in it").
 
+
+
+# P-perf: one copy per frame and recycled samples in the camera service
+
+The performance sign-off (`docs/PERF.md`) missed one target: the camera service host used 1.5 to 6.8 % of a core at 1080p60 and
+4.5 to 8.6 % at 4K30 for our stream (target: 1 % and 2 %), with +7 MB (1080p) and +28 to +33 MB (4K) of private bytes. The
+audit pointed at the DLL: a new `MFCreate2DMediaBuffer` per sample (fresh memory over 1 MB page-faults in on its first write,
+every frame), a slot -> `scratch` -> `frame` copy, then a `frame` -> sample copy, and three frame-sized buffers per stream.
+No change to the file layout or `PROTOCOL_VERSION`; the app's writer is untouched. `crates/vcam-source` and the reader of
+`crates/vcam-protocol` changed, so the machine needs one new registration (Update).
+
+## Design
+
+* **One copy.** `FrameSource::poll(now, sink)` copies the slot straight into the buffer of the sample that will be posted
+  (`frames::FrameSink`, implemented by `samples::SampleSink`), then the existing seqlock check follows. A torn copy is not
+  delivered: the poll answers `Wait`, the buffer is overwritten by the next copy. The source keeps **no frame of its own**:
+  `frame` and `scratch` are gone, and `slate_buf` exists only while a slate is shown (freed at the first live frame).
+* **A repeat copies the slot of the last frame again** (`Shared::read_slot`, new, additive: the same validation, torn rule and
+  "reader slot" mark as `read_latest`, for one chosen slot). The writer reuses a slot only for a newer frame, so the slot of
+  `last_id` holds the last good picture until the writer has written two newer frames of another size or format into the two
+  other slots. Then the picture is gone from the file: the repeat falls back to the newest slot if that has the right size, else
+  the stream shows the "starting" slate (before: the last frame was kept in a private buffer for ever). This is the one
+  behaviour change; with a writer of the negotiated size it cannot happen. A repeat that is torn or finds no buffer is asked
+  again at the next poll.
+* **A pool of tracked samples** (`samples::SamplePool`): `MFCreateTrackedSample` + one `MFCreate2DMediaBuffer`, with an
+  `IMFAsyncCallback` as owner (`IMFTrackedSample::SetAllocator`): when Frame Server and the consumers have released a sample,
+  the callback puts it back on a free list; the next frame takes it, buffer and all. The pool makes at most `POOL_MAX = 6`
+  samples, only when the free list is empty; when all are out (or one cannot be made) the sample is a plain
+  `MFCreateSample` + `MFCreate2DMediaBuffer`, as before. Nothing ever waits. The pool lives in the pump thread and ends with it
+  (stream stop, shutdown, and a format change, which starts a new pump): `Drop` sets `closed` and empties the free list under
+  the lock the callback takes, so a sample that comes back later is simply released; a sample that a consumer still holds stays
+  whole and is freed when it is released.
+* **`IMFVideoSampleAllocatorEx` (system memory) was tried first and rejected.** In a probe (`InitializeSampleAllocatorEx(1, 2)`,
+  no D3D manager) `AllocateSample` returned two samples at once and then **blocked for 1.00 s per call** (then
+  `MF_E_SAMPLEALLOCATOR_EMPTY`) when both were still held: a pump could stall a second at a time behind a slow consumer, and the
+  pump must never wait. After releases it also handed out samples at 3 to 4 new addresses in 12 cycles, so it did not give the
+  same memory back either (a 100-sample test saw 64 to 72 distinct buffers). `Source::GetAllocatorUsage` still says
+  `UsesCustomAllocator`: the source makes its own samples; Frame Server did not set an allocator (`SetDefaultAllocator` is only
+  logged) and nothing in the negotiation changed.
+* The sample's content length comes from `IMF2DBuffer2::GetContiguousLength`, the time, duration, clean point and token are set on
+  every frame (a pooled sample's old token is deleted when the new request has none), the buffer is locked through
+  `Lock2DSize` and the pitch is checked (`pitch >= row`, `pitch * rows <= length`, `start == scan0`) before a byte is written.
+  `frames::dest` checks the same again against the frame, so a sink with a short buffer is never written past its end.
+
+## Tests added (all pass)
+
+`samples`: the pool gives the same buffer back 299 times in 300 frames at 1080p NV12 and 720p RGB32 (1 buffer allocated, 0 plain
+samples); a consumer that holds one sample at a time needs exactly 2 buffers for 200 frames; time, duration, length and token
+are those of the frame only, over pooled reuse; with every sample held the pool falls back (2 pooled, 4 plain from 6 asks,
+under 500 ms) and takes its samples back after the release; a pool that may make nothing gives plain samples; ending the pool
+empties it while a held sample stays whole and is freed on release; a sink dropped with a locked sample gives it back.
+`stream`: a real pump answers 100 requests from at most 3 allocated buffers and the pool is gone after the stop.
+`frames`: a frame lands whole for every slot-stride/sink-pitch combination (NV12 and RGB32, padded and tight; live and repeat);
+slates fill a buffer at 8 size/subtype/pitch combinations (320x180 to 3840x2160, NV12 and RGB32); the scaled slate is freed at
+the first live frame; a repeat after one frame of another size still shows the last good picture, after two it shows the
+"starting" slate and counts no repeat; a torn repeat delivers nothing and the next is whole (the torn-read test of the live path
+was adapted too: the repeat shows the good frame); a sink with no buffer costs no frame; a short buffer is never written.
+`tests` (DLL loaded through `DllGetClassObject`): a restart through four formats (NV12 720p, 360p, RGB32 720p, NV12 720p) gives
+whole live samples each time from a new pool. `seqlock`: `read_slot` (no frame, bad index, an older slot, reader mark, torn,
+odd seq, invalid descriptor).
+
+## Check results
+
+```
+cargo test -p vcam-protocol -p vcam-source -p vcam-tool    78 + 73 + 17 passed, 0 failed (before: 77 + 57 + 17)
+cargo clippy -p vcam-protocol -p vcam-source -p vcam-tool --all-targets   0 warnings (the LNK4104 linker note was there before)
+cargo fmt -p vcam-protocol -p vcam-source -p vcam-tool --check            clean
+```
+
+Registered build: `C:\Program Files\Better Cam\vcam\better_cam_vcam_1.ac92262c.dll` (`Build=ac92262c`, SHA-256 `BBDDF9E1...B6B3CA2E`,
+identical to `target\release\better_cam_vcam.dll`), installed with Update from the dev app through the DevTools protocol.
+
+Live, same method as `docs/PERF.md` (3 runs of each; `perf_synth1080_none.json` and `perf_4k30_none.json`, 20 s windows, camera
+service CPU = delta of the `svchost` process time minus an idle baseline, private bytes minus the idle baseline):
+
+| | before (3 runs) | after (3 runs) |
+|---|---|---|
+| 1080p60 camera service CPU, % of one core | 3.07, 3.34, 5.40 | 1.78, 1.95, 1.98 |
+| 1080p60 added private bytes | +8.0, +7.1, +6.4 MB | +12.8, +3.5, +12.3 MB |
+| 4K30 camera service CPU | 7.72, 8.25, 7.66 | 1.97, 2.03, 2.68 |
+| 4K30 added private bytes | +30.6, +30.3, +30.4 MB | +24.2, +19.2, +23.4 MB |
+| header `latency_p95_us` 1080p60 / 4K30 | 2487-2711 / 4871-5105 | 2723-2771 / 4473-4696 |
+| DLL `repeated`, 1080p60 / 4K30 | 1, 0, 0 / 0, 0, 0 | 19, 0, 0 / 0, 0, 0 |
+
+The 19 repeats are in the first "after" run, with the machine 36 % busy by other work and the engine itself late (published
+59.05 fps, one render pass of 199 ms in that window: the writer stalled, the DLL repeated as designed; its other two runs and
+all 4K runs had 0). The app side (engine process CPU, fps, `gpu_ms`, dropped counters) did not change beyond the load of the
+machine (app CPU 1.7 to 8.0 % before, 4.1 to 8.0 % after at 1080p; 6.2 to 7.4 % at 4K after, 6.3 to 6.9 % before).
+Per-thread view of the service at 4K30 after the change (22.6 s): 1.9 % of a core in all, of which the pump thread of our
+stream 1.36 % (1.16 user, 0.20 kernel: the copy, plus a 1 ms timer poll); no other thread above 0.2 %.
+
+`vcam-tool feed --size 1920x1080 --fps 60 --seconds 30` with `capture-test --expect feed --frames 600`: 600 frames in 9.99 s,
+60.00 fps, max gap 17 ms, 0 torn, 0 black, 0 without stripe, 0 repeated, PASS; stats right after: `latency_p50_us` 798,
+`latency_p95_us` 1815, `repeated` 0. After the feeder ended, `capture-test --expect slate --frames 120`: 120 of 120 frames
+match the slate, PASS.
+
+## Verdict on the target (Frame Server CPU <= 1 %, <= 2 % at 4K)
+
+* **4K30: met in two of three runs** (1.97 and 2.03 % against 2 %; the third 2.68 %). The counter ticks in 15.6 ms steps and the
+  machine was busy, so the spread is about +-0.5 %: call it "at the target".
+* **1080p60: not met: 1.8 to 2.0 % against 1 %**, down from 3.1 to 5.4 %. What is left is, as far as the per-thread sample
+  shows, our pump thread (about 1.4 % at 4K, one copy of 12 MB per frame at 30 fps plus the 1 ms polls) and the other threads
+  of the service (Frame Server's own work to hand the sample to the consumer, about 0.5 %). The 1 ms poll (60 wake-ups plus 940
+  timer polls a second per stream) is the next thing to cut: wait for the writer's heartbeat or frame-count change on an event
+  instead of polling, which needs the app's writer to signal (a protocol change, not done here). It is also no longer clear that
+  1 % is reachable with a per-frame copy at all: one copy of a 1080p NV12 frame is 3.1 MB, 190 MB/s at 60 fps.
+* **Private bytes: met** (<= 50 MB): +3.5 to +12.8 MB at 1080p60, +19 to +24 MB at 4K30 (was +28 to +33). The pool holds 2 or 3
+  samples in practice; `POOL_MAX` is 6 (75 MB at 4K) and only reached when the consumer keeps every sample.
+
+## Risks and things not checked
+
+* The pooled samples are `MFCreateTrackedSample` objects reused after `IMFTrackedSample::SetAllocator`'s callback: if a
+  consumer kept a pointer into a buffer after releasing the sample it would see the next frame. A sample is returned only when
+  every reference to it is gone, so a consumer that holds the sample holds the buffer; how Frame Server hands the pixels to its
+  clients (a copy or a shared view) was not examined, and nothing in the live runs showed a torn or repeated picture from it.
+* The recycle callback runs on an MF work queue thread and takes the pool lock; the pump takes it for a `pop` only. Nothing
+  else is held while either runs, and the callback does no I/O or logging.
+* Only the dev app, `vcam-tool feed` + `capture-test` and the `p6b-consumer` of the perf harness were used as consumers; a
+  browser or the Windows Camera app were not run against this build.
+* The perf runs shared the PC with other agents' work (machine busy 17 to 42 %); and another agent's dev app took the lock file
+  away once during the feed check, which was then redone under a new lock.
