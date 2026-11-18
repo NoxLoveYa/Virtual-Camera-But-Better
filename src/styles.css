@@ -3,7 +3,7 @@
   /* The page is one translucent layer over the window's acrylic backdrop. Everything on it is unfilled and separated
      by hairlines, so no two areas differ in tone. Things that float (menus, dropdowns, dialogs, the toast) are
      frosted instead: --pop tint plus --blur on whatever is behind them. */
-  --bg: rgba(9, 11, 14, 0.88);
+  --bg: rgba(9, 11, 14, 0.92);
   --surface: transparent;
   --pop: rgba(16, 20, 26, 0.6);
   --blur: blur(18px) saturate(1.35);
@@ -11,7 +11,7 @@
   --line-strong: rgba(255, 255, 255, 0.14);
   --text: #eceff3;
   --dim: #8a94a3;
-  --faint: #636e7e;
+  --faint: #7f8a9a;
   --accent: #2ee6d6;
   --accent-soft: rgba(46, 230, 214, 0.12);
   --glow: 0 0 12px rgba(46, 230, 214, 0.22);
@@ -38,7 +38,7 @@ body {
 #root { display: flex; flex-direction: column; }
 
 ::selection { background: var(--accent-soft); }
-:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 ::-webkit-scrollbar { width: 12px; }
 ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.12); border: 3px solid transparent; background-clip: padding-box; border-radius: 6px; }
@@ -242,7 +242,7 @@ button.ghost:hover:not(:disabled) { color: var(--text); box-shadow: none; border
 .splitter { position: absolute; top: 0; bottom: 0; left: calc(var(--left) - 4px); width: 8px; z-index: 6; cursor: col-resize; touch-action: none; }
 .splitter::after { content: ""; position: absolute; top: 0; bottom: 0; left: 4px; width: 1px; transition: background 0.15s, box-shadow 0.15s; }
 .splitter:hover::after, .splitter.dragging::after, .splitter:focus-visible::after { background: var(--accent); box-shadow: var(--glow-soft); }
-.splitter:focus-visible { outline: none; }
+.splitter:focus-visible { outline-offset: -2px; }
 body.col-resizing, body.col-resizing * { cursor: col-resize !important; user-select: none; }
 /* Banners span the window under the toolbar; the padding is the toolbar's, so their edges line up with it. */
 .banners { flex: none; display: flex; flex-direction: column; gap: 10px; padding: 12px 40px 0 28px; }
@@ -411,6 +411,8 @@ input[type="color"]::-webkit-color-swatch { border: 0; border-radius: 2px; }
 .switch[aria-checked="true"] { background: var(--accent-soft); box-shadow: inset 0 0 0 1px rgba(46, 230, 214, 0.55), var(--glow); }
 .switch[aria-checked="true"]::after { transform: translateX(14px); background: var(--accent); }
 .switch:hover:not(:disabled) { box-shadow: inset 0 0 0 1px rgba(46, 230, 214, 0.55); }
+/* The look stays 30x16; the hit area is 30x24. */
+.switch::before { content: ""; position: absolute; inset: -4px 0; }
 
 .params { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px 28px; margin-top: 12px; transition: opacity 0.2s; }
 .step:not(.on) .params { opacity: 0.4; }
@@ -418,9 +420,14 @@ input[type="color"]::-webkit-color-swatch { border: 0; border-radius: 2px; }
 .params label > span, .params .pf > span { display: flex; justify-content: space-between; }
 .params label b { color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; }
 .params small { color: var(--faint); }
-/* A switch row: caption left, switch right, an optional hint on its own line. */
+/* A switch row: the caption takes the room and wraps beside the switch at the right end, an optional hint on its own line. */
 .params label.pf-row { flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; min-height: 28px; cursor: pointer; }
+.params label.pf-row > span { flex: 1 1 0; min-width: 0; }
 .params label.pf-row > .pf-hint { flex-basis: 100%; }
+/* A slider's value with its reset button (components/ParamField.tsx, ControlsCard.tsx): 24x24 hit area, 16px icon, no extra row height. */
+.pf-val { display: inline-flex; align-items: center; gap: 2px; }
+button.reset-btn { flex: none; width: 24px; height: 24px; margin: -4px -4px -4px 0; padding: 0; display: inline-grid; place-items: center; color: var(--dim); background: none; border-color: transparent; }
+button.reset-btn:hover:not(:disabled) { color: var(--text); box-shadow: none; border-color: var(--line-strong); }
 /* A file param (components/PathField.tsx): the path as read-only text in the look of `.select`, Browse…, clear. The
    folder shortens first (its end becomes "…"), then the file name's stem; the extension never shrinks. The shrink
    weights are 1000 : 1 : 0, so the folder gives way before the stem does (a flex-shrink sum below 1 would not
@@ -457,8 +464,6 @@ input[type="color"]::-webkit-color-swatch { border: 0; border-radius: 2px; }
 .layout-crop::before, .layout-crop::after { content: ""; grid-area: frame; align-self: stretch; pointer-events: none; }
 .layout-crop::before { min-height: 56px; border: 1px dashed var(--line-strong); border-radius: var(--r); background: rgba(255, 255, 255, 0.02); }
 .layout-crop::after { margin: 12px 18px; border: 1px solid rgba(46, 230, 214, 0.55); border-radius: 2px; background: var(--accent-soft); }
-/* The long switch caption of Scaling/Aspect Ratio wraps beside its switch instead of pushing the switch to a second line. */
-.params label.pf-row[data-key="undistort"] > span { flex: 1 1 0; min-width: 0; }
 /* Integer box (components/NumberField.tsx) */
 .num-field { display: flex; align-items: center; gap: 4px; }
 .num-field input { flex: 1; min-width: 0; text-align: center; font-variant-numeric: tabular-nums; }

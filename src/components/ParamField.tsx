@@ -1,8 +1,9 @@
-import type { CSSProperties, KeyboardEvent, ReactNode } from "react";
+import { useId, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
 import { isShown, type ParamDef, type ParamValue, type SliderDef } from "../filters/schema";
 import { formatValue, snap, toColorInt } from "../filters/values";
 import { ColorField } from "./ColorField";
 import { ComboField } from "./ComboField";
+import { Icon } from "./Icon";
 import { NumberField } from "./NumberField";
 import { PathField } from "./PathField";
 import { Select } from "./Select";
@@ -87,6 +88,7 @@ export function ParamField({ def, params, onChange }: Props) {
 
 function Slider({ def, value, onChange, hint }: { def: SliderDef; value: number; onChange: (v: number) => void; hint: ReactNode }) {
   const fill = ((value - def.min) / (def.max - def.min)) * 100;
+  const id = useId();
   const reset = () => onChange(def.def);
   const onKeyDown = (e: KeyboardEvent) => {
     if (e.key === "Delete") {
@@ -94,13 +96,33 @@ function Slider({ def, value, onChange, hint }: { def: SliderDef; value: number;
       reset();
     }
   };
+  const text = (v: number) => formatValue(v, def.int ? 1 : def.step, def.unit);
   return (
-    <label data-key={def.key} title={def.hint}>
+    // `htmlFor`: the reset button inside is the first labelable descendant, which would take the label's clicks.
+    <label data-key={def.key} title={def.hint} htmlFor={id}>
       <span>
         {def.label}
-        <b>{formatValue(value, def.int ? 1 : def.step, def.unit)}</b>
+        <span className="pf-val">
+          <b>{text(value)}</b>
+          {value !== def.def && (
+            <button
+              type="button"
+              className="reset-btn"
+              aria-label={`Reset ${def.label}`}
+              title={`Reset to ${text(def.def)}`}
+              onClick={() => {
+                reset();
+                // The button leaves with the change: keep the keyboard on the slider.
+                document.getElementById(id)?.focus();
+              }}
+            >
+              <Icon name="reset" size={16} />
+            </button>
+          )}
+        </span>
       </span>
       <input
+        id={id}
         type="range"
         aria-label={def.label}
         title="Double-click or press Delete to reset"

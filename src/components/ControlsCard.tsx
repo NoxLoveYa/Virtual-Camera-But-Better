@@ -117,8 +117,11 @@ function ControlRow({ info, ctx }: { info: ControlInfo; ctx: AutoCtx }) {
   const mode = modeOf(info);
   const app = mode === "app";
   const modal = hasModeList(info);
-  // With Auto on, or Better Cam auto, the controller sets the value; the slider only shows it.
-  const locked = app || info.auto || !info.can_manual;
+  // Better Cam auto sets the value and the control only shows it; a control without a manual mode cannot be set.
+  // With the camera's Auto on it stays usable: moving it turns Auto off (the store does that).
+  const locked = app || !info.can_manual;
+  // The default state is Auto where the camera has it, else the default value; with Auto on the value is the camera's own.
+  const changed = info.auto !== info.can_auto || (!info.auto && info.value !== info.def);
   const loop = info.key === "exposure" ? "exposure" : info.key === "white_balance" ? "white_balance" : null;
   const status = loop === "exposure" ? ctx.exposure : loop === "white_balance" ? ctx.whiteBalance : null;
   const gain = ctx.infos.find((i) => i.key === "gain");
@@ -137,12 +140,27 @@ function ControlRow({ info, ctx }: { info: ControlInfo; ctx: AutoCtx }) {
   }
 
   return (
-    <div className={`ctl${locked ? " auto" : ""}${modal ? " multi" : ""}`} data-key={info.key} data-mode={mode}>
+    <div className={`ctl${locked || info.auto ? " auto" : ""}${modal ? " multi" : ""}`} data-key={info.key} data-mode={mode}>
       <div className="ctl-head">
         <span className="ctl-name" title={label}>
           {label}
         </span>
         {kind !== "select" && <b>{controlValueText(info)}</b>}
+        {kind === "slider" && !app && changed && (
+          <button
+            type="button"
+            className="reset-btn"
+            aria-label={`Reset ${label}`}
+            title={`Reset to ${info.can_auto ? "Auto" : controlValueText({ ...info, value: info.def })}`}
+            onClick={(e) => {
+              reset();
+              // The button leaves with the change: keep the keyboard on the slider.
+              (e.currentTarget.closest(".ctl")?.querySelector("input[type=range]") as HTMLElement | null)?.focus();
+            }}
+          >
+            <Icon name="reset" size={16} />
+          </button>
+        )}
         {modal && (
           <label className="ctl-mode">
             <span className="sr-only">{label} mode</span>
@@ -215,7 +233,7 @@ function Slider({
     <input
       type="range"
       aria-label={label}
-      title={locked ? undefined : "Double-click or press Delete to reset"}
+      title={locked ? undefined : info.auto ? "Moving this turns Auto off" : "Double-click or press Delete to reset"}
       style={{ "--p": `${fill}%` } as CSSProperties}
       min={info.min}
       max={info.max}

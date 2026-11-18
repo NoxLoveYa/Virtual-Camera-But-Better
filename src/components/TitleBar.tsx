@@ -100,8 +100,11 @@ function Settings() {
       onClose={() => setOpen(false)}
       align="right"
       className="w320"
+      role="dialog"
+      label="Settings"
+      autoFocusFirst
       anchor={
-        <button className={open ? "toggled" : ""} aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen(!open)}>
+        <button className={open ? "toggled" : ""} aria-haspopup="dialog" aria-expanded={open} onClick={() => setOpen(!open)}>
           Settings
         </button>
       }

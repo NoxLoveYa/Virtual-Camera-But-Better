@@ -11,6 +11,10 @@ interface Props {
   /** Make the panel at least as wide as the anchor (for dropdowns). */
   matchWidth?: boolean;
   role?: "menu" | "listbox" | "dialog";
+  /** The accessible name of the panel. */
+  label?: string;
+  /** Move the focus into the panel when it opens (its first switch, else its first button), and back to the anchor on Escape. */
+  autoFocusFirst?: boolean;
   className?: string;
 }
 
@@ -19,11 +23,13 @@ interface Props {
  * It is positioned against the window and capped to the room below the anchor, and rendered at the top of the page,
  * so a scrolling or dimmed parent can neither clip it nor affect its backdrop blur.
  */
-export function Popover({ open, onClose, anchor, children, align = "left", matchWidth, role = "menu", className = "" }: Props) {
+export function Popover({ open, onClose, anchor, children, align = "left", matchWidth, role = "menu", label, autoFocusFirst, className = "" }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const menu = useRef<HTMLDivElement>(null);
   const close = useRef(onClose);
   close.current = onClose;
+  const returnFocus = useRef(autoFocusFirst);
+  returnFocus.current = autoFocusFirst;
   const [place, setPlace] = useState<CSSProperties>({});
 
   useLayoutEffect(() => {
@@ -38,10 +44,20 @@ export function Popover({ open, onClose, anchor, children, align = "left", match
   }, [open, align, matchWidth]);
 
   useEffect(() => {
+    if (!open || !autoFocusFirst) return;
+    menu.current?.querySelector<HTMLElement>("[role=switch], button, input, [tabindex]")?.focus({ preventScroll: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  useEffect(() => {
     if (!open) return;
     const inside = (t: EventTarget | null) => ref.current?.contains(t as Node) || menu.current?.contains(t as Node);
     const away = (e: MouseEvent) => !inside(e.target) && close.current();
-    const esc = (e: KeyboardEvent) => e.key === "Escape" && close.current();
+    const esc = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      close.current();
+      if (returnFocus.current) ref.current?.querySelector<HTMLElement>("button, input, [tabindex]")?.focus();
+    };
     const scrolled = (e: Event) => !inside(e.target) && close.current();
     const resized = () => close.current();
     document.addEventListener("mousedown", away);
@@ -61,7 +77,7 @@ export function Popover({ open, onClose, anchor, children, align = "left", match
       {anchor}
       {open &&
         createPortal(
-          <div className={`pop-menu ${className}`} style={place} role={role} ref={menu}>
+          <div className={`pop-menu ${className}`} style={place} role={role} aria-label={label} ref={menu}>
             {children}
           </div>,
           document.body,
