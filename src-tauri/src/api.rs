@@ -249,11 +249,7 @@ impl Service {
 
     fn emit_state(&self, state: EngineState, reason: &str) {
         if let Some(s) = lock(&self.sink).clone() {
-            s.emit(EngineEvent::State(StateEvent {
-                state,
-                reason: Some(reason.into()),
-                kind: None,
-            }));
+            s.emit(EngineEvent::State(StateEvent::new(state, Some(reason.into()), None)));
         }
     }
 

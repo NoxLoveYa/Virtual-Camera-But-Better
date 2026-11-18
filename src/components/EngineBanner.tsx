@@ -1,5 +1,5 @@
 import { api } from "../api";
-import { isDeviceDefault } from "../camera/schema";
+import { inUseText, isDeviceDefault } from "../camera/schema";
 import { useStore } from "../store";
 
 const sentence = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
@@ -21,10 +21,10 @@ function privacyText(reason: string | null): string {
 }
 
 /** What the banner says while the camera is being waited for, by the engine's `kind` (plan 4.9). `reason` is the detail. */
-function waitingText(kind: string | null, reason: string | null): string {
+function waitingText(kind: string | null, reason: string | null, apps: string[], appsMaybe: boolean): string {
   switch (kind) {
     case "in_use":
-      return "Camera is in use by another app. Close it or pick another camera. Better Cam goes live as soon as it is free.";
+      return `${inUseText(apps, appsMaybe)} Better Cam goes live as soon as it is free.`;
     case "disconnected":
       return "The camera was disconnected. Plug it in again; Better Cam goes live as soon as it is back.";
     case "not_found":
@@ -45,6 +45,8 @@ export function EngineBanner() {
   const state = useStore((s) => s.engine.state);
   const reason = useStore((s) => s.engine.reason);
   const kind = useStore((s) => s.engine.kind);
+  const apps = useStore((s) => s.engine.apps);
+  const appsMaybe = useStore((s) => s.engine.appsMaybe);
   const error = useStore((s) => s.error);
   const errorKind = useStore((s) => s.errorKind);
   const onDefault = useStore((s) => isDeviceDefault(s.source));
@@ -75,7 +77,8 @@ export function EngineBanner() {
       )}
       {waiting && (
         <div className="banner warn" role="status" title={reason ?? undefined}>
-          <span>{waitingText(kind, reason)}</span>
+          {/* A program's file name has no break in it: let it wrap instead of pushing the banner wider. */}
+          <span style={{ minWidth: 0, overflowWrap: "anywhere" }}>{waitingText(kind, reason, apps, appsMaybe)}</span>
           {kind === "privacy" && (
             <button className="primary" onClick={() => void api.openCameraSettings().catch(() => {})}>
               Open camera settings

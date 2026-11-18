@@ -10,6 +10,7 @@
 
 pub mod controls;
 pub mod hotplug;
+pub mod in_use;
 pub mod privacy;
 pub mod reader;
 

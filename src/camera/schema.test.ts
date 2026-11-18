@@ -9,7 +9,9 @@
  */
 import {
   DEFAULT_SOURCE,
+  cameraUsers,
   describeSaved,
+  inUseText,
   effectiveSource,
   inUseAfterState,
   inUseDeviceDefault,
@@ -96,5 +98,17 @@ same(describeSaved({ ...saved, frame_interval: 0 }), "1920×1080 YUY2", "no rate
 same(describeSaved({ ...saved, frame_interval: 333667, video_format: "mjpeg" }), "1920×1080 MJPEG 29.97 fps", "29.97");
 same(describeSaved({ ...saved, res_type: "preferred", video_format: "nv12" }), "NV12", "device default size");
 same(describeSaved(DEFAULT_SOURCE), "device default", "device default");
+
+// who holds the camera: none, one, two, more (the backend's `reason` says the same in lower case)
+same(cameraUsers(null), "another app", "no list");
+same(cameraUsers([]), "another app", "empty list");
+same(cameraUsers(["Discord.exe"]), "Discord.exe", "one");
+same(cameraUsers(["Discord.exe", "chrome.exe"]), "Discord.exe and chrome.exe", "two");
+same(cameraUsers(["a.exe", "b.exe", "c.exe"]), "a.exe, b.exe and 1 more", "three");
+same(cameraUsers(["Discord.exe", "chrome.exe", "c.exe", "d.exe"]), "Discord.exe, chrome.exe and 2 more", "four");
+same(inUseText(["Discord.exe"]), "The camera is in use by Discord.exe.", "sentence");
+same(inUseText(undefined), "The camera is in use by another app.", "sentence without a list");
+same(inUseText(["Discord.exe"], true), "The camera may be in use by Discord.exe.", "may be");
+same(inUseText([], true), "The camera is in use by another app.", "nobody named, nothing to doubt");
 
 console.log("ok");

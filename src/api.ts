@@ -21,6 +21,13 @@ export interface EngineState {
    * reconnecting; `format` on the stop of a start that failed for want of a format.
    */
   kind?: string | null;
+  /**
+   * With kind `in_use`: the programs that use a camera now, most recently started first (file names such as
+   * `Discord.exe`). Missing when none could be named.
+   */
+  apps?: string[] | null;
+  /** `apps` may include a program that only reads Better Cam's virtual camera. */
+  apps_maybe?: boolean;
 }
 
 /** `format-fallback`: the camera lacks the saved format; the device default runs. Both are for a sentence, e.g. `1920×1080 YUY2 60 fps`. */

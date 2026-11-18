@@ -461,6 +461,27 @@ pub struct StateEvent {
     /// `not_found`, `privacy` or `error` while `reconnecting`; `format` when a start failed for want of a format.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<&'static str>,
+    /// With `kind` `in_use`: the programs that use a camera now (`["Discord.exe"]`: file names of the executables,
+    /// readable names for packaged apps), most recently started first, Better Cam excluded. Missing when none could be
+    /// named; the window then says "another app". `reason` has the same names in a plain sentence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apps: Option<Vec<String>>,
+    /// `apps` may include a program that only reads Better Cam's virtual camera (the record does not say which camera
+    /// a program uses): the window says "may be in use by".
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub apps_maybe: bool,
+}
+
+impl StateEvent {
+    pub fn new(state: EngineState, reason: Option<String>, kind: Option<&'static str>) -> StateEvent {
+        StateEvent {
+            state,
+            reason,
+            kind,
+            apps: None,
+            apps_maybe: false,
+        }
+    }
 }
 
 /// `format-fallback`: the saved format is not on the camera; the engine opened the device default instead and now
@@ -1138,7 +1159,7 @@ struct Control {
     attempt_started: Instant,
     /// The session that is being opened is a retry.
     retrying: bool,
-    emitted: Option<(EngineState, Option<String>, Option<&'static str>)>,
+    emitted: Option<StateEvent>,
     last_heartbeat: Instant,
     last_stats: Instant,
     hotplug: Option<(HotplugWatcher, Receiver<HotplugEvent>)>,
@@ -1258,23 +1279,20 @@ impl Control {
         reason: Option<String>,
         kind: Option<&'static str>,
     ) {
-        self.phase = phase;
+        self.set_phase_event(StateEvent::new(phase, reason, kind));
+    }
+
+    /// [`Control::set_phase_kind`] with the whole event (the list of programs of an `in_use` wait).
+    fn set_phase_event(&mut self, event: StateEvent) {
+        self.phase = event.state;
         // The event goes out before `Engine::state` changes: whoever sees the state has had the event.
-        let now = Some((phase, reason.clone(), kind));
-        if self.emitted != now {
-            self.emitted = now;
-            emit(
-                &self.shared,
-                EngineEvent::State(StateEvent {
-                    state: phase,
-                    reason: reason.clone(),
-                    kind,
-                }),
-            );
+        if self.emitted.as_ref() != Some(&event) {
+            self.emitted = Some(event.clone());
+            emit(&self.shared, EngineEvent::State(event.clone()));
         }
-        *lock(&self.shared.reason) = reason;
-        *lock(&self.shared.state) = phase;
-        lock(&self.shared.stats).state = phase;
+        *lock(&self.shared.reason) = event.reason;
+        *lock(&self.shared.state) = event.state;
+        lock(&self.shared.stats).state = event.state;
         self.shared.cv.notify_all();
     }
 
@@ -1584,8 +1602,26 @@ impl Control {
         };
         self.next_retry = Some((base + interval).max(Instant::now()));
         self.set_slate();
-        self.set_phase_kind(EngineState::Reconnecting, Some(reason), Some(kind.name()));
+        let mut event = StateEvent::new(EngineState::Reconnecting, Some(reason), Some(kind.name()));
+        if matches!(kind, RetryKind::InUse | RetryKind::AccessDenied) {
+            self.name_camera_users(&mut event);
+        }
+        self.set_phase_event(event);
         self.advertise_idle();
+    }
+
+    /// Say which programs use the camera (the registry is read again with every failed try, so the names follow
+    /// reality). The code of the failure goes to the log, not to the window.
+    fn name_camera_users(&self, event: &mut StateEvent) {
+        let names = self.factory.camera_users();
+        let maybe = !names.is_empty() && self.writer.consumer_active();
+        let code = event.reason.take().unwrap_or_default();
+        event.reason = Some(crate::capture::in_use::reason(&names, maybe));
+        event.apps_maybe = maybe;
+        event.apps = (!names.is_empty()).then_some(names);
+        if self.emitted.as_ref() != Some(&*event) {
+            eprintln!("[engine] {code}; {}", event.reason.as_deref().unwrap_or_default());
+        }
     }
 
     /// The GPU device was lost (`DXGI_ERROR_DEVICE_REMOVED`, a reset): the session ended and its camera is closed.
@@ -2141,6 +2177,12 @@ trait SourceFactory: Send + Sync {
     /// camera is blocked" from "the camera is in use").
     fn privacy_blocked(&self) -> Option<crate::capture::privacy::Blocked> {
         crate::capture::privacy::desktop_access_blocked()
+    }
+
+    /// The programs that use a camera now (read after a failure with "in use"). A few registry reads; it never
+    /// opens a process.
+    fn camera_users(&self) -> Vec<String> {
+        crate::capture::in_use::camera_users()
     }
 }
 
@@ -3569,6 +3611,8 @@ mod tests {
         lose_device_in_open: AtomicBool,
         /// The registry says the privacy switch is off, but opens work (Windows does not enforce it for every app).
         registry_deny: AtomicBool,
+        /// The programs the registry says use a camera (`SourceFactory::camera_users`).
+        users: Mutex<Vec<String>>,
     }
 
     /// The symbolic link the fake camera has.
@@ -3712,6 +3756,10 @@ mod tests {
             (self.privacy.load(Ordering::SeqCst) || self.registry_deny.load(Ordering::SeqCst))
                 .then_some(crate::capture::privacy::Blocked::DesktopApps)
         }
+
+        fn camera_users(&self) -> Vec<String> {
+            self.users.lock().unwrap().clone()
+        }
     }
 
     struct Rig {
@@ -3751,6 +3799,7 @@ mod tests {
                 opened_on_removed: Mutex::new(Vec::new()),
                 lose_device_in_open: AtomicBool::new(false),
                 registry_deny: AtomicBool::new(false),
+                users: Mutex::new(Vec::new()),
             });
             let opener = Arc::new(crate::camera_controls::fake::FakeOpener {
                 camera: fake.controls.clone(),
@@ -4282,10 +4331,7 @@ mod tests {
         rig.engine.start(settings(bars(30), false));
         rig.wait_state(EngineState::Reconnecting, Duration::from_secs(5));
         let reason = rig.engine.reason().unwrap();
-        assert!(
-            reason.contains("in use") && reason.contains("0xC00D3704"),
-            "{reason}"
-        );
+        assert_eq!(reason, "camera is in use by another app", "no code in the words the window shows");
         rig.engine.wait_live(Duration::from_secs(10)).unwrap();
         // two failed opens, retried every 300 ms
         assert_eq!(rig.opens(), 3);
@@ -4303,6 +4349,85 @@ mod tests {
             ],
             "the repeated failure is not announced twice"
         );
+    }
+
+    /// The newest `reconnecting` event: `(reason, apps, apps_maybe)`.
+    fn last_in_use(rig: &Rig) -> Option<(Option<String>, Option<Vec<String>>, bool)> {
+        rig.events.lock().unwrap().iter().rev().find_map(|(_, e)| match e {
+            EngineEvent::State(s) if s.state == EngineState::Reconnecting => {
+                Some((s.reason.clone(), s.apps.clone(), s.apps_maybe))
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_camera_in_use_names_the_programs_and_the_list_follows_each_retry() {
+        let rig = Rig::new("sm-inuse-names.bin", fast());
+        let in_use = || Failure::in_use(Some(HRESULT(0xC00D_3704_u32 as i32)));
+        *rig.fake.users.lock().unwrap() = vec!["Discord.exe".into()];
+        for _ in 0..200 {
+            rig.fake.failures.lock().unwrap().push_back(in_use());
+        }
+        rig.engine.start(settings(bars(30), false));
+        rig.wait_state(EngineState::Reconnecting, Duration::from_secs(5));
+        let (reason, apps, maybe) = last_in_use(&rig).unwrap();
+        assert_eq!(reason.as_deref(), Some("camera is in use by Discord.exe"));
+        assert_eq!(apps, Some(vec!["Discord.exe".to_string()]));
+        assert!(!maybe);
+        assert_eq!(last_kind(&rig), Some("in_use"));
+
+        // the registry is read again with every retry: another program, then two, then none
+        let next = |users: &[&str], what: &str| {
+            *rig.fake.users.lock().unwrap() = users.iter().map(|s| s.to_string()).collect();
+            let want: Option<Vec<String>> = (!users.is_empty()).then(|| users.iter().map(|s| s.to_string()).collect());
+            rig.wait(what, Duration::from_secs(5), |r| last_in_use(r).is_some_and(|(_, a, _)| a == want));
+            last_in_use(&rig).unwrap()
+        };
+        let (reason, ..) = next(&["chrome.exe"], "the new name");
+        assert_eq!(reason.as_deref(), Some("camera is in use by chrome.exe"));
+        let (reason, ..) = next(&["a.exe", "b.exe", "c.exe", "d.exe"], "four names");
+        assert_eq!(reason.as_deref(), Some("camera is in use by a.exe, b.exe and 2 more"));
+        let (reason, apps, _) = next(&[], "nobody");
+        assert_eq!(reason.as_deref(), Some("camera is in use by another app"));
+        assert_eq!(apps, None, "no list, not an empty one");
+
+        // every state event of the wait is a real change: the same list is not announced twice
+        let events = rig.states();
+        assert!(events.windows(2).all(|w| w[0] != w[1]), "{events:?}");
+        rig.fake.failures.lock().unwrap().clear();
+        rig.engine.wait_live(Duration::from_secs(10)).unwrap();
+    }
+
+    #[test]
+    fn the_names_are_a_maybe_while_an_app_reads_the_virtual_camera() {
+        let rig = Rig::new("sm-inuse-maybe.bin", fast());
+        *rig.fake.users.lock().unwrap() = vec!["Discord.exe".into()];
+        for _ in 0..200 {
+            rig.fake.failures.lock().unwrap().push_back(Failure::in_use(None));
+        }
+        let mut consumer = rig.consumer("sm-inuse-maybe.bin");
+        rig.engine.start(settings(bars(30), true));
+        rig.wait_state(EngineState::Reconnecting, Duration::from_secs(5));
+        let (reason, apps, maybe) = last_in_use(&rig).unwrap();
+        assert_eq!(reason.as_deref(), Some("camera may be in use by Discord.exe"));
+        assert_eq!(apps, Some(vec!["Discord.exe".to_string()]));
+        assert!(maybe, "a consumer is attached: the list may name it");
+        consumer.detach();
+        rig.fake.failures.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn only_a_camera_in_use_is_named() {
+        let rig = Rig::new("sm-inuse-only.bin", fast());
+        *rig.fake.users.lock().unwrap() = vec!["Discord.exe".into()];
+        rig.fake.failures.lock().unwrap().push_back(Failure::disconnected(Some(HRESULT(0xC00D_36B2_u32 as i32))));
+        rig.engine.start(settings(bars(30), false));
+        rig.wait_state(EngineState::Reconnecting, Duration::from_secs(5));
+        let (reason, apps, _) = last_in_use(&rig).unwrap();
+        assert!(reason.unwrap().starts_with("camera disconnected"), "the code stays in this reason (not in scope)");
+        assert_eq!(apps, None);
+        assert_eq!(last_kind(&rig), Some("disconnected"));
     }
 
     #[test]
@@ -6115,23 +6240,38 @@ mod tests {
 
     #[test]
     fn state_events_serialize_as_plan_5_6() {
-        let live = serde_json::to_value(StateEvent {
-            state: EngineState::Live,
-            reason: None,
-            kind: None,
-        })
-        .unwrap();
+        let live = serde_json::to_value(StateEvent::new(EngineState::Live, None, None)).unwrap();
         assert_eq!(live, serde_json::json!({"state": "live"}));
-        let r = serde_json::to_value(StateEvent {
-            state: EngineState::Reconnecting,
-            reason: Some("camera in use by another app (0xC00D3704)".into()),
-            kind: Some(RetryKind::InUse.name()),
-        })
+        let r = serde_json::to_value(StateEvent::new(
+            EngineState::Reconnecting,
+            Some("camera is in use by another app".into()),
+            Some(RetryKind::InUse.name()),
+        ))
         .unwrap();
         assert_eq!(
             r,
-            serde_json::json!({"state": "reconnecting", "reason": "camera in use by another app (0xC00D3704)", "kind": "in_use"})
+            serde_json::json!({"state": "reconnecting", "reason": "camera is in use by another app", "kind": "in_use"})
         );
+        // with the programs: the list, and the flag only when it is set
+        let named = StateEvent {
+            apps: Some(vec!["Discord.exe".into(), "chrome.exe".into()]),
+            ..StateEvent::new(
+                EngineState::Reconnecting,
+                Some("camera is in use by Discord.exe and chrome.exe".into()),
+                Some(RetryKind::InUse.name()),
+            )
+        };
+        assert_eq!(
+            serde_json::to_value(&named).unwrap(),
+            serde_json::json!({
+                "state": "reconnecting",
+                "reason": "camera is in use by Discord.exe and chrome.exe",
+                "kind": "in_use",
+                "apps": ["Discord.exe", "chrome.exe"]
+            })
+        );
+        let maybe = StateEvent { apps_maybe: true, ..named };
+        assert_eq!(serde_json::to_value(&maybe).unwrap()["apps_maybe"], serde_json::json!(true));
         for (s, n) in [
             (EngineState::Stopped, "stopped"),
             (EngineState::Standby, "standby"),

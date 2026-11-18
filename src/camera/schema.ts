@@ -347,6 +347,25 @@ export const pausedAfterState = (paused: boolean, e: { state: string; reason?: s
 export const inUseAfterState = (inUse: InUse | null, e: { state: string; reason?: string | null }): InUse | null =>
   e.state === "stopped" && e.reason !== "vcam-change" ? null : inUse;
 
+/**
+ * Who holds the camera, in words (`engine-state.apps`): `Discord.exe`, `Discord.exe and chrome.exe`,
+ * `Discord.exe, chrome.exe and 2 more`; `another app` when the engine could name none.
+ */
+export const cameraUsers = (apps?: readonly string[] | null): string => {
+  const a = apps ?? [];
+  if (a.length === 0) return "another app";
+  if (a.length === 1) return a[0];
+  if (a.length === 2) return `${a[0]} and ${a[1]}`;
+  return `${a[0]}, ${a[1]} and ${a.length - 2} more`;
+};
+
+/**
+ * What the window says while the camera is held by another program. `maybe`: the list may include a program that only
+ * reads Better Cam's virtual camera. Nothing is named, nothing is doubted.
+ */
+export const inUseText = (apps?: readonly string[] | null, maybe?: boolean): string =>
+  `The camera ${maybe && apps?.length ? "may be" : "is"} in use by ${cameraUsers(apps)}.`;
+
 /** Whether source, output and chain edits go to the backend: while the engine runs, and while the virtual camera is changed (it parks them). */
 export const shouldPushSettings = (engineState: string, vcamBusy: string | null): boolean => engineState !== "stopped" || vcamBusy !== null;
 

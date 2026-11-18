@@ -74,9 +74,13 @@ export interface EngineInfo {
   reason: string | null;
   /** What kind of problem `reason` is (see `EngineState.kind`): the banner picks its text and button by it. */
   kind: string | null;
+  /** The programs that hold the camera while `kind` is `in_use` (see `EngineState.apps`); empty when none is known. */
+  apps: string[];
+  /** `apps` may include a program that only reads the virtual camera. */
+  appsMaybe: boolean;
 }
 
-const STOPPED: EngineInfo = { state: "stopped", reason: null, kind: null };
+const STOPPED: EngineInfo = { state: "stopped", reason: null, kind: null, apps: [], appsMaybe: false };
 const isRunning = (e: EngineInfo) => e.state !== "stopped";
 
 const loadSaved = (): Saved => {
@@ -372,7 +376,7 @@ export const useStore = create<State>((set, get) => {
       await api.startEngine(effectiveSource(source, inUse), output, chain, record());
       // The events may already have said more than "standby"; only fill in when they have not. Not while the virtual
       // camera is being changed: the engine is released then (the events said so) and starts when the change ends.
-      if (!running() && !get().vcamBusy) set({ engine: { state: "standby", reason: "opening", kind: null } });
+      if (!running() && !get().vcamBusy) set({ engine: { ...STOPPED, state: "standby", reason: "opening" } });
       set({ error: null, errorKind: null, paused: false, wasRunning: true, filterErrors: {} });
       persist();
       return true;
@@ -597,7 +601,13 @@ export const useStore = create<State>((set, get) => {
     init: async () => {
       await api.onEngineState((e) => {
         set((s) => ({
-          engine: { state: e.state, reason: e.reason ?? null, kind: e.kind ?? null },
+          engine: {
+            state: e.state,
+            reason: e.reason ?? null,
+            kind: e.kind ?? null,
+            apps: e.apps ?? [],
+            appsMaybe: e.apps_maybe ?? false,
+          },
           // A stop clears the pause and the fallback, except the one the virtual camera change announces: the engine
           // comes back with both (the backend reports the pause again). The kind of a stop that has an error says what
           // the error is about (`format`).

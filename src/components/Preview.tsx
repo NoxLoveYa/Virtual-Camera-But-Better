@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
+import { inUseText } from "../camera/schema";
 import { useStore } from "../store";
 
 /** The preview frame of `src-tauri/src/preview.rs`: 16 header bytes (four little-endian u32), then RGBA pixels. */
@@ -107,6 +108,9 @@ export function Preview() {
   const previewOn = useStore((s) => s.previewOn);
   const state = useStore((s) => s.engine.state);
   const reason = useStore((s) => s.engine.reason);
+  const kind = useStore((s) => s.engine.kind);
+  const apps = useStore((s) => s.engine.apps);
+  const appsMaybe = useStore((s) => s.engine.appsMaybe);
   const paused = useStore((s) => s.paused);
   const { setPreviewOn } = useStore.getState();
   const visible = usePageVisible();
@@ -248,7 +252,9 @@ export function Preview() {
   if (!previewOn) placeholder = "Preview off";
   else if (state === "stopped") placeholder = "Camera stopped";
   else if (paused) placeholder = "Paused";
-  else if (state === "reconnecting") placeholder = reason ? sentence(reason) : "Waiting for the camera";
+  else if (state === "reconnecting") {
+    placeholder = kind === "in_use" ? inUseText(apps, appsMaybe) : reason ? sentence(reason) : "Waiting for the camera";
+  }
   else if (state === "standby") placeholder = reason === "idle" ? "Camera off: no app is using Better Cam" : "Opening the camera…";
   else if (!shown) placeholder = "Starting…";
   const showing = placeholder === null;
