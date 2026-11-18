@@ -23,7 +23,7 @@ pub use header::{
 #[cfg(windows)]
 pub use map::{
     data_dir as frames_dir, frames_path, hns_to_qpc, qpc_frequency, qpc_now, qpc_to_hns,
-    read_advertised, read_advertised_pinned, Access, MappedFile, Writer,
+    read_advertised, read_advertised_pinned, Access, BackingFile, MappedFile, Writer,
 };
 pub use seqlock::{Disposition, PublishError, Read, ReadError, Shared, SlotData, SlotFormat};
 pub use validate::{

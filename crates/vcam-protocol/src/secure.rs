@@ -47,7 +47,8 @@ use windows::Win32::Foundation::{
 use windows::Win32::Security::SECURITY_DESCRIPTOR;
 use windows::Win32::Storage::FileSystem::{
     FileDispositionInfo, FileDispositionInfoEx, FileFullDirectoryInfo,
-    FileFullDirectoryRestartInfo, FileIdInfo, FileRenameInfo, FileStreamInfo, FlushFileBuffers,
+    FileFullDirectoryRestartInfo, FileIdInfo, FileRenameInfo, FileStandardInfo, FileStreamInfo,
+    FlushFileBuffers, FILE_STANDARD_INFO,
     GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
     GetFinalPathNameByHandleW, GetFullPathNameW, SetFileInformationByHandle,
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, FILE_ACCESS_RIGHTS, FILE_ATTRIBUTE_DIRECTORY,
@@ -1272,6 +1273,49 @@ pub fn file_identity(h: HANDLE) -> io::Result<FileIdentity> {
         volume: i.VolumeSerialNumber,
         id,
     })
+}
+
+/// Open an existing file only to ask about it: `FILE_READ_ATTRIBUTES` and nothing else. No read access to the data,
+/// so the open does not wake a virus scanner that scans on open, and it needs the least a file can give. A link is
+/// opened as the link.
+pub fn open_to_inspect(path: &Path) -> io::Result<OwnedHandle> {
+    open_with(path, ACCESS_READ_ATTRIBUTES, SHARE_ALL, OPEN_EXISTING, false, 0)
+}
+
+/// Whether the file behind `h` is marked for deletion (its name is gone or goes when the last handle closes; no new
+/// open of it succeeds, and the open reports "access denied", which is why this asks the handle). Needs
+/// `FILE_READ_ATTRIBUTES`.
+pub fn delete_pending(h: HANDLE) -> io::Result<bool> {
+    let mut i = FILE_STANDARD_INFO::default();
+    // SAFETY: `i` is a FILE_STANDARD_INFO and the size passed is its size.
+    unsafe {
+        GetFileInformationByHandleEx(
+            h,
+            FileStandardInfo,
+            &mut i as *mut FILE_STANDARD_INFO as *mut c_void,
+            std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    }
+    .map_err(win_err)?;
+    Ok(i.DeletePending)
+}
+
+/// Test helper: mark the file at `path` for deletion the classic way (it stays, delete pending, while a handle is open
+/// on it; the name does not go at once as it does with POSIX semantics).
+#[cfg(test)]
+pub(crate) fn mark_delete_pending_classic(path: &Path) -> io::Result<()> {
+    let h = open_with(path, ACCESS_DELETE, SHARE_ALL, OPEN_EXISTING, false, 0)?;
+    // FILE_DISPOSITION_INFO: one BOOLEAN
+    let info = [1u8];
+    unsafe {
+        SetFileInformationByHandle(
+            raw(&h),
+            FileDispositionInfo,
+            info.as_ptr() as *const c_void,
+            1,
+        )
+    }
+    .map_err(win_err)
 }
 
 fn ioctl(h: HANDLE, code: u32, input: *const c_void, len: u32) -> io::Result<()> {

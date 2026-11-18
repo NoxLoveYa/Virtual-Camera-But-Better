@@ -40,3 +40,7 @@ features = [
     "Win32_Devices_Properties",
     "Win32_UI_Shell_PropertiesSystem",
 ]
+
+[dev-dependencies]
+# Writer::shared: the tests set up a file's contents directly
+vcam-protocol = { workspace = true, features = ["test-support"] }

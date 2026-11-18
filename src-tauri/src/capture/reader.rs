@@ -61,7 +61,13 @@ pub struct OpenOptions {
     pub queue_len: usize,
     /// How long `open` waits for the first frame or a terminal error.
     pub first_frame_timeout: Duration,
+    /// Set by the caller to cut the wait for the first frame short (the engine stops a session whose camera is still
+    /// opening): `open` then fails with [`CaptureError::Timeout`] within [`CANCEL_POLL`] instead of at the timeout.
+    pub cancel: Option<Arc<AtomicBool>>,
 }
+
+/// How often the wait for the first frame looks at [`OpenOptions::cancel`].
+const CANCEL_POLL: Duration = Duration::from_millis(25);
 
 impl OpenOptions {
     pub fn new(link: &str, request: FormatRequest) -> OpenOptions {
@@ -72,6 +78,7 @@ impl OpenOptions {
             gpu: None,
             queue_len: 3,
             first_frame_timeout: Duration::from_secs(5),
+            cancel: None,
         }
     }
 }
@@ -727,7 +734,7 @@ impl CaptureReader {
             this.close();
             return Err(CaptureError::from_call("ReadSample", e));
         }
-        if let Err(e) = this.wait_first_frame(opts.first_frame_timeout) {
+        if let Err(e) = this.wait_first_frame(opts.first_frame_timeout, opts.cancel.as_deref()) {
             this.close();
             return Err(e);
         }
@@ -735,7 +742,11 @@ impl CaptureReader {
     }
 
     /// Block until a frame is queued or the stream stopped before delivering any.
-    fn wait_first_frame(&self, timeout: Duration) -> Result<(), CaptureError> {
+    fn wait_first_frame(
+        &self,
+        timeout: Duration,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(), CaptureError> {
         let deadline = Instant::now() + timeout;
         let mut st = lock(&self.shared.state);
         loop {
@@ -757,13 +768,18 @@ impl CaptureReader {
                 });
             }
             let now = Instant::now();
-            if now >= deadline {
+            if now >= deadline || cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
                 return Err(CaptureError::Timeout("the first frame"));
             }
+            let wait = if cancel.is_some() {
+                (deadline - now).min(CANCEL_POLL)
+            } else {
+                deadline - now
+            };
             st = self
                 .shared
                 .cv
-                .wait_timeout(st, deadline - now)
+                .wait_timeout(st, wait)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }

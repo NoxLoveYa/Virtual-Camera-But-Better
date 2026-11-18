@@ -3,6 +3,7 @@
 use std::io;
 use std::os::windows::io::IntoRawHandle;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -16,7 +17,9 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
-use crate::header::{Format, WriterState, FILE_SIZE, HEADER_SIZE, MAX_FILE_SIZE};
+use crate::header::{
+    Format, RawHeader, SlotMeta, WriterState, FILE_SIZE, HEADER_SIZE, MAX_FILE_SIZE,
+};
 use crate::secure;
 use crate::seqlock::{PublishError, Shared, SlotFormat};
 
@@ -297,7 +300,7 @@ pub fn read_advertised_pinned(path: &Path, root: &Path) -> Vec<Format> {
 fn advertised_from(read: io::Result<(Vec<u8>, u64)>) -> Vec<Format> {
     let from_file = (|| {
         let (bytes, len) = read.ok()?;
-        let raw = crate::RawHeader::from_bytes(&bytes)?;
+        let raw = RawHeader::from_bytes(&bytes)?;
         let v = crate::validate_header(&raw, len, None, None).ok()?;
         Some(v.advertised)
     })();
@@ -309,9 +312,39 @@ fn advertised_from(read: io::Result<(Vec<u8>, u64)>) -> Vec<Format> {
 
 /// The app's end of the transport: creates `frames.bin`, publishes frames and state.
 ///
-/// Dropping the writer sets `writer_state = closed` so the DLL switches to its slate at once.
+/// Dropping a writer does **not** touch the file: the owner says when the camera is gone ([`Writer::close`]). A drop
+/// that closed the file would let a writer that is left behind (a render thread that a stop could not wait for) mark
+/// `Closed` the file of the *next* writer on the same path.
+///
+/// # One writer at a time: leases
+///
+/// The seqlock assumes a single writer, but a thread that was left behind keeps its handle to the writer until it ends
+/// (it may be stuck in a driver call for minutes). So a session does not write through the engine's writer but
+/// through its own [`Writer::lease`]: the same mapping with its own write gate. [`Writer::retire`] shuts that gate;
+/// once it has returned, no write of the lease reaches the file (a write that is running is waited for), however
+/// long the thread lives on. The gate is a lock, not a flag that is looked at before a write, so there is no gap
+/// between the look and the write.
 pub struct Writer {
-    map: MappedFile,
+    map: Arc<MappedFile>,
+    /// The path the file was opened by: the virtual camera opens the file by this path, so it is what must still lead
+    /// to the mapped file ([`Writer::backing_file`]).
+    path: PathBuf,
+    /// The write gate: `true` once the writer is retired. Every write to the file holds it for reading, so a writer
+    /// that retires waits for the writes under way, and no later one starts.
+    retired: RwLock<bool>,
+}
+
+/// Whether the path of a [`Writer`]'s file still leads to the file it has mapped ([`Writer::backing_file`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackingFile {
+    /// The path names the mapped file.
+    Same,
+    /// The path names another file, a link, or nothing (deleted, or deleted and pending): the virtual camera reads
+    /// something else than the writer writes.
+    Replaced,
+    /// Could not tell (the open was refused for now, an opportunistic lock; the open failed for another reason such as
+    /// "access denied" or a sharing violation; the file system has no file ids): nothing is known, look again later.
+    Unknown,
 }
 
 impl Writer {
@@ -395,7 +428,40 @@ impl Writer {
         map.shared()
             .init_writer(std::process::id(), qpc_frequency(), qpc_now())
             .map_err(|e| io::Error::other(format!("{e:?}")))?;
-        Ok(Writer { map })
+        Ok(Writer {
+            map: Arc::new(map),
+            path: path.to_path_buf(),
+            retired: RwLock::new(false),
+        })
+    }
+
+    /// A writer on the same mapped file with a write gate of its own (see the type's notes). It shares the mapping, so
+    /// the file stays mapped until the last lease is gone; nothing is written or reset by making it.
+    pub fn lease(&self) -> Writer {
+        Writer {
+            map: self.map.clone(),
+            path: self.path.clone(),
+            retired: RwLock::new(false),
+        }
+    }
+
+    /// Shut the write gate: from here on this writer's writes ([`Writer::set_state`], [`Writer::heartbeat`],
+    /// [`Writer::set_advertised`], [`Writer::publish`], [`Writer::clear_latest`], [`Writer::close`]) do nothing, and
+    /// when this returns none is still running. Reads keep working. Final.
+    pub fn retire(&self) {
+        *self.retired.write().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+
+    /// Whether [`Writer::retire`] was called.
+    pub fn is_retired(&self) -> bool {
+        *self.retired.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The gate held open for one write: `None` when the writer is retired. The write must be done before the guard
+    /// is dropped.
+    fn open_gate(&self) -> Option<RwLockReadGuard<'_, bool>> {
+        let g = self.retired.read().unwrap_or_else(|e| e.into_inner());
+        (!*g).then_some(g)
     }
 
     /// [`Writer::create`] at `%ProgramData%\BetterCam\frames.bin`: opens the file the installer made.
@@ -403,24 +469,51 @@ impl Writer {
         Writer::create(&frames_path())
     }
 
+    /// The writable view of the mapping. A write through it bypasses the write gate ([`Writer::retire`]), so it is
+    /// not public: other crates read with [`Writer::header`] and [`Writer::slot_meta`] and write with the writer's own
+    /// methods. Only the tests of other crates, which set up a file's contents directly (`poke`, a consumer's fields),
+    /// get it, with the `test-support` feature; no product build enables that.
+    #[cfg(not(feature = "test-support"))]
+    pub(crate) fn shared(&self) -> &Shared {
+        self.map.shared()
+    }
+
+    /// See the notes of the `pub(crate)` form: the same view, public for tests.
+    #[cfg(feature = "test-support")]
     pub fn shared(&self) -> &Shared {
         self.map.shared()
     }
 
+    /// A copy of the file's header (read only).
+    pub fn header(&self) -> RawHeader {
+        self.shared().header()
+    }
+
+    /// A copy of the metadata of slot `i` (read only).
+    pub fn slot_meta(&self, i: usize) -> SlotMeta {
+        self.shared().slot_meta(i)
+    }
+
     /// Set the media types the camera advertises (read by the DLL at activation).
     pub fn set_advertised(&self, formats: &[Format]) {
-        self.shared().set_advertised(formats);
+        if let Some(_gate) = self.open_gate() {
+            self.shared().set_advertised(formats);
+        }
     }
 
     /// Set `writer_state` and refresh the heartbeat.
     pub fn set_state(&self, state: WriterState) {
-        self.shared().set_writer_state(state);
-        self.heartbeat();
+        if let Some(_gate) = self.open_gate() {
+            self.shared().set_writer_state(state);
+            self.shared().set_writer_heartbeat(qpc_now());
+        }
     }
 
     /// Refresh `writer_heartbeat`. Call it every frame and at least every 200 ms when idle.
     pub fn heartbeat(&self) {
-        self.shared().set_writer_heartbeat(qpc_now());
+        if let Some(_gate) = self.open_gate() {
+            self.shared().set_writer_heartbeat(qpc_now());
+        }
     }
 
     /// True while a stream runs in Frame Server (`consumer_active != 0` and its heartbeat is under 1 s old).
@@ -448,18 +541,71 @@ impl Writer {
         capture_qpc: u64,
         fill: impl FnOnce(&mut [u8]),
     ) -> Result<u64, PublishError> {
+        // The gate stays open for the whole publish, the copy of the frame included.
+        let Some(_gate) = self.open_gate() else {
+            return Err(PublishError::Retired);
+        };
         self.shared().publish(f, capture_qpc, qpc_now(), fill)
     }
 
-    /// Mark the file closed (the DLL shows "not running" immediately). Also done on drop.
+    /// Whether the path the file was opened by still leads to the file this writer has mapped: the file ids (volume
+    /// and 128-bit id) of the path, opened without following a link, and of the mapped handle are compared. A deleted,
+    /// replaced or relinked file is [`BackingFile::Replaced`]: the writer then writes into a file the virtual camera
+    /// does not read. One open and two queries; the file is not touched.
+    ///
+    /// The path is opened with `FILE_READ_ATTRIBUTES` only (no read access to the data: an open that reads is what a
+    /// virus scanner that scans on open wakes up for). Only an answer that says the file is gone counts as
+    /// [`BackingFile::Replaced`]: the path does not exist (`NotFound`, `PathNotFound`), the mapped file is marked for
+    /// deletion (an open of such a file says "access denied", so its own handle is asked), or the path names another
+    /// file. Any other failure to open (access denied, a sharing violation, a lock held back) is
+    /// [`BackingFile::Unknown`]: it says nothing about the file.
+    pub fn backing_file(&self) -> BackingFile {
+        let mine = match secure::file_identity(self.map.file) {
+            Ok(id) => id,
+            Err(_) => return BackingFile::Unknown,
+        };
+        // Delete pending: the name is gone or will go with the last handle, whatever the path opens to.
+        if matches!(secure::delete_pending(self.map.file), Ok(true)) {
+            return BackingFile::Replaced;
+        }
+        let h = match secure::open_to_inspect(&self.path) {
+            Ok(h) => h,
+            Err(e) => return open_failure_verdict(&e),
+        };
+        match secure::file_identity(secure::raw(&h)) {
+            Ok(theirs) if theirs == mine => BackingFile::Same,
+            Ok(_) => BackingFile::Replaced,
+            Err(_) => BackingFile::Unknown,
+        }
+    }
+
+    /// Forget the newest frame (see [`Shared::clear_latest`]): a reader that attaches gets no old picture, only the
+    /// next one published. The state and the heartbeat are not touched.
+    pub fn clear_latest(&self) {
+        if let Some(_gate) = self.open_gate() {
+            self.shared().clear_latest();
+        }
+    }
+
+    /// Mark the file closed (the DLL shows "not running" immediately). Nothing else does that: dropping a writer
+    /// leaves the file as it is.
     pub fn close(&self) {
         self.set_state(WriterState::Closed);
     }
 }
 
-impl Drop for Writer {
-    fn drop(&mut self) {
-        self.close();
+/// What a failed open of the frame file's path says about the file ([`Writer::backing_file`]): only "there is nothing
+/// at that path" (`ERROR_FILE_NOT_FOUND`, `ERROR_PATH_NOT_FOUND`) means the file is gone.
+fn open_failure_verdict(e: &io::Error) -> BackingFile {
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    const ERROR_PATH_NOT_FOUND: i32 = 3;
+    if secure::is_refused(e) {
+        // held back for now (an opportunistic lock), or refused for what the file is: nothing is known
+        return BackingFile::Unknown;
+    }
+    match e.raw_os_error() {
+        Some(ERROR_FILE_NOT_FOUND) | Some(ERROR_PATH_NOT_FOUND) => BackingFile::Replaced,
+        _ => BackingFile::Unknown,
     }
 }
 
@@ -494,6 +640,80 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "mklink /J failed");
+    }
+
+    #[test]
+    fn the_writer_notices_a_frame_file_that_was_deleted_or_replaced() {
+        // untouched
+        let path = temp_file("backing-same.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        assert_eq!(w.backing_file(), BackingFile::Same);
+        // writing and mapping leave it the same file
+        w.set_state(WriterState::Live);
+        assert_eq!(w.backing_file(), BackingFile::Same);
+
+        // deleted: the mapping lives on (the handle allows delete), the path leads nowhere
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(w.backing_file(), BackingFile::Replaced);
+        // and a new file at the path is another file
+        let other = Writer::create(&path).unwrap();
+        assert_eq!(other.backing_file(), BackingFile::Same);
+        assert_eq!(w.backing_file(), BackingFile::Replaced);
+        drop(w);
+
+        // renamed over by another file
+        let spare = temp_file("backing-spare.bin");
+        let _ = std::fs::remove_file(&spare);
+        std::fs::write(&spare, vec![0u8; FILE_SIZE as usize]).unwrap();
+        assert_eq!(other.backing_file(), BackingFile::Same);
+        std::fs::rename(&spare, &path).unwrap();
+        assert_eq!(other.backing_file(), BackingFile::Replaced);
+    }
+
+    #[test]
+    fn the_writer_can_forget_its_newest_frame_and_a_reader_gets_the_next_one() {
+        let path = temp_file("clear-latest.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        let fmt = SlotFormat {
+            width: 16,
+            height: 16,
+            stride: 16,
+            subtype: SUBTYPE_NV12,
+        };
+        w.publish(fmt, 111, |d| d.fill(1)).unwrap();
+        // a second process's view of the same file, as the DLL has it
+        let m = MappedFile::open(&path, Access::ReadWrite).unwrap();
+        let v = validate_header(&m.shared().header(), m.len() as u64, None, None).unwrap();
+        let first = |m: &MappedFile| {
+            let mut got = None;
+            let _ = m.shared().read_latest(&v, |meta, _| {
+                got = Some(meta.capture_qpc);
+                Disposition::Taken
+            });
+            got
+        };
+        assert_eq!(first(&m), Some(111));
+        w.clear_latest();
+        assert_eq!(m.shared().header().latest_slot, crate::NO_SLOT);
+        assert_eq!(
+            first(&m),
+            None,
+            "an attaching reader is offered no old frame"
+        );
+        assert_eq!(
+            m.shared().header().writer_state,
+            WriterState::Live as u32,
+            "the state is the caller's"
+        );
+        w.publish(fmt, 222, |d| d.fill(2)).unwrap();
+        assert_eq!(
+            first(&m),
+            Some(222),
+            "the next frame is the first one it can take"
+        );
     }
 
     #[test]
@@ -656,12 +876,180 @@ mod tests {
 
         // plain read of the advertised list
         assert_eq!(read_advertised(&path).len(), 4);
-        drop(w);
-        // dropping the writer closes the file for readers
+        // closing is the owner's act: the file is `Closed` after `close`, not after a drop
+        w.close();
         assert_eq!(
             ro.shared().header().writer_state,
             WriterState::Closed as u32
         );
+    }
+
+    /// M-2: a writer that is dropped late (a render thread that was left behind, after the engine was rebuilt on the
+    /// same path) must not mark the file of the new writer `Closed`.
+    #[test]
+    fn dropping_an_old_writer_leaves_the_new_writers_file_alone() {
+        let path = temp_file("late-drop.bin");
+        let _ = std::fs::remove_file(&path);
+        let old = std::sync::Arc::new(Writer::create(&path).unwrap());
+        let straggler = old.lease();
+        old.set_state(WriterState::Live);
+        // the engine is rebuilt: a new writer on the same path starts the header again
+        let new = Writer::create(&path).unwrap();
+        new.set_state(WriterState::Live);
+        // the old handles go, the straggler last
+        drop(old);
+        drop(straggler);
+        assert_eq!(
+            new.shared().header().writer_state,
+            WriterState::Live as u32,
+            "the last drop of an old writer closed the file under the new one"
+        );
+    }
+
+    #[test]
+    fn a_retired_lease_writes_nothing_and_the_owner_still_does() {
+        let path = temp_file("retire.bin");
+        let _ = std::fs::remove_file(&path);
+        let owner = Writer::create(&path).unwrap();
+        let lease = owner.lease();
+        let fmt = SlotFormat {
+            width: 16,
+            height: 16,
+            stride: 16,
+            subtype: SUBTYPE_NV12,
+        };
+        lease.set_state(WriterState::Live);
+        lease.publish(fmt, 111, |d| d.fill(1)).unwrap();
+        assert_eq!(owner.shared().header().writer_frames, 1);
+
+        lease.retire();
+        assert!(lease.is_retired() && !owner.is_retired());
+        // every write is refused or ignored
+        assert_eq!(
+            lease.publish(fmt, 222, |_| panic!("the fill of a retired writer ran")),
+            Err(PublishError::Retired)
+        );
+        lease.set_state(WriterState::Paused);
+        lease.close();
+        lease.heartbeat();
+        lease.set_advertised(&[]);
+        lease.clear_latest();
+        let h = owner.shared().header();
+        assert_eq!(h.writer_state, WriterState::Live as u32);
+        assert_eq!(h.writer_frames, 1, "a retired writer's frame reached the file");
+        assert_ne!(h.latest_slot, crate::NO_SLOT, "a retired writer cleared the newest frame");
+        let beat = h.writer_heartbeat;
+        lease.heartbeat();
+        assert_eq!(owner.shared().header().writer_heartbeat, beat);
+        // reads still work, and the owner is not affected
+        assert_eq!(lease.backing_file(), BackingFile::Same);
+        owner.publish(fmt, 333, |d| d.fill(3)).unwrap();
+        assert_eq!(owner.shared().header().writer_frames, 2);
+        owner.close();
+        assert_eq!(owner.shared().header().writer_state, WriterState::Closed as u32);
+    }
+
+    /// The gate is a lock: a publish that is running finishes before `retire` returns, and none starts after it.
+    #[test]
+    fn retiring_waits_for_the_publish_that_is_running() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let path = temp_file("retire-wait.bin");
+        let _ = std::fs::remove_file(&path);
+        let owner = Writer::create(&path).unwrap();
+        let lease = std::sync::Arc::new(owner.lease());
+        let fmt = SlotFormat {
+            width: 16,
+            height: 16,
+            stride: 16,
+            subtype: SUBTYPE_NV12,
+        };
+        let (in_fill, filled) = (
+            std::sync::Arc::new(AtomicBool::new(false)),
+            std::sync::Arc::new(AtomicBool::new(false)),
+        );
+        let t = {
+            let (lease, in_fill, filled) = (lease.clone(), in_fill.clone(), filled.clone());
+            std::thread::spawn(move || {
+                lease
+                    .publish(fmt, 5, |d| {
+                        in_fill.store(true, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        d.fill(5);
+                        filled.store(true, Ordering::SeqCst);
+                    })
+                    .unwrap();
+            })
+        };
+        while !in_fill.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        lease.retire();
+        assert!(
+            filled.load(Ordering::SeqCst),
+            "retire returned while a publish was still writing"
+        );
+        t.join().unwrap();
+        assert_eq!(owner.shared().header().writer_frames, 1);
+        assert!(lease.publish(fmt, 6, |_| {}).is_err());
+    }
+
+    #[test]
+    fn only_a_missing_path_or_a_deleted_file_counts_as_replaced() {
+        // the verdict on a failed open
+        let denied = io::Error::from_raw_os_error(5);
+        let sharing = io::Error::from_raw_os_error(32);
+        let other = io::Error::other("something");
+        assert_eq!(open_failure_verdict(&denied), BackingFile::Unknown);
+        assert_eq!(open_failure_verdict(&sharing), BackingFile::Unknown);
+        assert_eq!(open_failure_verdict(&other), BackingFile::Unknown);
+        assert_eq!(open_failure_verdict(&secure::refused("held back")), BackingFile::Unknown);
+        assert_eq!(
+            open_failure_verdict(&io::Error::from_raw_os_error(2)),
+            BackingFile::Replaced
+        );
+        assert_eq!(
+            open_failure_verdict(&io::Error::from_raw_os_error(3)),
+            BackingFile::Replaced
+        );
+
+        // a file that is marked for deletion but still open keeps its name, and an open of it says "access denied":
+        // only the handle that is open knows (a mapped file cannot be marked the classic way, so a plain file shows it)
+        let path = temp_file("backing-pending.bin");
+        std::fs::write(&path, b"x").unwrap();
+        let h = secure::open_with(
+            &path,
+            secure::ACCESS_READ,
+            secure::SHARE_ALL,
+            secure::DISP_OPEN_EXISTING,
+            false,
+            0,
+        )
+        .unwrap();
+        assert!(!secure::delete_pending(secure::raw(&h)).unwrap());
+        secure::mark_delete_pending_classic(&path).unwrap();
+        assert!(secure::delete_pending(secure::raw(&h)).unwrap());
+        let e = secure::open_to_inspect(&path).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(5), "{e}");
+        assert_eq!(
+            open_failure_verdict(&e),
+            BackingFile::Unknown,
+            "an open that is refused with 'access denied' says nothing"
+        );
+        drop(h);
+    }
+
+    /// The path is opened for its attributes only.
+    #[test]
+    fn the_frame_file_is_inspected_without_read_access() {
+        let path = temp_file("backing-inspect.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        let h = secure::open_to_inspect(&path).unwrap();
+        // no data access: a read through that handle is refused
+        let mut f = std::fs::File::from(h);
+        let mut b = [0u8; 4];
+        assert!(std::io::Read::read(&mut f, &mut b).is_err(), "the inspect handle can read data");
+        assert_eq!(w.backing_file(), BackingFile::Same);
     }
 
     #[test]

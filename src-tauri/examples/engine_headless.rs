@@ -835,7 +835,7 @@ fn run() -> Result<(), String> {
         out.0,
         out.1,
         {
-            let h = engine.writer().shared().header();
+            let h = engine.writer().header();
             let f = h.advertised[0];
             format!(
                 "{}x{}@{} {}",
@@ -927,7 +927,7 @@ fn run() -> Result<(), String> {
         }
         next_print += Duration::from_secs(1);
         let s = engine.stats();
-        let h = engine.writer().shared().header();
+        let h = engine.writer().header();
         println!(
             "t={:>3}s cap {:>5.1} render {:>5.1} pub {:>5.1} fps | gpu {:.2} ms readback {:.2} ms cpu {:.2} ms | latency p50/p95/max {:.1}/{:.1}/{:.1} ms, pipeline p95 {:.1} ms | dropped mailbox {} output {} errors {} | out {}x{} {} | dll: {} delivered {} repeated {} p50 {} us",
             started.elapsed().as_secs(),
@@ -955,7 +955,7 @@ fn run() -> Result<(), String> {
 
     // ---- results
     let last = engine.stats();
-    let h = engine.writer().shared().header();
+    let h = engine.writer().header();
     let mean = |i: usize| samples.iter().map(|s| s[i]).sum::<f64>() / samples.len().max(1) as f64;
     let max = |i: usize| samples.iter().map(|s| s[i]).fold(0.0, f64::max);
     println!(
@@ -972,7 +972,7 @@ fn run() -> Result<(), String> {
     engine.stop();
     let stopped = engine.wait_stopped(Duration::from_secs(10));
     let _ = ENGINE_STOPPED_AT.set(Instant::now());
-    let state = WriterState::from_u32(writer.shared().header().writer_state)
+    let state = WriterState::from_u32(writer.header().writer_state)
         .map(|s| s.name())
         .unwrap_or("?");
     println!("stopped: {stopped}, writer_state: {state}");

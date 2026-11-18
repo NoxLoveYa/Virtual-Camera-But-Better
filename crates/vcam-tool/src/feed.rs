@@ -262,6 +262,8 @@ pub fn run(args: &[String]) -> i32 {
                 });
                 if let Err(e) = r {
                     eprintln!("publish failed: {e:?}");
+                    // the file must not be left on its last picture (a writer's drop does not close it)
+                    writer.close();
                     return 1;
                 }
                 n += 1;
@@ -288,6 +290,8 @@ pub fn run(args: &[String]) -> i32 {
         "done: {frames} frames in {el:.2} s ({:.2} fps), {late} schedule resets; closing the file",
         frames as f64 / el.max(0.001)
     );
+    // (a writer's drop no longer closes the file)
+    writer.close();
     drop(writer);
     0
 }

@@ -974,7 +974,7 @@ fn run() -> Result<(), String> {
                 let label = step["label"].as_str().unwrap_or("engine_stats");
                 let seconds = secs(step, "seconds", 20.0);
                 let engine = svc.engine()?;
-                let (s0, h0) = (engine.stats(), engine.writer().shared().header());
+                let (s0, h0) = (engine.stats(), engine.writer().header());
                 println!("PERF_WINDOW_START {label} t={:.3}", log.t());
                 let begin = Instant::now();
                 // capture fps, render fps, publish fps, gpu, readback, cpu, worst pass of the render loop
@@ -996,7 +996,7 @@ fn run() -> Result<(), String> {
                     }
                 }
                 println!("PERF_WINDOW_END {label} t={:.3}", log.t());
-                let (s1, h1) = (engine.stats(), engine.writer().shared().header());
+                let (s1, h1) = (engine.stats(), engine.writer().header());
                 let mean = |i: usize| v.iter().map(|x| x[i]).sum::<f64>() / v.len().max(1) as f64;
                 let max = |i: usize| v.iter().map(|x| x[i]).fold(0.0f64, f64::max);
                 println!(

@@ -47,6 +47,8 @@ pub struct SlotFormat {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PublishError {
     ReadOnly,
+    /// The [`crate::Writer`] was retired ([`crate::Writer::retire`]): it no longer writes to the file.
+    Retired,
     Format(FormatError),
     BadStride,
     TooLarge,
@@ -221,6 +223,16 @@ impl Shared {
         if self.writable {
             self.a64(off::WRITER_HEARTBEAT)
                 .store(now_qpc, Ordering::Release);
+        }
+    }
+
+    /// Forget the newest frame: `latest_slot` becomes [`NO_SLOT`], so a reader that attaches finds no frame until the
+    /// next [`publish`](Self::publish). The slots keep their data (a reader that is copying one is not disturbed) and
+    /// `writer_frames` is untouched. The engine calls it while nobody reads the camera, so the picture of an earlier
+    /// session (another camera, an older filter chain) is never what a new app gets first. Ignored on a read-only view.
+    pub fn clear_latest(&self) {
+        if self.writable {
+            self.a32(off::LATEST_SLOT).store(NO_SLOT, Ordering::Release);
         }
     }
 
@@ -655,6 +667,77 @@ mod tests {
             Err(ReadError::Invalid(_))
         ));
         assert_eq!(s.header().reader_slot, NO_SLOT);
+    }
+
+    #[test]
+    fn clearing_the_latest_frame_leaves_a_new_reader_nothing_until_the_next_publish() {
+        let (_h, s) = fresh();
+        let v = valid(&s);
+        let fmt = SlotFormat {
+            width: 16,
+            height: 16,
+            stride: 16,
+            subtype: SUBTYPE_NV12,
+        };
+        s.publish(fmt, 11, 1, |d| d.fill(1)).unwrap();
+        s.publish(fmt, 22, 2, |d| d.fill(2)).unwrap();
+        assert_ne!(s.header().latest_slot, NO_SLOT);
+        let frames = s.header().writer_frames;
+        s.clear_latest();
+        let h = s.header();
+        assert_eq!(h.latest_slot, NO_SLOT);
+        assert_eq!(
+            h.writer_frames, frames,
+            "the count of published frames stays"
+        );
+        assert_eq!(h.writer_state, WriterState::Live as u32, "the state stays");
+        // a reader that attaches now finds nothing, and the callback never runs
+        assert_eq!(
+            s.read_latest(&v, |_, _| panic!("an old frame was offered")),
+            Ok(Read::NoFrame)
+        );
+        // the next publish is what it gets
+        s.publish(fmt, 33, 3, |d| d.fill(3)).unwrap();
+        let mut seen = None;
+        let r = s
+            .read_latest(&v, |m, data| {
+                let mut b = [0u8; 1];
+                data.copy_to(0, &mut b);
+                seen = Some((m.capture_qpc, b[0]));
+                Disposition::Taken
+            })
+            .unwrap();
+        assert!(matches!(r, Read::Taken(_)));
+        assert_eq!(seen, Some((33, 3)));
+        // clearing twice is harmless, and publishing goes on after it
+        s.clear_latest();
+        s.clear_latest();
+        assert_eq!(s.header().latest_slot, NO_SLOT);
+        s.publish(fmt, 44, 4, |d| d.fill(4)).unwrap();
+        assert_ne!(s.header().latest_slot, NO_SLOT);
+    }
+
+    #[test]
+    fn a_read_only_view_cannot_clear_the_latest_frame() {
+        // the same bytes seen through a read-only view: poke through the writable one
+        let mut heap = Heap::new();
+        let w = heap.shared(true);
+        w.init_writer(1, 1_000_000, 1).unwrap();
+        let fmt = SlotFormat {
+            width: 16,
+            height: 16,
+            stride: 16,
+            subtype: SUBTYPE_NV12,
+        };
+        w.publish(fmt, 1, 1, |d| d.fill(9)).unwrap();
+        let slot = w.header().latest_slot;
+        let ro = heap.shared(false);
+        ro.clear_latest();
+        assert_eq!(
+            ro.header().latest_slot,
+            slot,
+            "a read-only view never stores"
+        );
     }
 
     #[test]

@@ -10,11 +10,24 @@
 //! | Situation | Output |
 //! |---|---|
 //! | file missing, bad magic or other invalid header, heartbeat older than 1 s, writer `closed`, hostile slot | slate "Better Cam is not running" |
+//! | file only readable by this process (no write access: the DLL cannot announce itself, so the engine never publishes to it) | slate "Better Cam is not running", logged once |
 //! | writer `paused` | slate "Camera paused" |
 //! | writer `starting`, or live but no usable frame yet | slate "Starting cameraâ€¦" |
-//! | live, new frame of the negotiated size | the frame (never scaled) |
+//! | live, new frame of the negotiated size, captured after this stream attached (see below) | the frame (never scaled) |
 //! | live, no new frame within 1.5 frame durations | the last frame again (counted in `repeated`) |
 //!
+//! A frame captured before this stream attached is never shown (privacy): what the file holds when a consumer
+//! attaches may be an old frame left by an earlier session, and the first poll must not hand it to a new app.
+//! A frame counts when its capture time is at most [`attach_tolerance`] before the attach: the larger of 250 ms and
+//! two frame periods. The newest frame in the file of a live writer is never as young as the attach: it was captured
+//! one capture-to-publish latency before it was published (a USB camera, the engine's conversion and readback: tens
+//! of milliseconds, 20 to 48 on the camera this was measured with, and seconds for a camera that lags), and the
+//! attach lands anywhere in the gap before the next one (up to a whole frame period). A tolerance of the order of the
+//! clock error (the 50 ms this was once) put the newest frame outside it in a fifth of the starts and showed the
+//! "starting" slate for a frame or more. What the rule must keep out is a frame of an earlier session, seconds to
+//! minutes old (the engine forgets the newest frame while no app reads, `Writer::clear_latest`, so that is the rare
+//! case); so the tolerance is a few frame periods, not a few milliseconds. Until a frame inside it arrives the
+//! "starting" slate is shown.
 //! One copy per frame: the pixels go from the slot of the shared file straight into the buffer a [`FrameSink`]
 //! hands out (in the stream: the buffer of the sample that is about to be posted), and only then is the slot's
 //! sequence number checked. A copy the check rejects is never delivered. The source keeps no frame of its own: a
@@ -89,6 +102,16 @@ pub fn advertised() -> Vec<Format> {
 /// Window in which a capture time read from the file is believed: this far before `now` and 1/20 s after it.
 /// The file is not trusted, and one far-future value would hold every later sample time in the future.
 const CAPTURE_PAST_SECS: u64 = 5;
+
+/// The least a frame may have been captured before the stream attached and still be shown: 1/4 s ([`attach_tolerance`]).
+const ATTACH_TOLERANCE_MIN_DIV: u64 = 4;
+
+/// How long before the stream attached a frame may have been captured and still be shown (a frame older than that
+/// is one left in the file by an earlier session, never shown): `max(250 ms, 2 x period)`, `period` in QPC ticks
+/// of the negotiated frame rate. See the module docs for why it is not smaller.
+pub fn attach_tolerance(freq: u64, period: u64) -> u64 {
+    (freq / ATTACH_TOLERANCE_MIN_DIV).max(period.saturating_mul(2))
+}
 
 /// `capture_qpc` clamped to the window around `now` ([`CAPTURE_PAST_SECS`] back, 50 ms ahead). Never panics, for
 /// any input.
@@ -257,17 +280,20 @@ pub enum Kind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Emit {
     pub kind: Kind,
-    /// QPC of the capture for a live frame, else 0.
+    /// QPC of the capture for a live frame, else 0 (latency statistics).
     pub capture_qpc: u64,
+    /// QPC the sample of a live frame is stamped with, else 0: the capture time, moved later when a frame taken
+    /// past the repeat deadline would otherwise start less than the minimum capture gap after the one before.
+    pub stamp_qpc: u64,
     /// QPC when the decision was taken.
     pub at: u64,
 }
 
 impl Emit {
-    /// QPC the sample is stamped with: the capture time of a live frame, else the time of the decision.
+    /// QPC the sample is stamped with: the stamp of a live frame, else the time of the decision.
     pub fn sample_qpc(&self) -> u64 {
         if self.kind == Kind::Live {
-            self.capture_qpc
+            self.stamp_qpc
         } else {
             self.at
         }
@@ -307,11 +333,14 @@ enum ReadResult {
 enum RepeatResult {
     /// The frame is in the sink.
     Copied,
-    /// The copy was torn, or a newer frame took the place of the one to repeat (the live path takes that one, as it
-    /// is not decimated this late): try again at the next poll.
+    /// The copy was torn: try again at the next poll.
     Retry,
     /// The sink has no buffer right now: nothing was read.
     NoBuffer,
+    /// The slot of the last frame holds a newer frame of the negotiated size (the writer reused the slot) and the
+    /// newest slot did not give one the live path could take: that frame is in the sink and is a live frame, not a
+    /// repeat. Carries its capture time, clamped.
+    Newer(u64),
     /// No slot holds a frame of the negotiated size any more.
     Lost,
     /// The slot descriptor was stable but invalid.
@@ -352,7 +381,14 @@ pub struct FrameSource {
     last_new_seen: u64,
     /// Capture time (QPC) of the last live frame emitted: the next one must be captured a frame period later.
     last_capture: Option<u64>,
+    /// Sample stamp (QPC) of the last live frame emitted: the next one is stamped a minimum capture gap later.
+    last_stamp: Option<u64>,
     last_emit: u64,
+    /// QPC when this source was made or started: a frame captured (more than the tolerance) before it is an old
+    /// frame left in the file and is never shown.
+    attach: u64,
+    /// The "read-only" log line was written (once per source: the file is reopened every half second).
+    read_only_logged: bool,
 
     /// The slate scaled to the negotiated size, kept while a slate is shown (a slate is shown every frame period)
     /// and freed as soon as a live frame is.
@@ -387,7 +423,10 @@ impl FrameSource {
             last_id: None,
             last_new_seen: 0,
             last_capture: None,
+            last_stamp: None,
             last_emit: 0,
+            attach: vcam_protocol::qpc_now(),
+            read_only_logged: false,
             slate_kind: None,
             slate_buf: Vec::new(),
             lat: Vec::with_capacity(LAT_RING),
@@ -405,6 +444,7 @@ impl FrameSource {
             return;
         }
         self.running = true;
+        self.attach = vcam_protocol::qpc_now();
         active_adjust(&self.path, 1);
         self.delivered = 0;
         self.repeated = 0;
@@ -538,6 +578,15 @@ impl FrameSource {
         if v.state == WriterState::Closed || is_stale(&v, now) {
             return Status::Slate(SlateKind::NotRunning);
         }
+        // A file this process can only read: it cannot announce itself, so the engine (which publishes only to a
+        // file with a consumer) never sends a new frame, and what the file holds is an old one. Say so.
+        if self.map.as_ref().is_some_and(|m| !m.shared().is_writable()) {
+            if !self.read_only_logged {
+                self.read_only_logged = true;
+                vlog!("frames: the file is read-only for this process: no frames are shown (the engine cannot see this consumer)");
+            }
+            return Status::Slate(SlateKind::NotRunning);
+        }
         match v.state {
             WriterState::Paused => Status::Slate(SlateKind::Paused),
             WriterState::Starting => Status::Slate(SlateKind::Starting),
@@ -563,6 +612,38 @@ impl FrameSource {
         self.live_since = 0;
         self.last_new_seen = 0;
         self.last_capture = None;
+        self.last_stamp = None;
+    }
+
+    /// The oldest raw capture time a frame may have to be shown: the attach time less the tolerance. An older frame
+    /// is one left in the file by an earlier session (see the module docs).
+    fn oldest_capture(&self) -> u64 {
+        self.attach
+            .saturating_sub(attach_tolerance(self.freq, self.period))
+    }
+
+    /// The stamp for a live frame captured at `capture_qpc`, decided at `now`: the capture time, moved later when
+    /// that is less than a minimum gap after the stamp of the frame before (or before it). A frame taken past the
+    /// repeat deadline is not held back by the decimation, so it can be captured less than a gap after the last one
+    /// (or before it), and its sample would overlap the one before (a sample lasts a frame period); it is stamped a
+    /// gap after that one, never more than 50 ms after `now`. Every live frame goes through this, not only those:
+    /// the decimation looks at the raw capture times, so a frame that follows a moved one can be captured before the
+    /// moved stamp, and stamping it with its own capture time would run the stamps backwards.
+    fn live_stamp(&self, capture_qpc: u64, now: u64) -> u64 {
+        match self.last_stamp {
+            Some(last) => {
+                let wanted = last.saturating_add(self.min_capture_gap());
+                if capture_qpc >= wanted {
+                    capture_qpc
+                } else {
+                    wanted
+                        .min(now.saturating_add(self.freq / 20))
+                        .max(capture_qpc)
+                        .max(last)
+                }
+            }
+            None => capture_qpc,
+        }
     }
 
     fn note_shown(&mut self, s: Shown) {
@@ -593,6 +674,7 @@ impl FrameSource {
         Poll::Ready(Emit {
             kind: Kind::Slate(kind),
             capture_qpc: 0,
+            stamp_qpc: 0,
             at: now,
         })
     }
@@ -625,6 +707,7 @@ impl FrameSource {
         let last_capture = self.last_capture.filter(|_| decimate);
         let min_gap = self.min_capture_gap();
         let freq = self.freq;
+        let oldest = self.oldest_capture();
         let pid = v.writer_pid;
         // The buffer is asked for before the read, not inside it: making a sample can allocate and log, and the
         // read must stay short.
@@ -638,6 +721,10 @@ impl FrameSource {
                 return Disposition::Skip;
             }
             if Some((m.index, pid, m.seq)) == last_id {
+                return Disposition::Skip;
+            }
+            // an old frame left in the file before this stream attached is never shown
+            if m.capture_qpc < oldest {
                 return Disposition::Skip;
             }
             // a faster writer is decimated by capture time: skip a frame captured too soon after the last one
@@ -674,30 +761,46 @@ impl FrameSource {
     }
 
     /// Copy the last frame again: the slot of `last_id` while it still holds that very frame. A slot that holds a
-    /// newer frame (the writer reused it) is `Retry`: that frame is the live path's, which takes it past the repeat
-    /// deadline whatever its capture time. A slot that cannot be read (a writer that died in the middle of it, or
-    /// another size in it) falls back to the newest slot, the best picture left.
-    fn try_repeat(&mut self, v: &ValidHeader, sink: &mut dyn FrameSink) -> RepeatResult {
+    /// newer frame of the right size (the writer reused it) is not a repeat: the live path takes the newest frame
+    /// past the repeat deadline whatever its capture time, and when it could not (the newest slot holds another
+    /// size, or is torn) this is the best frame there is, so it is taken here as [`RepeatResult::Newer`], a live
+    /// frame with its own capture time (a stalled writer would otherwise leave the stream with nothing to show). A
+    /// slot that cannot be read (a writer that died in the middle of it, or another size in it) falls back to the
+    /// newest slot, the best picture left.
+    fn try_repeat(&mut self, v: &ValidHeader, now: u64, sink: &mut dyn FrameSink) -> RepeatResult {
         let (Some(map), Some((slot, _, last_seq))) = (&self.map, self.last_id) else {
             return RepeatResult::Lost;
         };
         let l = Layout::of(&self.fmt);
         let subtype = self.fmt.pixel.protocol_subtype();
         let pid = v.writer_pid;
+        let oldest = self.oldest_capture();
+        let freq = self.freq;
         // asked for before the reads, not inside them (see `try_read`)
         let Some(mut dst) = dest(&mut *sink, &l) else {
             return RepeatResult::NoBuffer;
         };
-        // the pass over the slot of the last frame takes only that frame; a slot that holds a newer one is left to
-        // the live path (a newer frame is not a repeat)
+        // the pass over the slot of the last frame meets either that frame (a repeat) or, when the writer reused the
+        // slot, a newer one (a live frame, never a repeat)
         let exact = std::cell::Cell::new(true);
         let moved = std::cell::Cell::new(false);
+        // its capture time, clamped
+        let newer = std::cell::Cell::new(0u64);
         let mut copy = |m: &vcam_protocol::SlotMeta, data: &SlotData<'_>| {
             if m.width as usize != l.w || m.height as usize != l.h || m.subtype != subtype {
                 return Disposition::Skip;
             }
-            if exact.get() && m.seq != last_seq {
-                moved.set(true);
+            if exact.get() {
+                moved.set(m.seq != last_seq);
+                if moved.get() {
+                    newer.set(clamp_capture(m.capture_qpc, now, freq));
+                }
+            }
+            // Any frame but the very one that is being repeated (a newer one in its slot, or the newest slot's after
+            // the fall back) is new to this stream, so it must have been captured after the attach less the
+            // tolerance (an old frame left in the file is never shown). The frame that was shown was checked when it
+            // was taken.
+            if (moved.get() || !exact.get()) && m.capture_qpc < oldest {
                 return Disposition::Skip;
             }
             #[cfg(test)]
@@ -726,9 +829,12 @@ impl FrameSource {
             Ok(Read::Taken(m)) => {
                 // what was shown is now what the slot holds: it is not a new frame when it comes round again
                 self.last_id = Some((m.index, pid, m.seq));
-                RepeatResult::Copied
+                if moved.get() {
+                    RepeatResult::Newer(newer.get())
+                } else {
+                    RepeatResult::Copied
+                }
             }
-            Ok(_) if moved.get() => RepeatResult::Retry,
             Err(ReadError::Torn) => RepeatResult::Retry,
             Ok(_) => RepeatResult::Lost,
             Err(ReadError::Invalid(e)) => {
@@ -785,21 +891,15 @@ impl FrameSource {
         // whatever its capture time: a stalled camera that left two decimated frames after the last one shown would
         // otherwise be skipped for good (the writer alternates between two slots, so the slot of the last frame holds
         // a newer one and cannot be repeated), and the stream would deliver nothing while the app keeps the
-        // heartbeat alive. The sample time is then that frame's own capture time (`next_timestamp` keeps it rising).
-        let decimate = now < self.last_new_seen.saturating_add(period * 3 / 2);
-        if now >= next_ok {
+        // heartbeat alive. The capture time of such a frame can be after the take of the last one (up to 50 ms), so
+        // `next_ok` can lie past the deadline: the read does not wait for it then. The sample time keeps the spacing
+        // (see `live_stamp`).
+        let deadline = self.last_new_seen.saturating_add(period * 3 / 2);
+        let decimate = now < deadline;
+        if now >= next_ok || !decimate {
             match self.try_read(&v, now, decimate, &mut *sink) {
                 ReadResult::New(capture_qpc) => {
-                    self.have_frame = true;
-                    self.last_capture = Some(capture_qpc);
-                    self.last_new_seen = now;
-                    self.drop_slate_cache();
-                    self.note_shown(Shown::Live);
-                    return Poll::Ready(Emit {
-                        kind: Kind::Live,
-                        capture_qpc,
-                        at: now,
-                    });
+                    return Poll::Ready(self.emit_live(capture_qpc, now));
                 }
                 ReadResult::Invalid => {
                     self.not_running = true;
@@ -813,14 +913,19 @@ impl FrameSource {
         if self.have_frame {
             // live but late: the last frame again
             if now >= self.last_new_seen + period * 3 / 2 && now >= self.last_emit + period {
-                match self.try_repeat(&v, &mut *sink) {
+                match self.try_repeat(&v, now, &mut *sink) {
                     RepeatResult::Copied => {
                         self.drop_slate_cache();
                         return Poll::Ready(Emit {
                             kind: Kind::Repeat,
                             capture_qpc: 0,
+                            stamp_qpc: 0,
                             at: now,
                         });
+                    }
+                    // a newer frame in the slot of the last one, which the live path could not take: it is one
+                    RepeatResult::Newer(capture_qpc) => {
+                        return Poll::Ready(self.emit_live(capture_qpc, now));
                     }
                     RepeatResult::Retry => {}
                     RepeatResult::NoBuffer => return Poll::Wait(self.no_buffer_wait(now)),
@@ -837,11 +942,35 @@ impl FrameSource {
             // live, but nothing usable yet (no frame, or frames of another size)
             return self.slate_poll(SlateKind::Starting, now, sink);
         }
-        Poll::Wait(if now >= next_ok {
+        // Nothing to do before `next_ok` (no frame can qualify earlier), nor, with a frame on show, before the
+        // repeat deadline: never sleep past it.
+        let wake = if self.have_frame {
+            next_ok.min(deadline)
+        } else {
+            next_ok
+        };
+        Poll::Wait(if now >= wake {
             Wait::Soon
         } else {
-            Wait::Until(next_ok)
+            Wait::Until(wake)
         })
+    }
+
+    /// A live frame (in the sink) captured at `capture_qpc` is on its way.
+    fn emit_live(&mut self, capture_qpc: u64, now: u64) -> Emit {
+        let stamp_qpc = self.live_stamp(capture_qpc, now);
+        self.have_frame = true;
+        self.last_capture = Some(capture_qpc);
+        self.last_stamp = Some(stamp_qpc);
+        self.last_new_seen = now;
+        self.drop_slate_cache();
+        self.note_shown(Shown::Live);
+        Emit {
+            kind: Kind::Live,
+            capture_qpc,
+            stamp_qpc,
+            at: now,
+        }
     }
 
     /// The pump posted the sample for `emit` at QPC `after`: count it and publish consumer state.
@@ -1425,11 +1554,18 @@ mod tests {
 
     /// Run a source against `path` for a short time the way the pump does: start, poll for about `ms`, stop.
     fn run_source_for(path: &std::path::Path, ms: u64) -> Vec<Kind> {
+        run_source_fed(path, ms, || {})
+    }
+
+    /// [`run_source_for`] with a writer that feeds the file: `feed` runs before every poll round (a frame captured
+    /// before the source attached is never shown, so a frame published before the run does not count).
+    fn run_source_fed(path: &std::path::Path, ms: u64, mut feed: impl FnMut()) -> Vec<Kind> {
         let mut src = Rig::new(path.to_path_buf(), nv12(320, 180, 30));
         src.start();
         let began = Instant::now();
         let mut kinds = Vec::new();
         while began.elapsed() < Duration::from_millis(ms) {
+            feed();
             kinds.push(next_ready(&mut src, Duration::from_secs(2)).kind);
         }
         src.stop();
@@ -1461,7 +1597,7 @@ mod tests {
             w.set_state(WriterState::Live);
             publish_pattern(&w, 320, 180, 1);
             spoil(&w);
-            drop(w); // the writer's own close writes to the header: take the snapshot after it
+            drop(w);
             let before = std::fs::read(&path).unwrap();
             let kinds = run_source_for(&path, 150);
             assert!(
@@ -1539,7 +1675,9 @@ mod tests {
         w.set_state(WriterState::Live);
         w.set_advertised(&vcam_protocol::advertised_for_output(1280, 720, 30));
         publish_pattern(&w, 320, 180, 3);
-        let direct = run_source_for(&real.join("frames.bin"), 100);
+        let direct = run_source_fed(&real.join("frames.bin"), 100, || {
+            publish_pattern(&w, 320, 180, 3)
+        });
         assert!(
             direct.contains(&Kind::Live),
             "control run without a link: {direct:?}"
@@ -1641,8 +1779,7 @@ mod tests {
         // the lock is gone: the same file works
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
-        publish_pattern(&w, 320, 180, 2);
-        let kinds = run_source_for(&path, 150);
+        let kinds = run_source_fed(&path, 150, || publish_pattern(&w, 320, 180, 2));
         assert!(kinds.contains(&Kind::Live), "{kinds:?}");
     }
 
@@ -1677,6 +1814,30 @@ mod tests {
             };
             w.publish(fmt, cap, |d| pattern::fill_nv12(i as u64, 320, 180, d, 320))
                 .unwrap();
+            if cap < before.saturating_sub(freq) {
+                // a capture time long before the stream attached is an old frame: never shown, and the stream goes
+                // on (the next frame, captured now, is shown)
+                let t = Instant::now();
+                while t.elapsed() < Duration::from_millis(120) {
+                    w.heartbeat();
+                    let e = next_ready(&mut src, Duration::from_secs(2));
+                    assert_ne!(e.kind, Kind::Live, "capture {cap} is an old frame");
+                }
+                w.publish(fmt, qpc_now(), |d| pattern::fill_nv12(99, 320, 180, d, 320))
+                    .unwrap();
+                let mut live = None;
+                for _ in 0..200 {
+                    let e = next_ready(&mut src, Duration::from_secs(2));
+                    if e.kind == Kind::Live {
+                        live = Some(e);
+                        break;
+                    }
+                    w.heartbeat();
+                }
+                let e = live.unwrap_or_else(|| panic!("no live frame after capture time {cap}"));
+                prev_ts = crate::stream::next_timestamp(e.sample_qpc(), prev_ts);
+                continue;
+            }
             let mut live = None;
             for _ in 0..200 {
                 let e = next_ready(&mut src, Duration::from_secs(2));
@@ -2178,7 +2339,7 @@ mod tests {
             _ => panic!("setup: not live"),
         };
         let Rig { src: s, sink, .. } = src;
-        s.try_repeat(&v, sink)
+        s.try_repeat(&v, qpc_now(), sink)
     }
 
     #[test]
@@ -2214,8 +2375,42 @@ mod tests {
         assert_ne!(src.last_id.map(|(s, _, _)| s as usize), Some(stuck.slot));
     }
 
+    /// The fall back to the newest slot is a frame that is new to this stream like any other: one captured before the
+    /// attach (less the tolerance) must not be shown, as `try_read` does not show it.
     #[test]
-    fn a_last_slot_stuck_mid_write_does_not_starve_the_stream() {
+    fn a_repeat_never_falls_back_to_a_frame_older_than_the_attach() {
+        let path = temp_path("repeat-fallback-old.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        let (fw, fh) = (320u32, 180u32);
+        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        src.start();
+        publish_pattern(&w, fw, fh, 5);
+        assert_eq!(
+            next_ready(&mut src, Duration::from_secs(1)).kind,
+            Kind::Live
+        );
+        let stuck = Stuck::of(&src);
+        // the next frame is in the other slot and an old one: captured ten seconds before the attach (something an
+        // earlier session left); the slot of the frame that was shown is torn
+        publish_at(&w, fw, fh, 6, src.attach - qpc_frequency() * 10);
+        assert_ne!(w.shared().header().latest_slot as usize, stuck.slot);
+        stuck.odd(&w);
+        w.heartbeat();
+        let r = repeat_now(&mut src);
+        assert!(
+            !matches!(r, RepeatResult::Copied | RepeatResult::Newer(_)),
+            "an old frame left in the file was shown as a repeat"
+        );
+        assert!(
+            src.data() != pattern_frame(6, fw, fh).as_slice(),
+            "the old frame is in the sink"
+        );
+    }
+
+    #[test]
+    fn a_last_slot_stuck_mid_write_gets_the_newest_frame_as_a_live_frame_not_a_repeat() {
         let path = temp_path("repeat-stuck-live.bin");
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
@@ -2349,25 +2544,376 @@ mod tests {
             Kind::Live
         );
         let shown = Stuck::of(&src);
-        // two frames right behind (too soon after the last one to be live frames); the poll in between moves the
-        // reader's mark off the slot of frame 5, so the writer reuses it for frame 7
+        // two frames right behind (too soon after the last one to be live frames): the writer puts 6 in the other
+        // slot and then reuses the slot of frame 5 for frame 7
         publish_pattern(&w, fw, fh, 6);
-        assert!(matches!(src.poll(qpc_now()), Poll::Wait(_)));
         publish_pattern(&w, fw, fh, 7);
         assert_ne!(
             w.shared().slot_meta(shown.slot).seq,
             shown.seq,
             "setup: the slot of frame 5 was not reused"
         );
-        let before = src.sink.buf.clone();
         let r = repeat_now(&mut src);
+        // the slot holds a newer frame: it is a live frame with its own capture time, never a plain repeat
         assert!(
-            matches!(r, RepeatResult::Retry),
+            matches!(r, RepeatResult::Newer(_)),
             "a newer frame went out as a repeat"
         );
-        assert!(src.sink.buf == before, "the buffer was written");
-        // (the live path shows that frame once the repeat deadline has passed: see
+        assert!(src.data() == pattern_frame(7, fw, fh).as_slice());
+        // (the live path shows the newest frame once the repeat deadline has passed: see
         // `frames_decimated_behind_the_last_one_are_shown_when_the_camera_stalls`)
+    }
+
+    /// Frame 5 in slot A (shown), 6 in B, 7 (right size, decimated) in A, 8 (another size) in B, then the writer
+    /// stalls (the app only keeps the heartbeat alive). `try_read` skips 8 on its size and `try_repeat` found 7 in
+    /// the slot of frame 5, called it "moved" and asked for a retry for ever: nothing was delivered until the writer
+    /// published again.
+    #[test]
+    fn a_newer_frame_in_the_last_slot_goes_out_live_when_the_newest_frame_has_another_size() {
+        let path = temp_path("repeat-moved-other-size.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        let (fw, fh) = (320u32, 180u32);
+        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        src.start();
+        publish_pattern(&w, fw, fh, 5);
+        let first = next_ready(&mut src, Duration::from_secs(1));
+        assert_eq!(first.kind, Kind::Live);
+        let shown = Stuck::of(&src);
+        publish_pattern(&w, fw, fh, 6);
+        publish_pattern(&w, fw, fh, 7);
+        publish_pattern(&w, 160, 90, 8);
+        assert_ne!(
+            w.shared().slot_meta(shown.slot).seq,
+            shown.seq,
+            "setup: the slot of frame 5 was not reused"
+        );
+        let latest = w.shared().header().latest_slot as usize;
+        assert_eq!(
+            w.shared().slot_meta(latest).width,
+            160,
+            "setup: the newest slot does not hold the other size"
+        );
+        let t0 = Instant::now();
+        let e = loop {
+            w.heartbeat();
+            match src.poll(qpc_now()) {
+                Poll::Ready(e) => {
+                    src.finish_emit(e, qpc_now());
+                    break e;
+                }
+                Poll::Wait(_) => {
+                    assert!(
+                        t0.elapsed() < Duration::from_secs(1),
+                        "the stream starved: a newer frame in the last slot was never taken"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        };
+        assert_eq!(e.kind, Kind::Live);
+        assert!(src.data() == pattern_frame(7, fw, fh).as_slice());
+        assert!(e.capture_qpc > first.capture_qpc, "its own capture time");
+        // and the stall goes on: a repeat of that frame
+        let e = next_ready(&mut src, Duration::from_secs(1));
+        assert_eq!(e.kind, Kind::Repeat);
+        assert!(src.data() == pattern_frame(7, fw, fh).as_slice());
+    }
+
+    fn publish_at(w: &Writer, width: u32, height: u32, n: u64, capture: u64) {
+        let fmt = SlotFormat {
+            width,
+            height,
+            stride: width,
+            subtype: SUBTYPE_NV12,
+        };
+        w.publish(fmt, capture, |d| {
+            pattern::fill_nv12(n, width, height, d, width as usize)
+        })
+        .unwrap();
+    }
+
+    /// A 60 fps source that took frame 5 at `t0` with a capture time 40 ms after the decision (a camera clock a
+    /// little ahead: the clamp allows 50 ms), and frames 6 and 7 right behind it (the writer reuses the slot of
+    /// frame 5 for 7), the writer stalled after them. The polls are made at chosen times, so nothing here depends on
+    /// the speed of the machine.
+    fn took_a_frame_captured_after_the_take(name: &str, reuse: bool) -> (Writer, Rig, u64, Emit) {
+        let path = temp_path(name);
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        let mut src = Rig::new(path, nv12(320, 180, 60));
+        src.start();
+        let freq = qpc_frequency();
+        let t0 = qpc_now();
+        publish_at(&w, 320, 180, 5, t0 + freq / 25);
+        let Poll::Ready(first) = src.poll(t0) else {
+            panic!("setup: frame 5 was not taken");
+        };
+        assert_eq!(first.kind, Kind::Live);
+        assert_eq!(first.capture_qpc, t0 + freq / 25);
+        src.finish_emit(first, t0);
+        let shown = Stuck::of(&src);
+        publish_at(&w, 320, 180, 6, qpc_now());
+        if reuse {
+            publish_at(&w, 320, 180, 7, qpc_now());
+            assert_ne!(
+                w.shared().slot_meta(shown.slot).seq,
+                shown.seq,
+                "setup: the slot of frame 5 was not reused"
+            );
+        }
+        (w, src, t0, first)
+    }
+
+    #[test]
+    fn the_wait_never_sleeps_past_the_repeat_deadline() {
+        let (_w, mut src, t0, _) =
+            took_a_frame_captured_after_the_take("late-capture-wait.bin", true);
+        let freq = qpc_frequency();
+        let period = freq / 60;
+        // 20 ms after the take: before the deadline (25 ms), and the earliest a frame qualifies (capture + 3/4 of a
+        // period, 52 ms after the take) is long after it
+        match src.poll(t0 + freq / 50) {
+            Poll::Wait(Wait::Until(t)) => assert!(
+                t <= t0 + period * 3 / 2,
+                "sleeps until {} ticks after the take, the deadline is at {}",
+                t - t0,
+                period * 3 / 2
+            ),
+            p => panic!("{p:?}"),
+        }
+    }
+
+    #[test]
+    fn a_frame_is_taken_at_the_repeat_deadline_also_when_its_capture_gate_is_later() {
+        // frame 6 sits in the other slot, the slot of frame 5 still holds frame 5 (a repeat would be possible)
+        let (_w, mut src, t0, _) =
+            took_a_frame_captured_after_the_take("late-capture-take.bin", false);
+        // 26 ms after the take: the deadline (25 ms) has passed, `next_ok` (capture + 3/4 of a period) has not. The
+        // newest frame must go out as a live frame, not wait behind `next_ok` and be answered with a repeat of 5
+        let e = match src.poll(t0 + qpc_frequency() * 26 / 1000) {
+            Poll::Ready(e) => e,
+            p => panic!("nothing delivered at the deadline: {p:?}"),
+        };
+        assert_eq!(e.kind, Kind::Live);
+        assert!(src.data() == pattern_frame(6, 320, 180).as_slice());
+    }
+
+    #[test]
+    fn a_frame_taken_past_the_deadline_is_stamped_a_gap_after_the_one_before_whatever_its_capture_time(
+    ) {
+        let (_w, mut src, t0, first) =
+            took_a_frame_captured_after_the_take("late-capture-stamp.bin", true);
+        let gap = qpc_frequency() / 60 * 3 / 4;
+        let e = match src.poll(t0 + qpc_frequency() * 26 / 1000) {
+            Poll::Ready(e) => e,
+            p => panic!("nothing delivered at the deadline: {p:?}"),
+        };
+        assert_eq!(e.kind, Kind::Live);
+        // frame 7 was captured before frame 5 (the camera clock was ahead): the real capture time stays for the
+        // latency statistics, the sample is stamped a gap after the one before
+        assert!(e.capture_qpc < first.capture_qpc, "setup");
+        assert!(
+            e.sample_qpc() >= first.sample_qpc() + gap,
+            "the samples overlap: {} ticks apart, a gap is {gap}",
+            e.sample_qpc().saturating_sub(first.sample_qpc())
+        );
+        // never more than 50 ms ahead of the decision
+        assert!(e.sample_qpc() <= t0 + qpc_frequency() * 26 / 1000 + qpc_frequency() / 20);
+        // and a frame that is far enough behind the last one is stamped with its own capture time
+        let (_w2, mut src2, t0, first) =
+            took_a_frame_captured_after_the_take("late-capture-stamp-own.bin", true);
+        publish_at(&_w2, 320, 180, 8, t0 + qpc_frequency() / 10);
+        let e = match src2.poll(t0 + qpc_frequency() * 26 / 1000) {
+            Poll::Ready(e) => e,
+            p => panic!("nothing delivered at the deadline: {p:?}"),
+        };
+        assert!(e.capture_qpc > first.sample_qpc() + gap);
+        assert_eq!(e.sample_qpc(), e.capture_qpc);
+    }
+
+    /// The review's sequence: frame 5 stamped t0+40 ms; frame 7 taken past the repeat deadline, stamped a gap
+    /// (12.5 ms at 60 fps) after it, t0+52.5 ms; then frame 8, captured at t0+20 ms (the decimation looks at raw capture
+    /// times, and 20 ms after frame 7's own capture it passes). Its own capture time lies before the stamp of frame 7:
+    /// stamped with it the sample times would run backwards.
+    #[test]
+    fn sample_stamps_never_run_backwards_after_a_frame_that_was_moved_later() {
+        let (w, mut src, t0, first) =
+            took_a_frame_captured_after_the_take("stamp-monotonic.bin", true);
+        let freq = qpc_frequency();
+        let gap = freq / 60 * 3 / 4;
+        assert_eq!(first.sample_qpc(), t0 + freq / 25, "frame 5: its own capture time");
+        let now7 = t0 + freq * 26 / 1000;
+        let Poll::Ready(e7) = src.poll(now7) else {
+            panic!("frame 7 was not taken at the deadline");
+        };
+        src.finish_emit(e7, now7);
+        assert_eq!(e7.kind, Kind::Live);
+        assert!(e7.sample_qpc() >= first.sample_qpc() + gap, "frame 7 overlaps frame 5");
+        // frame 8: captured 20 ms after the take of frame 5, polled 45 ms after it
+        publish_at(&w, 320, 180, 8, t0 + freq / 50);
+        let now8 = t0 + freq * 45 / 1000;
+        let Poll::Ready(e8) = src.poll(now8) else {
+            panic!("frame 8 was not taken");
+        };
+        assert_eq!(e8.kind, Kind::Live);
+        assert!(src.data() == pattern_frame(8, 320, 180).as_slice(), "setup: not frame 8");
+        assert_eq!(e8.capture_qpc, t0 + freq / 50, "setup: frame 8's capture time");
+        assert!(
+            e8.sample_qpc() >= e7.sample_qpc() + gap,
+            "frame 8 is stamped {} ticks after frame 7 (a gap is {gap}): the sample times ran backwards or overlap",
+            e8.sample_qpc() as i64 - e7.sample_qpc() as i64
+        );
+        // never more than 50 ms ahead of the decision
+        assert!(e8.sample_qpc() <= now8 + freq / 20);
+    }
+
+    #[test]
+    fn a_frame_captured_before_the_stream_attached_is_never_shown() {
+        let path = temp_path("old-frame.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        let freq = qpc_frequency();
+        // what an earlier session left: a frame captured a second ago, with a writer that is alive again
+        publish_at(&w, 320, 180, 1, qpc_now() - freq);
+        let mut src = Rig::new(path, nv12(320, 180, 30));
+        src.start();
+        let began = Instant::now();
+        while began.elapsed() < Duration::from_millis(200) {
+            w.heartbeat();
+            let e = next_ready(&mut src, Duration::from_secs(1));
+            assert_eq!(e.kind, Kind::Slate(SlateKind::Starting), "an old frame");
+        }
+        // a frame captured after the attach is shown
+        publish_at(&w, 320, 180, 2, qpc_now());
+        let e = next_ready(&mut src, Duration::from_secs(1));
+        assert_eq!(e.kind, Kind::Live);
+        assert!(src.data() == pattern_frame(2, 320, 180).as_slice());
+    }
+
+    #[test]
+    fn the_attach_tolerance_is_the_larger_of_a_quarter_second_and_two_periods() {
+        let f = 10_000_000u64;
+        assert_eq!(attach_tolerance(f, f / 30), f / 4);
+        assert_eq!(attach_tolerance(f, f / 60), f / 4);
+        // a slow camera: two of its periods
+        assert_eq!(attach_tolerance(f, f / 4), f / 2);
+        assert_eq!(attach_tolerance(f, f / 2), f);
+        // no overflow, for any input
+        assert!(attach_tolerance(u64::MAX, u64::MAX) == u64::MAX);
+    }
+
+    /// M-3: the newest frame in the file of a live writer is as old as the capture-to-publish latency plus where
+    /// the attach falls in the frame period: a stream that attaches to a steady 14 fps writer whose frames are
+    /// 20 to 90 ms old when the file is read must get a frame at once and never flash the "starting" slate.
+    #[test]
+    fn a_steady_writer_never_gets_the_starting_slate_at_the_attach() {
+        let freq = qpc_frequency();
+        for age_ms in [20u64, 35, 48, 60, 71, 90, 140, 200] {
+            let path = temp_path(&format!("attach-latency-{age_ms}.bin"));
+            let _ = std::fs::remove_file(&path);
+            let w = Writer::create(&path).unwrap();
+            w.set_state(WriterState::Live);
+            // the writer has been publishing at 14 fps: the newest frame is `age_ms` older than the attach
+            let mut src = Rig::new(path, nv12(320, 180, 14));
+            src.start();
+            publish_at(&w, 320, 180, 3, src.attach - freq * age_ms / 1000);
+            w.heartbeat();
+            let e = next_ready(&mut src, Duration::from_secs(1));
+            assert_eq!(
+                e.kind,
+                Kind::Live,
+                "a frame captured {age_ms} ms before the attach showed the slate"
+            );
+            assert!(src.data() == pattern_frame(3, 320, 180).as_slice());
+        }
+    }
+
+    /// The tolerance follows the frame period of a slow camera: two periods, here 2 x 250 ms.
+    #[test]
+    fn the_attach_tolerance_follows_a_slow_cameras_period() {
+        let freq = qpc_frequency();
+        // 4 fps: tolerance is 500 ms
+        for (before_ms, shown) in [(450u64, true), (600, false)] {
+            let path = temp_path(&format!("attach-slow-{shown}.bin"));
+            let _ = std::fs::remove_file(&path);
+            let w = Writer::create(&path).unwrap();
+            w.set_state(WriterState::Live);
+            let mut src = Rig::new(path, nv12(320, 180, 4));
+            src.start();
+            publish_at(&w, 320, 180, 3, src.attach - freq * before_ms / 1000);
+            w.heartbeat();
+            let e = next_ready(&mut src, Duration::from_secs(2));
+            assert_eq!(e.kind == Kind::Live, shown, "{before_ms} ms before the attach");
+        }
+    }
+
+    #[test]
+    fn the_attach_tolerance_keeps_a_frame_captured_right_at_the_start_and_not_one_before_it() {
+        let freq = qpc_frequency();
+        // 200 ms before the attach (the capture latency of a camera, a camera clock behind QPC): shown
+        // 300 ms before: an old frame
+        for (before, shown) in [(freq * 200 / 1000, true), (freq * 300 / 1000, false)] {
+            let path = temp_path(&format!("attach-tolerance-{shown}.bin"));
+            let _ = std::fs::remove_file(&path);
+            let w = Writer::create(&path).unwrap();
+            w.set_state(WriterState::Live);
+            let mut src = Rig::new(path, nv12(320, 180, 30));
+            src.start();
+            publish_at(&w, 320, 180, 3, src.attach - before);
+            let began = Instant::now();
+            let mut live = false;
+            while began.elapsed() < Duration::from_millis(150) {
+                w.heartbeat();
+                live |= next_ready(&mut src, Duration::from_secs(1)).kind == Kind::Live;
+            }
+            assert_eq!(
+                live, shown,
+                "a frame captured {before} ticks before the attach"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_the_dll_can_only_read_shows_the_not_running_slate_and_recovers() {
+        let path = temp_path("read-only.bin");
+        let unlock = |ro: bool| {
+            if let Ok(m) = std::fs::metadata(&path) {
+                let mut p = m.permissions();
+                p.set_readonly(ro);
+                let _ = std::fs::set_permissions(&path, p);
+            }
+        };
+        unlock(false);
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        unlock(true);
+        let mut src = Rig::new(path.clone(), nv12(320, 180, 30));
+        src.start();
+        // a writer that is alive and a frame captured after the attach: the DLL cannot announce itself, so the
+        // engine would never publish like this: the slate, not the frame
+        let began = Instant::now();
+        while began.elapsed() < Duration::from_millis(250) {
+            publish_at(&w, 320, 180, 4, qpc_now());
+            let e = next_ready(&mut src, Duration::from_secs(1));
+            assert_eq!(e.kind, Kind::Slate(SlateKind::NotRunning), "read-only view");
+        }
+        assert_eq!(w.shared().header().consumer_active, 0);
+        assert!(src.read_only_logged);
+        // write access again: the file is reopened (every half second) and frames flow
+        unlock(false);
+        let mut live = false;
+        let began = Instant::now();
+        while began.elapsed() < Duration::from_secs(3) && !live {
+            publish_at(&w, 320, 180, 5, qpc_now());
+            live = next_ready(&mut src, Duration::from_secs(1)).kind == Kind::Live;
+        }
+        assert!(live, "no recovery once the file was writable");
+        assert_eq!(w.shared().header().consumer_active, 1);
     }
 
     #[test]

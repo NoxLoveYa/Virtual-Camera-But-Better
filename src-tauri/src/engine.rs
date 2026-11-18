@@ -447,8 +447,9 @@ pub struct EngineStats {
     pub worst_frame_ms: f64,
     /// What closing the last one-second window cost the render thread (the latency percentiles), milliseconds.
     pub stats_ms: f64,
-    /// Publishes that came more than 1.5 frame periods after the one before: the virtual camera repeats a frame for
-    /// each, whatever the frames are stamped (a stall of the render thread, a slow GPU, a busy machine).
+    /// Publishes that came more than half a frame period of the app later, against the frames' capture times, than
+    /// the one before: the virtual camera may repeat a frame for each (a stall of the render thread, a slow GPU, a
+    /// busy machine). A camera that is itself slow, an app that attaches, a pause or a format change do not count.
     pub late_publishes: u64,
     pub captured: u64,
     pub rendered: u64,
@@ -667,6 +668,31 @@ const GPU_LOSSES_MAX: u32 = 3;
 const ARRIVAL_RETRIES: u32 = 16;
 const ARRIVAL_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How long [`Control::end_session`] waits for the render thread to end before it leaves the thread behind (it has
+/// seen the stop flag already, so it ends by itself when the call it is stuck in returns). Opening a camera takes 7 to
+/// 14 s in the worst case (decoder retry, format fallback, 5 s for the first frame each), and a control write that hangs
+/// holds the thread longer: this only bounds a driver that never answers.
+const SESSION_END_CAP: Duration = Duration::from_secs(30);
+
+/// The cap of [`Control::end_session`] when the app is quitting ([`Engine::close_for_exit`]): the process exit frees
+/// the camera, so a driver that holds the render thread for longer than this must not hold up the exit. (A change of
+/// the virtual camera keeps [`SESSION_END_CAP`]: a thread that is left behind keeps `frames.bin` mapped, which the
+/// helper that replaces the file cannot have.)
+const SHUTDOWN_END_CAP: Duration = Duration::from_secs(3);
+
+/// How often [`Control::end_session`] looks whether the render thread has ended (and beats the file's heartbeat).
+const SESSION_END_POLL: Duration = Duration::from_millis(5);
+
+/// How often the engine looks whether `frames.bin` is still the file it has mapped ([`Control::check_frame_file`]).
+const FILE_CHECK_INTERVAL: Duration = Duration::from_secs(3);
+
+/// The pause between the two looks at the frame file that a Start makes before it believes "replaced".
+const FILE_RECHECK_DELAY: Duration = Duration::from_millis(150);
+
+/// The error when the frame file was replaced or deleted under the running engine. Names the Repair, and holds the
+/// words the window clears the error on after one (`runVcam` in `src/store.ts`).
+const FRAME_FILE_REPLACED: &str = "Better Cam's frame file was replaced or deleted, so the virtual camera is not installed correctly and apps get no picture. Choose Repair in the virtual camera menu of the title bar.";
+
 // ---------------------------------------------------------------------------------------------------------------
 // Handle
 
@@ -712,7 +738,11 @@ struct Shared {
     /// The newest measurement the render thread made ([`Engine::meter`]).
     meter: crate::meter::Mailbox,
     /// What the controller reads besides the samples ([`Engine::session_facts`]); the render loop keeps it current.
-    facts: Mutex<crate::meter::SessionFacts>,
+    /// The cell of the newest session: each session writes its own (a render thread that was left behind cannot
+    /// reset the facts of the session that followed it when it ends), and registers it here unless it was abandoned.
+    facts: Mutex<Arc<Mutex<crate::meter::SessionFacts>>>,
+    /// The app is quitting ([`Engine::close_for_exit`]): the end of a session is waited for [`SHUTDOWN_END_CAP`] at most.
+    exiting: AtomicBool,
     /// Test hook: frames that fail with `DXGI_ERROR_DEVICE_REMOVED` before they render. The first one also marks the
     /// current device removed, as a real loss would.
     #[cfg(test)]
@@ -720,6 +750,31 @@ struct Shared {
     /// Test hook: how long building a new GPU device takes on top of the real work.
     #[cfg(test)]
     rebuild_delay: Mutex<Duration>,
+    /// Test hook: [`SESSION_END_CAP`] for a test.
+    #[cfg(test)]
+    session_end_cap: Mutex<Option<Duration>>,
+    /// Test hook: [`FILE_CHECK_INTERVAL`] for a test.
+    #[cfg(test)]
+    file_check_interval: Mutex<Option<Duration>>,
+    /// Test hook: how long the render thread waits before it takes the lock to go live (a first frame that comes late).
+    #[cfg(test)]
+    go_live_delay: Mutex<Duration>,
+    /// Test hook: how long the render thread waits before it writes the `Paused` slate (a thread that is slow to get
+    /// there).
+    #[cfg(test)]
+    pause_write_delay: Mutex<Duration>,
+    /// Test hook: while set, the controls poller does not return to its loop (a read of the controls that hangs in the
+    /// driver) and does not look at its stop flag.
+    #[cfg(test)]
+    poller_stall: AtomicBool,
+    /// Test hook: how many looks at the frame file ([`Control::check_frame_file`]) were made, how many of them said
+    /// "replaced", and what runs before each look (with the number of the look, from 1).
+    #[cfg(test)]
+    file_looks: std::sync::atomic::AtomicU32,
+    #[cfg(test)]
+    file_looks_replaced: std::sync::atomic::AtomicU32,
+    #[cfg(test)]
+    before_file_look: Mutex<Option<Box<dyn FnMut(u32) + Send>>>,
     /// Test hook: the control thread takes this at the top of every pass, so a test that holds it keeps messages
     /// queued and unprocessed.
     #[cfg(test)]
@@ -731,6 +786,21 @@ struct Shared {
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// How long the end of a session (and, at exit, of the threads around it) is waited for: [`SESSION_END_CAP`], and
+/// [`SHUTDOWN_END_CAP`] once the app is quitting.
+fn end_cap(shared: &Shared) -> Duration {
+    let exiting = shared.exiting.load(Ordering::Acquire);
+    #[cfg(test)]
+    if let Some(cap) = *lock(&shared.session_end_cap) {
+        return if exiting { cap.min(SHUTDOWN_END_CAP) } else { cap };
+    }
+    if exiting {
+        SHUTDOWN_END_CAP
+    } else {
+        SESSION_END_CAP
+    }
 }
 
 fn emit(shared: &Shared, event: EngineEvent) {
@@ -768,7 +838,10 @@ fn write_advertised(
 ) {
     if *record != Some(want) {
         writer.set_advertised(&advertised_list(want.0, want.1, want.2, want.3));
-        *record = Some(want);
+        // A retired writer (a render thread that was left behind) wrote nothing, so the record says nothing is known
+        // and the next writer writes its list again. (A write that went through just before the retirement leaves a
+        // record that differs from the file, which the next writer corrects the same way.)
+        *record = if writer.is_retired() { None } else { Some(want) };
     }
 }
 
@@ -851,11 +924,28 @@ impl Engine {
             gpu_generation: AtomicU64::new(1),
             metering: AtomicBool::new(false),
             meter: crate::meter::Mailbox::default(),
-            facts: Mutex::new(crate::meter::SessionFacts::CLOSED),
+            facts: Mutex::new(Arc::new(Mutex::new(crate::meter::SessionFacts::CLOSED))),
+            exiting: AtomicBool::new(false),
             #[cfg(test)]
             gpu_faults: Default::default(),
             #[cfg(test)]
             rebuild_delay: Mutex::new(Duration::ZERO),
+            #[cfg(test)]
+            session_end_cap: Mutex::new(None),
+            #[cfg(test)]
+            file_check_interval: Mutex::new(None),
+            #[cfg(test)]
+            go_live_delay: Mutex::new(Duration::ZERO),
+            #[cfg(test)]
+            pause_write_delay: Mutex::new(Duration::ZERO),
+            #[cfg(test)]
+            poller_stall: AtomicBool::new(false),
+            #[cfg(test)]
+            file_looks: Default::default(),
+            #[cfg(test)]
+            file_looks_replaced: Default::default(),
+            #[cfg(test)]
+            before_file_look: Mutex::new(None),
             #[cfg(test)]
             control_gate: Mutex::new(()),
             #[cfg(test)]
@@ -896,6 +986,8 @@ impl Engine {
                 retrying: false,
                 emitted: None,
                 last_heartbeat: Instant::now(),
+                last_file_check: Instant::now(),
+                file_replaced_seen: false,
                 last_stats: Instant::now(),
                 last_stats_sent: None,
                 hotplug: None,
@@ -904,7 +996,7 @@ impl Engine {
                 gpu_dirty: false,
                 gpu_losses: 0,
                 gpu_last_loss: None,
-                gpu_recovering_since: None,
+                reopening_since: None,
                 arrival_burst: 0,
                 first_open: true,
                 paused_reported: false,
@@ -951,7 +1043,9 @@ impl Engine {
     /// What the controller reads each tick besides the samples: [`SessionFacts::CLOSED`](crate::meter::SessionFacts)
     /// while no camera session runs.
     pub fn session_facts(&self) -> crate::meter::SessionFacts {
-        *lock(&self.shared.facts)
+        let cell = lock(&self.shared.facts).clone();
+        let facts = *lock(&cell);
+        facts
     }
 
     /// Where the engine reports to (replaces the previous sink). Events come from the control thread.
@@ -1172,6 +1266,13 @@ impl Engine {
         self.close();
     }
 
+    /// [`Engine::close`] for an app that is quitting: the render thread is waited for [`SHUTDOWN_END_CAP`] at most (3 s),
+    /// not [`SESSION_END_CAP`] (30 s): the exit frees the camera, so a driver that never answers must not hold it up.
+    pub fn close_for_exit(&self) {
+        self.shared.exiting.store(true, Ordering::Release);
+        self.close();
+    }
+
     /// [`Engine::shutdown`] for a shared handle.
     pub fn close(&self) {
         let handle = lock(&self.control).take();
@@ -1180,16 +1281,46 @@ impl Engine {
             let _ = h.join();
         }
         let poller = lock(&self.poller).take();
-        if let Some((stop, h)) = poller {
-            stop.store(true, Ordering::Release);
-            let _ = h.join();
-        }
         let runner = lock(&self.runner).take();
-        if let Some((stop, h)) = runner {
-            stop.store(true, Ordering::Release);
-            let _ = h.join();
+        let shared = self.shared.clone();
+        let tail = move || {
+            if let Some((stop, h)) = poller {
+                stop.store(true, Ordering::Release);
+                let _ = h.join();
+            }
+            if let Some((stop, h)) = runner {
+                stop.store(true, Ordering::Release);
+                let _ = h.join();
+            }
+            shared.hub.release_lease();
+        };
+        if !self.shared.exiting.load(Ordering::Acquire) {
+            tail();
+            return;
         }
-        self.shared.hub.release_lease();
+        // Quitting: a camera driver that does not answer can hold the poller (a read of the controls), the auto runner
+        // (a write, under the hub's gate) and the release of the lease. The exit frees the camera anyway, so they get
+        // [`SHUTDOWN_END_CAP`] and are left behind after that (the app is about to end).
+        let helper = std::thread::Builder::new()
+            .name("engine close".into())
+            .spawn(tail);
+        let Ok(helper) = helper else {
+            eprintln!("[engine] cannot start the thread that ends the controls: they are left running");
+            return;
+        };
+        let started = Instant::now();
+        let cap = end_cap(&self.shared);
+        while !helper.is_finished() {
+            if started.elapsed() >= cap {
+                eprintln!(
+                    "[engine] the controls did not stop within {:.0} s of the quit: leaving them behind",
+                    cap.as_secs_f32()
+                );
+                return;
+            }
+            std::thread::sleep(SESSION_END_POLL);
+        }
+        let _ = helper.join();
     }
 }
 
@@ -1208,7 +1339,26 @@ struct Session {
     stop: Arc<AtomicBool>,
     /// Set by the control thread when the hot-plug watcher reports this camera removed.
     removed: Arc<AtomicBool>,
+    /// Set (with the writer retired) when the control thread gives up waiting for the thread and leaves it behind: from
+    /// then on it writes nothing to anything the engine shares ([`Control::abandon`]).
+    abandoned: Arc<AtomicBool>,
+    /// The session's own handle on the frame file: the render thread writes through it, so retiring it ends the
+    /// thread's writes to the file whatever the thread is doing ([`vcam_protocol::Writer::lease`]).
+    writer: Arc<Writer>,
     join: JoinHandle<()>,
+}
+
+/// What the file shows while [`Control::end_session`] waits for the render thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Leave {
+    /// The last picture stays (a reopen: the camera comes back at once), for [`Timings::gpu_slate_delay`] at most;
+    /// then the "starting" slate.
+    Picture,
+    /// The slate the engine's settings give ([`Control::slate_state`]) from the moment the stop flag is set.
+    Slate,
+    /// This state from the moment the stop flag is set (a stop or a failure: nothing is going to run; the app is
+    /// quitting: `Closed`).
+    State(WriterState),
 }
 
 struct SessionEvent {
@@ -1261,6 +1411,10 @@ struct Control {
     retrying: bool,
     emitted: Option<StateEvent>,
     last_heartbeat: Instant,
+    /// When the frame file was last compared with the writer's mapping ([`Control::check_frame_file`]).
+    last_file_check: Instant,
+    /// The last look at the frame file said "replaced": the next one that says so stops the engine.
+    file_replaced_seen: bool,
     /// When the numbers were last looked at for a `stats` event ([`Timings::stats_interval`]).
     last_stats: Instant,
     /// The last `stats` event that went out: the next one is sent only when it differs, and only while the window
@@ -1276,9 +1430,10 @@ struct Control {
     /// Device losses in the current run and when the last one happened (`Timings::gpu_failure_window`).
     gpu_losses: u32,
     gpu_last_loss: Option<Instant>,
-    /// Since when the engine has been getting back from a device loss (the last frame stays on the file for a
-    /// second, then the "starting" slate shows: plan 4.9).
-    gpu_recovering_since: Option<Instant>,
+    /// Since when the engine has been getting back from a device loss or reopening the camera for a changed source
+    /// while live (the last frame stays on the file for [`Timings::gpu_slate_delay`], then the "starting" slate shows:
+    /// plan 4.9). Cleared when the new session reports its camera open.
+    reopening_since: Option<Instant>,
     /// Retries left that follow the arrival of the camera being waited for at the short interval.
     arrival_burst: u32,
     /// No session has opened the current source yet: a camera that opens but sends no picture in a saved format
@@ -1328,7 +1483,9 @@ impl Control {
     }
 
     fn shutdown(&mut self) {
-        self.end_session();
+        // The file says "closed" from the start of the wait: the camera may take its time to close, and the apps
+        // must not be left on the last picture meanwhile.
+        self.end_session(Leave::State(WriterState::Closed));
         self.cfg = None;
         self.sync_cfg();
         self.writer.set_state(WriterState::Closed);
@@ -1460,13 +1617,26 @@ impl Control {
 
     /// The writer state while no frames flow: `Paused` when stopped or paused, else `Starting`. Depends on `cfg` and
     /// the pause flag, not on the phase.
-    fn set_slate(&self) {
+    fn slate_state(&self) -> WriterState {
         let paused = self.shared.paused.load(Ordering::Acquire);
-        self.writer.set_state(if self.cfg.is_none() || paused {
+        if self.cfg.is_none() || paused {
             WriterState::Paused
         } else {
             WriterState::Starting
-        });
+        }
+    }
+
+    /// Show the slate ([`Control::slate_state`]). Written under the lock the render thread takes to go live
+    /// (`Shared::live_gen`), so a first frame that is published late cannot put `Live` back over it: the thread looks
+    /// at its stop flag under that lock, and the stop flag is set before a slate is written for a session that ends.
+    fn set_slate(&self) {
+        self.set_writer_state(self.slate_state());
+    }
+
+    /// Write `state` under the lock of [`Control::set_slate`].
+    fn set_writer_state(&self, state: WriterState) {
+        let _live = lock(&self.shared.live_gen);
+        self.writer.set_state(state);
     }
 
     fn wants_camera(&self) -> bool {
@@ -1491,8 +1661,20 @@ impl Control {
     // ---- commands
 
     fn start(&mut self, s: Settings) {
-        self.end_session();
+        self.end_session(Leave::Slate);
         *lock(&self.shared.error) = None;
+        // An engine whose frame file was replaced (and stopped for it) must not start again on the file it still has
+        // mapped: it would publish for nobody. Looked at here whatever the interval, twice (a moment apart) before it
+        // is believed, like the periodic look ([`Control::check_frame_file`]).
+        if self.writer.backing_file() == vcam_protocol::BackingFile::Replaced {
+            std::thread::sleep(FILE_RECHECK_DELAY);
+            if self.writer.backing_file() == vcam_protocol::BackingFile::Replaced {
+                self.last_file_check = Instant::now();
+                self.file_replaced_seen = false;
+                self.fail(FRAME_FILE_REPLACED.into());
+                return;
+            }
+        }
         *lock(&self.shared.output) = s.output;
         self.shared.flip.store(s.flip_vertical, Ordering::Relaxed);
         *lock(&self.shared.color) = s.color;
@@ -1501,7 +1683,7 @@ impl Control {
         self.next_retry = None;
         self.retrying = false;
         self.error_streak = None;
-        self.gpu_recovering_since = None;
+        self.reopening_since = None;
         self.gpu_losses = 0;
         self.gpu_last_loss = None;
         self.first_open = true;
@@ -1516,7 +1698,9 @@ impl Control {
     }
 
     fn stop(&mut self) {
-        self.end_session();
+        // Nothing runs after this: the file shows the paused slate from the first moment of the wait, not the last
+        // picture for as long as the camera takes to close.
+        self.end_session(Leave::State(WriterState::Paused));
         self.cfg = None;
         self.sync_cfg();
         self.shared.paused.store(false, Ordering::Release);
@@ -1524,7 +1708,7 @@ impl Control {
         self.next_retry = None;
         self.retrying = false;
         self.error_streak = None;
-        self.gpu_recovering_since = None;
+        self.reopening_since = None;
         self.report_paused();
         self.enter_slate(EngineState::Stopped, None);
         self.emit_stats();
@@ -1536,7 +1720,7 @@ impl Control {
     }
 
     fn fail_kind(&mut self, message: String, kind: Option<&'static str>) {
-        self.end_session();
+        self.end_session(Leave::State(WriterState::Paused));
         eprintln!("[engine] {message}");
         *lock(&self.shared.error) = Some(message.clone());
         self.cfg = None;
@@ -1546,7 +1730,7 @@ impl Control {
         self.next_retry = None;
         self.retrying = false;
         self.error_streak = None;
-        self.gpu_recovering_since = None;
+        self.reopening_since = None;
         self.report_paused();
         // The slate first: neither the error nor the `Stopped` event may be seen with the writer still `Starting`.
         self.set_slate();
@@ -1606,7 +1790,17 @@ impl Control {
         if self.cfg.is_none() {
             return;
         }
-        self.end_session();
+        // A reopen keeps the last picture while the camera closes (for a second at most); the other opens show the slate.
+        self.end_session(match mode {
+            OpenMode::Reopen => Leave::Picture,
+            OpenMode::Fresh | OpenMode::Retry => Leave::Slate,
+        });
+        if mode == OpenMode::Reopen {
+            // The old picture stays for the delay and then gives way to the slate for however long the camera takes to
+            // open (a device loss has set the time already). `tick` does it: the session of this open has not been
+            // live, so its `gen` is not `live_gen` until its first frame (`slate_after_gpu_loss`).
+            self.reopening_since.get_or_insert_with(Instant::now);
+        }
         // The device may have been lost while nothing used it (a driver update while the app sat in the tray, the
         // camera off in standby, the engine stopped): look before every open, so the camera is never handed a dead
         // device, and its failure never mistaken for a format or camera problem.
@@ -1631,10 +1825,13 @@ impl Control {
         // A lease on the camera (a control call while no camera was open) makes way for the engine.
         self.shared.hub.release_lease();
         self.gen += 1;
-        let (stop, removed) = (
+        let (stop, removed, abandoned) = (
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         );
+        // The session writes to the file through a handle of its own, so that it can be cut off if it is left behind.
+        let writer = Arc::new(self.writer.lease());
         let ctx = SessionCtx {
             source,
             readback,
@@ -1642,10 +1839,11 @@ impl Control {
             shared: self.shared.clone(),
             renderer: self.renderer.clone(),
             assets: self.assets.client(),
-            writer: self.writer.clone(),
+            writer: writer.clone(),
             factory: self.factory.clone(),
             stop: stop.clone(),
             removed: removed.clone(),
+            abandoned: abandoned.clone(),
             events: self.events_tx.clone(),
             first_open: self.first_open,
         };
@@ -1669,6 +1867,8 @@ impl Control {
                     gen: self.gen,
                     stop,
                     removed,
+                    abandoned,
+                    writer,
                     join,
                 })
             }
@@ -1685,17 +1885,72 @@ impl Control {
     }
 
     /// Stop the session thread and wait for it: the camera is closed when this returns.
-    fn end_session(&mut self) {
+    ///
+    /// The thread checks the stop flag between the steps of opening a camera, not inside one (a camera that takes its
+    /// time to open, a control write that hangs), so the wait can last seconds. Nothing else beats the file's
+    /// heartbeat meanwhile, so this does: the virtual camera shows "Better Cam is not running" after a second without
+    /// one. But a heartbeat on a file that still says `Live` keeps the apps on the last picture, frozen, for as long
+    /// as the wait lasts, so `leave` says what the file shows meanwhile: the slate (or another state) from the moment
+    /// the stop flag is set, or, for a reopen, the last picture for [`Timings::gpu_slate_delay`] and then the slate.
+    ///
+    /// After [`SESSION_END_CAP`] (3 s when the app is quitting) the thread is left behind: it ends by itself, its events
+    /// are ignored (the session is no longer the current one) and it can write nothing that the engine shares
+    /// ([`Control::abandon`]), so a driver that never answers cannot hold up a Stop or the app's exit.
+    fn end_session(&mut self, leave: Leave) {
         if let Some(s) = self.session.take() {
             s.stop.store(true, Ordering::Release);
+            // After the stop flag, under the lock of the render thread's first frame: that frame is either live
+            // already (and covered here) or finds the flag and does not go live.
+            match leave {
+                Leave::Picture => {}
+                Leave::Slate => self.set_slate(),
+                Leave::State(state) => self.set_writer_state(state),
+            }
+            let started = Instant::now();
+            let mut slated = leave != Leave::Picture;
+            while !s.join.is_finished() {
+                self.beat();
+                if !slated && started.elapsed() >= self.timings.gpu_slate_delay {
+                    // the camera is not back within a second: the last picture gives way to the slate
+                    slated = true;
+                    self.set_slate();
+                }
+                // Looked at on every pass: a quit ([`Engine::close_for_exit`]) that comes while this wait runs
+                // shortens it.
+                let cap = end_cap(&self.shared);
+                if started.elapsed() >= cap {
+                    eprintln!(
+                        "[engine] the render thread did not end within {:.0} s of the stop: leaving it behind",
+                        cap.as_secs_f32()
+                    );
+                    self.abandon(&s);
+                    return;
+                }
+                std::thread::sleep(SESSION_END_POLL);
+            }
             let _ = s.join.join();
         }
         *lock(&self.shared.camera_link) = None;
     }
 
+    /// The control thread gives up on a render thread: from here on it writes nothing the engine shares, whatever it
+    /// is doing and for however long it lives. Everything it writes is cut off in an order that leaves no gap: the
+    /// flag first, then a pass through each lock the thread writes under (a write that began before the flag was set
+    /// is over when the pass returns, one that begins later sees the flag), then the frame file ([`Writer::retire`]).
+    fn abandon(&self, s: &Session) {
+        s.abandoned.store(true, Ordering::Release);
+        s.writer.retire();
+        // the camera it may still announce, its statistics, its facts
+        *lock(&self.shared.camera_link) = None;
+        drop(lock(&self.shared.stats));
+        *lock(&self.shared.facts) = Arc::new(Mutex::new(crate::meter::SessionFacts::CLOSED));
+        // what it may have put in the meter's mailbox is not for the session that follows it
+        self.shared.meter.clear();
+    }
+
     /// `Standby` with the camera closed: nobody watches.
     fn go_idle(&mut self) {
-        self.end_session();
+        self.end_session(Leave::Slate);
         self.idle_since = None;
         self.next_retry = None;
         self.retrying = false;
@@ -1755,7 +2010,7 @@ impl Control {
         if !self.note_gpu_loss(&why) {
             return;
         }
-        self.gpu_recovering_since = Some(Instant::now());
+        self.reopening_since = Some(Instant::now());
         // The window and the log say what is going on while the device is rebuilt (the last frame stays on the file).
         self.set_phase(EngineState::Standby, Some("reopening".into()));
         self.open_session(OpenMode::Reopen);
@@ -1835,6 +2090,9 @@ impl Control {
                     Ok(built) => break built,
                     Err(RecvTimeoutError::Timeout) => {
                         self.beat();
+                        // `tick` does not run meanwhile: a recovery that takes long shows the slate from here.
+                        self.slate_after_gpu_loss(Instant::now(), true);
+
                         if self.stop_queued() {
                             eprintln!("[engine] GPU device rebuild abandoned: the engine is stopping");
                             return false;
@@ -1914,7 +2172,7 @@ impl Control {
                     self.retrying = false;
                     self.next_retry = None;
                     self.opened_at = Some(Instant::now());
-                    self.gpu_recovering_since = None;
+                    self.reopening_since = None;
                     self.arrival_burst = 0;
                     // This source has opened: from now on a camera that sends no picture is retried in its format.
                     self.first_open = false;
@@ -1942,7 +2200,9 @@ impl Control {
                     self.set_phase(EngineState::Live, None);
                 }
                 SessionMsg::Ended(result) => {
-                    self.end_session();
+                    // The thread is done: nothing to wait for, and the picture it left stays until the handling below
+                    // decides (a lost device keeps it for a second).
+                    self.end_session(Leave::Picture);
                     let lived = self.opened_at.take().map(|t| t.elapsed());
                     match result {
                         Ok(()) => self.go_idle(),
@@ -2011,26 +2271,78 @@ impl Control {
         }
     }
 
+    /// A device loss, or a reopen of the camera for a changed source, that takes longer than `Timings::gpu_slate_delay`
+    /// to get over: the frame that was repeated gives way to the "starting" slate (the first frame of the new session sets `Live` again, and is the only thing that
+    /// does: see `live_gen`). Called by [`Control::tick`] and, while the device is rebuilt ([`Control::rebuild_gpu`],
+    /// which is where a slow recovery spends its time and `tick` does not run), by the wait loop.
+    ///
+    /// `rebuilding`: called from the wait of [`Control::rebuild_gpu`], which runs before the next session is made. No
+    /// render thread runs then (the one the loss ended is joined, `gen` is still its number, and it did go live), so
+    /// nothing can be covered by mistake and the slate shows whatever `live_gen` says.
+    fn slate_after_gpu_loss(&mut self, now: Instant, rebuilding: bool) {
+        if self
+            .reopening_since
+            .is_some_and(|t| now.duration_since(t) >= self.timings.gpu_slate_delay)
+        {
+            self.reopening_since = None;
+            // Under the lock the render thread takes to go live: the slate cannot replace the picture of a session
+            // that has published its first frame already.
+            let live = lock(&self.shared.live_gen);
+            if rebuilding || *live != self.gen {
+                // (the lock is held: not `set_slate`)
+                self.writer.set_state(self.slate_state());
+            }
+        }
+    }
+
+    /// Whether `frames.bin` is still the file the writer has mapped. An installer's Repair, a cleaner or a person that
+    /// deletes or replaces it leaves the engine publishing into a file nobody reads (the virtual camera opens the file
+    /// by its path): the engine stops with a message that names the Repair, like an engine that finds no frame file
+    /// at its start. Looked at every [`FILE_CHECK_INTERVAL`] while the engine runs, and at every Start.
+    fn check_frame_file(&mut self, now: Instant) {
+        if self.cfg.is_none() || now.duration_since(self.last_file_check) < self.file_check_interval() {
+            return;
+        }
+        self.last_file_check = now;
+        #[cfg(test)]
+        {
+            let n = self.shared.file_looks.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some(hook) = lock(&self.shared.before_file_look).as_mut() {
+                hook(n);
+            }
+        }
+        // Two looks in a row say "replaced" before the engine stops: one can be a file that is being swapped by a
+        // Repair, and an answer that is not "replaced" (including "could not tell") starts the count again.
+        let replaced = self.writer.backing_file() == vcam_protocol::BackingFile::Replaced;
+        #[cfg(test)]
+        if replaced {
+            self.shared.file_looks_replaced.fetch_add(1, Ordering::SeqCst);
+        }
+        if replaced {
+            if std::mem::replace(&mut self.file_replaced_seen, true) {
+                self.file_replaced_seen = false;
+                self.fail(FRAME_FILE_REPLACED.into());
+            }
+        } else {
+            self.file_replaced_seen = false;
+        }
+    }
+
+    fn file_check_interval(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(i) = *lock(&self.shared.file_check_interval) {
+            return i;
+        }
+        FILE_CHECK_INTERVAL
+    }
+
     fn tick(&mut self) {
         let now = Instant::now();
         // The DLL shows "not running" after a second without a heartbeat; the render thread beats while it works,
         // this covers everything else (opening, standby, stopped).
         self.beat();
-        // A device loss that takes longer than `Timings::gpu_slate_delay` to get over: the frame that was repeated
-        // gives way to the "starting" slate (the first frame of the new session sets `Live` again, and is the only
-        // thing that does: see `live_gen`).
-        if self
-            .gpu_recovering_since
-            .is_some_and(|t| now.duration_since(t) >= self.timings.gpu_slate_delay)
-        {
-            self.gpu_recovering_since = None;
-            // Under the lock the render thread takes to go live: the slate cannot replace the picture of a session
-            // that has published its first frame already.
-            let live = lock(&self.shared.live_gen);
-            if *live != self.gen {
-                self.set_slate();
-            }
-        }
+        self.slate_after_gpu_loss(now, false);
+        self.check_frame_file(now);
 
         if let Some(deactivate) = self.cfg.as_ref().map(|c| c.deactivate_when_not_showing) {
             let wants = self.wants_camera();
@@ -2085,7 +2397,7 @@ impl Control {
     fn stats_event(&self) -> StatsEvent {
         let s = lock(&self.shared.stats).clone();
         let live = self.phase == EngineState::Live;
-        let header = self.writer.shared().header();
+        let header = self.writer.header();
         StatsEvent {
             capture: CaptureStatsEvent {
                 width: if live { s.capture_width } else { 0 },
@@ -2163,13 +2475,55 @@ struct SessionCtx {
     factory: Arc<dyn SourceFactory>,
     stop: Arc<AtomicBool>,
     removed: Arc<AtomicBool>,
+    /// The control thread gave up on this session ([`Control::abandon`]): nothing the engine shares is written any more.
+    abandoned: Arc<AtomicBool>,
     events: Sender<SessionEvent>,
     /// No session has opened this source yet (see [`Control::first_open`]).
     first_open: bool,
 }
 
+/// The render thread (and the synthetic source that runs on it) registered with the Multimedia Class Scheduler as
+/// "Capture" for the session: a thread of that class is scheduled ahead of ordinary work, which the periodic repeats of
+/// the virtual camera in a busy machine point at. Best effort: when the call fails (no service, no rights) the
+/// thread simply runs at its normal priority.
+struct Mmcss(Option<windows::Win32::Foundation::HANDLE>);
+
+impl Mmcss {
+    fn capture() -> Mmcss {
+        // Not in the tests: they run many engines in parallel, and render threads of a class that is scheduled ahead of
+        // everything else starve the test threads that read the file (a consumer that misses its heartbeat).
+        #[cfg(test)]
+        return Mmcss(None);
+        #[cfg(not(test))]
+        Mmcss::register()
+    }
+
+    #[cfg(not(test))]
+    fn register() -> Mmcss {
+        let mut task = 0u32;
+        // SAFETY: plain call; the task name is a NUL-terminated literal and `task` a local.
+        let h = unsafe {
+            windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW(
+                windows::core::w!("Capture"),
+                &mut task,
+            )
+        };
+        Mmcss(h.ok())
+    }
+}
+
+impl Drop for Mmcss {
+    fn drop(&mut self) {
+        if let Some(h) = self.0 {
+            // SAFETY: the handle came from `AvSetMmThreadCharacteristicsW` on this thread.
+            let _ = unsafe { windows::Win32::System::Threading::AvRevertMmThreadCharacteristics(h) };
+        }
+    }
+}
+
 fn session_thread(ctx: SessionCtx) {
     ensure_com();
+    let _mmcss = Mmcss::capture();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render_session(&ctx)));
     let outcome = match result {
         Ok(r) => r,
@@ -2224,21 +2578,34 @@ struct SynthFrame {
     arrival_100ns: i64,
 }
 
+/// How far ahead of its arrival a camera's capture timestamp may be before it is not believed: the virtual camera
+/// clamps capture times at `now + 50 ms` (`crates/vcam-source/src/frames.rs`, `clamp_capture`), so a stamp further
+/// ahead than that would only be cut there, and one that is ahead at all is a camera clock that runs fast.
+const CAPTURE_AHEAD_MAX: i64 = 500_000;
+
+/// A frame can have been captured up to this long before it arrived (a camera buffers, a USB hub is busy).
+const CAPTURE_BEHIND_MAX: i64 = 10_000_000;
+
+/// The capture time of a camera frame (100 ns): the camera's own timestamp when it is plausible, else the arrival.
+/// Plausible: positive, at most [`CAPTURE_AHEAD_MAX`] after the arrival (never from the future, apart from the clock
+/// jitter of the capture callback), and less than [`CAPTURE_BEHIND_MAX`] before it.
+fn plausible_capture(timestamp: i64, arrival: i64) -> i64 {
+    if timestamp > 0 && timestamp - arrival <= CAPTURE_AHEAD_MAX && arrival - timestamp < CAPTURE_BEHIND_MAX {
+        timestamp
+    } else {
+        arrival
+    }
+}
+
 impl InFrame {
-    /// `(capture timestamp, arrival)` in 100 ns QPC units. A timestamp that is missing or implausible (more than a
-    /// second from the arrival) is replaced by the arrival time.
+    /// `(capture timestamp, arrival)` in 100 ns QPC units. A timestamp that is missing or implausible is replaced by
+    /// the arrival time ([`plausible_capture`]).
     fn times(&self) -> (i64, i64) {
         match self {
-            InFrame::Camera(f, _) => {
-                let ts = if f.timestamp_100ns > 0
-                    && (f.arrival_100ns - f.timestamp_100ns).abs() < 10_000_000
-                {
-                    f.timestamp_100ns
-                } else {
-                    f.arrival_100ns
-                };
-                (ts, f.arrival_100ns)
-            }
+            InFrame::Camera(f, _) => (
+                plausible_capture(f.timestamp_100ns, f.arrival_100ns),
+                f.arrival_100ns,
+            ),
             InFrame::Synthetic(s) => (s.timestamp_100ns, s.arrival_100ns),
         }
     }
@@ -2335,13 +2702,17 @@ struct FormatFallback {
 trait SourceFactory: Send + Sync {
     /// `output_fps` is the output rate in effect (for `frame_interval` -1). `first_open`: no session has opened this
     /// source yet, so a camera that sends no picture in a saved format may be treated as lacking it (see
-    /// [`Control::first_open`]).
+    /// [`Control::first_open`]). `stop` is the session's stop flag: an open that takes long (the decoder retry, the
+    /// format fallback and the wait for the first frame are up to 5 s each) looks at it between its steps and gives
+    /// up when it is set, so ending the session does not wait for all of them ([`Control::end_session`]). What an
+    /// open that was stopped returns does not matter: nobody reads it.
     fn open(
         &self,
         spec: &SourceSpec,
         output_fps: Option<u32>,
         gpu: &Arc<GpuDevice>,
         first_open: bool,
+        stop: &Arc<AtomicBool>,
     ) -> Result<Box<dyn Source>, Failure>;
 
     /// Which Windows privacy switch keeps desktop apps from the camera, if any (read after a failure to tell "the
@@ -2367,22 +2738,30 @@ impl SourceFactory for DefaultFactory {
         output_fps: Option<u32>,
         gpu: &Arc<GpuDevice>,
         first_open: bool,
+        stop: &Arc<AtomicBool>,
     ) -> Result<Box<dyn Source>, Failure> {
         if !matches!(spec, SourceSpec::Synthetic(_)) && crate::capture::privacy::test_access_denied() {
             return Err(Failure::in_use(Some(windows::Win32::Foundation::E_ACCESSDENIED)));
         }
         Ok(match spec {
-            SourceSpec::Camera(c) => {
-                Box::new(open_retrying_decoder(c, first_open, |c| open_camera(c, gpu, first_open))?)
-            }
+            SourceSpec::Camera(c) => Box::new(open_retrying_decoder(c, first_open, |c| {
+                open_unless_stopped(stop, || open_camera(c, gpu, first_open, stop))
+            })?),
             SourceSpec::Configured(cap) => {
                 let (mut camera, fallback) = open_with_fallback(cap, |cap| {
+                    // Between the attempts of the format fallback (and the decoder retry below) the stop flag is
+                    // looked at, so a stopped session does not go on to the next one.
+                    if stop.load(Ordering::Acquire) {
+                        return Err(stopped_open());
+                    }
                     let c = resolve_camera(cap, output_fps)?;
                     // A camera that cannot deliver a picture in the format it lists is as good as one that lacks it,
                     // but only the first time this source is opened: one that did open and then timed out after a
                     // reconnect is slow, not lacking the format, and is retried in the same format.
-                    open_retrying_decoder(&c, first_open, |c| open_camera(c, gpu, first_open))
-                        .map_err(|f| no_picture_as_format_problem(f, cap, first_open))
+                    open_retrying_decoder(&c, first_open, |c| {
+                        open_unless_stopped(stop, || open_camera(c, gpu, first_open, stop))
+                    })
+                    .map_err(|f| format_problem_unless_stopped(f, cap, first_open, stop))
                 })?;
                 camera.info.fallback = finish_fallback(fallback, &camera.info);
                 Box::new(camera)
@@ -2390,6 +2769,39 @@ impl SourceFactory for DefaultFactory {
             SourceSpec::Synthetic(s) => Box::new(SyntheticInput::new(*s)?),
         })
     }
+}
+
+/// What an open returns when the session was stopped meanwhile. It is a generic retry failure, so neither the decoder
+/// retry nor the format fallback takes it for their own; nobody reads it (the session is gone).
+fn stopped_open() -> Failure {
+    Failure::Retry(RetryKind::Error, "the camera open was stopped".into())
+}
+
+/// [`no_picture_as_format_problem`] for an open that may have been stopped: a stopped session ends the wait for the
+/// first frame with a "no picture", which is the stop and not the camera's format, so it must not turn into the
+/// fallback to the device default (and its log line "delivers no picture ...; using the device default").
+fn format_problem_unless_stopped(
+    f: Failure,
+    cap: &CaptureCfg,
+    first_open: bool,
+    stop: &AtomicBool,
+) -> Failure {
+    if stop.load(Ordering::Acquire) {
+        eprintln!("[engine] the camera open was stopped ({})", describe_cap(cap));
+        return stopped_open();
+    }
+    no_picture_as_format_problem(f, cap, first_open)
+}
+
+/// One attempt to open a camera, unless the session was stopped before it began.
+fn open_unless_stopped<T>(
+    stop: &AtomicBool,
+    open: impl FnOnce() -> Result<T, Failure>,
+) -> Result<T, Failure> {
+    if stop.load(Ordering::Acquire) {
+        return Err(stopped_open());
+    }
+    open()
 }
 
 /// A camera that cannot deliver a picture in the format it lists is as good as one that lacks it, so the saved
@@ -2597,10 +3009,17 @@ impl Source for CameraInput {
     }
 }
 
-fn open_camera(spec: &CameraSpec, gpu: &Arc<GpuDevice>, first_open: bool) -> Result<CameraInput, Failure> {
+fn open_camera(
+    spec: &CameraSpec,
+    gpu: &Arc<GpuDevice>,
+    first_open: bool,
+    stop: &Arc<AtomicBool>,
+) -> Result<CameraInput, Failure> {
     let mut opts = OpenOptions::new(&spec.link, spec.request);
     opts.hw_decode = spec.hw_decode;
     opts.gpu = Some(gpu.clone());
+    // The wait for the first frame (5 s) ends when the session is stopped.
+    opts.cancel = Some(stop.clone());
     // A queue of one is the latest-frame mailbox: a newer frame replaces the one the render thread has not taken.
     opts.queue_len = 1;
     let reader = CaptureReader::open(opts).map_err(|e| Failure::from_capture_at(&e, first_open))?;
@@ -2914,7 +3333,9 @@ impl runner::Host for Shared {
     }
 
     fn facts(&self) -> crate::meter::SessionFacts {
-        *lock(&self.facts)
+        let cell = lock(&self.facts).clone();
+        let facts = *lock(&cell);
+        facts
     }
 
     fn sample(&self, timeout: Duration) -> Option<crate::meter::MeterSample> {
@@ -2947,6 +3368,10 @@ fn spawn_poller(shared: Arc<Shared>) -> std::io::Result<(Arc<AtomicBool>, JoinHa
             let mut was_visible = false;
             while !flag.load(Ordering::Acquire) {
                 std::thread::sleep(Duration::from_millis(100));
+                #[cfg(test)]
+                while shared.poller_stall.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
                 shared.hub.expire_lease();
                 let visible = shared.window_visible.load(Ordering::Acquire);
                 let mut due = last_poll.elapsed() >= Duration::from_secs(1);
@@ -3101,12 +3526,29 @@ fn period_100ns(fps_num: u32, fps_den: u32) -> Option<i64> {
     (fps_num > 0 && fps_den > 0).then(|| 10_000_000 * fps_den as i64 / fps_num as i64)
 }
 
+/// The frame period of a consumer that negotiated `f`, as the virtual camera computes it (`crates/vcam-source/src/
+/// frames.rs`: `freq / fps` in QPC ticks, `fps` the rate rounded to a whole number, at least 1, integer division).
+/// `None` for a format without a usable rate.
+fn dll_period(f: &Format, freq: u64) -> Option<i64> {
+    let fps = f.fps();
+    (fps > 0).then(|| (freq / fps.max(1) as u64) as i64)
+}
+
+/// The period of the consumer in QPC ticks, when it reads at a lower rate than the camera delivers (`camera_fps`, more
+/// than 5 % lower): the frames for it are decimated ([`Pacer`]). `None` when it reads at the camera's rate or above.
+fn lower_consumer_period(f: &Format, camera_fps: f64, freq: u64) -> Option<i64> {
+    let theirs = dll_period(f, freq)?;
+    (camera_fps > 0.0 && theirs as f64 / freq as f64 > 1.05 / camera_fps).then_some(theirs)
+}
+
 /// Decimation for a consumer that reads at a lower rate than the camera delivers (a 30 fps app on a 60 fps camera).
 ///
 /// The virtual camera takes a frame only when it was captured at least 3/4 of its period after the last frame it took
 /// ([`dll_min_gap`]; `crates/vcam-source/src/frames.rs`, `min_capture_gap`) and drops the others unseen, so
 /// encoding, reading back and publishing them is work for nothing. The engine follows the same rule on the capture
-/// times, but looser, so that nothing the virtual camera would have taken is ever held back:
+/// times, but looser, so that nothing the virtual camera would have taken is ever held back. It runs on QPC ticks with
+/// the virtual camera's own integer period (`freq / fps`, [`dll_period`]), so that no rounding through 100 ns units
+/// makes it disagree with the virtual camera about a frame that sits right on the limit:
 ///
 /// * [`Pacer::base`] is the capture time of the last frame the virtual camera would have taken from what was published:
 ///   the engine runs the virtual camera's rule itself on the frames it publishes.
@@ -3114,11 +3556,22 @@ fn period_100ns(fps_num: u32, fps_den: u32) -> Option<i64> {
 ///   ([`engine_min_gap`]). Between 7/10 and 3/4 it is published although the virtual camera will drop it (it does not
 ///   move `base`); from 3/4 on, the virtual camera takes it and `base` moves to it.
 ///
-/// By induction `base` is always the virtual camera's own last taken frame, so the frames it takes from the published
+/// By induction `base` is the virtual camera's own last taken frame, so the frames it takes from the published
 /// sequence are exactly the frames it takes from the whole sequence (see the test
 /// `the_pacer_never_holds_back_a_frame_the_virtual_camera_takes`). A time that goes backwards is taken (the virtual
 /// camera takes it too). The first frame, and the first after the consumer changed or went away ([`Pacer::reset`]),
 /// is always published.
+///
+/// **The virtual camera's bypass.** Past its repeat deadline (the last new frame it saw plus 1.5 periods) the virtual
+/// camera takes the newest frame live even if the decimation would drop it, and stamps it a gap after the last one
+/// (`crates/vcam-source/src/frames.rs`, `decimate`, `live_stamp`): a camera that stalled must not leave a stream
+/// without a picture. The Pacer does not model that, and need not: a frame it holds back is one captured less than 7/10
+/// of a period after `base`, which the virtual camera would have dropped unless its own stream had stalled for 1.5
+/// periods, and then the newest frame it finds is the last one published, at most 0.7 of a period older than the one
+/// held back. At worst a stall shows that older picture as a repeat; nothing is wasted the other way round, and `base`
+/// is still the last frame the virtual camera took by the decimation rule, which is all the bypass leaves alone. So
+/// "never holds back a frame the virtual camera takes" holds for the decimating path, and for the bypass it costs a
+/// repeat of at most 0.7 of a period in a stall.
 #[derive(Default)]
 struct Pacer {
     base: Option<i64>,
@@ -3198,9 +3651,13 @@ impl Window {
 // ---------------------------------------------------------------------------------------------------------------
 // Render loop
 
-/// Replace the published statistics but keep the state the control thread owns.
-fn store_stats(shared: &Shared, stats: &EngineStats) {
+/// Replace the published statistics but keep the state the control thread owns. Nothing is stored by a session that
+/// was abandoned (looked at under the lock that [`Control::abandon`] passes through after it sets the flag).
+fn store_stats(shared: &Shared, abandoned: &AtomicBool, stats: &EngineStats) {
     let mut s = lock(&shared.stats);
+    if abandoned.load(Ordering::Acquire) {
+        return;
+    }
     let state = s.state;
     *s = stats.clone();
     s.state = state;
@@ -3247,16 +3704,25 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
         writer,
         stop,
         removed,
+        abandoned,
         ..
     } = ctx;
     let output_fps = lock(&shared.output).fps;
     // A failed open is looked at through the device first: with the device gone, the open fails with whatever code
     // the decoder or the media type happens to give, and none of them is about the camera or its format.
-    let mut source: Box<dyn Source> =
-        match ctx.factory.open(&ctx.source, output_fps, &renderer.gpu, ctx.first_open) {
-            Ok(s) => s,
-            Err(f) => return Err(device_check(renderer, f)),
-        };
+    let mut source: Box<dyn Source> = match ctx.factory.open(
+        &ctx.source,
+        output_fps,
+        &renderer.gpu,
+        ctx.first_open,
+        stop,
+    ) {
+        Ok(s) => s,
+        // A stopped open fails with whatever it was doing: the session is over, and the control thread has forgotten
+        // it already.
+        Err(_) if stop.load(Ordering::Acquire) => return Ok(()),
+        Err(f) => return Err(device_check(renderer, f)),
+    };
     if stop.load(Ordering::Acquire) {
         return Ok(());
     }
@@ -3277,7 +3743,14 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
             ),
         )
     };
-    *lock(&shared.camera_link) = capture_info.4.clone();
+    {
+        // Under the lock, so that a session that was abandoned meanwhile ([`Control::abandon`] clears the link after
+        // it sets the flag) does not announce its camera after that.
+        let mut link = lock(&shared.camera_link);
+        if !abandoned.load(Ordering::Acquire) {
+            *link = capture_info.4.clone();
+        }
+    }
     // The colour space and range the user chose win over what the camera states; read again every frame, so a
     // change applies live.
     let effective_color = |user: ColorSettings| ColorSettings {
@@ -3300,18 +3773,34 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
     // in the mailbox is gone, and the facts are this session's until it ends.
     let mut meter = crate::meter::Meter::new();
     let mut meter_failed = false;
-    shared.meter.clear();
+    if !abandoned.load(Ordering::Acquire) {
+        shared.meter.clear();
+    }
+    // The session's own cell, made current below: when this thread ends, late, its feed resets its own cell and not the
+    // facts of the session that took its place.
+    let facts_cell = Arc::new(Mutex::new(crate::meter::SessionFacts::CLOSED));
     let mut facts = crate::meter::FactsFeed::new(
-        &shared.facts,
+        &facts_cell,
         _controls.as_ref().map(|c| c.token),
         source.info().fps,
     );
+    {
+        // Under the lock, so that a session that was abandoned meanwhile ([`Control::abandon`] replaces the cell after
+        // it sets the flag) does not take the place again.
+        let mut current = lock(&shared.facts);
+        if !abandoned.load(Ordering::Acquire) {
+            *current = facts_cell.clone();
+        }
+    }
 
     let mut published_any = false;
     // The consumer rate the pacer last saw; a change starts it over.
     let mut pacer = Pacer::default();
     let mut paced_for: Option<Format> = None;
     let mut gaps = Gaps::default();
+    // The file's newest frame was forgotten ([`Writer::clear_latest`]) since the last frame that was published. The
+    // file may hold the last frame of an earlier session (or of the app that left a moment ago) when this one starts.
+    let mut latest_cleared = false;
     let mut was_paused = false;
     let mut window = Window::new(0);
     let mut latency = LatencyTrack::new();
@@ -3333,12 +3822,40 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
     // The first published frame (or, with nobody reading the camera, the first rendered one) is the only thing that
     // sets the writer `Live` (see `Shared::live_gen`).
     let go_live = || {
+        #[cfg(test)]
+        {
+            let delay = *lock(&shared.go_live_delay);
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+        }
         let mut live = lock(&shared.live_gen);
+        // A session that is being stopped does not go live: the control thread sets the stop flag first and writes the
+        // slate under this lock, so a first frame that comes late cannot put `Live` back over the slate.
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
         *live = ctx.gen;
         writer.set_state(WriterState::Live);
     };
+    // The `Paused` slate, written under the same lock and with the same look at the stop flag: a stop that comes first
+    // wrote its own state (a quit: `Closed`) under that lock, and a thread that is still within its wait for the end
+    // must not write over it.
+    let write_paused = || {
+        #[cfg(test)]
+        {
+            let delay = *lock(&shared.pause_write_delay);
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+        }
+        let _live = lock(&shared.live_gen);
+        if !stop.load(Ordering::Acquire) {
+            writer.set_state(WriterState::Paused);
+        }
+    };
 
-    store_stats(shared, &stats);
+    store_stats(shared, abandoned, &stats);
     // The camera is open and (for a real camera) the first frame is in: the control thread may call us `Live`.
     let _ = ctx.events.send(SessionEvent {
         gen: ctx.gen,
@@ -3365,9 +3882,13 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
         if paused != was_paused {
             was_paused = paused;
             stats.paused = paused;
+            // The time between two publishes says nothing about lateness across a pause.
+            gaps.reset();
             if paused {
                 // Nothing is measured while paused, and what was in flight must not reach the controller after.
-                meter.reset(&shared.meter);
+                if !abandoned.load(Ordering::Acquire) {
+                    meter.reset(&shared.meter);
+                }
             } else {
                 // Resumed: the writer leaves `Paused` with the first frame published from here on.
                 published_any = false;
@@ -3380,13 +3901,20 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
             vcam_protocol::qpc_now(),
         );
         if paused {
-            writer.set_state(WriterState::Paused);
-            match source.next(Duration::from_millis(40)) {
+            write_paused();
+            let event = source.next(Duration::from_millis(40));
+            // A thread that was stuck in the read and wakes after the stop (left behind, or about to be) does nothing
+            // more: it shares the GPU context with the session that took its place.
+            if stop.load(Ordering::Acquire) {
+                break Ok(());
+            }
+            match event {
                 SourceEvent::Frame(_) | SourceEvent::Timeout => {}
                 SourceEvent::Stopped(f) => break Err(gpu_check(f)),
             }
             maybe_publish_stats(
                 shared,
+                abandoned,
                 &mut stats,
                 &mut window,
                 source.as_ref(),
@@ -3420,7 +3948,14 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
             }
         }
 
-        let frame = match source.next(Duration::from_millis(40)) {
+        let event = source.next(Duration::from_millis(40));
+        // Before any GPU work, statistics or tap call of this pass: a thread that was stuck in the read and wakes after
+        // the stop (left behind, or about to be) shares the GPU context with the session that took its place, and
+        // after a device rebuild its renderer is not the tap's any more.
+        if stop.load(Ordering::Acquire) {
+            break Ok(());
+        }
+        let frame = match event {
             SourceEvent::Frame(f) => f,
             SourceEvent::Timeout => {
                 if last_heartbeat.elapsed() >= Duration::from_millis(100) {
@@ -3429,6 +3964,7 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                 }
                 maybe_publish_stats(
                     shared,
+                    abandoned,
                     &mut stats,
                     &mut window,
                     source.as_ref(),
@@ -3445,6 +3981,7 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
             SourceEvent::Stopped(failure) => break Err(gpu_check(failure)),
         };
         let (capture_100ns, arrival_100ns) = frame.times();
+        let capture_qpc = vcam_protocol::hns_to_qpc(capture_100ns);
         let cpu_started = Instant::now();
 
         // Who reads the virtual camera, read once for the whole frame: the format to encode, and whether the frame
@@ -3458,24 +3995,37 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
         if !watched {
             pacer.reset();
             paced_for = None;
+            // Nothing is published, so no gap between publishes is looked at when an app comes back.
+            gaps.reset();
             skip = Some(Skip::NoConsumer);
+            if !latest_cleared {
+                // With nobody reading, the file's newest frame is the last one of the app that left (or of an earlier
+                // session): the first frame the next app takes must be a new one, so the old one is forgotten, and so
+                // are the frames still in flight, which would put another old one there.
+                output.clear();
+                writer.clear_latest();
+                latest_cleared = true;
+            }
         } else {
+            latest_cleared = false;
             if paced_for != negotiated {
                 // A new consumer or format: its first frame is published at once.
                 pacer.reset();
+                gaps.reset();
                 paced_for = negotiated;
             }
+            // The consumer's period in the virtual camera's own units and arithmetic (QPC ticks, `freq / fps`), when
+            // it reads at a lower rate than the camera delivers.
             let lower = negotiated.and_then(|f| {
-                let theirs = period_100ns(f.fps_num, f.fps_den)?;
-                let ours = source.info().fps;
-                (ours > 0.0 && theirs as f64 > 10_000_000.0 / ours * 1.05).then_some(theirs)
+                lower_consumer_period(&f, source.info().fps, vcam_protocol::qpc_frequency())
             });
-            // What a gap between two publishes may be before the virtual camera repeats: 1.5 periods of the slower
-            // of camera and consumer.
-            let slower = lower.unwrap_or_else(|| (10_000_000.0 / source.info().fps.max(1.0)) as i64);
-            gaps.limit = slower * 3 / 2;
+            // What a publish may be behind its frame's capture time, compared with the one before, before it counts
+            // as late: half the frame period of the app (of the camera while the app's rate is not known).
+            gaps.period = negotiated
+                .and_then(|f| period_100ns(f.fps_num, f.fps_den))
+                .unwrap_or_else(|| (10_000_000.0 / source.info().fps.max(1.0)) as i64);
             match lower {
-                Some(period) if !pacer.admit(capture_100ns, period) => skip = Some(Skip::Rate),
+                Some(period) if !pacer.admit(capture_qpc as i64, period) => skip = Some(Skip::Rate),
                 Some(_) => {}
                 None => pacer.reset(),
             }
@@ -3510,19 +4060,27 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
             drop(frame);
             // The meter sees what the sensor delivers (converted, before any filter). A failure of it is not the
             // frame's, unless the device is gone.
-            if let Err(e) = meter.frame(
-                renderer,
-                &rgba,
-                shared.metering.load(Ordering::Acquire),
-                facts.token().unwrap_or(0),
-                vcam_protocol::hns_to_qpc(capture_100ns),
-                cpu_started,
-                &shared.meter,
-            ) {
+            // (Not at all once the session is abandoned: its samples are not for whoever reads the mailbox now. The
+            // controller drops a sample of another session by its token as well.)
+            if let Err(e) = if abandoned.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                meter.frame(
+                    renderer,
+                    &rgba,
+                    shared.metering.load(Ordering::Acquire),
+                    facts.token().unwrap_or(0),
+                    capture_qpc,
+                    cpu_started,
+                    &shared.meter,
+                )
+            } {
                 if e.is_device_lost() || renderer.gpu.removed_reason().is_some() {
                     return Err(e);
                 }
-                meter.reset(&shared.meter);
+                if !abandoned.load(Ordering::Acquire) {
+                    meter.reset(&shared.meter);
+                }
                 if !std::mem::replace(&mut meter_failed, true) {
                     eprintln!("[engine] meter: {e}");
                 }
@@ -3546,7 +4104,6 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                     background: out_settings.background.map(|c| c as f32 / 255.0),
                 },
             )?;
-            let capture_qpc = vcam_protocol::hns_to_qpc(capture_100ns);
             if let Some(tap) = lock(&shared.tap).as_mut() {
                 tap.on_frame(renderer, &fitted, capture_qpc);
             }
@@ -3683,12 +4240,13 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
         }
         // A pause that arrived while this frame was in flight must not be undone by its first publish.
         if shared.paused.load(Ordering::Acquire) {
-            writer.set_state(WriterState::Paused);
+            write_paused();
         }
         stats.dropped_output = output.dropped + output.rejected;
         stats.late_publishes = gaps.late;
         maybe_publish_stats(
             shared,
+            abandoned,
             &mut stats,
             &mut window,
             source.as_ref(),
@@ -3739,25 +4297,38 @@ fn describe_color(c: &ColorSettings, height: u32) -> String {
     )
 }
 
-/// How long after the previous publish a publish is too late for the virtual camera, which repeats the last picture
-/// when no new one comes within 1.5 frame periods, whatever the frames are stamped.
+/// Publishes that came late: the virtual camera repeats the last picture when no new one comes within 1.5 frame periods
+/// of the app, so a publish that comes later than its frame's capture time says it should is a repeat.
+///
+/// A publish is late when the time since the publish before it exceeds the time between the capture of the two
+/// frames by more than half a period of the app ([`Gaps::period`]): the engine kept the frame for that much longer than
+/// the camera made it wait. The gap between the publishes alone says nothing (a camera below its nominal rate, or one
+/// that stalls, has big gaps and a pipeline that keeps up), and a gap that spans a time nothing was published (no app
+/// reading, a pause, another format) is not a lateness at all: [`Gaps::reset`] forgets the publish before.
 #[derive(Default)]
 struct Gaps {
-    last: Option<i64>,
-    /// 1.5 periods of the slower of the camera and the consumer, 100 ns; 0 until known.
-    limit: i64,
-    /// Publishes that came later than `limit` after the one before.
+    /// `(publish time, capture time)` of the last publish, 100 ns.
+    last: Option<(i64, i64)>,
+    /// The frame period of the app (the camera's while it has not said), 100 ns; 0 until known.
+    period: i64,
+    /// Publishes that came more than half a period later, against the frames' capture times, than the one before.
     late: u64,
 }
 
 impl Gaps {
-    fn note(&mut self, at: i64) {
-        if let Some(last) = self.last {
-            if self.limit > 0 && at - last > self.limit {
+    fn note(&mut self, published: i64, captured: i64) {
+        if let Some((last_pub, last_cap)) = self.last {
+            let behind = (published - last_pub) - (captured - last_cap);
+            if self.period > 0 && behind > self.period / 2 {
                 self.late += 1;
             }
         }
-        self.last = Some(at);
+        self.last = Some((published, captured));
+    }
+
+    /// Nothing was published for a while (or what was is not comparable): the next publish is the first of a run.
+    fn reset(&mut self) {
+        self.last = None;
     }
 }
 
@@ -3779,7 +4350,7 @@ fn note_published(
     *published += 1;
     window.published += 1;
     let done = qpc_to_hns(p.publish_qpc);
-    gaps.note(done);
+    gaps.note(done, p.tag.capture_100ns);
     latency.push((done - p.tag.capture_100ns) as f64 / 10_000.0);
     pipeline.push((done - p.tag.arrival_100ns) as f64 / 10_000.0);
 }
@@ -3787,6 +4358,7 @@ fn note_published(
 #[allow(clippy::too_many_arguments)]
 fn maybe_publish_stats(
     shared: &Shared,
+    abandoned: &AtomicBool,
     stats: &mut EngineStats,
     window: &mut Window,
     source: &dyn Source,
@@ -3848,7 +4420,7 @@ fn maybe_publish_stats(
     stats.consumer = output.writer().consumer_active();
     // What closing this window cost the render thread (the percentiles above); the next window reports it.
     stats.stats_ms = closing.elapsed().as_secs_f64() * 1000.0;
-    store_stats(shared, stats);
+    store_stats(shared, abandoned, stats);
     *window = Window::new(captured);
 }
 
@@ -4133,6 +4705,17 @@ mod tests {
         lose_device_with_error: Arc<AtomicBool>,
         /// How long an open takes.
         open_delay: Mutex<Duration>,
+        /// How long closing a source takes (a camera that is slow to close, a control write that hangs).
+        close_delay: Arc<Mutex<Duration>>,
+        /// The flag the sources opened from now on stall on: while it is set, their `next` does not return (a read
+        /// that is stuck in the driver, and does not look at the stop flag).
+        stall: Mutex<Arc<Stall>>,
+        /// An open that has this many steps of this length, each only begun when the session is not stopped.
+        open_steps: Mutex<(u32, Duration)>,
+        /// The steps of `open_steps` that were begun.
+        steps_taken: std::sync::atomic::AtomicU32,
+        /// The rate the next opens report as the camera's (the media type's), whatever it really makes.
+        nominal_fps: Mutex<Option<f64>>,
         /// Formats the camera does not list: opening a `SourceSpec::Configured` that names one fails as a format.
         /// `VideoFormat::Any` here is a camera that offers nothing the engine can read.
         lacks: Mutex<Vec<VideoFormat>>,
@@ -4181,10 +4764,41 @@ mod tests {
         gpu: Arc<GpuDevice>,
         alive: Arc<std::sync::atomic::AtomicU32>,
         live: Option<LiveLevel>,
+        close_delay: Arc<Mutex<Duration>>,
+        stall: Arc<Stall>,
+    }
+
+    /// A read that is stuck in the driver: while `on` is set the source's `next` does not return, and it does not
+    /// look at the stop flag.
+    #[derive(Default)]
+    struct Stall {
+        on: AtomicBool,
+        /// A `next` is stuck right now.
+        inside: AtomicBool,
+    }
+
+    impl Stall {
+        /// Stick the next read of the sources that were opened with this and wait until one is stuck.
+        fn hold(&self) {
+            self.on.store(true, Ordering::SeqCst);
+            let t = Instant::now();
+            while !self.inside.load(Ordering::SeqCst) {
+                assert!(t.elapsed() < Duration::from_secs(5), "no read got stuck");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        fn release(&self) {
+            self.on.store(false, Ordering::SeqCst);
+        }
     }
 
     impl Drop for FakeSource {
         fn drop(&mut self) {
+            let delay = *self.close_delay.lock().unwrap();
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
             self.alive.fetch_sub(1, Ordering::SeqCst);
         }
     }
@@ -4197,6 +4811,13 @@ mod tests {
             Some(self.controls.clone())
         }
         fn next(&mut self, timeout: Duration) -> SourceEvent {
+            if self.stall.on.load(Ordering::SeqCst) {
+                self.stall.inside.store(true, Ordering::SeqCst);
+                while self.stall.on.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                self.stall.inside.store(false, Ordering::SeqCst);
+            }
             if self.gone.load(Ordering::SeqCst) {
                 return SourceEvent::Stopped(Failure::disconnected(None));
             }
@@ -4228,6 +4849,7 @@ mod tests {
             _output_fps: Option<u32>,
             gpu: &Arc<GpuDevice>,
             first_open: bool,
+            stop: &Arc<AtomicBool>,
         ) -> Result<Box<dyn Source>, Failure> {
             self.opens.fetch_add(1, Ordering::SeqCst);
             self.specs.lock().unwrap().push(spec.clone());
@@ -4243,6 +4865,16 @@ mod tests {
             let delay = *self.open_delay.lock().unwrap();
             if !delay.is_zero() {
                 std::thread::sleep(delay);
+            }
+            // An open of several steps that looks at the stop flag between them, as the real factory does (the
+            // decoder retry, the format fallback): each step takes `step`.
+            let (steps, step) = *self.open_steps.lock().unwrap();
+            for _ in 0..steps {
+                open_unless_stopped(stop, || {
+                    self.steps_taken.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(step);
+                    Ok(())
+                })?;
             }
             if let Some(gate) = self.open_gate.lock().unwrap().as_ref() {
                 let _ = gate.lock().unwrap().recv();
@@ -4313,6 +4945,10 @@ mod tests {
                 link: Some(FAKE_LINK.into()),
                 ..inner.info().clone()
             };
+            // A camera whose media type says more than it makes (the W4GS: 30 nominal, 14.4 real).
+            if let Some(nominal) = *self.nominal_fps.lock().unwrap() {
+                info.fps = nominal;
+            }
             info.fallback = finish_fallback(fallback, &info);
             // A camera that was closed and opened again has forgotten its controls (plan 4.1).
             self.controls.forget();
@@ -4327,6 +4963,8 @@ mod tests {
                 gpu: gpu.clone(),
                 alive: self.alive.clone(),
                 live: self.live.lock().unwrap().clone(),
+                close_delay: self.close_delay.clone(),
+                stall: self.stall.lock().unwrap().clone(),
             }))
         }
 
@@ -4376,6 +5014,11 @@ mod tests {
                 stream_error_once: Arc::new(AtomicBool::new(false)),
                 lose_device_with_error: Arc::new(AtomicBool::new(false)),
                 open_delay: Mutex::new(Duration::ZERO),
+                close_delay: Arc::new(Mutex::new(Duration::ZERO)),
+                stall: Mutex::new(Arc::default()),
+                open_steps: Mutex::new((0, Duration::ZERO)),
+                steps_taken: Default::default(),
+                nominal_fps: Mutex::new(None),
                 lacks: Mutex::new(Vec::new()),
                 first_opens: Mutex::new(Vec::new()),
                 silent_formats: Mutex::new(Vec::new()),
@@ -4403,7 +5046,7 @@ mod tests {
             let (sink, seen) = (events.clone(), writer_at.clone());
             engine.set_event_sink(Arc::new(move |e: EngineEvent| {
                 if matches!(e, EngineEvent::State(_) | EngineEvent::Error(_)) {
-                    let w = probe.shared().header().writer_state;
+                    let w = probe.header().writer_state;
                     seen.lock().unwrap().push((e.clone(), w));
                 }
                 sink.lock().unwrap().push((Instant::now(), e));
@@ -5867,18 +6510,130 @@ mod tests {
     }
 
     #[test]
-    fn a_publish_more_than_one_and_a_half_periods_after_the_last_counts_as_late() {
-        // 60 fps: the virtual camera repeats a frame when none came within 250 000 (100 ns).
-        let mut gaps = Gaps { limit: 250_000, ..Gaps::default() };
-        for at in [0, 166_666, 333_332, 333_332 + 260_000, 333_332 + 260_000 + 166_666] {
-            gaps.note(at);
+    fn a_publish_that_trails_its_capture_time_by_more_than_half_a_period_more_than_the_last_counts_as_late() {
+        // 60 fps app: period 166 666, so half a period is 83 333
+        let period = 166_666;
+        let mut gaps = Gaps { period, ..Gaps::default() };
+        let mut captured = 1_000_000_000;
+        let mut note = |gaps: &mut Gaps, delay: i64| {
+            captured += period;
+            gaps.note(captured + delay, captured);
+        };
+        for _ in 0..5 {
+            note(&mut gaps, 20_000);
         }
-        assert_eq!(gaps.late, 1, "one gap of 260 000");
-        // until the limit is known nothing is late
+        assert_eq!(gaps.late, 0, "a steady pipeline is never late");
+        note(&mut gaps, 20_000 + 50_000);
+        note(&mut gaps, 20_000);
+        assert_eq!(gaps.late, 0, "50 000 later than usual is under half a period");
+        note(&mut gaps, 20_000 + 100_000);
+        assert_eq!(gaps.late, 1, "100 000 later than usual is late");
+        // the frame after it, back on time, is early against the late one, not late
+        note(&mut gaps, 20_000);
+        assert_eq!(gaps.late, 1);
+        // until the period is known nothing is late
         let mut unknown = Gaps::default();
-        unknown.note(0);
-        unknown.note(10_000_000);
+        unknown.note(0, 0);
+        unknown.note(10_000_000, 0);
         assert_eq!(unknown.late, 0);
+    }
+
+    /// M3: a camera that makes fewer frames than its media type says (the W4GS: 14.4 fps of 30) has publish gaps far
+    /// over 1.5 nominal periods and a pipeline that keeps up: nothing is late.
+    #[test]
+    fn a_camera_below_its_nominal_rate_is_never_late() {
+        let nominal_period = 10_000_000 / 30;
+        let mut gaps = Gaps { period: nominal_period, ..Gaps::default() };
+        let actual = 10_000_000 * 10 / 144; // 14.4 fps
+        for k in 0..100i64 {
+            let captured = 5_000_000_000 + k * actual;
+            gaps.note(captured + 30_000, captured);
+        }
+        assert_eq!(gaps.late, 0);
+        // a stall of the render thread on such a camera is still found
+        gaps.note(5_000_000_000 + 100 * actual + 400_000, 5_000_000_000 + 100 * actual);
+        assert_eq!(gaps.late, 1);
+    }
+
+    #[test]
+    fn a_gap_that_spans_a_time_nothing_was_published_is_forgotten() {
+        let mut gaps = Gaps { period: 166_666, ..Gaps::default() };
+        gaps.note(1_000, 900);
+        gaps.note(168_000, 167_566);
+        gaps.reset();
+        // an app attached after seconds without one, or a pause was left: not late
+        gaps.note(50_000_000, 49_990_000);
+        assert_eq!(gaps.late, 0);
+        gaps.note(50_170_000, 50_156_666);
+        assert_eq!(gaps.late, 0);
+    }
+
+    /// L2: a capture time ahead of the arrival is a camera clock that runs fast, not a time to believe.
+    #[test]
+    fn a_camera_timestamp_ahead_of_its_arrival_is_not_believed() {
+        let arrival = 50_000_000_000i64;
+        // a little behind: the camera's own
+        assert_eq!(plausible_capture(arrival - 300_000, arrival), arrival - 300_000);
+        assert_eq!(plausible_capture(arrival - 9_000_000, arrival), arrival - 9_000_000);
+        // up to 50 ms ahead (the virtual camera's own clamp): accepted
+        assert_eq!(plausible_capture(arrival + 400_000, arrival), arrival + 400_000);
+        assert_eq!(plausible_capture(arrival + 500_000, arrival), arrival + 500_000);
+        // further ahead: the arrival (it was believed up to a second ahead)
+        assert_eq!(plausible_capture(arrival + 600_000, arrival), arrival);
+        assert_eq!(plausible_capture(arrival + 9_000_000, arrival), arrival);
+        // missing, or a second or more behind: the arrival
+        assert_eq!(plausible_capture(0, arrival), arrival);
+        assert_eq!(plausible_capture(-5, arrival), arrival);
+        assert_eq!(plausible_capture(arrival - 10_000_000, arrival), arrival);
+        assert_eq!(plausible_capture(arrival - 50_000_000, arrival), arrival);
+    }
+
+    /// L3: the pacer works in QPC ticks with the virtual camera's integer period, so it agrees with the virtual camera
+    /// about every frame whatever the frequency of the counter is (not only at 10 MHz).
+    #[test]
+    fn the_pacer_follows_the_virtual_cameras_arithmetic_at_any_counter_frequency() {
+        let mut next = unit_stream(0x1234_5678_9ABC_DEF0);
+        let mut saved = 0usize;
+        let mut total = 0usize;
+        for freq in [3_000_000u64, 10_000_000, 19_200_000, 24_000_000] {
+            for camera_fps in [60u32, 30, 25] {
+                for consumer_fps in [30u32, 24, 20, 15, 7] {
+                    for jitter in [0.0, 0.1, 0.3] {
+                        let format = Format::new(320, 180, consumer_fps, SUBTYPE_NV12);
+                        let Some(period) = lower_consumer_period(&format, camera_fps as f64, freq) else {
+                            continue;
+                        };
+                        assert_eq!(period, (freq / consumer_fps as u64) as i64, "the virtual camera's own period");
+                        let cam_period = freq as f64 / camera_fps as f64;
+                        let mut t = 1_000_000_000.0f64;
+                        let captures: Vec<i64> = (0..600)
+                            .map(|_| {
+                                t += cam_period;
+                                (t + (next() - 0.5) * 2.0 * jitter * cam_period) as i64
+                            })
+                            .collect();
+                        let mut pacer = Pacer::default();
+                        let published: Vec<i64> =
+                            captures.iter().copied().filter(|&c| pacer.admit(c, period)).collect();
+                        assert_eq!(
+                            dll_takes(&published, period),
+                            dll_takes(&captures, period),
+                            "counter {freq} Hz, camera {camera_fps}, consumer {consumer_fps}, jitter {jitter}"
+                        );
+                        total += captures.len();
+                        saved += captures.len() - published.len();
+                    }
+                }
+            }
+        }
+        assert!(saved * 5 > total, "the pacer saves nothing: {saved} of {total}");
+        // a consumer at or above the camera's rate is not decimated at all, and no rate is no period
+        let f = |fps| Format::new(320, 180, fps, SUBTYPE_NV12);
+        assert_eq!(lower_consumer_period(&f(30), 30.0, 10_000_000), None);
+        assert_eq!(lower_consumer_period(&f(60), 30.0, 10_000_000), None);
+        assert_eq!(lower_consumer_period(&f(30), 29.97, 10_000_000), None);
+        assert_eq!(lower_consumer_period(&Format { fps_num: 0, ..f(30) }, 60.0, 10_000_000), None);
+        assert_eq!(dll_period(&Format { fps_num: 30000, fps_den: 1001, ..f(30) }, 10_000_000), Some(333_333));
     }
 
     #[test]
@@ -7747,6 +8502,8 @@ mod tests {
     #[derive(Default)]
     struct MeterLog {
         frames: Vec<u64>,
+        /// When the tap saw each of `frames`.
+        times: Vec<Instant>,
         first_on: Option<usize>,
         samples: Vec<(usize, Instant, MeterSample)>,
     }
@@ -7763,6 +8520,7 @@ mod tests {
             let mut log = self.log.lock().unwrap();
             let idx = log.frames.len();
             log.frames.push(capture_qpc);
+            log.times.push(Instant::now());
             if log.first_on.is_none() && self.shared.metering.load(Ordering::SeqCst) {
                 log.first_on = Some(idx);
             }
@@ -7864,20 +8622,56 @@ mod tests {
         rig.engine.set_metering(true);
         wait_log(&rig, &log, "samples", |l| l.samples.len() >= 3);
         let from = Instant::now();
-        let before = log.lock().unwrap().samples.len();
+        let (before, frames_before) = {
+            let l = log.lock().unwrap();
+            (l.samples.len(), l.frames.len())
+        };
         std::thread::sleep(Duration::from_secs(4));
         let l = log.lock().unwrap();
         let n = l.samples.iter().filter(|(_, t, _)| *t >= from).count();
+        let frames = l.frames.len() - frames_before;
         assert!(l.samples.len() >= before);
-        // 15 a second when frames come at 60: no more than 16 a second, and not far fewer on a loaded machine
+        // 15 a second when frames come at 60: no more than 16 a second ...
         assert!(n <= 16 * 4, "{n} samples in 4 s");
-        assert!(n >= 30, "{n} samples in 4 s");
+        // ... and, on a machine that is busy with other work (a whole test run in parallel), as many as the frames the
+        // render thread got to allow: a sample is taken from the first frame that comes 66 ms after the last sample's
+        // (every frame when they come slower than that), so starving the thread lowers the frames and with them the
+        // samples, not the ratio. The rule is played over the wall times of the frames of the window, which is what
+        // a meter that samples at the rate it should makes; three quarters of that allows for the frames whose
+        // spacing is borderline (the tap sees a frame a little after the meter took its time), and for the samples that
+        // are still on their way when the window ends. A meter that samples at half the rate gets half.
+        let mut last: Option<Instant> = None;
+        let mut allowed = 0usize;
+        for t in l.times.iter().filter(|t| **t >= from) {
+            if last.is_none_or(|p| t.duration_since(p) >= crate::meter::MIN_GAP) {
+                allowed += 1;
+                last = Some(*t);
+            }
+        }
+        assert!(
+            n * 4 >= allowed * 3,
+            "{n} samples in 4 s from {frames} frames, the 66 ms rule allows {allowed}"
+        );
+        assert!(n >= 3, "{n} samples in 4 s");
         // each sample is of a different frame, in order
         let q: Vec<u64> = l.samples.iter().map(|(_, _, s)| s.capture_qpc).collect();
         assert!(q.windows(2).all(|w| w[1] > w[0]), "{q:?}");
-        // and at least three frames of capture time apart (66 ms of wall time, between frames that may be late)
-        let min = vcam_protocol::qpc_frequency() * 45 / 1000;
-        assert!(q.windows(2).all(|w| w[1] - w[0] >= min), "{q:?}");
+        // and they are 66 ms of wall time apart at the most often: the first and the last sample's frames are at least
+        // (n - 1) of those apart. The wall clock is the meter's (the frames' capture stamps are planned times, which a
+        // thread that wakes late leaves behind the clock by a different amount for each frame), and the total, not
+        // each pair, because the time from the meter's pass to the tap varies with the load by as much as tens of ms
+        // for one frame and cancels over many.
+        let wall: Vec<Instant> = q
+            .iter()
+            .map(|c| l.times[l.frames.iter().position(|f| f == c).expect("the sample's frame")])
+            .collect();
+        let span = *wall.last().unwrap() - wall[0];
+        let least = crate::meter::MIN_GAP * (wall.len() as u32 - 1);
+        assert!(
+            span + Duration::from_millis(250) >= least,
+            "{} samples came over {span:?}, 66 ms apart at the least is {least:?}",
+            wall.len()
+        );
     }
 
     #[test]
@@ -8221,5 +9015,637 @@ mod tests {
             auto_statuses(r).iter().skip(after).any(|s| s.status.exposure.is_none())
         });
         rig.wait("the meter off", Duration::from_secs(5), |r| !r.engine.metering());
+    }
+
+    // ---- robustness review: M1 (privacy), M2 (stop), M3 (late publishes), M4 (slate), L4 (frame file) -----------
+
+    /// Capture time of the frame in the file's newest slot; `None` when the file holds no newest frame.
+    fn newest_capture(map: &MappedFile) -> Option<u64> {
+        let h = map.shared().header();
+        (h.latest_slot != vcam_protocol::NO_SLOT)
+            .then(|| map.shared().slot_meta(h.latest_slot as usize).capture_qpc)
+    }
+
+    fn heartbeat_age_ms(r: &Rig) -> i64 {
+        let h = r.file.shared().header();
+        vcam_protocol::qpc_to_hns(vcam_protocol::qpc_now().saturating_sub(h.writer_heartbeat)) / 10_000
+    }
+
+    /// M1: with no app reading, the file's newest frame is the last one of the app that left. The first frame a new app
+    /// can take must be a new one, so it is forgotten when the app leaves.
+    #[test]
+    fn the_first_frame_an_attaching_app_can_take_is_a_new_one() {
+        let rig = Rig::new("m1-new-frame.bin", fast());
+        let mut consumer = rig.consumer("m1-new-frame.bin");
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("frames", Duration::from_secs(10), |r| frames_in_file(r) >= 5);
+        let old = newest_capture(&rig.file).expect("a frame in the file");
+
+        consumer.detach();
+        rig.wait("the file forgets its newest frame", Duration::from_secs(5), |r| {
+            newest_capture(&r.file).is_none()
+        });
+        assert!(latest(&rig.file).is_none(), "an attaching reader would be offered a frame");
+        // the camera is open and live all the while, and nothing comes back into the file
+        assert_eq!(rig.engine.state(), EngineState::Live);
+        assert_eq!(rig.writer_state(), LIVE);
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(newest_capture(&rig.file).is_none());
+
+        let _again = rig.consumer("m1-new-frame.bin");
+        rig.wait("a frame for the new app", Duration::from_secs(5), |r| newest_capture(&r.file).is_some());
+        let first = newest_capture(&rig.file).unwrap();
+        assert!(first > old, "the first frame is the one of the earlier app ({first} <= {old})");
+    }
+
+    /// M1: a session that starts with a frame of an earlier one in the file forgets it before it goes live.
+    #[test]
+    fn a_frame_left_by_an_earlier_session_is_forgotten_before_the_writer_goes_live() {
+        let rig = Rig::new("m1-stale.bin", fast());
+        let format = vcam_protocol::SlotFormat { width: 320, height: 180, stride: 320, subtype: SUBTYPE_NV12 };
+        rig.engine
+            .writer()
+            .publish(format, vcam_protocol::qpc_now(), |d| d.fill(7))
+            .unwrap();
+        assert!(newest_capture(&rig.file).is_some());
+        rig.engine.start(settings(bars(30), false));
+        rig.wait("the writer is live", Duration::from_secs(20), |r| r.writer_state() == LIVE);
+        assert!(
+            newest_capture(&rig.file).is_none(),
+            "the writer went live with the earlier session's frame in the file"
+        );
+        assert!(latest(&rig.file).is_none());
+    }
+
+    /// M2: ending a session waits for a render thread that is stuck in a slow open, and the heartbeat of the file does
+    /// not stop meanwhile (the virtual camera shows "not running" after a second without one).
+    #[test]
+    fn a_stop_during_a_slow_open_keeps_the_heartbeat_fresh() {
+        let rig = Rig::new("m2-heartbeat.bin", fast());
+        // an open that cannot be interrupted, longer than the second after which the virtual camera gives up
+        *rig.fake.open_delay.lock().unwrap() = Duration::from_millis(2500);
+        rig.engine.start(settings(bars(30), false));
+        rig.wait_state(EngineState::Standby, Duration::from_secs(5));
+        rig.wait("the open has begun", Duration::from_secs(5), |r| r.opens() == 1);
+        let t0 = Instant::now();
+        rig.engine.stop();
+        let mut worst = 0;
+        while rig.engine.state() != EngineState::Stopped {
+            worst = worst.max(heartbeat_age_ms(&rig));
+            assert!(t0.elapsed() < Duration::from_secs(10), "the stop did not return");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(t0.elapsed() > Duration::from_millis(1500), "the stop did not wait for the open: {:?}", t0.elapsed());
+        eprintln!("oldest heartbeat during a stop of {:?}: {worst} ms", t0.elapsed());
+        assert!(worst < 500, "the heartbeat was {worst} ms old during the stop");
+        assert_eq!(rig.alive(), 0);
+    }
+
+    /// M2: the stop flag reaches the factory and is looked at between the steps of an open (the decoder retry, the
+    /// format fallback): a stop does not wait for the steps that have not begun.
+    #[test]
+    fn a_stop_during_an_open_of_several_steps_ends_it_before_the_next_step() {
+        let rig = Rig::new("m2-steps.bin", fast());
+        *rig.fake.open_steps.lock().unwrap() = (8, Duration::from_millis(500));
+        rig.engine.start(settings(bars(30), false));
+        rig.wait_state(EngineState::Standby, Duration::from_secs(5));
+        rig.wait("a step has begun", Duration::from_secs(5), |r| r.fake.steps_taken.load(Ordering::SeqCst) >= 1);
+        let t0 = Instant::now();
+        rig.engine.stop();
+        assert!(rig.engine.wait_stopped(Duration::from_secs(10)), "{:?}", rig.states());
+        // one step was under way (up to 500 ms); eight steps are 4 s
+        assert!(t0.elapsed() < Duration::from_millis(1600), "the stop took {:?}", t0.elapsed());
+        let taken = rig.fake.steps_taken.load(Ordering::SeqCst);
+        assert!(taken <= 2, "{taken} steps were begun after the stop");
+        assert_eq!(rig.alive(), 0);
+    }
+
+    /// M2: a render thread that does not end for [`SESSION_END_CAP`] is left behind; the engine is stopped, the heartbeat
+    /// went on, and the thread's late end changes nothing.
+    #[test]
+    fn a_render_thread_that_does_not_end_in_time_is_left_behind() {
+        let rig = Rig::new("m2-cap.bin", fast());
+        *rig.engine.shared.session_end_cap.lock().unwrap() = Some(Duration::from_millis(400));
+        *rig.fake.open_delay.lock().unwrap() = Duration::from_millis(2500);
+        rig.engine.start(settings(bars(30), false));
+        rig.wait_state(EngineState::Standby, Duration::from_secs(5));
+        rig.wait("the open has begun", Duration::from_secs(5), |r| r.opens() == 1);
+        let t0 = Instant::now();
+        rig.engine.stop();
+        assert!(rig.engine.wait_stopped(Duration::from_secs(10)));
+        assert!(t0.elapsed() < Duration::from_millis(1500), "the stop took {:?}", t0.elapsed());
+        // the abandoned open finishes, sees the stop flag and closes its camera; the engine stays stopped
+        std::thread::sleep(Duration::from_millis(3000).saturating_sub(t0.elapsed()));
+        assert_eq!(rig.alive(), 0, "the abandoned open kept its camera");
+        assert_eq!(rig.engine.state(), EngineState::Stopped);
+        assert!(rig.engine.last_error().is_none());
+        // and a new start works
+        *rig.fake.open_delay.lock().unwrap() = Duration::ZERO;
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+    }
+
+    /// M3: a publish after the app was away, or after a pause, is the first of a run, not a late one.
+    #[test]
+    fn attaching_again_and_resuming_from_a_pause_are_not_late_publishes() {
+        let rig = Rig::new("m3-attach.bin", fast());
+        let format = Format::new(320, 180, 30, SUBTYPE_NV12);
+        let mut consumer = rig.consumer_with("m3-attach.bin", format);
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        wait_stats(&rig, "30 frames", |s| s.published >= 30);
+
+        // the app leaves for a while and comes back
+        consumer.detach();
+        std::thread::sleep(Duration::from_millis(1500));
+        let base = wait_stats(&rig, "a fresh snapshot", |s| s.rendered >= 60);
+        let at = frames_in_file(&rig);
+        let _again = rig.consumer_with("m3-attach.bin", format);
+        let after = wait_stats(&rig, "frames after the app came back", |s| s.published >= at + 15);
+        assert_eq!(
+            after.late_publishes, base.late_publishes,
+            "the first publish after the app came back counted as late: {after:?}"
+        );
+
+        // a pause of a while
+        rig.engine.set_pause(true);
+        std::thread::sleep(Duration::from_millis(1500));
+        let base = wait_stats(&rig, "a snapshot of the pause", |s| s.paused);
+        let at = frames_in_file(&rig);
+        rig.engine.set_pause(false);
+        let after = wait_stats(&rig, "frames after the pause", |s| !s.paused && s.published >= at + 15);
+        assert_eq!(
+            after.late_publishes, base.late_publishes,
+            "the first publish after the pause counted as late: {after:?}"
+        );
+    }
+
+    /// M3: a camera that makes 15 fps of the 30 its media type says is not late at every publish.
+    #[test]
+    fn a_camera_below_its_nominal_rate_is_not_late_at_every_publish() {
+        let rig = Rig::new("m3-slow-camera.bin", fast());
+        *rig.fake.nominal_fps.lock().unwrap() = Some(30.0);
+        let _consumer = rig.consumer_with("m3-slow-camera.bin", Format::new(320, 180, 30, SUBTYPE_NV12));
+        rig.engine.start(settings(bars(15), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        let s = wait_stats(&rig, "45 frames", |s| s.published >= 45);
+        assert!(
+            s.late_publishes * 5 < s.published,
+            "{} of {} publishes were late on a steady 15 fps camera: {s:?}",
+            s.late_publishes,
+            s.published
+        );
+    }
+
+    /// M4: a slow rebuild of the GPU device shows the slate after `gpu_slate_delay` (the control thread's tick does not
+    /// run meanwhile, so the wait loop does it).
+    #[test]
+    fn a_slow_gpu_rebuild_shows_the_slate_after_the_delay_while_it_runs() {
+        let mut t = fast();
+        t.gpu_slate_delay = Duration::from_millis(300);
+        let rig = Rig::new("m4-slate.bin", t);
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("video", Duration::from_secs(10), |r| r.writer_state() == LIVE);
+        *rig.engine.shared.rebuild_delay.lock().unwrap() = Duration::from_secs(3);
+        let t0 = Instant::now();
+        rig.engine.inject_device_loss(1);
+        rig.wait("the slate while the device is rebuilt", Duration::from_millis(2000), |r| {
+            r.writer_state() == STARTING
+        });
+        assert_eq!(rig.engine.gpu_generation(), 1, "the device was rebuilt already: the slate came late");
+        assert!(t0.elapsed() < Duration::from_millis(2000), "{:?}", t0.elapsed());
+        // the new session's first frame ends it
+        rig.wait_state(EngineState::Live, Duration::from_secs(20));
+        rig.wait("video again", Duration::from_secs(10), |r| r.writer_state() == LIVE);
+    }
+
+    /// L4: a frame file that is deleted under the running engine stops it with the message that names the Repair, and
+    /// a Start does not publish into the file it still has mapped.
+    #[test]
+    fn a_frame_file_deleted_under_the_running_engine_stops_it_with_the_repair_message() {
+        let rig = Rig::new("l4-deleted.bin", fast());
+        *rig.engine.shared.file_check_interval.lock().unwrap() = Some(Duration::from_millis(100));
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        // an untouched file is never a problem
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(rig.engine.state(), EngineState::Live);
+        assert!(rig.engine.last_error().is_none());
+
+        std::fs::remove_file(temp_file("l4-deleted.bin")).unwrap();
+        assert!(rig.engine.wait_stopped(Duration::from_secs(5)), "{:?}", rig.states());
+        let err = rig.engine.last_error().expect("an error");
+        assert!(
+            err.contains("frame file") && err.contains("Repair") && err.contains("virtual camera is not installed"),
+            "{err}"
+        );
+        assert!(rig
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, e)| matches!(e, EngineEvent::Error(m) if m.contains("frame file"))));
+        assert_eq!(rig.alive(), 0);
+
+        // a Start on the engine that still maps the old file: the same answer, no camera opened
+        let opens = rig.opens();
+        rig.engine.start(settings(bars(30), false));
+        rig.wait("the error again", Duration::from_secs(5), |r| {
+            r.engine.last_error().is_some_and(|e| e.contains("frame file"))
+        });
+        assert_eq!(rig.engine.state(), EngineState::Stopped);
+        assert_eq!(rig.opens(), opens, "a camera was opened to publish into a deleted file");
+    }
+
+    /// L4: one look that says "replaced" is not enough (a Repair that swaps the file for a moment): the engine stops
+    /// when two looks in a row say so.
+    #[test]
+    fn a_frame_file_that_is_away_for_a_single_look_does_not_stop_the_engine() {
+        let rig = Rig::new("l4-swap.bin", fast());
+        *rig.engine.shared.file_check_interval.lock().unwrap() = Some(Duration::from_millis(100));
+        let (path, away) = (temp_file("l4-swap.bin"), temp_file("l4-swap-away.bin"));
+        let _ = std::fs::remove_file(&away);
+        // No timing: the control thread itself moves the file away just before its first look and back just before its
+        // second, so the first look says "replaced" and the second does not, whatever the machine is doing.
+        {
+            let (p, a) = (path.clone(), away.clone());
+            *rig.engine.shared.before_file_look.lock().unwrap() = Some(Box::new(move |n| match n {
+                1 => std::fs::rename(&p, &a).unwrap(),
+                2 => std::fs::rename(&a, &p).unwrap(),
+                _ => {}
+            }));
+        }
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("four looks", Duration::from_secs(10), |r| {
+            r.engine.shared.file_looks.load(Ordering::SeqCst) >= 4
+        });
+        assert_eq!(
+            rig.engine.shared.file_looks_replaced.load(Ordering::SeqCst),
+            1,
+            "the one look that found the file away did not happen: the test proves nothing"
+        );
+        assert_eq!(rig.engine.state(), EngineState::Live, "{:?}", rig.states());
+        assert!(rig.engine.last_error().is_none(), "{:?}", rig.engine.last_error());
+        // gone for good: two looks stop it
+        std::fs::remove_file(&path).unwrap();
+        assert!(rig.engine.wait_stopped(Duration::from_secs(5)), "{:?}", rig.states());
+        assert!(rig.engine.last_error().is_some_and(|e| e.contains("frame file")));
+    }
+
+    /// M-1: stopping a live session whose camera is slow to close: the file shows the slate at once and keeps a fresh
+    /// heartbeat, not the last picture, frozen, for as long as the camera takes.
+    #[test]
+    fn a_stop_with_a_slow_close_shows_the_slate_while_the_camera_closes() {
+        let rig = Rig::new("m1-slow-close.bin", fast());
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("video", Duration::from_secs(10), |r| r.writer_state() == LIVE);
+        *rig.fake.close_delay.lock().unwrap() = Duration::from_millis(2000);
+        let t0 = Instant::now();
+        rig.engine.stop();
+        rig.wait("the slate while the camera is still open", Duration::from_millis(800), |r| {
+            r.writer_state() != LIVE
+        });
+        assert_eq!(rig.alive(), 1, "the camera was closed already: the check proves nothing");
+        assert_eq!(rig.writer_state(), PAUSED);
+        // it stays the slate, with a fresh heartbeat, until the camera is closed
+        while rig.alive() > 0 {
+            assert_eq!(rig.writer_state(), PAUSED, "the last picture came back");
+            assert!(heartbeat_age_ms(&rig) < 500, "the heartbeat stopped");
+            assert!(t0.elapsed() < Duration::from_secs(8));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(rig.engine.wait_stopped(Duration::from_secs(5)));
+        assert_eq!(rig.writer_state(), PAUSED);
+    }
+
+    /// M-1: a reopen keeps the last picture while the camera closes, for `gpu_slate_delay`; then the slate.
+    #[test]
+    fn a_reopen_with_a_slow_close_keeps_the_picture_for_a_second_and_then_shows_the_slate() {
+        let mut t = fast();
+        t.gpu_slate_delay = Duration::from_millis(400);
+        let rig = Rig::new("m1-reopen.bin", t);
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("video", Duration::from_secs(10), |r| r.writer_state() == LIVE);
+        *rig.fake.close_delay.lock().unwrap() = Duration::from_millis(1800);
+        rig.engine.set_source(SourceUpdate {
+            source: bars(15),
+            flip_vertical: false,
+            color: ColorSettings::default(),
+            deactivate_when_not_showing: false,
+        });
+        let t0 = Instant::now();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(rig.alive(), 1, "setup: the camera is closed already");
+        assert_eq!(rig.writer_state(), LIVE, "the picture did not stay for the first moments of a reopen");
+        rig.wait("the slate", Duration::from_millis(1200), |r| r.writer_state() == STARTING);
+        assert!(t0.elapsed() >= Duration::from_millis(350), "the slate came too early: {:?}", t0.elapsed());
+        assert_eq!(rig.alive(), 1, "the camera was closed before the slate");
+        // the new session goes live again
+        *rig.fake.close_delay.lock().unwrap() = Duration::ZERO;
+        rig.wait("video again", Duration::from_secs(20), |r| r.writer_state() == LIVE);
+    }
+
+    /// M-1: a first frame that is published after the stop (the thread was past its stop check) does not put `Live`
+    /// back over the slate.
+    #[test]
+    fn a_late_first_frame_does_not_flip_the_slate_back_to_live() {
+        let rig = Rig::new("m1-late-first.bin", fast());
+        *rig.engine.shared.go_live_delay.lock().unwrap() = Duration::from_millis(700);
+        rig.engine.start(settings(bars(30), false));
+        // the camera is open (the state is live) and the first frame is on its way, held at the lock
+        rig.wait_state(EngineState::Live, Duration::from_secs(20));
+        // the camera takes a while to close, so the file's state can be looked at after the late frame went live
+        *rig.fake.close_delay.lock().unwrap() = Duration::from_millis(1500);
+        rig.engine.stop();
+        rig.wait("the slate", Duration::from_secs(2), |r| r.writer_state() == PAUSED);
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_millis(1800) {
+            assert_eq!(
+                rig.writer_state(),
+                PAUSED,
+                "the late first frame made the engine live again {:?} after the stop",
+                t0.elapsed()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(rig.engine.wait_stopped(Duration::from_secs(10)));
+        assert_eq!(rig.writer_state(), PAUSED);
+    }
+
+    /// The app quits while the camera does not close: the file says closed at once, and the exit waits 3 s at the most
+    /// (not the 30 s of other stops).
+    #[test]
+    fn quitting_waits_three_seconds_at_most_for_a_render_thread_and_the_file_says_closed_meanwhile() {
+        let rig = Rig::new("m1-quit.bin", fast());
+        *rig.engine.shared.session_end_cap.lock().unwrap() = Some(Duration::from_secs(30));
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("video", Duration::from_secs(10), |r| r.writer_state() == LIVE);
+        let stall = rig.fake.stall.lock().unwrap().clone();
+        stall.hold();
+        let t0 = Instant::now();
+        std::thread::scope(|s| {
+            let quit = s.spawn(|| rig.engine.close_for_exit());
+            rig.wait("closed while the thread is stuck", Duration::from_secs(1), |r| r.writer_state() == CLOSED);
+            assert!(!quit.is_finished(), "the quit did not wait at all");
+            quit.join().unwrap();
+        });
+        let took = t0.elapsed();
+        assert!(took >= Duration::from_millis(2500) && took < Duration::from_secs(6), "the quit took {took:?}");
+        assert_eq!(rig.writer_state(), CLOSED);
+        stall.release();
+    }
+
+    /// M-2: a render thread that is left behind writes nothing to the file, however long it lives: not when it comes
+    /// back to its frame, not after the engine was shut down and a new writer took the file over, and its end resets
+    /// nothing of the session that followed it.
+    #[test]
+    fn a_render_thread_that_was_left_behind_cannot_write_to_the_file_or_the_facts_of_a_later_one() {
+        let rig = Rig::new("m2-left-behind.bin", fast());
+        *rig.engine.shared.session_end_cap.lock().unwrap() = Some(Duration::from_millis(300));
+        let _consumer = rig.consumer("m2-left-behind.bin");
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("frames", Duration::from_secs(10), |r| frames_in_file(r) >= 5);
+        // the read of the camera is stuck in the driver: the thread does not see the stop
+        let first = rig.fake.stall.lock().unwrap().clone();
+        first.hold();
+        rig.engine.stop();
+        assert!(rig.engine.wait_stopped(Duration::from_secs(10)));
+        assert_eq!(rig.alive(), 1, "setup: the thread is not stuck");
+        assert_eq!(rig.writer_state(), PAUSED);
+        let frames = rig.file.shared().header().writer_frames;
+
+        // a new session while the old thread is still stuck
+        *rig.fake.stall.lock().unwrap() = Arc::default();
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("video of the new session", Duration::from_secs(10), |r| r.writer_state() == LIVE);
+        let token = rig.engine.session_facts().token.expect("the new session's facts");
+        let frames_now = rig.file.shared().header().writer_frames;
+        assert!(frames_now > frames, "setup: the new session publishes nothing");
+
+        // the old thread comes back to its frame: it must not publish, set a state, or reset the facts
+        first.release();
+        rig.wait("the old camera closes", Duration::from_secs(10), |r| r.alive() == 1);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(rig.writer_state(), LIVE, "the old thread changed the state of the file");
+        assert_eq!(rig.engine.session_facts().token, Some(token), "the old thread reset the new session's facts");
+        // the numbers of the file only grow with the new session's frames (one writer): the sequence of every slot is even
+        let h = rig.file.shared().header();
+        assert!(h.writer_frames >= frames_now);
+        assert_eq!(rig.engine.state(), EngineState::Live);
+    }
+
+    /// M-2, the way a change of the virtual camera goes: the engine is closed while a thread is stuck, a new writer
+    /// takes the file over, then the thread wakes. It publishes nothing and its last drop does not close the file.
+    #[test]
+    fn a_thread_left_behind_by_an_engine_that_was_replaced_does_not_touch_the_new_writer() {
+        let rig = Rig::new("m2-replaced.bin", fast());
+        *rig.engine.shared.session_end_cap.lock().unwrap() = Some(Duration::from_millis(300));
+        let consumer = rig.consumer("m2-replaced.bin");
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("frames", Duration::from_secs(10), |r| frames_in_file(r) >= 5);
+        let stall = rig.fake.stall.lock().unwrap().clone();
+        stall.hold();
+        // the old engine goes (the thread is left behind), and its writer is released
+        rig.engine.close();
+        assert_eq!(rig.alive(), 1, "setup: the thread is not stuck");
+        // a new engine's writer on the same path
+        let path = temp_file("m2-replaced.bin");
+        let new = Writer::create(&path).unwrap();
+        new.set_state(WriterState::Live);
+        // the app is still there: it announces itself to the new header (the old thread would publish for it)
+        consumer.file.shared().set_negotiated(&Format::new(320, 180, 30, SUBTYPE_NV12));
+        consumer.file.shared().set_consumer_active(true);
+        let t = Instant::now();
+        while !new.consumer_active() {
+            assert!(t.elapsed() < Duration::from_secs(2), "setup: nobody reads the new file");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let format = vcam_protocol::SlotFormat { width: 320, height: 180, stride: 320, subtype: SUBTYPE_NV12 };
+        new.publish(format, vcam_protocol::qpc_now(), |d| d.fill(9)).unwrap();
+        let frames = new.header().writer_frames;
+        // the old thread wakes: it renders its frame, tries to publish, ends, and the last of its handles goes
+        stall.release();
+        rig.wait("the old camera is closed", Duration::from_secs(10), |r| r.alive() == 0);
+        std::thread::sleep(Duration::from_millis(200));
+        let h = new.header();
+        assert_eq!(h.writer_state, WriterState::Live as u32, "the old engine closed or changed the new writer's file");
+        assert_eq!(h.writer_frames, frames, "the old thread published into the new writer's file");
+    }
+
+    /// The app quits while the wait of a Stop for a stuck render thread is already running: the quit cap (3 s from the
+    /// start of that wait) applies to it, not the cap it began with.
+    #[test]
+    fn a_quit_shortens_a_wait_for_the_render_thread_that_is_already_running() {
+        let rig = Rig::new("m1-quit-running.bin", fast());
+        *rig.engine.shared.session_end_cap.lock().unwrap() = Some(Duration::from_secs(12));
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("video", Duration::from_secs(10), |r| r.writer_state() == LIVE);
+        let stall = rig.fake.stall.lock().unwrap().clone();
+        stall.hold();
+        rig.engine.stop();
+        // the control thread is in its wait for the thread (the state changes after it)
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(rig.engine.state(), EngineState::Live, "setup: the stop is not waiting");
+        let t0 = Instant::now();
+        rig.engine.close_for_exit();
+        let took = t0.elapsed();
+        stall.release();
+        assert!(took < Duration::from_secs(5), "the quit waited for the cap the Stop began with: {took:?}");
+        assert_eq!(rig.writer_state(), CLOSED);
+    }
+
+    /// The app quits while the controls poller hangs in the driver: the quit leaves it behind after the cap.
+    #[test]
+    fn a_quit_does_not_wait_for_ever_for_a_controls_poller_that_hangs() {
+        let rig = Rig::new("m1-quit-poller.bin", fast());
+        *rig.engine.shared.session_end_cap.lock().unwrap() = Some(Duration::from_millis(800));
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.engine.shared.poller_stall.store(true, Ordering::SeqCst);
+        // the poller beats every 100 ms: by now it is inside the hang
+        std::thread::sleep(Duration::from_millis(400));
+        let t0 = Instant::now();
+        let (finished, took) = std::thread::scope(|s| {
+            let quit = s.spawn(|| rig.engine.close_for_exit());
+            while !quit.is_finished() && t0.elapsed() < Duration::from_secs(6) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let finished = quit.is_finished();
+            let took = t0.elapsed();
+            // whatever happened, let the poller go so that the scope can end
+            rig.engine.shared.poller_stall.store(false, Ordering::SeqCst);
+            (finished, took)
+        });
+        assert!(finished, "the quit hung with the poller");
+        assert!(took >= Duration::from_millis(600), "the quit did not wait for the poller at all: {took:?}");
+        assert_eq!(rig.writer_state(), CLOSED);
+    }
+
+    /// A render thread that is stuck in the read of its camera and wakes after the stop (it was left behind) shares the
+    /// GPU context with the next session: it does no frame of work, so no tap call either (the tap has the new
+    /// device's renderer after a rebuild).
+    #[test]
+    fn a_render_thread_that_wakes_after_the_stop_does_no_gpu_work_and_no_tap_call() {
+        let rig = Rig::new("m2-wakes.bin", fast());
+        *rig.engine.shared.session_end_cap.lock().unwrap() = Some(Duration::from_millis(300));
+        let seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        rig.engine.send(Msg::SetTap(Some(Box::new(CountingTap(seen.clone())))));
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("frames through the tap", Duration::from_secs(10), |_| seen.load(Ordering::SeqCst) >= 5);
+        let stall = rig.fake.stall.lock().unwrap().clone();
+        stall.hold();
+        rig.engine.stop();
+        assert!(rig.engine.wait_stopped(Duration::from_secs(10)));
+        assert_eq!(rig.alive(), 1, "setup: the thread is not stuck");
+        // the thread is inside its read: nothing of its last pass is in flight
+        let before = seen.load(Ordering::SeqCst);
+        stall.release();
+        rig.wait("the old camera closes", Duration::from_secs(10), |r| r.alive() == 0);
+        assert_eq!(seen.load(Ordering::SeqCst), before, "the thread that woke after the stop ran a frame");
+    }
+
+    /// Quitting while a paused render thread is slow to reach its `Paused` write: the file says `Closed` from the stop on
+    /// and stays so.
+    #[test]
+    fn a_paused_render_thread_does_not_write_its_slate_over_the_quit() {
+        let rig = Rig::new("m1-quit-paused.bin", fast());
+        *rig.engine.shared.session_end_cap.lock().unwrap() = Some(Duration::from_secs(10));
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.engine.set_pause(true);
+        rig.wait("the paused slate", Duration::from_secs(5), |r| r.writer_state() == PAUSED);
+        *rig.engine.shared.pause_write_delay.lock().unwrap() = Duration::from_millis(700);
+        // the thread is inside the delay of its next write
+        std::thread::sleep(Duration::from_millis(150));
+        let seen = std::thread::scope(|s| {
+            let quit = s.spawn(|| rig.engine.close_for_exit());
+            let mut seen = Vec::new();
+            while !quit.is_finished() {
+                seen.push(rig.writer_state());
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            seen
+        });
+        let first = seen.iter().position(|s| *s == CLOSED).expect("the file never said closed");
+        assert!(
+            seen[first..].iter().all(|s| *s == CLOSED),
+            "the paused thread wrote over the quit: {:?}",
+            &seen[first..]
+        );
+        assert_eq!(rig.writer_state(), CLOSED);
+    }
+
+    /// A camera switch while live: the old picture stays for `gpu_slate_delay` and then gives way to the slate for as
+    /// long as the new open takes; the new session's first frame ends the slate.
+    #[test]
+    fn a_reopen_with_a_slow_open_shows_the_slate_after_the_delay_and_goes_live_again() {
+        let mut t = fast();
+        t.gpu_slate_delay = Duration::from_millis(400);
+        let rig = Rig::new("m1-reopen-slow-open.bin", t);
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("video", Duration::from_secs(10), |r| r.writer_state() == LIVE);
+        *rig.fake.open_delay.lock().unwrap() = Duration::from_millis(3500);
+        rig.engine.set_source(SourceUpdate {
+            source: bars(15),
+            flip_vertical: false,
+            color: ColorSettings::default(),
+            deactivate_when_not_showing: false,
+        });
+        let t0 = Instant::now();
+        // the old camera closes at once; the picture stays for the first moments
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(rig.writer_state(), LIVE, "the picture did not stay for the first moments of a reopen");
+        rig.wait("the slate while the new camera opens", Duration::from_millis(1500), |r| {
+            r.writer_state() == STARTING
+        });
+        assert!(t0.elapsed() >= Duration::from_millis(350), "the slate came too early: {:?}", t0.elapsed());
+        assert_eq!(rig.engine.state(), EngineState::Standby, "setup: the new camera is open already");
+        assert_eq!(rig.engine.reason().as_deref(), Some("reopening"));
+        // the new session publishes: live again, and the slate does not come back
+        rig.wait("video again", Duration::from_secs(20), |r| r.writer_state() == LIVE);
+        rig.wait_state(EngineState::Live, Duration::from_secs(5));
+        // past the delay since the reopen began, and past the moment the control thread cleared it
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(rig.writer_state(), LIVE, "the slate covered the live session");
+    }
+
+    /// L2: a first open that was stopped is logged as stopped and never turned into a format problem.
+    #[test]
+    fn a_stopped_first_open_is_not_taken_for_a_missing_format() {
+        let cap = saved_format(VideoFormat::Any);
+        let cap = CaptureCfg {
+            // a saved format (not the device default), so that a failure to deliver in it is a format problem
+            video_format: VideoFormat::Format(crate::capture::PixelFormat::Nv12),
+            ..cap
+        };
+        let no_picture = || Failure::Retry(RetryKind::NoFrames, "no frame".into());
+        let running = AtomicBool::new(false);
+        assert!(matches!(
+            format_problem_unless_stopped(no_picture(), &cap, true, &running),
+            Failure::Format(_)
+        ));
+        let stopped = AtomicBool::new(true);
+        let f = format_problem_unless_stopped(no_picture(), &cap, true, &stopped);
+        assert!(matches!(f, Failure::Retry(RetryKind::Error, _)), "{f:?}");
+        // so the fallback to the device default is not tried
+        let mut tries = 0;
+        let r: Result<((), Option<FormatFallback>), Failure> = open_with_fallback(&cap, |c| {
+            tries += 1;
+            Err(format_problem_unless_stopped(no_picture(), c, true, &stopped))
+        });
+        assert!(r.is_err());
+        assert_eq!(tries, 1, "the device default was tried after a stop");
     }
 }

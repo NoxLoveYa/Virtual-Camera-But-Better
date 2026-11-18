@@ -605,12 +605,15 @@ mod tests {
             drop(previous.replace(s));
         }
         let st = sink.stats();
+        // How many samples the pool had to make depends on how fast the work-queue callback brings one back, so the
+        // count is not fixed: what must hold is that the pump never fell back to a plain sample (it would have
+        // waited or allocated), that the pool stayed inside its bound, and that samples were mostly reused.
         assert_eq!(st.plain, 0, "a plain sample was made: {st:?}");
         assert!(
-            (2..=3).contains(&st.created),
-            "pool samples made: {st:?}, wanted at most 3"
+            st.created <= POOL_MAX as u64,
+            "pool samples made: {st:?}, wanted at most {POOL_MAX}"
         );
-        assert!(st.reused >= 117, "{st:?}");
+        assert!(st.reused >= 120 - POOL_MAX as u64, "{st:?}");
     }
 
     #[test]

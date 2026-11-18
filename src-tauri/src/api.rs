@@ -606,7 +606,8 @@ impl Service {
         self.preview.stop(None);
         let e = lock(&self.engine).take();
         if let Some(e) = e {
-            e.close();
+            // The process exits next and frees the camera: a render thread that does not end in 3 s is left behind.
+            e.close_for_exit();
         }
     }
 }
