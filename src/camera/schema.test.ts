@@ -11,6 +11,10 @@
 import {
   DEFAULT_AUTO,
   DEFAULT_SOURCE,
+  FACTORY_SOURCE,
+  factorySize,
+  repairFreshSource,
+  repairSource,
   afterVcamRemoval,
   inUseAfterStart,
   cameraUsers,
@@ -400,5 +404,63 @@ same(cameraIsSlow(53.9, 60), true, "just under 90 %");
 same(cameraIsSlow(0, 60), false, "no frames is not a slow camera");
 same(cameraIsSlow(14, null), false, "no rate asked for");
 same(slowCameraText(14.3, 60), "Camera auto is slowing the camera to 14 fps in this light. Better Cam auto keeps 60 fps.", "hint text");
+
+{
+// --- the first pick of a camera (a fresh install's factory capture) ------------------------------------------------------
+const mj = (width: number, height: number, ...intervals: number[]) => ({ format: "mjpeg", width, height, intervals });
+const mkcam = (id: string, ...formats: CameraInfo["formats"]): CameraInfo => ({ id, name: "Cam", formats });
+const firstPick = (c: CameraInfo, src: Partial<SourceCfg> = {}) => repairSource({ ...FACTORY_SOURCE, ...src }, [c]);
+const shape = (s: SourceCfg) => [s.video_device_id, s.res_type, s.video_format, s.resolution, s.frame_interval];
+
+// the largest 16:9 size in MJPEG that offers 30 fps: a 4K that only runs at 15 fps is passed over for 1080p30
+const only15 = mkcam("a", mj(3840, 2160, 666667), mj(2560, 1920, 333333), mj(1920, 1080, 166667, 333333), mj(1280, 720, 333333));
+same(shape(firstPick(only15)), ["a", "custom", "mjpeg", "1920x1080", 333333], "the largest 16:9 MJPEG size that offers 30 fps");
+same(factorySize(only15, "mjpeg", 333333), { resolution: "1920x1080", video_format: "mjpeg" }, "factorySize: 30 fps");
+// the largest 16:9 size when the camera offers 30 fps at that size
+const top30 = mkcam("a", mj(2688, 1520, 333333), mj(1920, 1080, 333333), mj(2560, 1920, 333333));
+same(shape(firstPick(top30)), ["a", "custom", "mjpeg", "2688x1520", 333333], "the largest 16:9 size, a bigger 4:3 one is not taken");
+// no 16:9 MJPEG size at 30 fps: the largest 16:9 MJPEG size at any rate, and the rate the camera has there
+const slow = mkcam("a", mj(1920, 1080, 666667), mj(1280, 720, 1000000), mj(640, 480, 333333));
+same(shape(firstPick(slow)), ["a", "custom", "mjpeg", "1920x1080", 666667], "no 30 fps in 16:9: the largest 16:9 size at its own rate");
+// 16:9 sizes only in another format: the format becomes "any" with that size, not a 4:3 MJPEG size
+const nv12Wide = mkcam(
+  "a",
+  { format: "nv12", width: 1920, height: 1080, intervals: [333333] },
+  { format: "nv12", width: 1280, height: 720, intervals: [333333] },
+  mj(1600, 1200, 333333),
+  mj(640, 480, 333333),
+);
+same(shape(firstPick(nv12Wide)), ["a", "custom", "any", "1920x1080", 333333], "16:9 only in NV12: any format at that size, never a 4:3 MJPEG size");
+same(factorySize(nv12Wide, "mjpeg", 333333), { resolution: "1920x1080", video_format: "any" }, "factorySize: the other format's 16:9 size");
+// a camera without MJPEG: the format becomes "any" first, then the same pick over every format
+const yuy = mkcam("a", { format: "yuy2", width: 1280, height: 720, intervals: [333333] }, { format: "yuy2", width: 640, height: 480, intervals: [333333] });
+same(shape(firstPick(yuy)), ["a", "custom", "any", "1280x720", 333333], "a camera without MJPEG");
+// no 16:9 size at all: the current rule (the largest size)
+same(shape(firstPick(mkcam("a", mj(1600, 1200, 333333), mj(640, 480, 333333)))), ["a", "custom", "mjpeg", "1600x1200", 333333], "no 16:9 size: the largest size");
+same(factorySize(mkcam("a", mj(1600, 1200, 333333)), "mjpeg", 333333), null, "factorySize: none");
+// Device default and a rate of "as the output" keep the old rule (the largest 16:9 size over every format)
+same(shape(firstPick(only15, { res_type: "preferred", video_format: "any", frame_interval: 0 })), ["a", "preferred", "any", "3840x2160", 0], "device default: the largest 16:9 size");
+same(firstPick(only15, { frame_interval: 0 }).resolution, "3840x2160", "no rate asked: the largest 16:9 MJPEG size at any rate");
+// a saved camera is never moved to another size by the first-pick rule
+same(shape(repairSource({ ...FACTORY_SOURCE, video_device_id: "a", resolution: "1280x720" }, [only15])), ["a", "custom", "mjpeg", "1280x720", 333333], "a chosen camera keeps its size");
+
+// a first pick that lands on a camera whose formats cannot be read (busy, driver error) is owed the factory capture
+const busy = mkcam("a");
+const first = repairFreshSource(FACTORY_SOURCE, [busy], true, false);
+same([shape(first.source), first.capturePending], [["a", "preferred", "any", FACTORY_SOURCE.resolution, 333333], true], "busy at the first pick: device default, capture owed");
+same(repairFreshSource(FACTORY_SOURCE, [busy], false, false).capturePending, false, "a save that already existed is not owed anything");
+same(repairFreshSource(FACTORY_SOURCE, [], true, false), { source: FACTORY_SOURCE, capturePending: false }, "no camera yet: nothing picked, nothing owed");
+same(repairFreshSource(FACTORY_SOURCE, [only15], true, false), { source: repairSource(FACTORY_SOURCE, [only15]), capturePending: false }, "readable at the first pick: nothing owed");
+same(repairFreshSource(first.source, [busy], false, true), { source: first.source, capturePending: true }, "still busy: still owed");
+same(repairFreshSource(first.source, [], false, true), { source: first.source, capturePending: true }, "unplugged: still owed");
+// the camera becomes readable: the factory capture at the largest 16:9 size, once
+const later = repairFreshSource({ ...first.source, flip_vertically: true }, [only15], false, true);
+same([shape(later.source), later.source.flip_vertically, later.capturePending], [["a", "custom", "mjpeg", "1920x1080", 333333], true, false], "readable later: the factory capture, other fields kept");
+const big = mkcam("a", mj(2688, 1520, 333333), mj(1920, 1080, 333333));
+same(shape(repairFreshSource(first.source, [big], false, true).source), shape(repairSource(FACTORY_SOURCE, [big])), "readable later: the same as the first pick would have made");
+// the user chose a format meanwhile: nothing is applied, nothing is owed
+const chosen = { ...first.source, res_type: "custom" as const, video_format: "yuy2" as const, resolution: "640x480" };
+same(repairFreshSource(chosen, [big], false, true), { source: repairSource(chosen, [big]), capturePending: false }, "an edited capture is left alone");
+}
 
 console.log("ok");

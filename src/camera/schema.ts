@@ -84,6 +84,26 @@ export const DEFAULT_OUTPUT: OutputCfg = {
   extra_sizes: true,
 };
 
+/**
+ * What a fresh install starts with and "Reset to defaults" loads. `DEFAULT_SOURCE` / `DEFAULT_OUTPUT` / `DEFAULT_AUTO` are not
+ * these: they are what a saved or preset file with a missing or bad field reads as, so an existing save never changes. `resolution`
+ * is a placeholder: the camera's largest 16:9 size replaces it (`defaultState`, `repairSource`).
+ */
+export const FACTORY_SOURCE: SourceCfg = {
+  ...DEFAULT_SOURCE,
+  res_type: "custom",
+  frame_interval: 333333,
+  video_format: "mjpeg",
+};
+
+export const FACTORY_OUTPUT: OutputCfg = {
+  resolution: "source",
+  fps: "source",
+  fit: "fill",
+  background_color: 0xffff00ff,
+  extra_sizes: false,
+};
+
 // ---------------------------------------------------------------------------------------------------------------
 // Option tables (value is always a string, as the Select widget wants)
 
@@ -205,6 +225,24 @@ export const largestWide = (cam: CameraInfo): string | null => {
   return sizes.find((k) => isWide(parseSize(k)!)) ?? sizes[0] ?? null;
 };
 
+/** The largest 16:9 size of `format` ("any" = every format) that offers `interval` (null: at any rate); null when there is none. */
+const wideSize = (cam: CameraInfo, format: VideoFormat, interval: number | null): string | null =>
+  cameraSizes(cam, format).find((k) => isWide(parseSize(k)!) && (interval === null || cameraIntervals(cam, k, format).includes(interval))) ?? null;
+
+/**
+ * The size (and format) a Custom capture starts at on the first pick of a camera: the largest 16:9 size in the chosen format
+ * that offers the chosen rate; else the largest 16:9 size in that format at any rate; else, when the format has no 16:9
+ * size, the same two steps over every format ("any", so the size is not 4:3 in a format that has no 16:9). Null: no 16:9
+ * size at all (the caller uses `largestWide`).
+ */
+export const factorySize = (cam: CameraInfo, format: VideoFormat, interval: number): { resolution: string; video_format: VideoFormat } | null => {
+  const rate = interval > 0 ? interval : null;
+  const own = wideSize(cam, format, rate) ?? wideSize(cam, format, null);
+  if (own) return { resolution: own, video_format: format };
+  const any = format === "any" ? null : (wideSize(cam, "any", rate) ?? wideSize(cam, "any", null));
+  return any ? { resolution: any, video_format: "any" } : null;
+};
+
 /** The listed size closest to `target`: the same aspect first, then the nearest pixel count. */
 export const nearestSize = (sizes: string[], target: string): string | null => {
   const t = parseSize(target);
@@ -253,7 +291,7 @@ export const findCamera = (cams: CameraInfo[], id: string | null): CameraInfo | 
 
 /**
  * Makes `src` consistent with the camera it names, changing as little as possible:
- * - no camera chosen: the first one (and, with that first choice, its largest 16:9 size);
+ * - no camera chosen: the first one (and, with that first choice, its largest 16:9 size; with Custom, `factorySize`);
  * - the saved camera is not connected: nothing changes (the user's settings wait for it);
  * - a format the camera lacks becomes "any"; with Custom a size or rate the camera lacks (for that format) becomes
  *   the nearest one it has;
@@ -271,8 +309,16 @@ export function repairSource(src: SourceCfg, cams: CameraInfo[]): SourceCfg {
     s.video_format = "any";
     return s;
   }
-  if (firstChoice) s.resolution = largestWide(cam) ?? s.resolution;
   if (s.video_format !== "any" && !cameraFormats(cam).includes(s.video_format)) s.video_format = "any";
+  if (firstChoice) {
+    const pick = s.res_type === "custom" ? factorySize(cam, s.video_format, s.frame_interval) : null;
+    if (pick) {
+      s.resolution = pick.resolution;
+      s.video_format = pick.video_format;
+    } else {
+      s.resolution = largestWide(cam) ?? s.resolution;
+    }
+  }
 
   // The stored size also has to be one the camera has under Device default, so a later switch to Custom starts valid.
   const custom = s.res_type === "custom";
@@ -283,6 +329,26 @@ export function repairSource(src: SourceCfg, cams: CameraInfo[]): SourceCfg {
     if (!rates.includes(s.frame_interval)) s.frame_interval = nearestInterval(rates, s.frame_interval) ?? MATCH_OUTPUT_FPS;
   }
   return s;
+}
+
+/**
+ * `repairSource` for a camera list, with the second chance of a fresh install's factory capture: `fresh` says the save is a
+ * fresh install's, and its first pick of a camera whose formats cannot be read (it is busy, or its driver failed) falls
+ * back to the device default, so the factory capture is owed (`capturePending`). At the first list where that camera has
+ * formats, and while the source is still that fallback, the capture fields become what the first pick would have made.
+ * The caller clears `capturePending` when the user edits the capture or loads a preset (then nothing is owed).
+ */
+export function repairFreshSource(prev: SourceCfg, cams: CameraInfo[], fresh: boolean, capturePending: boolean): { source: SourceCfg; capturePending: boolean } {
+  if (capturePending && prev.video_device_id) {
+    const cam = findCamera(cams, prev.video_device_id);
+    if (!cam || cam.formats.length === 0) return { source: repairSource(prev, cams), capturePending };
+    if (!isDeviceDefault(prev)) return { source: repairSource(prev, cams), capturePending: false };
+    const { res_type, resolution, frame_interval, video_format } = repairSource({ ...FACTORY_SOURCE, video_device_id: null }, [cam]);
+    return { source: repairSource({ ...prev, res_type, resolution, frame_interval, video_format }, cams), capturePending: false };
+  }
+  const source = repairSource(prev, cams);
+  const cam = findCamera(cams, source.video_device_id);
+  return { source, capturePending: capturePending || (fresh && !prev.video_device_id && cam !== null && cam.formats.length === 0) };
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -630,7 +696,8 @@ export const sortControls = (infos: ControlInfo[]): ControlInfo[] =>
  * (Better Cam auto) it is the resume point, which the controller keeps up to date and the engine writes on open.
  */
 export interface StoredControl {
-  value: number;
+  /** Absent only with `mode: "app"`: no resume point yet, so the loop starts from what the camera holds (its default). */
+  value?: number;
   /** The camera's Auto flag; false for `app`. */
   auto: boolean;
   /** Absent: Manual or Camera auto, as `auto` says. A build without Better Cam auto reads an `app` control as Manual at `value`. */
@@ -666,6 +733,16 @@ export interface AutoCfg {
 export const DEFAULT_AUTO: AutoCfg = {
   exposure: { target: 0.45, longest: "fit", max_gain: null, speed: "normal" },
   white_balance: { warmth: 0, speed: "normal" },
+};
+
+export const FACTORY_AUTO: AutoCfg = {
+  exposure: { target: 0.45, longest: "fit", max_gain: null, speed: "normal" },
+  white_balance: { warmth: 0.48, speed: "fast" },
+};
+
+/** The camera controls of the factory state: white balance in Better Cam auto, no fixed value (the camera's own is the start). */
+export const FACTORY_CONTROLS: Partial<Record<ControlKey, StoredControl>> = {
+  white_balance: { auto: false, mode: "app" },
 };
 
 export const TARGET_MIN = 0.2;
@@ -863,12 +940,17 @@ export function normalizeControls(raw: unknown): StoredControls {
       (d.values && typeof d.values === "object" ? (d.values as Record<string, unknown>)[key] : undefined) as Record<string, unknown> | undefined;
     for (const key of CONTROL_KEYS) {
       const v = at(key);
-      if (v && Number.isInteger(v.value) && typeof v.auto === "boolean") {
-        values[key] = v.mode === "app" && !v.auto && APP_KEYS.includes(key) ? { value: v.value as number, auto: false, mode: "app" } : { value: v.value as number, auto: v.auto };
-      }
+      if (!v || typeof v.auto !== "boolean") continue;
+      const app = v.mode === "app" && !v.auto && APP_KEYS.includes(key);
+      // Better Cam auto may have no resume point; any other entry needs its value.
+      if (app && v.value === undefined) values[key] = { auto: false, mode: "app" };
+      else if (Number.isInteger(v.value)) values[key] = app ? { value: v.value as number, auto: false, mode: "app" } : { value: v.value as number, auto: v.auto };
     }
     // The gain is Better Cam auto only with the exposure.
-    if (values.gain?.mode === "app" && values.exposure?.mode !== "app") values.gain = { value: values.gain.value, auto: false };
+    if (values.gain?.mode === "app" && values.exposure?.mode !== "app") {
+      if (values.gain.value === undefined) delete values.gain;
+      else values.gain = { value: values.gain.value, auto: false };
+    }
     const auto = normalizeAutoCfg(d.auto);
     const learned = normalizeLearned(d.learned);
     const device: StoredDevice = { name: typeof d.name === "string" ? d.name : "", values, ...(auto && { auto }), ...(learned && { learned }) };

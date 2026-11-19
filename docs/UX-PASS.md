@@ -370,7 +370,7 @@ Stacked (900–1099 px)
   | reconnecting | `problemText().short` | — |
 
   The placeholder becomes a centred stack: text plus an optional button. The canvas keeps its last frame for the dimmed states; today `is-off` hides it (`Preview.tsx:265`). On a camera or size change the old frame is dropped (`shown` = false) so a stale picture never stays up.
-- **P12, empty chain.** Between the terminals, `li.empty`: "No filters yet. Filters change the picture before other apps see it." Then quick-add buttons for Color Correction, Auto Adjust and Crop/Pad, plus NVIDIA Background Blur only when an RTX GPU is present (`gpu` in the store), and "More…" which opens the Add filter menu. After W2, add the line "Or drop a .cube LUT or a picture here."
+- **P12, empty chain.** (Since 0.1.2 a fresh install and "Reset to defaults" start with one Auto Adjust filter, so this empty-chain screen only shows after the user removes it.) Between the terminals, `li.empty`: "No filters yet. Filters change the picture before other apps see it." Then quick-add buttons for Color Correction, Auto Adjust and Crop/Pad, plus NVIDIA Background Blur only when an RTX GPU is present (`gpu` in the store), and "More…" which opens the Add filter menu. After W2, add the line "Or drop a .cube LUT or a picture here."
 - **P13, banners.** Move `.banners` out of the right column to a full-width row between the toolbar and `.cols`, in both layouts (`App.tsx:57-62`). The error banner gets a ghost × button (`aria-label="Dismiss"`) and `role="alert"`; clicking its text no longer dismisses it.
 - **P14, stats line.** Lead with use, then the rest:
   - live, no app: "Not in use · choose “Better Cam” as the camera in your video app · 1280×720 → 1280×720 · 16.7 fps · GPU 0.1 ms · 34 ms latency";

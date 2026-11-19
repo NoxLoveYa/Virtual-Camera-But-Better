@@ -4,24 +4,27 @@
  * the DOM, so a script can import it. The store (P2) turns a parsed preset into engine calls; `planControls` is the
  * part of that which needs no engine.
  */
-import type { ExtensionInfo, FilterCfg } from "../filters/schema";
+import { defaultChain, type ExtensionInfo, type FilterCfg } from "../filters/schema";
 import { normalizeChain, signature } from "../filters/chain";
 import {
   CONTROL_KEYS,
   CONTROL_LABELS,
   DEFAULT_AUTO,
   DEFAULT_OUTPUT,
-  DEFAULT_SOURCE,
+  FACTORY_AUTO,
+  FACTORY_CONTROLS,
+  FACTORY_OUTPUT,
+  FACTORY_SOURCE,
   autoCfgOf,
   findCamera,
   findStored,
-  largestWide,
   linkKey,
   modeOf,
   normalizeAutoCfg,
   normalizeControls,
   normalizeOutput,
   normalizeSource,
+  repairSource,
   vidPid,
   withAutoCfg,
   withControlValues,
@@ -204,9 +207,13 @@ export const presetFileOfParsed = (p: ParsedPreset): PresetFileAny => {
   return p.camera || p.output ? { ...rest, ...(p.camera && { camera }), ...(p.output && { output }) } : { ...rest, version: 1 };
 };
 
-/** The controls with each Better Cam auto entry turned into Manual at the same value (the resume point becomes the seed of the later `mode app` write). */
+/** The controls with each Better Cam auto entry turned into Manual at the same value (the resume point becomes the seed of the later `mode app` write); one with no value is left out (the camera's own value is the seed). */
 export const appAsManual = (controls: PresetCamera["controls"]): PresetCamera["controls"] =>
-  Object.fromEntries(Object.entries(controls).map(([k, c]) => [k, c.mode === "app" ? { value: c.value, auto: false } : c]));
+  Object.fromEntries(
+    Object.entries(controls).flatMap(([k, c]): [string, StoredControl][] =>
+      c.mode !== "app" ? [[k, c]] : c.value === undefined ? [] : [[k, { value: c.value, auto: false }]],
+    ),
+  );
 
 /** `stored` with a preset's controls and Better Cam auto settings as the record of `cam`; `seed`: Better Cam auto entries as Manual (see `appAsManual`). Learned values stay. */
 export const withPresetCamera = (stored: StoredControls, cam: { id: string; name: string }, controls: PresetCamera["controls"], auto: AutoCfg, seed: boolean): StoredControls =>
@@ -228,25 +235,55 @@ export const presetNotes = (p: ParsedPreset, name: string): string[] => [
   ...(p.version > 2 ? ["This preset was saved by a newer Better Cam; some settings may be missing."] : []),
 ];
 
-/** The defaults for a camera: empty chain, DEFAULT_SOURCE (largest 16:9 size), no controls, DEFAULT_AUTO, DEFAULT_OUTPUT. */
+/**
+ * The defaults for a camera (what a fresh install starts with): the default chain (`defaultChain`), the factory capture
+ * settings at the size the camera's first pick gets (`repairSource`: the largest 16:9 size in MJPEG at 30 fps, else see `factorySize`), Better Cam auto white
+ * balance with no fixed value, the factory Better Cam auto settings and the factory output.
+ */
 export function defaultState(cam: CameraInfo | null): PresetState {
+  const capture = withoutDevice(cam ? repairSource({ ...FACTORY_SOURCE, video_device_id: null }, [cam]) : FACTORY_SOURCE);
   return {
-    chain: [],
+    chain: defaultChain(),
     camera: {
       device: cam ? { id: cam.id, name: cam.name } : null,
-      capture: { ...withoutDevice(DEFAULT_SOURCE), resolution: (cam && largestWide(cam)) || DEFAULT_SOURCE.resolution },
-      controls: {},
-      auto: normalizeAutoCfg(DEFAULT_AUTO)!,
+      capture,
+      controls: Object.fromEntries(Object.entries(FACTORY_CONTROLS).map(([k, c]) => [k, { ...c }])),
+      auto: normalizeAutoCfg(FACTORY_AUTO)!,
     },
-    output: { ...DEFAULT_OUTPUT },
+    output: { ...FACTORY_OUTPUT },
   };
 }
 
-const DEFAULT_PRESET_SIGNATURE = presetSignature(defaultState(null));
+/**
+ * Whether Better Cam auto white balance is offered, as the camera's control list says (`white_balance.app`); `null`: the list
+ * is not read (or is not this camera's).
+ */
+export const wbAppOffered = (infos: ControlInfo[] | null): boolean | null =>
+  infos === null ? null : infos.some((i) => i.key === "white_balance" && i.app != null);
 
-/** Whether `state` is the defaults, whatever camera it has ("Default" in the title bar). */
-export const isDefaultPreset = (state: PresetState): boolean =>
-  presetSignature({ ...state, camera: { ...state.camera, device: null } }) === DEFAULT_PRESET_SIGNATURE;
+/** The camera controls of a first camera's factory record: white balance in Better Cam auto only where the camera offers it (else nothing: the camera's own Auto stays). */
+export const factoryControls = (infos: ControlInfo[]): PresetCamera["controls"] =>
+  wbAppOffered(infos) ? Object.fromEntries(Object.entries(FACTORY_CONTROLS).map(([k, c]) => [k, { ...c }])) : {};
+
+/**
+ * Whether `state` is the defaults for its camera, whatever camera that is ("Default" in the title bar). `cams` says which
+ * camera that is: its largest size is part of the defaults. A camera that is not in `cams` (unplugged, list not read) has
+ * its size, rate and format left out of the comparison. With no camera at all nothing is stored for one, so the controls
+ * are none and Better Cam auto's settings are the fallback's. `wbApp` (`wbAppOffered`): a camera that does not offer Better
+ * Cam auto white balance never got the factory entry, so for it none is the default; `null` (not read yet): either is.
+ */
+export const isDefaultPreset = (state: PresetState, cams: CameraInfo[] | null = null, wbApp: boolean | null = true): boolean => {
+  const d = state.camera.device;
+  const cam = d && cams ? findCamera(cams, d.id) : null;
+  const base = defaultState(cam);
+  const { resolution, frame_interval, video_format } = state.camera.capture;
+  const capture = cam ? base.camera.capture : { ...base.camera.capture, resolution, frame_interval, video_format };
+  const sig = presetSignature({ ...state, camera: { ...state.camera, device: null } });
+  const wants = (controls: PresetCamera["controls"], auto: AutoCfg) =>
+    presetSignature({ ...base, camera: { ...base.camera, device: null, capture, controls, auto } }) === sig;
+  if (!d) return wants({}, normalizeAutoCfg(DEFAULT_AUTO)!);
+  return (wbApp !== false && wants(base.camera.controls, base.camera.auto)) || (wbApp !== true && wants({}, base.camera.auto));
+};
 
 /**
  * The camera a preset names, among the connected ones: `findCamera` (the same link, else the only one with that
@@ -307,7 +344,7 @@ export function planControls(infos: ControlInfo[], target: PresetCamera["control
   const want = new Map<ControlKey, { mode: ControlMode; value: number }>();
   for (const info of infos) {
     const t = target[info.key];
-    const value = clamp(t ? t.value : info.def, info.min, info.max);
+    const value = clamp(t?.value ?? info.def, info.min, info.max);
     let mode: ControlMode;
     if (!t) mode = info.can_auto ? "camera" : "manual";
     else if (t.mode === "app") {

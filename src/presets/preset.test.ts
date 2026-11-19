@@ -8,15 +8,24 @@ import {
   DEFAULT_AUTO,
   DEFAULT_OUTPUT,
   DEFAULT_SOURCE,
+  FACTORY_AUTO,
+  FACTORY_CONTROLS,
+  FACTORY_OUTPUT,
+  FACTORY_SOURCE,
+  normalizeAutoCfg,
+  normalizeControls,
+  repairSource,
   type CameraInfo,
   type ControlInfo,
   type ControlKey,
   type StoredControls,
 } from "../camera/schema";
-import { makeFilter } from "../filters/schema";
+import { defaultChain, makeFilter } from "../filters/schema";
 import { signature } from "../filters/chain";
 import {
+  appAsManual,
   defaultState,
+  factoryControls,
   isDefaultPreset,
   migrateBaseline,
   parsePreset,
@@ -31,6 +40,7 @@ import {
   presetStateOf,
   restoreRecord,
   UNKNOWN_CAMERA,
+  wbAppOffered,
   withDeviceName,
   withPresetCamera,
   type PresetCamera,
@@ -343,16 +353,70 @@ const wide = (id: string): CameraInfo => ({
     { format: "mjpeg", width: 1920, height: 1080, intervals: [333333] },
   ],
 });
+// The owner's preset "best" is the defaults, except the camera-bound parts: the largest 16:9 size, no power-line frequency, no fixed white balance value.
+const FACTORY_CAPTURE = {
+  res_type: "custom",
+  resolution: "1920x1080",
+  frame_interval: 333333,
+  video_format: "mjpeg",
+  color_space: "default",
+  color_range: "default",
+  buffering: "auto",
+  flip_vertically: false,
+  autorotation: true,
+  hw_decode: true,
+  deactivate_when_not_showing: true,
+};
+const FACTORY_AUTO_CFG = {
+  exposure: { target: 0.45, longest: "fit", max_gain: null, speed: "normal" },
+  white_balance: { warmth: 0.48, speed: "fast" },
+};
+const FACTORY_OUT = { resolution: "source", fps: "source", fit: "fill", background_color: 4294902015, extra_sizes: false };
+const FACTORY_PARAMS = {
+  exposure: false, target: 0.45, contrast: false, target_contrast: 0.4, saturation: false, target_saturation: 0.2,
+  white_balance: true, temperature: 0, tint: 0.45, strength: 1, speed: 0.3,
+};
 const def = defaultState(wide(BRIO));
-same(def.chain, [], "default chain");
+same(def.chain.map(({ kind, enabled, params }) => ({ kind, enabled, params })), [{ kind: "auto_adjust", enabled: true, params: FACTORY_PARAMS }], "default chain: one Auto Adjust");
 same(def.camera.device, { id: BRIO, name: "Cam" }, "default device");
-same(def.camera.capture, { ...DEFAULT_CAPTURE, resolution: "1920x1080" }, "default capture");
-same([def.camera.controls, def.camera.auto, def.output], [{}, DEFAULT_AUTO, DEFAULT_OUTPUT], "default controls, auto and output");
+same(def.camera.capture, FACTORY_CAPTURE, "default capture");
+same(def.camera.controls, { white_balance: { auto: false, mode: "app" } }, "default controls: white balance in Better Cam auto with no value, nothing else (no exposure, no power line)");
+same(def.camera.auto, FACTORY_AUTO_CFG, "default Better Cam auto settings");
+same(def.output, FACTORY_OUT, "default output");
 same(defaultState(null).camera.device, null, "default state without a camera");
-same(defaultState(null).camera.capture, DEFAULT_CAPTURE, "default capture without a camera");
+same(defaultState(null).camera.capture, FACTORY_CAPTURE, "default capture without a camera");
+// The largest 16:9 size of each camera, not a fixed one; a camera that cannot do the format or rate gets what it has.
+const big = (id: string): CameraInfo => ({
+  id,
+  name: "Big",
+  formats: [
+    { format: "mjpeg", width: 2688, height: 1520, intervals: [333333] },
+    { format: "mjpeg", width: 1920, height: 1080, intervals: [166667, 333333] },
+    { format: "mjpeg", width: 2560, height: 1920, intervals: [333333] },
+  ],
+});
+same(defaultState(big(BRIO)).camera.capture, { ...FACTORY_CAPTURE, resolution: "2688x1520" }, "default capture: the largest 16:9 size");
+const yuyOnly: CameraInfo = { id: BRIO, name: "Yuy", formats: [{ format: "yuy2", width: 1280, height: 720, intervals: [333333] }] };
+same(defaultState(yuyOnly).camera.capture, { ...FACTORY_CAPTURE, resolution: "1280x720", video_format: "any" }, "default capture: a camera without MJPEG");
+same(defaultState({ id: BRIO, name: "None", formats: [] }).camera.capture.res_type, "preferred", "default capture: a camera whose formats are unknown");
 // Two calls do not share objects.
 defaultState(null).camera.auto.exposure.target = 0.8;
-same(defaultState(null).camera.auto, DEFAULT_AUTO, "defaults are fresh");
+defaultState(null).camera.controls.white_balance!.auto = true;
+defaultState(null).chain[0].params.speed = 1;
+same([defaultState(null).camera.auto, defaultState(null).camera.controls, defaultState(null).chain[0].params.speed], [FACTORY_AUTO_CFG, def.camera.controls, 0.3], "defaults are fresh");
+same(DEFAULT_AUTO.white_balance.warmth, 0, "the fallback for a file with no Better Cam auto settings stays neutral");
+same(DEFAULT_OUTPUT.fit, "fit", "the fallback for a file with no output stays as it was");
+same(makeFilter("auto_adjust").params, { exposure: true, target: 0.45, contrast: false, target_contrast: 0.4, saturation: false, target_saturation: 0.2, white_balance: true, temperature: 0, tint: 0, strength: 1, speed: 0.3 }, "a new Auto Adjust filter keeps its own defaults");
+
+// A Better Cam auto control with no value survives the file and the save, and a Manual one without a value does not.
+same(parsePreset(JSON.parse(JSON.stringify(presetFileOf(def))), []).camera!.controls, def.camera.controls, "file round trip: no value stays no value");
+same(normalizeControls({ [BRIO]: { name: "", values: { white_balance: { auto: false, mode: "app" }, brightness: { auto: false }, gain: { auto: false, mode: "app" } } } })[BRIO].values, { white_balance: { auto: false, mode: "app" } }, "no value: only Better Cam auto; a gain without the exposure is dropped");
+same(appAsManual(def.camera.controls), {}, "no value is not seeded as Manual");
+same(appAsManual({ white_balance: { value: 4000, auto: false, mode: "app" } }), { white_balance: { value: 4000, auto: false } }, "a value is seeded as Manual");
+// The plan engages Better Cam auto for it (the camera's own value is the start).
+same(plan([whiteBalance()], def.camera.controls).c, [{ key: "white_balance", op: "mode", mode: "app" }], "plan: engage Better Cam auto, no value written");
+same(plan([whiteBalance({ app: null })], def.camera.controls).downgraded, ["white_balance"], "plan: a camera without Better Cam auto gets Camera auto");
+same(plan([brightness({ value: 140 }), whiteBalance({ auto: false, mode: "app", value: 4500 })], def.camera.controls), { a: [], b: [{ key: "brightness", op: "set", value: 128, auto: false }], c: [], skipped: [], downgraded: [] }, "plan: a reset keeps white balance in Better Cam auto and undoes the rest");
 
 // --- what the store holds as a preset state (P2) -----------------------------------------------------------------------
 
@@ -370,14 +434,73 @@ same(now.camera.device, { id: BRIO_OTHER_PORT, name: "Logitech BRIO" }, "state: 
 same([now.camera.controls, now.camera.auto.exposure.target, now.camera.capture.flip_vertically], [stored[BRIO].values, 0.6, true], "state: the record of the moved camera");
 const gone = presetStateOf([], { ...DEFAULT_SOURCE, video_device_id: BRIO }, DEFAULT_OUTPUT, stored, []);
 same(gone.camera.device, { id: BRIO, name: "Logitech BRIO" }, "state: a saved camera that is not connected keeps its name from the record");
-same(presetStateOf([], DEFAULT_SOURCE, DEFAULT_OUTPUT, {}, null).camera, defaultState(null).camera, "state: no camera, nothing stored");
+// With no camera nothing is stored for one: no controls, and Better Cam auto's settings are the fallback's (the factory ones are written when the first camera is picked).
+same(
+  presetStateOf([], FACTORY_SOURCE, FACTORY_OUTPUT, {}, null).camera,
+  { ...defaultState(null).camera, controls: {}, auto: normalizeAutoCfg(DEFAULT_AUTO) },
+  "state: no camera, nothing stored",
+);
 
 // Default, whatever the camera.
-if (!isDefaultPreset(defaultState(wide(BRIO)))) throw new Error("the defaults for a camera are the defaults");
-if (!isDefaultPreset(presetStateOf([], DEFAULT_SOURCE, DEFAULT_OUTPUT, {}, [wide(BRIO)]))) throw new Error("a fresh install is the defaults");
-if (isDefaultPreset(presetStateOf([makeFilter("color_filter")], DEFAULT_SOURCE, DEFAULT_OUTPUT, {}, null))) throw new Error("a filter is not the defaults");
-if (isDefaultPreset(presetStateOf([], DEFAULT_SOURCE, { ...DEFAULT_OUTPUT, resolution: "1280x720" }, {}, null))) throw new Error("an output change is not the defaults");
+const must = (state: PresetState, cams: CameraInfo[] | null, what: string) => {
+  if (!isDefaultPreset(state, cams)) throw new Error(`${what}: is the defaults`);
+};
+const mustNot = (state: PresetState, cams: CameraInfo[] | null, what: string) => {
+  if (isDefaultPreset(state, cams)) throw new Error(`${what}: is not the defaults`);
+};
+for (const c of [wide(BRIO), big(OTHER), yuyOnly, { id: BRIO, name: "None", formats: [] }]) must(defaultState(c), [c], `the defaults for ${c.name}`);
+// `defaultState(null)` carries the factory record, which a state with no camera never has (nothing is stored for no camera).
+mustNot(defaultState(null), null, "the factory record without a camera");
+must(defaultState(wide(BRIO)), null, "the defaults, camera list not read yet");
+must(defaultState(wide(BRIO)), [], "the defaults, camera unplugged");
+// A fresh install with no camera, and every fresh start before the camera list arrives: Default, not Unsaved.
+const noCamera = presetStateOf(defaultChain(), FACTORY_SOURCE, FACTORY_OUTPUT, {}, null);
+must(noCamera, null, "a fresh install, camera list not read");
+must(noCamera, [], "a fresh install, no camera connected");
+must(presetStateOf(defaultChain(), FACTORY_SOURCE, FACTORY_OUTPUT, {}, []), [], "a fresh install, list read and empty");
+mustNot(presetStateOf([], FACTORY_SOURCE, FACTORY_OUTPUT, {}, null), null, "no camera, no chain");
+mustNot({ ...noCamera, camera: { ...noCamera.camera, auto: normalizeAutoCfg(FACTORY_AUTO)! } }, null, "no camera, but a record's Better Cam auto settings");
+mustNot({ ...noCamera, camera: { ...noCamera.camera, controls: { brightness: { value: 3, auto: false } } } }, null, "no camera, but a changed control");
+// A factoryStart start as the store makes it: the factory source repaired for the first camera, the factory record, the factory chain and output.
+const first = big(BRIO);
+const factoryStart = presetStateOf(defaultChain(), repairSource(FACTORY_SOURCE, [first]), FACTORY_OUTPUT, withPresetCamera({}, first, FACTORY_CONTROLS, FACTORY_AUTO, false), [first]);
+must(factoryStart, [first], "a factoryStart install");
+same(factoryStart.camera.capture.resolution, "2688x1520", "a factoryStart install picks the largest 16:9 size");
+// What a camera in best's state looks like once the loop has run: the resume point is in the record, and still the defaults.
+const ran = withPresetCamera({}, first, { white_balance: { value: 4043, auto: false, mode: "app" } }, FACTORY_AUTO, false);
+must(presetStateOf(defaultChain(), repairSource(FACTORY_SOURCE, [first]), FACTORY_OUTPUT, ran, [first]), [first], "white balance with a resume point");
+mustNot(presetStateOf([], repairSource(FACTORY_SOURCE, [first]), FACTORY_OUTPUT, {}, [first]), [first], "no chain");
+mustNot(presetStateOf(defaultChain(), repairSource(FACTORY_SOURCE, [first]), FACTORY_OUTPUT, withPresetCamera({}, first, FACTORY_CONTROLS, DEFAULT_AUTO, false), [first]), [first], "the old Better Cam auto settings");
+mustNot(presetStateOf(defaultChain(), repairSource(FACTORY_SOURCE, [first]), FACTORY_OUTPUT, {}, [first]), [first], "no record (white balance not in Better Cam auto)");
+mustNot(presetStateOf([makeFilter("color_filter")], FACTORY_SOURCE, FACTORY_OUTPUT, {}, null), null, "another filter");
+mustNot(presetStateOf(defaultChain(), FACTORY_SOURCE, { ...FACTORY_OUTPUT, resolution: "1280x720" }, withPresetCamera({}, first, FACTORY_CONTROLS, FACTORY_AUTO, false), [first]), [first], "an output change");
+mustNot({ ...factoryStart, camera: { ...factoryStart.camera, capture: { ...factoryStart.camera.capture, resolution: "1920x1080" } } }, [first], "another size than the camera's largest");
+mustNot({ ...factoryStart, camera: { ...factoryStart.camera, controls: { ...factoryStart.camera.controls, powerline_frequency: { value: 2, auto: false } } } }, [first], "a power-line frequency");
+mustNot({ ...factoryStart, camera: { ...factoryStart.camera, controls: { ...factoryStart.camera.controls, exposure: { value: -4, auto: false, mode: "app" } } } }, [first], "exposure in Better Cam auto");
 if (isDefaultPreset(now)) throw new Error("changed controls are not the defaults");
+
+// The factory record is seeded only where the camera offers Better Cam auto white balance (its control list says so: `white_balance.app`).
+same(wbAppOffered(null), null, "wb app: list not read");
+same(wbAppOffered([brightness()]), false, "wb app: a camera without white balance");
+same(wbAppOffered([whiteBalance({ app: null })]), false, "wb app: not offered (no manual, or units that are not Kelvin)");
+same(wbAppOffered([whiteBalance()]), true, "wb app: offered");
+same(factoryControls([brightness(), whiteBalance()]), { white_balance: { auto: false, mode: "app" } }, "factory controls: white balance in Better Cam auto, no value");
+same(factoryControls([brightness(), whiteBalance({ app: null, app_why: "This camera reports white balance in units Better Cam does not know." })]), {}, "factory controls: nothing where it is not offered");
+same(factoryControls([brightness()]), {}, "factory controls: nothing for a camera without white balance");
+factoryControls([whiteBalance()]).white_balance!.auto = true;
+same(factoryControls([whiteBalance()]), FACTORY_CONTROLS, "factory controls are fresh");
+// For a camera that does not offer it the record has no white balance entry, and that is the default; the comparison knows from the control list.
+{
+  const c = big(BRIO);
+  const noWb = presetStateOf(defaultChain(), repairSource(FACTORY_SOURCE, [c]), FACTORY_OUTPUT, withPresetCamera({}, c, factoryControls([whiteBalance({ app: null })]), FACTORY_AUTO, false), [c]);
+  same(noWb.camera.controls, {}, "no white balance entry");
+  same([isDefaultPreset(noWb, [c], false), isDefaultPreset(noWb, [c], null), isDefaultPreset(noWb, [c], true)], [true, true, false], "no entry: the default where it is not offered (or not known yet), not where it is");
+  const withWb = presetStateOf(defaultChain(), repairSource(FACTORY_SOURCE, [c]), FACTORY_OUTPUT, withPresetCamera({}, c, FACTORY_CONTROLS, FACTORY_AUTO, false), [c]);
+  same([isDefaultPreset(withWb, [c], false), isDefaultPreset(withWb, [c], null), isDefaultPreset(withWb, [c], true)], [false, true, true], "the entry: the default where it is offered (or not known yet), not where it is not");
+  // another change is not hidden by either reading
+  const changed = { ...noWb, camera: { ...noWb.camera, controls: { brightness: { value: 3, auto: false } } } };
+  same([isDefaultPreset(changed, [c], false), isDefaultPreset(changed, [c], null)], [false, false], "a changed control is never the default");
+}
 
 // The record a load makes: values replaced, Better Cam auto settings replaced, learned values kept; app entries as Manual when they are to be engaged later.
 const seeded = withPresetCamera(stored, { id: BRIO, name: "Logitech BRIO" }, { focus: { value: 30, auto: false }, exposure: { value: -4, auto: false, mode: "app" } }, DEFAULT_AUTO, true);

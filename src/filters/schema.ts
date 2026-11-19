@@ -440,5 +440,25 @@ export const makeFilter = (kind: FilterKind, enabled = true, extensions: readonl
   params: defaultParams(kind, extensions),
 });
 
-/** The chain a fresh install starts with: empty. */
-export const defaultChain = (): FilterCfg[] => [];
+/**
+ * The chain a fresh install and "Reset to defaults" start with: one Auto Adjust that corrects white balance only. The
+ * filter's own defaults (what "Add filter" gives) are not these.
+ */
+export const defaultChain = (): FilterCfg[] => [
+  {
+    ...makeFilter("auto_adjust"),
+    params: {
+      exposure: false,
+      target: 0.45,
+      contrast: false,
+      target_contrast: 0.4,
+      saturation: false,
+      target_saturation: 0.2,
+      white_balance: true,
+      temperature: 0,
+      tint: 0.45,
+      strength: 1,
+      speed: 0.3,
+    },
+  },
+];

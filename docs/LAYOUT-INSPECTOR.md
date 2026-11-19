@@ -633,7 +633,12 @@ export function presetFileOf(state: PresetState): PresetFileV2;
 export function parsePreset(raw: unknown, extensions: readonly ExtensionInfo[]): ParsedPreset;
 /** Fingerprint for "unsaved changes" (3.6). */
 export function presetSignature(state: PresetState): string;
-/** The defaults for a camera: empty chain, DEFAULT_SOURCE (largest 16:9 size), no controls, DEFAULT_AUTO, DEFAULT_OUTPUT. */
+/**
+ * The defaults for a camera. (Changed in 0.1.2: the text this line had, "empty chain, DEFAULT_SOURCE, no controls,
+ * DEFAULT_AUTO, DEFAULT_OUTPUT", is the old behaviour. Now: the default chain (one Auto Adjust, white balance only), the
+ * factory capture at the camera's largest 16:9 size, Better Cam auto white balance with no fixed value, the factory
+ * Better Cam auto settings, the factory output: see `FACTORY_*` and `defaultState`.)
+ */
 export function defaultState(cam: CameraInfo | null): PresetState;
 /** The camera a preset names, among the connected ones (findCamera, then the same vid/pid and name). */
 export function presetCamera(cams: CameraInfo[], device: PresetCamera["device"]): CameraInfo | null;

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { useStore } from "../store";
 import { presetNameError } from "../filters/chain";
-import { isDefaultPreset, presetSignature, presetStateOf } from "../presets/preset";
+import { findCamera } from "../camera/schema";
+import { isDefaultPreset, presetSignature, presetStateOf, wbAppOffered } from "../presets/preset";
 import { Icon } from "./Icon";
 import { Popover } from "./Popover";
 
@@ -10,10 +11,13 @@ type StoreState = ReturnType<typeof useStore.getState>;
 // The selector runs on every store change, not only on one that matters here: work out the fingerprint once per set of inputs.
 let cached: { deps: unknown[]; sig: string; isDefault: boolean } | null = null;
 const fingerprint = (s: StoreState) => {
-  const deps = [s.chain, s.source, s.output, s.controls, s.cameras];
+  const deps = [s.chain, s.source, s.output, s.controls, s.cameras, s.controlInfos, s.controlsFor];
   if (!cached || deps.some((d, i) => d !== cached!.deps[i])) {
     const state = presetStateOf(s.chain, s.source, s.output, s.controls, s.cameras);
-    cached = { deps, sig: presetSignature(state), isDefault: isDefaultPreset(state) };
+    // Whether the camera offers Better Cam auto white balance (the factory entry is only there then): known once its controls were read.
+    const cam = s.cameras ? findCamera(s.cameras, s.source.video_device_id) : null;
+    const wbApp = wbAppOffered(cam && s.controlsFor === cam.id ? s.controlInfos : null);
+    cached = { deps, sig: presetSignature(state), isDefault: isDefaultPreset(state, s.cameras, wbApp) };
   }
   return cached;
 };

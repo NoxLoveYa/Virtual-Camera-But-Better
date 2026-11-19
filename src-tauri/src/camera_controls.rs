@@ -37,7 +37,7 @@ use crate::auto_controls::{
 };
 use crate::capture::controls::{
     apply_snapshot, ApplyReport, ControlDevice, ControlError, ControlInfo, ControlKey,
-    ControlSnapshot, DeviceControls, StoredControl,
+    ControlSnapshot, DeviceControls, SkipReason, StoredControl,
 };
 use crate::capture::{
     create_source, links_match, list_camera_keys, parse_vid_pid, Agile, CaptureError, DeviceKey,
@@ -660,10 +660,27 @@ impl ControlsHub {
                 let mut plain = rec.clone();
                 plain.controls.retain(|c| !c.app);
                 report = apply_snapshot(&dev, &plain)?;
+                // A loop that is not offered (2.3: no manual control, units Better Cam does not know, blocked) never
+                // runs, so its seed would only switch the camera's Auto off and freeze the control: the camera's own
+                // Auto stays on.
+                let offers = if rec.controls.iter().any(|c| c.app) {
+                    let caps = device.read_all()?;
+                    Some(AutoController::support(&caps, &rec.learned.clone().unwrap_or_default()))
+                } else {
+                    None
+                };
                 for key in [ControlKey::Exposure, ControlKey::Gain, ControlKey::WhiteBalance] {
                     let Some(c) = rec.get(key).filter(|c| c.app) else {
                         continue;
                     };
+                    let offered = offers.is_none_or(|s| match key {
+                        ControlKey::WhiteBalance => s.white_balance.offered(),
+                        _ => s.exposure.offered(),
+                    });
+                    if !offered {
+                        report.skipped.push((key, SkipReason::NotOffered));
+                        continue;
+                    }
                     let mut one = ControlSnapshot::new(rec.device.clone());
                     one.controls.push(c.clone());
                     let r = apply_snapshot(&dev, &one)?;
@@ -947,8 +964,9 @@ impl ControlsHub {
     /// `set_control_mode(id, key, mode)`: who drives `key` (docs/AUTO-CONTROLS.md 5.3, section 3).
     ///
     /// * `app`: engage Better Cam auto (exposure and white balance only). The control is written manual at the
-    ///   resume point (the stored value, else the camera's default; for exposure the gain follows at its own resume
-    ///   point), which switches the camera's Auto flag off; what the control was before is kept for a hand-back.
+    ///   resume point (the stored value, else what the camera holds now for white balance and its default for
+    ///   exposure; for exposure the gain follows at its own resume point), which switches the camera's Auto flag
+    ///   off; what the control was before is kept for a hand-back.
     ///   Works on a lease too: the camera keeps the seed and the controller starts at the next open.
     /// * `manual`: the controller stops and the last driven values stay as manual ones, so the picture does not jump.
     /// * `camera`: the camera's Auto flag on; for exposure the gain stays at its last driven value, as manual.
@@ -2109,6 +2127,43 @@ mod tests {
         assert_eq!(snap.modes.exposure, ControlMode::App);
         assert_eq!(snap.modes.resume.exposure, Some(-4));
         assert_eq!(snap.modes.resume.gain, Some(48));
+    }
+
+    #[test]
+    fn a_reopen_leaves_a_loop_the_camera_does_not_offer_on_its_own_auto() {
+        let (hub, cam, ..) = hub();
+        // white balance in units that are not Kelvin (a 0..100 slider): no loop runs, so writing the seed would freeze it
+        lock(&cam.state).push(fake::info(ControlKey::WhiteBalance, 0, 100, 50, true));
+        hub.set_record(Some(record(json!({
+            "white_balance": { "auto": false, "mode": "app" },
+            "exposure": { "value": -5, "auto": false, "mode": "app" }
+        }))));
+        let dev: Arc<dyn CameraControls> = cam.clone();
+        let token = hub.attach(LINK, dev.clone());
+        let (report, infos) = hub.apply_on_open(token, LINK, &dev, &Flag::new(false)).unwrap();
+        // the exposure (offered) is written as always; the white balance is not touched
+        assert_eq!(cam.log(), ["auto:exposure:false", "value:exposure:-5"]);
+        assert!(cam.get(ControlKey::WhiteBalance).auto, "the camera's own Auto stays on");
+        assert_eq!(report.skipped, [(ControlKey::WhiteBalance, SkipReason::NotOffered)]);
+        assert_eq!(row(&infos, ControlKey::WhiteBalance).mode, ControlMode::Camera);
+        assert_eq!(row(&infos, ControlKey::WhiteBalance).app, None);
+        assert_eq!(row(&infos, ControlKey::Exposure).mode, ControlMode::App);
+    }
+
+    #[test]
+    fn a_reopen_puts_white_balance_in_better_cam_auto_without_a_stored_value() {
+        let (hub, cam, ..) = hub();
+        lock(&cam.state).push(fake::info(ControlKey::WhiteBalance, 2800, 6500, 4600, true));
+        hub.set_record(Some(record(json!({ "white_balance": { "auto": false, "mode": "app" } }))));
+        assert_eq!(hub.record().unwrap().get(ControlKey::WhiteBalance).map(|c| (c.app, c.value)), Some((true, None)));
+        let dev: Arc<dyn CameraControls> = cam.clone();
+        let token = hub.attach(LINK, dev.clone());
+        let (report, infos) = hub.apply_on_open(token, LINK, &dev, &Flag::new(false)).unwrap();
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        // Auto off, no value written: the loop starts from what the camera holds
+        assert_eq!(cam.log(), ["auto:white_balance:false"]);
+        assert_eq!(cam.get(ControlKey::WhiteBalance).value, 4600);
+        assert_eq!(row(&infos, ControlKey::WhiteBalance).mode, ControlMode::App);
     }
 
     #[test]

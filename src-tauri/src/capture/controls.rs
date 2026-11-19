@@ -966,6 +966,8 @@ pub enum SkipReason {
     Unsupported,
     AutoNotSupported,
     ManualNotSupported,
+    /// The control is stored as Better Cam auto, but the camera does not offer it (no loop runs).
+    NotOffered,
     /// The device rejected the write; the message is the error text.
     Failed(String),
 }
@@ -976,6 +978,7 @@ impl fmt::Display for SkipReason {
             SkipReason::Unsupported => f.write_str("not supported"),
             SkipReason::AutoNotSupported => f.write_str("Auto not supported"),
             SkipReason::ManualNotSupported => f.write_str("manual not supported"),
+            SkipReason::NotOffered => f.write_str("Better Cam auto not offered"),
             SkipReason::Failed(m) => write!(f, "failed: {m}"),
         }
     }

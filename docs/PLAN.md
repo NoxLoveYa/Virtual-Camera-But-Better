@@ -771,6 +771,11 @@ interface FilterCfg { id: string; kind: FilterKind; enabled: boolean; params: Re
 Default chain for a fresh install: empty. (Better Mic ships its "Fifine" chain; a camera has no universal fix.
 `DEFAULT_SIGNATURE` becomes the signature of `[]`, so PresetMenu shows "Default" for an empty chain.)
 
+> **Changed in 0.1.2.** The default chain is no longer empty: a fresh install and "Reset to defaults" start with one Auto
+> Adjust filter (white balance only), together with the other built-in defaults (`FACTORY_*` in `src/camera/schema.ts`,
+> `defaultChain` in `src/filters/schema.ts`, `defaultState` in `src/presets/preset.ts`). Saved state and presets that
+> already exist are not changed.
+
 ### 5.4 Preset file (`<app_data_dir>/presets/<name>.json`)
 
 ```json

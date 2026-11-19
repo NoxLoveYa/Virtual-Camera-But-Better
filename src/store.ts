@@ -4,6 +4,7 @@ import { defOf, defaultChain, labelOf, makeFilter, type ExtensionInfo, type Filt
 import { normalizeChain, refreshExtParams } from "./filters/chain";
 import {
   defaultState,
+  factoryControls,
   migrateBaseline,
   parsePreset,
   planControls,
@@ -37,12 +38,16 @@ import {
   CAPTURE_KEYS,
   DEFAULT_OUTPUT,
   DEFAULT_SOURCE,
+  FACTORY_AUTO,
+  FACTORY_OUTPUT,
+  FACTORY_SOURCE,
   autoCfgOf,
   modeOf,
   normalizeAutoCfg,
   normalizeControls,
   normalizeOutput,
   normalizeSource,
+  repairFreshSource,
   repairSource,
   controlsRecord,
   touchesCapture,
@@ -93,7 +98,7 @@ const vcamReads = createReadGate();
 /** `npm run tauri dev` (the Vite dev server); false in a release build. The project has no `vite/client` types. */
 const IS_DEV_BUILD = (import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV === true;
 
-interface Saved {
+export interface Saved {
   source: SourceCfg;
   output: OutputCfg;
   /** Only the camera controls the user changed, per camera. Re-applied by the engine on every open. */
@@ -110,6 +115,13 @@ interface Saved {
   presetBaseline: string | null;
   /** Whether the engine was running when the app last ran, so the next launch starts it again. */
   wasRunning: boolean;
+  /**
+   * A fresh install (nothing was saved at the first launch) whose first camera has not got its factory record yet
+   * (`seedFactory`). False for every save that already existed, so an upgrade never seeds.
+   */
+  factoryPending: boolean;
+  /** The first camera of a fresh install was picked while its formats could not be read: the factory capture is applied when they can be (`repairFreshSource`). */
+  factoryCapturePending: boolean;
   /** The live preview in the window; off saves the IPC and the CPU it costs. */
   previewOn: boolean;
   /** The region widths, the selected item (`ui.selected`) and whether Advanced is open. Ids in `selected` are saved with the chain. */
@@ -144,25 +156,30 @@ export interface EngineInfo {
 const STOPPED: EngineInfo = { state: "stopped", reason: null, kind: null, apps: [], appsMaybe: false };
 const isRunning = (e: EngineInfo) => e.state !== "stopped";
 
-const loadSaved = (): Saved => {
+/** What the store starts with: the save, else (nothing saved) the factory defaults of a fresh install. Exported for its test. */
+export const loadSaved = (): Saved => {
+  // Only a launch with nothing saved is a fresh install: it gets the factory defaults. Corrupt data keeps what it always got.
+  const first = !localStorage.getItem(STORAGE_KEY);
   const fresh: Saved = {
-    source: DEFAULT_SOURCE,
-    output: DEFAULT_OUTPUT,
+    source: first ? FACTORY_SOURCE : DEFAULT_SOURCE,
+    output: first ? FACTORY_OUTPUT : DEFAULT_OUTPUT,
     controls: {},
-    chain: defaultChain(),
+    chain: first ? defaultChain() : [],
     closeToTray: false,
     autostartDefaulted: false,
     nvidiaPromptDismissed: false,
     activePreset: null,
     presetBaseline: null,
     wasRunning: false,
+    factoryPending: first,
+    factoryCapturePending: false,
     previewOn: true,
     ui: DEFAULT_UI,
   };
   try {
     const s = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "");
     if (s && typeof s === "object") {
-      const chain = Array.isArray(s.chain) ? normalizeChain(s.chain) : fresh.chain;
+      const chain = Array.isArray(s.chain) ? normalizeChain(s.chain) : [];
       const ui = normalizeUi(s.ui);
       // A saved selection that names no filter of the chain is the Camera. (An old `collapsed` key is ignored.)
       const id = selectedFilterId(ui.selected);
@@ -177,6 +194,8 @@ const loadSaved = (): Saved => {
         activePreset: typeof s.activePreset === "string" ? s.activePreset : null,
         presetBaseline: typeof s.presetBaseline === "string" ? s.presetBaseline : null,
         wasRunning: s.wasRunning === true,
+        factoryPending: s.factoryPending === true,
+        factoryCapturePending: s.factoryCapturePending === true,
         previewOn: s.previewOn !== false,
         ui: id !== null && !chain.some((f) => f.id === id) ? { ...ui, selected: DEFAULT_UI.selected } : ui,
       };
@@ -373,16 +392,16 @@ interface State extends Saved {
   deletePreset: (name: string) => Promise<void>;
   /** Renames a preset file; the active preset follows. A refusal (the name is taken) is a toast. */
   renamePreset: (from: string, to: string) => Promise<void>;
-  /** Back to the defaults (no filters, the device default format, no changed controls, Better Cam auto and output at their defaults); the camera stays. One Undo. */
+  /** Back to the built-in defaults (`defaultState`: the default chain, the factory capture, Better Cam auto white balance, the factory output); the camera stays. One Undo. */
   resetAll: () => Promise<void>;
 }
 
 export const useStore = create<State>((set, get) => {
   const write = () => {
-    const { source, output, controls, chain, closeToTray, autostartDefaulted, nvidiaPromptDismissed, activePreset, presetBaseline, wasRunning, previewOn, ui } = get();
+    const { source, output, controls, chain, closeToTray, autostartDefaulted, nvidiaPromptDismissed, activePreset, presetBaseline, wasRunning, factoryPending, factoryCapturePending, previewOn, ui } = get();
     localStorage.setItem(
       STORAGE_KEY,
-      JSON.stringify({ source, output, controls, chain, closeToTray, autostartDefaulted, nvidiaPromptDismissed, activePreset, presetBaseline, wasRunning, previewOn, ui }),
+      JSON.stringify({ source, output, controls, chain, closeToTray, autostartDefaulted, nvidiaPromptDismissed, activePreset, presetBaseline, wasRunning, factoryPending, factoryCapturePending, previewOn, ui }),
     );
   };
   // A slider drag changes the state many times a second and each save serialises everything: saves are folded into one
@@ -530,13 +549,49 @@ export const useStore = create<State>((set, get) => {
     for (const c of cameras) camNames.set(vidPid(c.id) ?? linkKey(c.id), c.name);
     set({ cameras });
     const prev = get().source;
-    const next = repairSource(prev, cameras);
-    if (JSON.stringify(next) === JSON.stringify(prev)) return;
-    set({ source: next });
-    persist();
-    pushSource();
-    // The very first pick of a camera is no news; later changes are the camera not offering what was saved.
-    if (prev.video_device_id) say("Camera settings adjusted to what the camera offers");
+    const owed = get().factoryCapturePending;
+    const { source: next, capturePending } = repairFreshSource(prev, cameras, get().factoryPending, owed);
+    if (capturePending !== owed) set({ factoryCapturePending: capturePending });
+    if (JSON.stringify(next) !== JSON.stringify(prev)) {
+      set({ source: next });
+      persist();
+      pushSource();
+      // The very first pick of a camera, and the factory capture it was owed, are no news; other changes are the camera not offering what was saved.
+      if (prev.video_device_id && !owed) say("Camera settings adjusted to what the camera offers");
+    } else if (capturePending !== owed) {
+      persist();
+    }
+    await seedFactory();
+  };
+
+  /**
+   * A fresh install's first camera gets its factory record once: Better Cam auto white balance with no fixed value (only when
+   * the camera offers it, so it never freezes on one that does not) and the factory Better Cam auto settings. It waits for
+   * a camera whose controls can be read (not in use by another app), and does nothing for a save that already existed or a
+   * camera that already has a record.
+   */
+  const seedFactory = async () => {
+    if (!get().factoryPending) return;
+    const cam = selectedCam();
+    if (!cam) return;
+    const spent = () => {
+      set({ factoryPending: false });
+      persist();
+    };
+    if (findStored(get().controls, cam)) return spent();
+    let infos: ControlInfo[];
+    try {
+      infos = await api.getCameraControls(cam.id);
+    } catch {
+      return; // busy or not readable now: the next list tries again
+    }
+    // Something else may have happened meanwhile (a preset load, an edit of the controls, another camera).
+    if (!get().factoryPending || selectedCam()?.id !== cam.id) return;
+    if (findStored(get().controls, cam)) return spent();
+    set({ controls: withPresetCamera(get().controls, cam, factoryControls(infos), FACTORY_AUTO, false), factoryPending: false });
+    persistNow();
+    // The backend's record of the camera, so the next open (and the controls panel) follow it.
+    await api.setSource(runningSource(), record()).catch(fail);
   };
 
   let backgroundTimer: ReturnType<typeof setTimeout> | undefined;
@@ -810,7 +865,8 @@ export const useStore = create<State>((set, get) => {
     const before = get().source;
     const fixed = repairSource({ ...camera.capture, video_device_id: id }, cams);
     const reopens = CAPTURE_KEYS.some((k) => before[k] !== fixed[k]);
-    set({ source: fixed, controls, ...(reopens && get().inUse !== null && { inUse: null }) });
+    // A load, a reset or an Undo is the user's word on the camera: nothing of the factory start is owed any more.
+    set({ source: fixed, controls, factoryPending: false, factoryCapturePending: false, ...(reopens && get().inUse !== null && { inUse: null }) });
     persistNow();
     // Always, also while stopped or when the source is the same: it sets the backend's record of the camera's controls.
     await api.setSource(runningSource(), record()).catch(fail);
@@ -1348,6 +1404,11 @@ export const useStore = create<State>((set, get) => {
     },
 
     patchSource: (patch) => {
+      // An edit of the capture is the user's word: the factory capture is not owed any more (`repairFreshSource`).
+      if (get().factoryCapturePending && touchesCapture(patch)) {
+        set({ factoryCapturePending: false });
+        persist();
+      }
       const prev = get().source;
       // An edit of the camera fields while a fallback runs starts from what the fields show, and is the new choice.
       const next = savedAfterEdit(prev, get().inUse, patch);
