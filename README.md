@@ -8,15 +8,31 @@ React, and runs on Windows 11 only.
 
 - Capture settings: camera, resolution and frame rate, video format, color space and range, buffering, flip,
   rotation data, hardware decoding, and an option to turn the camera off when no app is using Better Cam.
-- Device controls: the controls the camera itself offers (brightness, exposure, focus, gain and so on), each with an
-  Auto switch where the camera has one.
-- Filters, in a chain you can reorder: Color Correction, Crop/Pad, Scaling/Aspect Ratio, Transform, Sharpen,
-  Apply LUT, Chroma Key, Color Key, Luma Key, Image Mask/Blend, Auto Adjust (automatic exposure and white
-  balance in software), and the NVIDIA filters Background Removal, Blur and Background Blur. The NVIDIA filters need
-  a GeForce RTX card and NVIDIA's Video Effects runtime (see Licence).
+- Camera controls: the controls the camera itself offers (brightness, exposure, focus, gain and so on). Exposure and
+  white balance each have three modes: Manual, Camera auto and Better Cam auto. Focus keeps its Auto switch.
+- Better Cam auto: the app sets the camera's exposure, gain and white balance itself, from the picture before the
+  filters. In dim light it keeps the frame rate you asked for, up to the most gain you allow, but gain adds noise.
+  You set the target brightness, the longest exposure, the most gain, the warmth and the response speed. It is offered
+  only on cameras that support manual exposure and white balance.
+- Filters, in a chain you can reorder by dragging a card and insert where you want: Color Correction, Crop/Pad,
+  Scaling/Aspect Ratio, Transform, Sharpen, Apply LUT, Chroma Key, Color Key, Luma Key, Image Mask/Blend, Auto Adjust,
+  and the NVIDIA filters Background Removal, Blur and Background Blur. The NVIDIA filters need a GeForce RTX card and
+  NVIDIA's Video Effects runtime (see Licence).
+- Auto Adjust: moves brightness, contrast, saturation, warmth and tint toward targets you set. Its white balance also
+  corrects warm light, such as an orange lamp.
+- Extension filters: WGSL or HLSL shaders, each in its own folder with an `extension.json`, in
+  `%APPDATA%\dev.bettercam.app\extensions`. Settings → Extensions lists them. Scripts, overlays and widgets are not
+  built yet.
 - Presets: save and load a filter chain by name. A preset holds the filters only, not the device controls.
 - Live preview and a line of stats (capture and output size and frame rate, latency, dropped and repeated frames).
+  The preview stays in view while the settings scroll, and a splitter sets the width of the two columns.
+- Preview tools: show the picture as it enters a chosen filter, and hold Compare to see the camera picture. An
+  eyedropper picks key colours from the preview (Chroma Key, Color Key). Crop/Pad can be edited on the picture: drag to
+  pan, mouse wheel to zoom.
+- Drop files from Explorer: a LUT, a picture or a preset (`.json`) onto a field, the chain or the window.
 - Output: resolution, frame rate, aspect, background color, and an option to also offer 720p and 360p.
+- Errors in plain words (codes stay in tooltips), and accessibility basics: a clear focus ring, larger switch targets
+  and readable small labels.
 - Launch on Windows startup and minimize to the tray.
 
 ## Build
@@ -44,7 +60,7 @@ The installer is not code-signed, so Windows SmartScreen warns before it runs.
 
 The camera is a DLL (`crates/vcam-source`) that Windows' Frame Server loads. The app writes frames to a file in
 `%ProgramData%\BetterCam`, and the DLL reads them. When Better Cam is not running, other apps see a "Better Cam is not
-running" picture.
+running" picture. The virtual camera waits on a signal from the app instead of polling, falling back to polling.
 
 Registering it needs administrator rights, once. `better-cam.exe --vcam-install --user-sid <SID>` does it and
 `better-cam.exe --vcam-uninstall` undoes it (no window; details in `%ProgramData%\BetterCam\logs\install.log`).
@@ -57,6 +73,21 @@ Registering it needs administrator rights, once. `better-cam.exe --vcam-install 
 - Development: the camera is installed from `target\release\better_cam_vcam.dll`.
 
 The camera belongs to one Windows account at a time: the account that installed or repaired it.
+
+## Known limits
+
+- Disconnect and stream errors read in plain words, but some codes stay in tooltips.
+- A program that holds the camera through DirectShow may show as "another app" instead of its name.
+- Only ffmpeg and test consumers were tested against the virtual camera. Discord, Chrome, Teams and Windows Camera are untested.
+- `autostartDefaulted` survives an uninstall, so a reinstall does not re-enable autostart.
+- Some settings are accepted but do nothing: Buffering, Apply rotation data, and the 2100 PQ and HLG color spaces.
+- NVIDIA filters need the engine on the NVIDIA adapter. There is no adapter switching.
+- Untested for real: GPU reset, Windows refusing camera access, a declined elevation prompt, uninstall while running,
+  first run on a new profile, the portable zip, a compressed drive, and the installer on another PC.
+- After a replug, video returns about 6.7 s after the camera is re-enabled (the camera itself needs 5.9 s).
+- Auto Adjust contrast lands slightly short on hard-edged pictures.
+- The camera's own white balance cannot go below 2800 K. Auto Adjust finishes the rest.
+- The installer is unsigned, so Windows SmartScreen warns before it runs.
 
 ## Licence
 
