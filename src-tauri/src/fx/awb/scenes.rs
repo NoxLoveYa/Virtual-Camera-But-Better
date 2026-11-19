@@ -90,30 +90,8 @@ pub fn luma(c: [f64; 3]) -> f64 {
     0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
 }
 
-/// The linear sRGB colour of a blackbody of `kelvin` with the luminance 1 (Kim et al.'s spline of the Planckian
-/// locus). A copy of `auto_adjust::blackbody_rgb` (private there; W2 makes that one `pub(crate)` and this one goes).
-pub fn blackbody_rgb(kelvin: f64) -> [f64; 3] {
-    let t = kelvin.clamp(1667.0, 25000.0);
-    let (t2, t3) = (t * t, t * t * t);
-    let x = if t <= 4000.0 {
-        -0.266_123_9e9 / t3 - 0.234_358_9e6 / t2 + 0.877_695_6e3 / t + 0.179_910
-    } else {
-        -3.025_846_9e9 / t3 + 2.107_037_9e6 / t2 + 0.222_634_7e3 / t + 0.240_390
-    };
-    let y = if t <= 2222.0 {
-        -1.106_381_4 * x * x * x - 1.348_110_20 * x * x + 2.185_558_32 * x - 0.202_196_83
-    } else if t <= 4000.0 {
-        -0.954_947_6 * x * x * x - 1.374_185_93 * x * x + 2.091_370_15 * x - 0.167_488_67
-    } else {
-        3.081_758_0 * x * x * x - 5.873_386_70 * x * x + 3.751_129_97 * x - 0.370_014_83
-    };
-    let (cx, cz) = (x / y, (1.0 - x - y) / y);
-    [
-        3.2406 * cx - 1.5372 - 0.4986 * cz,
-        -0.9689 * cx + 1.8758 + 0.0415 * cz,
-        0.0557 * cx - 0.2040 + 1.0570 * cz,
-    ]
-}
+/// The linear sRGB colour of a blackbody of `kelvin` with the luminance 1 (shared with Auto Adjust's warmth aim).
+pub(crate) use crate::fx::auto_adjust::blackbody_rgb;
 
 /// A reflectance: the 8-bit sRGB code of a surface under neutral light, decoded to linear.
 fn lin(code: [u8; 3]) -> [f64; 3] {
@@ -319,6 +297,33 @@ pub fn camera(cells: &[Cell], light: [f64; 3], k_set: f64) -> Stats {
         out[i] = [v[0] as f32, v[1] as f32, v[2] as f32, 1.0];
     }
     Stats { cells: out }
+}
+
+/// The same picture as [`camera`] as 8-bit sRGB RGBA pixels of `w x h` (both multiples of 16): cell `(x * 16 / w, y *
+/// 16 / h)` fills the pixel, with the 16-sub-sample texture as a 4 x 4 pattern over the pixels (a cell whose sides are
+/// multiples of 4 pixels has the texture's mean exactly) and the two highlight cells clipped. For the GPU tests, which
+/// feed it to the real statistics chain.
+pub fn picture(cells: &[Cell], light: [f64; 3], k_set: f64, (w, h): (u32, u32)) -> Vec<[u8; 4]> {
+    let cast = bb_ratio(light, k_set);
+    let raw: Vec<[f64; 3]> =
+        cells.iter().map(|c| [c.rho[0] * cast[0], c.rho[1] * cast[1], c.rho[2] * cast[2]]).collect();
+    let exposure = exposure_for(&raw, 0.45);
+    let tex = texture();
+    let code = |v: f64| (srgb_encode(v.clamp(0.0, 1.0)) * 255.0).round_ties_even() as u8;
+    let mut out = Vec::with_capacity((w * h) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y as usize * GRID / h as usize) * GRID + x as usize * GRID / w as usize;
+            let rgb = if HIGHLIGHTS.contains(&i) {
+                cast.map(|c| c * exposure * 3.0)
+            } else {
+                let t = tex[(x % 4 + 4 * (y % 4)) as usize];
+                raw[i].map(|c| c * exposure * t)
+            };
+            out.push([code(rgb[0]), code(rgb[1]), code(rgb[2]), 255]);
+        }
+    }
+    out
 }
 
 /// [`camera`] for a blackbody light of `t` kelvin.

@@ -968,6 +968,20 @@ export const showsStatus = (mode: ControlMode, s: { state: AutoState; handed_bac
 /** The line under the row: the backend's text, else nothing (`no_picture` has none before 10 s). */
 export const autoText = (s: { message: string | null }): string | null => (s.message && s.message.trim() ? s.message : null);
 
+/** The part of a chain filter the white balance row reads (structural: the store's `FilterCfg` fits). */
+export interface ChainFilterLike {
+  kind: string;
+  enabled: boolean;
+  params: Record<string, unknown>;
+}
+
+/**
+ * The Auto Adjust filter that is balancing white in `chain`, if any (docs/AUTO-WHITE-BALANCE.md 4). It finishes what the
+ * device loop leaves at the end of the camera's range, and its Warmth, not the device's, decides the final colour.
+ */
+export const autoAdjustWhiteBalance = <F extends ChainFilterLike>(chain: readonly F[]): F | undefined =>
+  chain.find((f) => f.kind === "auto_adjust" && f.enabled && f.params.white_balance === true);
+
 /** The frame-rate limit of the exposure loop: the longest whole stop that fits `fps` (2.5.2). */
 export const rateStop = (fps: number): number => Math.floor(Math.log2(0.95 / fps));
 

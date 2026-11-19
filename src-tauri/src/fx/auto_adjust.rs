@@ -29,16 +29,20 @@
 //! sensor noise. Highlights roll off with a soft shoulder (see `auto_adjust.hlsl`) instead of clipping.
 //!
 //! # White balance
-//! Gray world on the cells that tell something about the light: not near black, not near white and not strongly
-//! saturated (a smooth weight in each, so no cell flips the result by crossing a threshold). The gains make the mean of
-//! those cells grey, `g_c = Y / m_c`, normalised to keep the luma of the mean, and each is limited to `0.5 ..= 2`: a
-//! scene that really is one colour is corrected only part of the way. A small dead band holds the gains too.
+//! The light the picture is lit by is estimated by [`awb::estimate_light`], the estimator the device loop uses too
+//! (docs/AUTO-WHITE-BALANCE.md 3.1): a gray world that judges the cells *after* the correction (so a grey wall under
+//! an orange lamp counts and a blue shirt that tungsten turned grey does not), with a blackbody prior that keeps the
+//! tint to what lamps show and lowers the confidence for what looks like skin or a coloured wall instead of a cast.
+//! The gains take that light to the aim colour, keep the luma, and are scaled by the confidence in the log domain, so
+//! a picture of one colour is corrected only as far as the evidence goes. Each is limited to `0.25 ..= 4` (two stops:
+//! a 2700 K lamp on a camera at 4600 K needs blue x 3.3). The wanted gains come from the input alone, every frame,
+//! without state; a dead band of 0.8 % against the held gains stops hunting. A picture with nothing to measure (too
+//! dark, clear) holds the gains.
 //!
 //! # Warmth and tint
-//! `temperature` ("Warmth") and `tint` move where the white balance aims. Gray world wants the mean of the usable
-//! cells to be neutral; with an aim colour `t` (linear RGB with the luma 1, see [`white_aim`]) it wants the mean to
-//! have the colour of `t` instead: `g_c = Y t_c / m_c`, then the same limits and luma normalisation. `0 / 0` is the
-//! aim `[1, 1, 1]` and the old behaviour to the bit. Warmth is a colour temperature of the light the neutral surface
+//! `temperature` ("Warmth") and `tint` move where the white balance aims: the estimated light is taken to the aim
+//! colour `t` (linear RGB with the luma 1, see [`white_aim`]) instead of to gray. `0 / 0` is the aim `[1, 1, 1]`.
+//! Warmth is a colour temperature of the light the neutral surface
 //! seems to be lit by, linear in mireds from 5500 K (0) to 4000 K (+1, warmer: a neutral ends orange, about
 //! R : G : B = 1.25 : 0.96 : 0.63) or 7000 K (-1, cooler: it ends blue), blackbody colours in linear sRGB relative to
 //! 5500 K. Tint multiplies red and blue by `e^d` and green by `e^-2d` with `d = 0.045 tint`, so +1 leaves green 13 %
@@ -93,6 +97,7 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16G16B16A16_UNORM, DXGI_SAMPLE_DESC};
 
+use super::awb;
 use super::geometry::{pack_f32, Program};
 use super::{pb, pf, GpuFilter, Params};
 use crate::gpu::readback::{MappedPlane, PlaneDesc, ReadbackRing};
@@ -128,9 +133,10 @@ const CELLS: usize = GRID * GRID;
 /// The exposure gain limits (linear): two stops either way.
 const MIN_GAIN: f64 = 0.25;
 const MAX_GAIN: f64 = 4.0;
-/// The white balance gain limits per channel (linear).
-const MIN_WB: f64 = 0.5;
-const MAX_WB: f64 = 2.0;
+/// The white balance gain limits per channel (linear): two stops either way (decision D3, so that a 2700 K light on a
+/// camera at 4600 K, or a 2200 K bulb with the device at its 2800 K floor, can be corrected fully).
+const MIN_WB: f64 = 0.25;
+const MAX_WB: f64 = 4.0;
 /// Dead band of the exposure loop, in brightness units (the sRGB-coded scale of `target`).
 const EXPOSURE_BAND: f32 = 0.012;
 /// Dead band of the white balance loop, in natural-log units of the gain (0.8 %).
@@ -350,7 +356,7 @@ pub fn exposure_target(stats: &Stats, target: f32, ln_cur: f64) -> f64 {
 
 /// The linear sRGB colour of a blackbody of `kelvin` with the luminance 1 (Kim et al.'s cubic spline of the Planckian
 /// locus, 1667 K to 25000 K).
-fn blackbody_rgb(kelvin: f64) -> [f64; 3] {
+pub(crate) fn blackbody_rgb(kelvin: f64) -> [f64; 3] {
     let t = kelvin.clamp(1667.0, 25000.0);
     let (t2, t3) = (t * t, t * t * t);
     let x = if t <= 4000.0 {
@@ -400,54 +406,21 @@ pub fn white_aim(temperature: f32, tint: f32) -> [f32; 3] {
 }
 
 /// The wanted white balance gains (natural logarithms, red green blue) for the measured `stats`, given the gains
-/// `ln_cur` held now and the colour `aim` a neutral surface should get (see [`white_aim`]; `[1; 3]` is gray). A
-/// picture with nothing usable to measure gives `ln_cur`.
+/// `ln_cur` held now and the colour `aim` a neutral surface should get (see [`white_aim`]; `[1; 3]` is gray). The
+/// light is estimated by the shared [`awb::estimate_light`]; the gains take it to `aim`, scaled by the estimate's
+/// confidence in the log domain and limited to `MIN_WB ..= MAX_WB` per channel. They are computed from the input
+/// alone every frame (no state: the same picture gives the same target); `ln_cur` only sets the dead band. A picture
+/// with nothing to measure (too dark, clear, or every cell clipped) gives `ln_cur`.
 pub fn white_balance_target(stats: &Stats, ln_cur: [f64; 3], aim: [f32; 3]) -> [f64; 3] {
-    let mut total = 0.0f32;
-    let mut weight_sum = 0.0f32;
-    let mut sum = [0.0f32; 3];
-    for (i, c) in stats.cells.iter().enumerate() {
-        if c[3] < 0.02 {
-            continue;
-        }
-        let cw = centre_weight(i) * c[3];
-        total += cw;
-        let rgb = [c[0], c[1], c[2]];
-        let y = srgb_encode(luma(rgb));
-        let (mx, mn) = (
-            rgb[0].max(rgb[1]).max(rgb[2]),
-            rgb[0].min(rgb[1]).min(rgb[2]),
-        );
-        let saturation = if mx > 1e-4 { (mx - mn) / mx } else { 1.0 };
-        let w = cw
-            * smoothstep(0.04, 0.15, y)
-            * (1.0 - smoothstep(0.85, 0.97, y))
-            * (1.0 - smoothstep(0.55, 0.9, saturation));
-        weight_sum += w;
-        for k in 0..3 {
-            sum[k] += w * rgb[k];
-        }
-    }
-    if total <= 0.0 || weight_sum <= 0.0 {
+    let est = awb::estimate_light(stats);
+    if est.reason == awb::Reason::Dark || est.share <= 0.0 {
         return ln_cur;
     }
-    let confidence = f64::from(smoothstep(0.02, 0.12, weight_sum / total));
-    let mean = sum.map(|s| s / weight_sum);
-    if mean.iter().any(|m| *m < 1e-5) {
-        return ln_cur;
-    }
-    // Gray world: every channel of the mean to the luma of the mean times the aim, limited, then normalised to keep
-    // that luma.
-    let y = luma(mean);
-    let limit = |g: f32| g.clamp(MIN_WB as f32, MAX_WB as f32);
-    let raw = [0, 1, 2].map(|k| limit(y * aim[k] / mean[k]));
-    let keep = y / luma([raw[0] * mean[0], raw[1] * mean[1], raw[2] * mean[2]]);
+    let wanted = est.gains(aim, (MIN_WB, MAX_WB)).map(f64::ln);
     let mut out = ln_cur;
     for k in 0..3 {
-        let wanted = f64::from(limit(raw[k] * keep)).ln();
-        let delta = wanted - ln_cur[k];
-        let past_band = delta.signum() * (delta.abs() - WB_BAND).max(0.0);
-        out[k] = ln_cur[k] + confidence * past_band;
+        let delta = wanted[k] - ln_cur[k];
+        out[k] = ln_cur[k] + delta.signum() * (delta.abs() - WB_BAND).max(0.0);
     }
     out
 }

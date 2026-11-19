@@ -1,6 +1,6 @@
 # Auto white balance under warm light — analysis and plan
 
-Status: design; W1 (the shared estimator and the scene kit) and W3 (the device loop on it) built, section 6. Date: 2026-11-19. Owner report: "if I have an orange light, auto colouring does not
+Status: design; W1 (the shared estimator and the scene kit), W2 (Auto Adjust on it), W3 (the device loop on it) and W4 (the card) built, section 6. Date: 2026-11-19. Owner report: "if I have an orange light, auto colouring does not
 compensate well." Covers both places Better Cam balances colour:
 
 1. **Auto Adjust** (the filter): `src-tauri/src/fx/auto_adjust.rs`, `gpu/shaders/auto_adjust.hlsl`,
@@ -507,6 +507,75 @@ of 100, the test allows 50 µs). Mixed 5500 | 2700 K at split 8: daylight side �
   `…static_scene_with_sensor_noise…`, `…a_picture_at_target_and_neutral_is_left_alone`) unchanged or changed only as
   listed in 5.2. `npm run build` passes.
 
+**W2 built (2026-11-19).** Files: `fx/auto_adjust.rs`, `fx/auto_adjust/tests.rs`, `fx/awb/scenes.rs`. Not done:
+`src/filters/schema.ts` (the Auto Adjust Warmth hint "0 is neutral. Up keeps warm light a little warm, down cools."
+of section 4; the brief for this session did not cover that file, and per D1 the default stays 0, so it is a text
+change only).
+
+- `white_balance_target(stats, ln_cur, aim)` is `awb::estimate_light` plus `est.gains(aim, (0.25, 4.0))` (the
+  confidence is inside the gains, in the log domain), then the dead band `WB_BAND` against the held gains.
+  `MIN_WB = 0.25`, `MAX_WB = 4`. A picture whose reason is `Dark`, or where no cell survives the gates (`share = 0`: all
+  clipped, clear), holds `ln_cur`, as the old gate did. A one-colour picture with a low confidence is *not* held: its
+  target is the confidence-scaled correction, close to no correction, so a gain left over from a cast goes home.
+- The old gate, the weights and the private gray world are gone. `blackbody_rgb` is `pub(crate)` and `scenes.rs`
+  re-exports it (the device simulator uses `scenes::blackbody_rgb`). The module doc is rewritten. `StatsChain`, `Stats` and
+  the Better Cam auto meter are untouched.
+- `scenes::picture` (new, test only) renders a scene as 8-bit pixels for the GPU test.
+
+Steady state of the real `white_balance_target` plus `follow` (camera at 4600 K, neutral aim, residual in mired with
+`+` too orange / angle in degrees), from `fx::auto_adjust::tests::report`, and today's from `fx::awb::tests::report`:
+
+| Scene | | 2200 K | 2500 K | 2700 K | 3000 K | 4000 K | 5500 K | 6500 K |
+|---|---|---|---|---|---|---|---|---|
+| office | before | +185 / 31.3° | +134 / 25.9° | +58 / 13.5° | +20 / 5.0° | −14 / 3.5° | −27 / 6.6° | −29 / 7.1° |
+| | after | +88 / 19.4° | +14 / 3.6° | −2 / 0.9° | −3 / 1.1° | −2 / 1.0° | −5 / 1.2° | −6 / 1.4° |
+| grey_room | after | +88 / 19.4° | +14 / 3.7° | −4 / 1.3° | −5 / 1.6° | −4 / 1.4° | −7 / 1.9° | −7 / 1.9° |
+| closeup | before | +187 / 31.7° | +129 / 25.1° | +56 / 13.1° | +17 / 4.7° | −39 / 9.4° | −49 / 11.6° | −49 / 11.6° |
+| | after | +82 / 19.6° | +8 / 4.2° | −21 / 5.0° | −21 / 5.2° | −21 / 5.1° | −24 / 5.9° | −24 / 5.9° |
+| warm_room | after | +76 / 20.3° | +1 / 6.5° | −30 / 7.2° | −52 / 12.7° | −51 / 12.5° | −51 / 12.6° | −54 / 13.3° |
+
+(The numbers match 3.5 within about 2 mired: the dead band holds the gains up to 0.8 % short of the target.) "Before" of
+grey_room and warm_room are the held ones of 3.5.
+
+New tests in `fx/auto_adjust/tests.rs`:
+
+| Test | What it checks |
+|---|---|
+| `auto_adjust_the_target_is_the_shared_estimators_gains_within_the_dead_band` | the wiring: the target equals `est.gains(...)` to within `WB_BAND`, 4 scenes × 5 lights, inside `0.25 ..= 4` |
+| `auto_adjust_corrects_normal_scenes_from_2700_to_6500_k_and_the_gain_limit_is_4` | A1/A3/A4 on the real target and `follow`: ≤ 3° and ≤ 12 mired from 2700 K, ≤ +95 mired at 2200 K, ≤ 3° at 2200 K on a camera at 2800 K |
+| `auto_adjust_a_picture_of_one_colour_is_never_corrected_past_no_correction` | A6 on the real target (blue wall at 2700 K on 4600 K: 2° of slack, as in W1) |
+| `auto_adjust_white_balance_holds_on_a_dark_scene_and_a_clipped_one` | the holds |
+| `auto_adjust_white_balance_target_costs_microseconds` | CPU: median of 100 in the office at 2700 K, **15.7 µs**, limit 50 µs |
+| `auto_adjust_an_office_under_tungsten_goes_neutral_on_the_gpu` | the GPU case below |
+
+GPU case (WARP, the real `StatsChain`; 90 frames at 30 fps, exposure off so only the white balance moves): office
+rendered as **256 × 128** pixels (cells of 16 × 8; not 256 × 144, because 144 rows do not divide into whole 4 × 4
+texture blocks per cell and the 18 → 16 stage of the chain would blur across cells). The grey wall's mean colour,
+angle to the wall's own colour: 2700 K / 4600 K **28.9° at the start, 0.84° after** (limit 3°); 5500 K / 4600 K 8.6°
+at the start, **1.35°** after (limit 2°). The chain's `Stats` against the kit's: at most **0.0087** per channel at
+2700 K and 0.0071 at 5500 K, over the 0.003 of 5.2. The cause is the one of 2.7: the first stage's bilinear taps
+average neighbouring coded texels before decoding, and the test picture changes by up to 30 % from one pixel to the
+next, so bright channels read about 1 % under the kit's mean of decoded values. It is a property of the picture's
+pixel-level texture, not of the colour: the estimator's `t` from the chain and from the kit differs by **0.0006 and
+0.0002** (limit 0.0105, one mired), so the test bounds the channels at 0.01 and `t` at one mired.
+
+Speed: `PERF.md` has Auto Adjust at +0.018 ms GPU in the 1080p chain (0.292 → 0.310 ms) and, for exposure and white
+balance alone at 1080p, 0.029 ms after its sRGB-view change (0.060 ms at 4K). The existing cost test
+(`auto_adjust_costs_well_under_a_tenth_of_a_millisecond_at_1080p_with_everything_on`, RTX 5080, 1080p, everything on)
+measured exposure and white balance only **0.026 ms** GPU, the whole filter **0.060 ms** (limit 0.1), and the CPU time
+of a frame with the loop included **0.375 ms** with everything on against 0.120 ms with the defaults (limit: under 0.6 ms
+more). The shader and the chain did not change, so the GPU cost is the same as before the change; the added CPU is
+the estimator, 16 µs per measurement.
+
+Existing tests changed: only `auto_adjust_a_one_colour_picture_is_corrected_only_up_to_the_limits` (A13): the orange
+wall (200, 150, 110) is no longer lifted to the old limit of 2 (`held.wb[2] > 1.9`); the estimator reads it with a
+confidence below 1 (skin-or-wall side of the locus), so it asserts `conf < 1`, blue lifted past 1.2, R > B (not
+turned grey) and the gains in range. All others pass unchanged, including `…a_blue_cast_goes_neutral…`,
+`…both_corrections_together`, `…does_not_oscillate_over_300_frames`, `…a_static_scene_with_sensor_noise…`,
+`…a_picture_at_target_and_neutral_is_left_alone`, and `auto_adjust_the_white_balance_target` (it still holds that
+neutral stays neutral, a red wall is left alone, black holds, gains in range). `cargo test -p better-cam --lib fx::`:
+250 passed, 4 ignored; `auto_controls`: 96 passed; `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+
 ### W3 — Device meter and loop
 
 - **Goal:** 3.3: `measure_white_balance` on the shared estimator with `reason`; `NoSignal` texts by reason; `at_limit`
@@ -578,6 +647,23 @@ Other changes:
   so the three states (with Auto Adjust, without it, cool limit) are checked by feeding `auto-status` payloads to the
   card in `npm run tauri dev` (emitting a hand-made event from the devtools console; whether the frontend accepts one
   from there is unverified, otherwise use a small render test), with a screenshot of each. The live look comes in W5.
+
+**W4 built (2026-11-19).** Files: `src/components/AutoControls.tsx`, `src/camera/schema.ts` (the helper
+`autoAdjustWhiteBalance(chain)` and its type), `src/camera/schema.test.ts`. No new CSS (the lines are `.ctl-hint`, the
+button is `.link`, as under the exposure row); `src/styles.css` was not touched.
+
+- White balance sub-block: with the loop `at_limit` (warm or cool end), one line under the status: with an enabled Auto
+  Adjust that has white balance on in the chain, "Auto Adjust finishes the colour."; without it, "Add Auto Adjust to
+  finish the colour." and the **Add Auto Adjust** button (the store's `addFilter("auto_adjust")`, the exposure row's
+  pattern; the new filter has white balance on by default). Both carry `data-hint="finish-colour"`.
+- The old "Auto Adjust has a warmth of its own. Leave this one at 0 …" hint is gone. With Auto Adjust white balance on, the
+  sub-block says "Auto Adjust's warmth decides the final colour (+0.20)." (its own warmth, signed; `0` when 0).
+- Defaults: none changed (D1: warmth 0 in both places; `camera/schema.ts` `DEFAULT_AUTO.white_balance.warmth` is 0, now a test, and
+  a stored warmth is kept, also a test). The backend texts for `at_limit` are W3's.
+- Checks: `npm run build`, `npm run test:schema`, `npm run test:ui` pass. Not done: the CDP screenshots of the three
+  card states (with Auto Adjust, without it, cool limit): optional in the brief, and a real camera cannot reach `at_limit`
+  without a hand-made `auto-status` event. The three states are the three branches of one JSX expression, covered by
+  the unit test of `autoAdjustWhiteBalance` for the condition only; the rendering itself was **not** looked at.
 
 ### W5 — Owner live check and constants (needs the owner and a warm light)
 

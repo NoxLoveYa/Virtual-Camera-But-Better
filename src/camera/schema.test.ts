@@ -27,6 +27,7 @@ import {
   stripCodes,
   touchesCapture,
   autoAction,
+  autoAdjustWhiteBalance,
   autoCfgOf,
   autoTone,
   cameraIsSlow,
@@ -254,6 +255,15 @@ same(normalizeAutoCfg({ exposure: { target: 0.01 }, white_balance: { warmth: 9 }
 same(normalizeAutoCfg({ white_balance: { warmth: 9 } })!.white_balance.warmth, 1, "warmth clamped");
 same(normalizeAutoCfg({ exposure: { longest: 99 } })!.exposure.longest, "fit", "longest out of range: fit");
 same(normalizeAutoCfg("x"), undefined, "auto that is no object");
+same(DEFAULT_AUTO.white_balance.warmth, 0, "the default warmth stays neutral (AUTO-WHITE-BALANCE.md D1)");
+same(normalizeAutoCfg({ white_balance: { warmth: 0.25 } })!.white_balance.warmth, 0.25, "a stored warmth is kept");
+
+// The Auto Adjust that finishes the colour past the camera's warm end (AUTO-WHITE-BALANCE.md 4)
+const adjustOn = { kind: "auto_adjust", enabled: true, params: { exposure: true, white_balance: true, temperature: 0.2 } };
+same(autoAdjustWhiteBalance([{ kind: "blur", enabled: true, params: {} }, adjustOn]), adjustOn, "Auto Adjust with white balance on is found");
+same(autoAdjustWhiteBalance([]), undefined, "no Auto Adjust");
+same(autoAdjustWhiteBalance([{ ...adjustOn, enabled: false }]), undefined, "a disabled Auto Adjust does not finish anything");
+same(autoAdjustWhiteBalance([{ ...adjustOn, params: { white_balance: false } }]), undefined, "Auto Adjust with white balance off does not either");
 same(
   normalizeLearned({ gain_stops: 99, wb_alpha: 0, rate_caps: { "30": -99, x: 1, "60": "no" }, blocked: ["exposure", "gain", "exposure"], extra: 1 }),
   { gain_stops: 6, wb_alpha: 0.002, rate_caps: { "30": -16 }, blocked: ["exposure"] },

@@ -7,6 +7,7 @@ import {
   TARGET_MAX,
   TARGET_MIN,
   autoAction,
+  autoAdjustWhiteBalance,
   autoText,
   autoTone,
   cameraIsSlow,
@@ -240,11 +241,11 @@ export function CameraAutoHint({ info }: { info: ControlInfo }) {
 /** The settings, the hint and the status of Better Cam auto white balance, under the white balance row. */
 export function WhiteBalanceAuto({ ctx }: { ctx: AutoCtx }) {
   const setAutoConfig = useStore((s) => s.setAutoConfig);
+  const addFilter = useStore((s) => s.addFilter);
   const cfg = ctx.cfg.white_balance;
-  // Auto Adjust's warmth wins when it measures too: the device warmth should then stay at 0.
-  const adjustWarm = useStore((s) =>
-    s.chain.some((f) => f.kind === "auto_adjust" && f.enabled && f.params.white_balance === true && Number(f.params.temperature) !== 0),
-  );
+  // Auto Adjust finishes what is left past the end of the camera's range, and its warmth decides the final colour.
+  const adjust = useStore((s) => autoAdjustWhiteBalance(s.chain));
+  const adjustWarmth = adjust ? Number(adjust.params.temperature) || 0 : 0;
 
   return (
     <div className="ctl-sub" data-for="white_balance">
@@ -262,9 +263,18 @@ export function WhiteBalanceAuto({ ctx }: { ctx: AutoCtx }) {
       </Field>
       <ResponseField value={cfg.speed} onChange={(speed) => setAutoConfig({ white_balance: { speed } })} />
       <LoopStatus loop="white_balance" label="White balance" status={ctx.whiteBalance} live={ctx.live} />
-      {adjustWarm && cfg.warmth !== 0 && (
-        <p className="ctl-hint">Auto Adjust has a warmth of its own. Leave this one at 0 while Auto Adjust white balance is on.</p>
-      )}
+      {ctx.whiteBalance?.state === "at_limit" &&
+        (adjust ? (
+          <p className="ctl-hint" data-hint="finish-colour">Auto Adjust finishes the colour.</p>
+        ) : (
+          <p className="ctl-hint" data-hint="finish-colour">
+            Add Auto Adjust to finish the colour.
+            <button type="button" className="link" onClick={() => addFilter("auto_adjust")}>
+              Add Auto Adjust
+            </button>
+          </p>
+        ))}
+      {adjust && <p className="ctl-hint">Auto Adjust's warmth decides the final colour ({signed(adjustWarmth)}).</p>}
     </div>
   );
 }
