@@ -3473,7 +3473,9 @@ fn the_status_sentence_is_for_the_folder_around_it_or_for_repair() {
         assert!(
             said.text
                 .starts_with(&format!("The folder {logs} is encrypted (Windows EFS)"))
-                && said.text.contains("Run Repair")
+                && said.text.contains(
+                    "Close the apps that use the camera first, then run Repair: it replaces the folder with a new one that is not encrypted"
+                )
                 && said.repairable,
             "{said:?}"
         );
@@ -3567,6 +3569,8 @@ fn a_data_folder_made_in_this_run_and_encrypted_says_the_refusal_not_that_it_was
 #[test]
 fn a_folder_is_made_since_when_it_was_created_at_or_after_the_start() {
     let dir = std::env::temp_dir().join(format!("bc-made-since-{}", std::process::id()));
+    // a folder left by an earlier run with the same pid would have an older creation time
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let hour = Duration::from_secs(3600);
     let now = SystemTime::now();

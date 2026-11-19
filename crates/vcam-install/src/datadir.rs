@@ -1151,7 +1151,7 @@ fn encryption_problem_from(
     if is_encrypted(logs_attributes) {
         return Some(DataProblem {
             text: format!(
-                "The folder {} is encrypted (Windows EFS), so install.log and the other logs in it are encrypted for one account and the app may not be able to show later errors. Run Repair: it replaces the folder with a new one that is not encrypted.",
+                "The folder {} is encrypted (Windows EFS), so install.log and the other logs in it are encrypted for one account and the app may not be able to show later errors. Close the apps that use the camera first, then run Repair: it replaces the folder with a new one that is not encrypted (while an app still uses the folder, Repair can only empty it and it stays encrypted).",
                 paths.logs().display()
             ),
             repairable: true,

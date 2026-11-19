@@ -2,7 +2,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { CAPTURE_KEYS, effectiveSource, problemText } from "../camera/schema";
 import { useStore } from "../store";
-import { BLOCKED_REASON } from "./VcamBanner";
+
+/** The Install button's tooltip while the data folder is encrypted: the banner sits above the preview, not below it. */
+const PREVIEW_BLOCKED_REASON = "An administrator must turn off encryption first (see the banner above).";
 
 /** The preview frame of `src-tauri/src/preview.rs`: 16 header bytes (four little-endian u32), then RGBA pixels. */
 const HEADER_BYTES = 16;
@@ -301,7 +303,7 @@ export function Preview() {
           label: "Install",
           onClick: () => void runVcam("install"),
           disabled: vcamBusy !== null || vcamBlocked,
-          title: vcamBlocked ? BLOCKED_REASON : undefined,
+          title: vcamBlocked ? PREVIEW_BLOCKED_REASON : undefined,
         },
       };
     } else if (noCamera) ph = { text: "No camera found", action: { label: "Refresh", onClick: refresh } };
