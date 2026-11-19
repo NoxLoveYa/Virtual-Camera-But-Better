@@ -735,8 +735,8 @@ impl PreviewTap {
     }
 
     /// Whether this frame makes no picture: nobody sees it, the 30 fps slot has not come, or the last one is not out yet.
-    /// Takes the slot when it does not skip.
-    fn skip_frame(&mut self) -> bool {
+    /// Does not take the slot (see [`PreviewTap::skip_frame`]).
+    fn would_skip(&mut self, now: Instant) -> bool {
         if self.hidden.load(Ordering::Relaxed) || self.shared.is_closed() {
             // Nobody sees the picture: no GPU work, and the frames in the ring would be stale on return.
             for s in [self.ring.as_mut(), self.before.as_mut()].into_iter().flatten() {
@@ -746,13 +746,21 @@ impl PreviewTap {
             self.pacer.reset();
             return true;
         }
-        let now = Instant::now();
         if !self.pacer.due(now) {
             return true;
         }
         if self.busy() {
             // Not a frame the 30 fps limit would have dropped: counted, and the slot stays free for the next one.
             self.shared.skipped.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    /// [`PreviewTap::would_skip`], and takes the slot when it does not skip.
+    fn skip_frame(&mut self) -> bool {
+        let now = Instant::now();
+        if self.would_skip(now) {
             return true;
         }
         self.pacer.accept(now);
@@ -785,6 +793,12 @@ impl FrameTap for PreviewTap {
         if let Err(e) = self.capture(renderer, frame, capture_qpc) {
             self.complain(&e.to_string());
         }
+    }
+
+    /// The engine asks before it fits the camera picture: a frame this tap would skip costs no GPU pass. The slot is
+    /// taken by the `on_compare` (or `on_frame`) that follows.
+    fn wants_compare(&mut self) -> bool {
+        !self.would_skip(Instant::now())
     }
 
     fn on_compare(&mut self, renderer: &Renderer, before: &RgbaTexture, after: &RgbaTexture, capture_qpc: u64) {

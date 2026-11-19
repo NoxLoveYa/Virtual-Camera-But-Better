@@ -364,6 +364,14 @@ pub struct SourceUpdate {
 pub trait FrameTap: Send {
     fn on_frame(&mut self, renderer: &Renderer, frame: &RgbaTexture, capture_qpc: u64);
 
+    /// Asked once per frame while the preview point is [`PreviewPoint::Compare`], before the engine spends a GPU pass
+    /// on the camera picture: whether the tap makes a picture from this frame at all. A tap that says no gets no
+    /// `on_compare` (nor `on_frame`) for the frame. A tap that says yes may still get `on_frame` instead, when the
+    /// camera picture could not be made.
+    fn wants_compare(&mut self) -> bool {
+        true
+    }
+
     /// Instead of `on_frame` while the preview point is [`PreviewPoint::Compare`]: `before` is the camera picture and
     /// `after` the output frame, both fitted to the output size by the output stage. A tap that does not know the two
     /// picture mode takes the output, which is what `on_frame` gets in every other mode.
@@ -3884,6 +3892,31 @@ fn tap_compare(shared: &Shared, stop: &AtomicBool, renderer: &Renderer, before: 
     }
 }
 
+/// Whether the tap wants this frame as a Compare pair ([`FrameTap::wants_compare`]); false without a tap or while the
+/// session is being stopped. Same lock and stop rule as [`tap_frame`].
+fn tap_wants_compare(shared: &Shared, stop: &AtomicBool) -> bool {
+    match lock(&shared.tap).as_mut() {
+        Some(tap) if !stop.load(Ordering::Acquire) => tap.wants_compare(),
+        _ => false,
+    }
+}
+
+/// The result of the Compare "before" pass, which only the preview uses: an error in it is never the frame's. A lost
+/// device is still returned (the output stage fails on it too); any other error is said once (`failed`) and gives `None`,
+/// so the frame goes to the apps and the preview shows the output alone.
+fn compare_before<T>(pass: Result<T, GpuError>, failed: &mut bool) -> Result<Option<T>, GpuError> {
+    match pass {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.is_device_lost() => Err(e),
+        Err(e) => {
+            if !std::mem::replace(failed, true) {
+                eprintln!("[engine] compare: {e}");
+            }
+            Ok(None)
+        }
+    }
+}
+
 /// Tell the tap (the preview) the frame's readback is done ([`FrameTap::frame_done`]), under the same lock and stop rule
 /// as [`tap_frame`].
 fn tap_done(shared: &Shared, stop: &AtomicBool, wait: bool) {
@@ -4008,6 +4041,7 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
     // in the mailbox is gone, and the facts are this session's until it ends.
     let mut meter = crate::meter::Meter::new();
     let mut meter_failed = false;
+    let mut compare_failed = false;
     if !abandoned.load(Ordering::Acquire) {
         shared.meter.clear();
     }
@@ -4398,9 +4432,13 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                 fit: out_settings.fit,
                 background: out_settings.background.map(|c| c as f32 / 255.0),
             };
-            // Compare: the camera picture, fitted the way the output is, before the chain takes the frame.
-            let before = if point == PreviewPoint::Compare {
-                Some(stage.run(&rgba, &out_params)?)
+            // Compare: the camera picture, fitted the way the output is, before the chain takes the frame. Only when
+            // the tap wants this frame (the 30 fps slot, nothing still in flight), and a failure of the pass is the
+            // preview's, never the frame's: the apps get the output either way.
+            let compare = point == PreviewPoint::Compare;
+            let compare_wanted = compare && tap_wants_compare(shared, stop);
+            let before = if compare_wanted {
+                compare_before(stage.run(&rgba, &out_params), &mut compare_failed)?
             } else {
                 None
             };
@@ -4412,6 +4450,8 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
             // The output frame is the preview's picture unless a point showed it another one this frame.
             match &before {
                 Some(before) => tap_compare(shared, stop, renderer, before, &fitted, capture_qpc),
+                // Compare, but the tap does not want this frame: nothing for it.
+                None if compare && !compare_wanted => {}
                 None if !tapped => tap_frame(shared, stop, renderer, &fitted, capture_qpc),
                 None => {}
             }
@@ -5090,6 +5130,74 @@ mod tests {
         point_is(&rig, PreviewPoint::Output);
         assert!(file_spread(&rig).is_some_and(|s| s <= 4));
         assert_eq!(rig.opens(), 1, "no reopen");
+    }
+
+    /// A tap that wants no Compare frame: counts what it is shown anyway.
+    struct DecliningTap {
+        asked: Arc<AtomicU64>,
+        shown: Arc<AtomicU64>,
+    }
+
+    impl FrameTap for DecliningTap {
+        fn wants_compare(&mut self) -> bool {
+            self.asked.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+
+        fn on_frame(&mut self, _: &Renderer, _: &RgbaTexture, _: u64) {
+            self.shown.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn on_compare(&mut self, _: &Renderer, _: &RgbaTexture, _: &RgbaTexture, _: u64) {
+            self.shown.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A tap that declines the frame costs no "before" pass and gets nothing, and what the apps get is the same output
+    /// as ever (grey, frames keep coming, no error).
+    #[test]
+    fn compare_asks_the_tap_first_and_a_declined_frame_changes_nothing_for_apps() {
+        let rig = Rig::new("sm-compare-skip.bin", fast());
+        let _consumer = rig.consumer("sm-compare-skip.bin");
+        let (asked, shown) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        rig.engine
+            .send(Msg::SetTap(Some(Box::new(DecliningTap { asked: asked.clone(), shown: shown.clone() }))));
+        let chain = crate::fx::parse_chain(&serde_json::json!([
+            { "id": "g", "kind": "color_filter", "enabled": true, "params": { "saturation": -1 } }
+        ]))
+        .unwrap();
+        let file_spread = |rig: &Rig| -> Option<u8> {
+            let (w, h, _, buf) = latest(&rig.file)?;
+            let rgb = nv12_to_rgb(&buf, w, h, w as usize, ColorSpace::Bt709, ColorRange::Limited);
+            rgb.chunks(3).map(|p| p.iter().max().unwrap() - p.iter().min().unwrap()).max()
+        };
+        rig.engine.set_chain(chain);
+        rig.engine.set_preview_point(PreviewPoint::Compare);
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("the tap was asked", Duration::from_secs(10), |_| asked.load(Ordering::Relaxed) >= 15);
+        assert_eq!(rig.engine.preview_point(), PreviewPoint::Compare);
+        assert_eq!(shown.load(Ordering::Relaxed), 0, "a declined frame gets no picture of any kind");
+        rig.wait("grey frames for the app", Duration::from_secs(10), |r| file_spread(r).is_some_and(|s| s <= 4));
+        rig.wait("frames published", Duration::from_secs(10), |r| r.engine.stats().published >= 5);
+        let s = rig.engine.stats();
+        assert_eq!(s.errors, 0);
+        assert!(s.rendered >= s.published);
+        assert_eq!(shown.load(Ordering::Relaxed), 0);
+    }
+
+    /// The "before" pass is the preview's: a failure of it is said once, gives no picture, and is not an error of the
+    /// frame; only a lost device still is.
+    #[test]
+    fn a_failed_compare_before_pass_is_not_the_frames_error() {
+        let mut failed = false;
+        assert_eq!(compare_before(Ok(7), &mut failed).unwrap(), Some(7));
+        assert!(!failed);
+        assert_eq!(compare_before::<u8>(Err(GpuError::Invalid("no".into())), &mut failed).unwrap(), None);
+        assert!(failed, "said once");
+        assert_eq!(compare_before::<u8>(Err(GpuError::Invalid("again".into())), &mut failed).unwrap(), None);
+        let lost = GpuError::Api(windows::core::Error::from(windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED));
+        assert!(compare_before::<u8>(Err(lost), &mut failed).unwrap_err().is_device_lost());
     }
 
     #[test]

@@ -316,11 +316,39 @@ pub fn set_close_to_tray(state: State<AppState>, on: bool) {
 
 /// The file of preset `name` inside the presets folder `dir`; the name is checked (it becomes a file name).
 fn preset_file_in(dir: &std::path::Path, name: &str) -> Result<PathBuf, String> {
-    let ok = !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_'));
-    if !ok {
+    check_preset_name(name)?;
+    Ok(dir.join(format!("{name}.json")))
+}
+
+/// The longest preset name, in characters. The page limits the field to 40; this is the margin for names that came by
+/// another way, and it keeps the path well under the Windows limit.
+const PRESET_NAME_MAX_CHARS: usize = 64;
+
+/// Device names Windows keeps for itself: a file called `CON.json` is the console, not a file.
+const RESERVED_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2",
+    "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Whether `name` is a preset name the folder can hold: letters, digits, spaces, '-' and '_' (the page's `PRESET_NAME`
+/// rule) up to [`PRESET_NAME_MAX_CHARS`], not a Windows device name, and with no trailing space or dot (Windows drops
+/// those from a file name). The name never has a dot of its own, so the file `<name>.json` is the device `<name>` when
+/// `<name>` is one ("con.json" is the console too).
+fn check_preset_name(name: &str) -> Result<(), String> {
+    let chars_ok = !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_'));
+    if !chars_ok {
         return Err("preset names may only contain letters, digits, spaces, '-' and '_'".into());
     }
-    Ok(dir.join(format!("{name}.json")))
+    if name.chars().count() > PRESET_NAME_MAX_CHARS {
+        return Err(format!("preset names may be at most {PRESET_NAME_MAX_CHARS} characters long"));
+    }
+    if name.ends_with(' ') || name.ends_with('.') {
+        return Err("a preset name may not end with a space or a dot".into());
+    }
+    if RESERVED_NAMES.iter().any(|r| r.eq_ignore_ascii_case(name)) {
+        return Err(format!("\"{name}\" is a name Windows keeps for itself; pick another"));
+    }
+    Ok(())
 }
 
 /// The presets folder (created when missing).
@@ -335,7 +363,8 @@ fn preset_path(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
 }
 
 /// The names of the presets in `dir`, sorted: the `.json` files only, so the `.json.tmp` an interrupted save may leave
-/// behind is never listed.
+/// behind is never listed, and only names that pass [`check_preset_name`]: a file the page could list but not load,
+/// rename or delete (a dropped-in `a.b.json`, a very long name) stays out of the menu.
 fn list_in(dir: &std::path::Path) -> Result<Vec<String>, String> {
     let mut v: Vec<String> = std::fs::read_dir(dir)
         .map_err(|e| e.to_string())?
@@ -343,6 +372,7 @@ fn list_in(dir: &std::path::Path) -> Result<Vec<String>, String> {
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("json")))
         .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .filter(|stem| check_preset_name(stem).is_ok())
         .collect();
     v.sort();
     Ok(v)
@@ -406,15 +436,21 @@ fn preset_from_file(content: serde_json::Value) -> Result<serde_json::Value, Str
     }
 }
 
-/// Writes `preset` to `path` without a moment in which the file is half written: the text goes to `<file>.tmp`, which
-/// then replaces the file (a rename over an existing file replaces it on Windows).
+/// Writes `preset` to `path` without a moment in which the file is half written: the text goes to `<file>.tmp` and is
+/// synced to the disk, and then replaces the file (a rename over an existing file replaces it on Windows). The `.tmp`
+/// is removed when the write or the rename fails.
 fn write_atomic(path: &std::path::Path, preset: &serde_json::Value) -> Result<(), String> {
+    use std::io::Write;
     let json = serde_json::to_string_pretty(preset).map_err(|e| e.to_string())?;
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| {
+    let written = std::fs::File::create(&tmp).and_then(|mut f| {
+        f.write_all(json.as_bytes())?;
+        // Without this, a power loss after the rename can leave the new name on an empty file.
+        f.sync_all()
+    });
+    written.and_then(|()| std::fs::rename(&tmp, path)).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         e.to_string()
     })
@@ -427,8 +463,12 @@ pub fn save_preset(app: AppHandle, name: String, preset: serde_json::Value) -> R
 
 #[tauri::command]
 pub fn load_preset(app: AppHandle, name: String) -> Result<serde_json::Value, String> {
-    let s = std::fs::read_to_string(preset_path(&app, &name)?).map_err(|e| e.to_string())?;
-    preset_from_file(serde_json::from_str(&s).map_err(|e| e.to_string())?)
+    load_in(&presets_dir(&app)?, &name)
+}
+
+/// Preset `name` of `dir`: the same read as a dropped file, so the same 1 MiB cap.
+fn load_in(dir: &std::path::Path, name: &str) -> Result<serde_json::Value, String> {
+    read_preset_at(&preset_file_in(dir, name)?)
 }
 
 #[tauri::command]
@@ -720,6 +760,87 @@ mod tests {
         std::fs::write(dir.0.join("gamma.json.tmp"), "{").unwrap();
         std::fs::write(dir.0.join("notes.txt"), "x").unwrap();
         assert_eq!(list_in(&dir.0).unwrap(), vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn a_failed_save_leaves_no_temp_file() {
+        let dir = TempDir::new("save-preset-fails");
+        let preset = preset_to_write(&json!({ "chain": [] })).unwrap();
+        // The rename fails when the target is a folder: the temp file written before it must go.
+        let target = dir.0.join("taken.json");
+        std::fs::create_dir(&target).unwrap();
+        assert!(write_atomic(&target, &preset).is_err());
+        assert!(!dir.0.join("taken.json.tmp").exists());
+        assert!(target.is_dir(), "the folder is untouched");
+        // The temp file cannot be made at all (no such folder): an error, nothing left.
+        let missing = dir.0.join("no-such-folder").join("x.json");
+        assert!(write_atomic(&missing, &preset).is_err());
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn preset_names_are_checked_before_they_become_file_names() {
+        let dir = std::path::Path::new("presets");
+        for ok in ["studio", "Studio light", "a-b_c", "Überlicht 2", "con1", "COM10", "LPT0", "console", "nulled"] {
+            assert!(preset_file_in(dir, ok).is_ok(), "{ok}");
+        }
+        // The characters the page allows, and nothing else.
+        for bad in ["", "a/b", "a\\b", "..", "../x", "a.b", "a:b", "a*", "a\"b", "x\0y"] {
+            assert!(preset_file_in(dir, bad).is_err(), "{bad:?}");
+        }
+        // Windows device names, whatever the case.
+        for name in ["CON", "con", "Prn", "AUX", "nul", "NUL", "COM1", "com9", "LPT1", "lpt9"] {
+            let err = preset_file_in(dir, name).unwrap_err();
+            assert!(err.contains("Windows keeps for itself"), "{name}: {err}");
+        }
+        for n in 1..=9 {
+            assert!(preset_file_in(dir, &format!("COM{n}")).is_err());
+            assert!(preset_file_in(dir, &format!("lpt{n}")).is_err());
+        }
+        // Names with an extension are device names too: the dot is refused outright.
+        assert!(preset_file_in(dir, "con.txt").is_err());
+        assert!(preset_file_in(dir, "NUL.").is_err());
+        // Trailing dots and spaces (Windows drops them from a file name).
+        assert!(preset_file_in(dir, "studio ").unwrap_err().contains("end with"));
+        assert!(preset_file_in(dir, "studio.").is_err());
+        assert!(preset_file_in(dir, "con ").is_err());
+        // The length limit counts characters, not bytes.
+        assert!(preset_file_in(dir, &"a".repeat(PRESET_NAME_MAX_CHARS)).is_ok());
+        assert!(preset_file_in(dir, &"ü".repeat(PRESET_NAME_MAX_CHARS)).is_ok());
+        assert!(preset_file_in(dir, &"a".repeat(PRESET_NAME_MAX_CHARS + 1)).unwrap_err().contains("at most 64"));
+        // Every command that takes a name goes through the same check.
+        assert!(rename_in(dir, "ok", "AUX").is_err());
+        assert!(load_in(dir, "COM1").is_err());
+    }
+
+    #[test]
+    fn loading_a_preset_by_name_caps_the_size() {
+        let dir = TempDir::new("load-preset-big");
+        write_preset_named(&dir, "small", &json!({ "chain": [] }));
+        assert_eq!(load_in(&dir.0, "small").unwrap(), json!({ "app": "better-cam", "version": 1, "chain": [] }));
+        let padding = " ".repeat(PRESET_FILE_MAX_BYTES as usize - 1);
+        std::fs::write(dir.0.join("big.json"), format!("[]{padding}")).unwrap();
+        assert!(load_in(&dir.0, "big").unwrap_err().contains("too big"));
+        assert!(load_in(&dir.0, "missing").unwrap_err().contains("could not read"));
+    }
+
+    #[test]
+    fn the_list_leaves_out_names_that_cannot_be_used() {
+        let dir = TempDir::new("list-bad-names");
+        write_preset_named(&dir, "good", &json!({ "chain": [] }));
+        let body = "{\"chain\":[]}";
+        // Stems the page could list but not load, rename or delete.
+        for stem in ["a.b", "con", "NUL", "COM3", "trailing ", "semi;colon", "dot.dot.dot"] {
+            // (some of these cannot be made by name on every system; the ones that can are the test)
+            let _ = std::fs::write(dir.0.join(format!("{stem}.json")), body);
+        }
+        let long = "x".repeat(PRESET_NAME_MAX_CHARS + 1);
+        std::fs::write(dir.0.join(format!("{long}.json")), body).unwrap();
+        assert_eq!(list_in(&dir.0).unwrap(), vec!["good".to_string()]);
+        // What is listed can be loaded.
+        for name in list_in(&dir.0).unwrap() {
+            assert!(load_in(&dir.0, &name).is_ok());
+        }
     }
 
     #[test]
