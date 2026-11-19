@@ -107,6 +107,23 @@ export function letterbox(box: { width: number; height: number }, canvas: { widt
 }
 
 /**
+ * The point on the tapped picture under a pointer, in source pixels and not rounded: 0 to the source size, edges included, clamped to
+ * the picture (the crop handles: a window edge may lie on the right or bottom edge, which no pixel index reaches).
+ */
+export function toSourceEdge(
+  clientX: number,
+  clientY: number,
+  box: Rect,
+  canvas: { width: number; height: number },
+  source: { width: number; height: number },
+): { x: number; y: number } {
+  const { s, ox, oy } = letterbox(box, canvas);
+  const cx = Math.min(Math.max((clientX - box.left - ox) / s, 0), canvas.width);
+  const cy = Math.min(Math.max((clientY - box.top - oy) / s, 0), canvas.height);
+  return { x: (cx * source.width) / canvas.width, y: (cy * source.height) / canvas.height };
+}
+
+/**
  * The pixel of the tapped picture under a pointer at (`clientX`, `clientY`), for the eyedropper and the crop handles, from the
  * box's rect `box`, the canvas size (the header's width and height) and the source size (the header's `source*`).
  * `null` when the pointer is in the letterbox, outside the picture; with `clamp` (a drag under way) it is the nearest edge pixel.

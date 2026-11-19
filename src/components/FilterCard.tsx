@@ -5,6 +5,7 @@ import { defOf, extIdOf, extOf, isExtKind, labelOf, type ExtensionInfo, type Par
 import { AddHere } from "./AddFilter";
 import { Icon } from "./Icon";
 import { ParamField } from "./ParamField";
+import { toolBlock, toolOf } from "../ui/previewTool";
 import { moveWithFocus, type ChainHandlers, type DragView } from "../ui/useChainDrag";
 
 /**
@@ -42,9 +43,13 @@ export const FilterCard = memo(function FilterCard({ id, dragMode: mode, reorder
   const gpu = useStore((s) => s.gpu);
   const gpuRead = useStore((s) => s.gpuRead);
   const nvidia = useStore((s) => s.nvidia);
+  // The preview tool running for this card (eyedropper or crop frame), and why none can start now (a tooltip), if so.
+  const tool = useStore((s) => (s.previewTool?.filter === id ? s.previewTool.kind : null));
+  const toolBlocked = useStore((s) => toolBlock({ previewOn: s.previewOn, state: s.engine.state, paused: s.paused }));
   // One function for the life of the card, so the fields that did not change do not render.
   const onChange = useCallback((key: string, value: ParamValue) => act().setParam(id, key, value), [id]);
   if (!filter) return null;
+  const toolKind = toolOf(filter.kind);
   // `def` is missing for an extension that is not installed or failed to load: the card keeps its settings and says why.
   const def = defOf(filter.kind, extensions);
   const label = labelOf(filter.kind, extensions);
@@ -67,7 +72,7 @@ export const FilterCard = memo(function FilterCard({ id, dragMode: mode, reorder
 
   return (
     <li
-      className={`step${filter.enabled ? " on" : ""}${movable ? " movable" : ""}${mode === "pointer" ? " dragging" : ""}${mode === "keyboard" ? " lifted" : ""}`}
+      className={`step${filter.enabled ? " on" : ""}${movable ? " movable" : ""}${mode === "pointer" ? " dragging" : ""}${mode === "keyboard" ? " lifted" : ""}${tool ? " tooling" : ""}`}
       data-filter-id={id}
       onKeyDown={(e) => reorder.onCardKeyDown(e, id)}
     >
@@ -155,6 +160,33 @@ export const FilterCard = memo(function FilterCard({ id, dragMode: mode, reorder
               </p>
             )}
           </>
+        )}
+        {toolKind && !folded && !needs && (
+          <div className="card-tool">
+            <button
+              type="button"
+              aria-pressed={tool !== null}
+              disabled={tool === null && toolBlocked !== null}
+              title={
+                tool !== null
+                  ? toolKind === "pick"
+                    ? "Stop picking"
+                    : "Finish editing on the picture"
+                  : (toolBlocked ??
+                    (toolKind === "pick"
+                      ? "Click the backdrop in the preview to use its colour as the key colour"
+                      : "Show the picture before this filter with a frame to drag: handles move the edges, inside pans, the wheel zooms"))
+              }
+              onClick={() => (tool !== null ? act().endPreviewTool() : act().startPreviewTool(toolKind, id))}
+            >
+              {toolKind === "pick" ? (tool !== null ? "Cancel pick" : "Pick from preview") : tool !== null ? "Done" : "Edit on picture"}
+            </button>
+            {tool !== null && (
+              <small className="pf-hint" role="status">
+                {toolKind === "pick" ? "Click the backdrop in the preview. Esc cancels." : "Drag the frame in the preview. Esc finishes."}
+              </small>
+            )}
+          </div>
         )}
         {def && def.params.length > 0 && !folded && (
           <div className={`params${def.layout ? ` layout-${def.layout}` : ""}`}>

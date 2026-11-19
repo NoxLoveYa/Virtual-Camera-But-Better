@@ -4,6 +4,10 @@ import { CAPTURE_KEYS, effectiveSource, problemText } from "../camera/schema";
 import { useStore } from "../store";
 import { labelOf } from "../filters/schema";
 import { HEADER_BYTES, NOT_HELD, holdStep, isHeld, pointLabel, readHeader, type FrameHeader, type HoldEvent } from "../ui/previewFrame";
+import { lastFrame } from "../ui/lastFrame";
+import { sourceChange, type SourceSize } from "../ui/previewTool";
+import { CropOverlay } from "./CropOverlay";
+import { PickOverlay } from "./PickOverlay";
 
 /** The Install button's tooltip while the data folder is encrypted: the banner sits above the preview, not below it. */
 const PREVIEW_BLOCKED_REASON = "An administrator must turn off encryption first (see the banner above).";
@@ -153,11 +157,20 @@ export function Preview() {
   const applied = useRef("");
   const busy = useRef(false);
   const dirty = useRef(false);
+  // The source size of the frames since a tool began: a camera reopened at another size ends the tool (the picture it works on is gone).
+  const toolSource = useRef<SourceSize | null>(null);
 
   const onFrame = useCallback((buf: ArrayBuffer, mine: number) => {
     if (mine !== gen.current) return;
     const header = readHeader(buf);
     if (!header) return;
+    lastFrame.set(buf, header);
+    const { previewTool, endPreviewTool } = useStore.getState();
+    if (previewTool) {
+      const seen = sourceChange(toolSource.current, { w: header.sourceWidth, h: header.sourceHeight }, previewTool.since, performance.now());
+      toolSource.current = seen.next;
+      if (seen.changed) endPreviewTool();
+    } else toolSource.current = null;
     try {
       const canvas = canvasRef.current;
       if (canvas) {
@@ -247,9 +260,15 @@ export function Preview() {
   // does not blink out. Any other state drops it, and so does another camera: a stale picture never stays up.
   const keepFrame = previewOn && (state === "live" || (state === "standby" && reason === "reopening"));
   useEffect(() => {
-    if (!keepFrame) setShown(false);
+    if (!keepFrame) {
+      setShown(false);
+      lastFrame.clear();
+    }
   }, [keepFrame]);
-  useEffect(() => setShown(false), [deviceId]);
+  useEffect(() => {
+    setShown(false);
+    lastFrame.clear();
+  }, [deviceId]);
 
   // The engine announces a reopen a moment after the edit (it gathers edits first). The preview says so at once: a change
   // to the capture settings of a live camera is "applying" until the engine has left live and come back (or 5 s pass).
@@ -353,9 +372,15 @@ export function Preview() {
   const point = useStore((s) => s.previewPoint);
   const caption = showing ? pointLabel(point, chain.map((f) => ({ id: f.id, label: labelOf(f.kind, extensions) }))) : null;
 
+  // A tool (eyedropper, crop frame) works on a live picture: when it stops showing (paused, reopened, stopped), the tool is over.
+  const tool = useStore((s) => s.previewTool);
+  useEffect(() => {
+    if (!showing && useStore.getState().previewTool) useStore.getState().endPreviewTool();
+  }, [showing]);
+
   return (
     <section className="panel preview" aria-label="Preview">
-      <div className="preview-box" ref={boxRef}>
+      <div className={`preview-box${tool ? " has-tool" : ""}`} ref={boxRef}>
         <canvas ref={canvasRef} className={`preview-canvas${canvasClass}`} role="img" aria-label="Camera preview" />
         {ph && (
           <div className="preview-ph" title={ph.title}>
@@ -372,6 +397,8 @@ export function Preview() {
             </div>
           </div>
         )}
+        {showing && tool?.kind === "pick" && <PickOverlay key={tool.filter} boxRef={boxRef} filter={tool.filter} />}
+        {showing && tool?.kind === "crop" && <CropOverlay key={tool.filter} boxRef={boxRef} filter={tool.filter} />}
         <div className="preview-bar">
           {showing ? (
             <span className="preview-fps" title="Frames drawn per second">
@@ -385,8 +412,8 @@ export function Preview() {
               type="button"
               className="preview-compare"
               aria-pressed={held}
-              disabled={!showing}
-              title={showing ? COMPARE_HINT : "Nothing to compare: the camera picture is not showing"}
+              disabled={!showing || tool !== null}
+              title={tool !== null ? "Finish the pick or the crop first" : showing ? COMPARE_HINT : "Nothing to compare: the camera picture is not showing"}
               onPointerDown={(e) => {
                 if (e.button !== 0) return;
                 e.currentTarget.setPointerCapture(e.pointerId);

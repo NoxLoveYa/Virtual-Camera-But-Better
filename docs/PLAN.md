@@ -545,7 +545,7 @@ can use it.
   window is visible (`document.visibilityState`) and the preview is on.
 - Backpressure: the sender keeps one frame in flight; JS acknowledges by calling `preview_ack`. New frames
   overwrite the pending one.
-- Payload: 16-byte header (width, height, stride, frame number) + pixels.
+- Payload: 24-byte header (width, height, stride, frame number, `source_width`, `source_height`) + pixels.
 - Upgrade path if profiling shows the copy matters: the WebView2 shared buffer, same JS drawing code.
 
 ### 4.5 Filter architecture

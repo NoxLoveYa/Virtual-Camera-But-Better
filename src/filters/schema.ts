@@ -281,7 +281,7 @@ const CATALOGUE = {
       { type: "bool", key: "saturation", label: "Auto saturation", def: false },
       { type: "slider", key: "target_saturation", label: "Target saturation", min: 0.05, max: 0.5, step: 0.01, def: 0.2, showIf: { key: "saturation", in: [true] }, hint: "Colour strength: 0.05 gray, 0.5 vivid" },
       { type: "bool", key: "white_balance", label: "Auto white balance", def: true },
-      { type: "slider", key: "temperature", label: "Warmth", min: -1, max: 1, step: 0.01, def: 0, showIf: { key: "white_balance", in: [true] }, hint: "Aim for an orange (up) or blue (down) cast" },
+      { type: "slider", key: "temperature", label: "Warmth", min: -1, max: 1, step: 0.01, def: 0, showIf: { key: "white_balance", in: [true] }, hint: "0 is neutral. Up keeps warm light a little warm, down cools." },
       { type: "slider", key: "tint", label: "Tint", min: -1, max: 1, step: 0.01, def: 0, showIf: { key: "white_balance", in: [true] }, hint: "Aim toward magenta (up) or green (down)" },
       { type: "slider", key: "strength", label: "Strength", min: 0, max: 1, step: 0.01, def: 1 },
       { type: "slider", key: "speed", label: "Adaptation speed", min: 0.05, max: 1, step: 0.01, def: 0.3 },

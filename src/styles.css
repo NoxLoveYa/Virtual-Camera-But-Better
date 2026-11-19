@@ -621,6 +621,32 @@ button.preview-compare { height: 24px; padding: 0 10px; background: rgba(9, 11, 
 button.preview-compare[aria-pressed="true"] { color: var(--accent); border-color: rgba(46, 230, 214, 0.55); background: var(--accent-soft); box-shadow: var(--glow-soft); }
 /* What the picture is while a point other than the output is set ("Before", or the step a gesture edits). */
 .preview-caption { position: absolute; left: 8px; bottom: 8px; max-width: calc(100% - 16px); padding: 2px 8px; color: var(--text); font-size: 11px; background: rgba(9, 11, 14, 0.72); border: 1px solid rgba(46, 230, 214, 0.55); border-radius: var(--r); pointer-events: none; }
+/* Preview tools (L2 eyedropper, L3 crop frame): a layer over the picture, under the bar and the caption. The card that owns the tool takes the accent. */
+.step.tooling .card { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent), var(--glow-soft); }
+.card-tool { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 12px; margin: 8px 0 2px; }
+.card-tool .pf-hint { color: var(--dim); }
+.card-tool button[aria-pressed="true"] { color: var(--accent); border-color: rgba(46, 230, 214, 0.55); background: var(--accent-soft); }
+/* The bar's chips sit over the picture's top corners, where a handle or a pick may be: while a tool runs the bar steps aside (Esc or Done first). */
+.preview-box.has-tool .preview-bar { visibility: hidden; }
+.pick-overlay, .crop-overlay { position: absolute; inset: 0; overflow: hidden; touch-action: none; user-select: none; }
+.pick-overlay { cursor: crosshair; }
+.crop-overlay { outline: none; }
+.crop-overlay:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
+.tool-hint, .crop-readout { position: absolute; padding: 2px 8px; color: var(--text); font-size: 11px; background: rgba(9, 11, 14, 0.72); border: 1px solid var(--line); border-radius: var(--r); pointer-events: none; }
+.tool-hint { left: 50%; top: 8px; transform: translateX(-50%); white-space: nowrap; max-width: calc(100% - 16px); overflow: hidden; text-overflow: ellipsis; }
+/* Above the caption (bottom left), so the two never run into each other on a narrow preview. */
+.crop-readout { left: 8px; bottom: 34px; font-variant-numeric: tabular-nums; }
+.pick-swatch { position: absolute; display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px 3px 4px; color: var(--text); font-size: 11px; font-variant-numeric: tabular-nums; background: rgba(9, 11, 14, 0.86); border: 1px solid var(--line-strong); border-radius: var(--r); pointer-events: none; }
+.pick-swatch i { width: 18px; height: 18px; border: 1px solid rgba(255, 255, 255, 0.4); border-radius: 2px; }
+.crop-picture { position: absolute; box-sizing: border-box; border: 1px dashed rgba(255, 255, 255, 0.3); pointer-events: none; }
+/* The window: what stays; the rest of the picture is dimmed by the shadow (the overlay clips it). A padded edge is dashed, and its handle hollow. */
+.crop-window { position: absolute; box-sizing: border-box; border: 2px solid var(--accent); box-shadow: 0 0 0 9999px rgba(5, 7, 10, 0.55); pointer-events: none; }
+.crop-window.pad-l { border-left-style: dashed; }
+.crop-window.pad-t { border-top-style: dashed; }
+.crop-window.pad-r { border-right-style: dashed; }
+.crop-window.pad-b { border-bottom-style: dashed; }
+.crop-handle { position: absolute; width: 10px; height: 10px; margin: -5px 0 0 -5px; box-sizing: border-box; background: var(--accent); border: 1px solid #05070a; border-radius: 2px; pointer-events: none; }
+.crop-handle.padded { background: transparent; border: 2px solid var(--accent); }
 /* Camera controls */
 .card.controls { grid-column: auto; }
 .card.controls .card-head .ghost { display: inline-flex; align-items: center; gap: 6px; }

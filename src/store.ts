@@ -5,6 +5,9 @@ import { normalizeChain, presetChain, refreshExtParams, signature } from "./filt
 import { presetNameFor, stemOf } from "./ui/fileDrop";
 import { DEFAULT_UI, normalizeUi, type UiState } from "./ui/layout";
 import { pointFilter, samePoint, type PreviewPoint } from "./ui/previewFrame";
+import { toolBlock, toolOf, type PreviewTool } from "./ui/previewTool";
+import { keyColorOf } from "./ui/eyedropper";
+import { colorToHex, toColorInt } from "./filters/values";
 import { createSaver } from "./ui/saver";
 import { createReadGate, wantsVcamPoll } from "./ui/vcamPoll";
 import {
@@ -89,7 +92,7 @@ interface Saved {
 }
 
 /** What "Undo" restores after loading a preset or resetting. */
-interface Snapshot {
+export interface Snapshot {
   chain: FilterCfg[];
   activePreset: string | null;
   presetBaseline: string | null;
@@ -185,6 +188,8 @@ interface State extends Saved {
   filterStatus: Record<string, string>;
   /** The picture the preview shows (see `setPreviewPoint`); `null` is the output. Not saved. */
   previewPoint: PreviewPoint;
+  /** The eyedropper or the crop frame while one runs (L2, L3): it owns `previewPoint` and ends when the point goes. Not saved. */
+  previewTool: PreviewTool | null;
   presets: string[];
   /** The extensions the app found (Settings → Extensions); empty until `extensionsRead`. Not saved: the folder is the truth. */
   extensions: ExtensionInfo[];
@@ -276,6 +281,21 @@ interface State extends Saved {
    * the window is hidden. The output to apps never changes. Not saved.
    */
   setPreviewPoint: (point: PreviewPoint) => void;
+  /**
+   * Starts the eyedropper (`pick`, on a Chroma Key or Color Key card) or the crop frame (`crop`, on a Crop/Pad card) for one card: the
+   * preview shows the picture entering it. Ends the tool that ran before. Does nothing while the preview does not show the live camera.
+   */
+  startPreviewTool: (kind: PreviewTool["kind"], filter: string) => void;
+  /** Ends the tool and puts the preview back to the output. */
+  endPreviewTool: () => void;
+  /** The eyedropper's pick: the card's key colour (alpha byte kept), its type "custom", one Undo; ends the tool. */
+  applyPickedColor: (id: string, rgb: readonly [number, number, number]) => void;
+  /** Several params of one card in one change (a crop gesture): no toast; the gesture's end says it with `sayUndo`. */
+  setParams: (id: string, patch: Record<string, ParamValue>) => void;
+  /** The chain as it is now, for `sayUndo` when a gesture is over. */
+  checkpoint: () => Snapshot;
+  /** A toast with an Undo that restores `before`. */
+  sayUndo: (text: string, before: Snapshot) => void;
   /** Remembers the column split or a panel's fold (see `Saved.ui`). */
   setUi: (patch: Partial<UiState>) => void;
   dismissError: () => void;
@@ -649,6 +669,7 @@ export const useStore = create<State>((set, get) => {
     filterErrors: {},
     filterStatus: {},
     previewPoint: null,
+    previewTool: null,
     presets: [],
     extensions: [],
     extensionsRead: false,
@@ -1157,10 +1178,37 @@ export const useStore = create<State>((set, get) => {
     },
     setPreviewPoint: (previewPoint) => {
       if (samePoint(get().previewPoint, previewPoint)) return;
-      set({ previewPoint });
+      // A tool lives as long as the point it set: any other point (compare, the output) or the point's end is the tool's end.
+      const tool = get().previewTool;
+      set({ previewPoint, ...(tool && !samePoint(previewPoint, { filter: tool.filter }) && { previewTool: null }) });
       // The calls reach the backend in order; the engine falls back to the output by itself when it cannot show the point.
       api.setPreviewPoint(previewPoint).catch(() => {});
     },
+    startPreviewTool: (kind, filter) => {
+      const s = get();
+      const card = s.chain.find((f) => f.id === filter);
+      if (!card || toolOf(card.kind) !== kind || toolBlock({ previewOn: s.previewOn, state: s.engine.state, paused: s.paused }) !== null) return;
+      // One tool at a time: the point changes in place, so the old tool is replaced without the preview flashing back to the output.
+      set({ previewTool: { kind, filter, since: performance.now() } });
+      get().setPreviewPoint({ filter });
+    },
+    endPreviewTool: () => {
+      if (get().previewTool === null) return;
+      set({ previewTool: null });
+      endPreviewPoint();
+    },
+    applyPickedColor: (id, rgb) => {
+      const prev = snapshot();
+      const card = prev.chain.find((f) => f.id === id);
+      if (!card) return;
+      const color = keyColorOf(toColorInt(card.params.key_color, 0x0000ff00), rgb);
+      setChain(prev.chain.map((f) => (f.id === id ? { ...f, params: { ...f.params, key_color: color, key_color_type: "custom" } } : f)));
+      say(`Key color set to ${colorToHex(color)}`, prev);
+      get().endPreviewTool();
+    },
+    setParams: (id, patch) => setChain(get().chain.map((f) => (f.id === id ? { ...f, params: { ...f.params, ...patch } } : f)), true),
+    checkpoint: () => snapshot(),
+    sayUndo: (text, before) => say(text, before),
     setUi: (patch) => {
       set((s) => ({ ui: normalizeUi({ ...s.ui, ...patch }) }));
       persist();

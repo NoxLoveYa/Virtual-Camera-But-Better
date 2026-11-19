@@ -124,13 +124,13 @@ So a pointer position on the preview maps cleanly to the **final output**, but n
 | P17 | **Switches at the right end of their cell**, captions wrap beside them. | `styles.css` | S | Low | Low |
 | P18 | **Accessibility basics.** 2 px focus ring, 24 px switch hit area, `--faint` raised to pass 4.5:1, Settings as a dialog with focus moved in. | `styles.css`, `TitleBar.tsx`, `Popover.tsx` | S | Low | Med |
 | P19 | **Stale size CSS fixed** (comment and dead queries). | `styles.css` | S | Low | Low |
-| L1 | **Preview point (engine).** The preview can show the picture entering a chosen filter, or the camera input, while a gesture runs. The output to apps does not change. | `fx/mod.rs`, `engine.rs`, `preview.rs`, `commands.rs`, `api.ts`, `Preview.tsx` | M–L | Med | High (enables L2–L4) |
-| L2 | **Eyedropper** for Chroma Key and Color Key: "Pick from preview", click the backdrop, the key colour is set. | `ParamField.tsx`, `Preview.tsx`, new `src/ui/previewTool.ts` | M | Low | High |
-| L3 | **Crop, zoom and pan on the picture.** "Edit on picture" on a Crop/Pad card shows the uncropped input with a frame and 8 handles; drag inside to pan, wheel to zoom. Writes the same params. | `FilterCard.tsx`, `Preview.tsx`, new `src/ui/cropOverlay.tsx` | M–L | Med | High |
-| L4 | **Hold to compare.** Press and hold "Compare" on the preview to see the camera input. | `Preview.tsx` | S | Low | Med |
-| L5 | **Insert at a position.** Drag a filter out of the Add menu into the chain, or use a "+" in the gap between cards. | `AddFilter.tsx`, `store.ts`, `chainDrag.ts` | M | Low | Med |
-| L6 | **Pop-out preview** in its own resizable window. Needs a second webview; the engine has one preview stream, so the main preview pauses while popped out. | Rust + new window | L | Med | Med |
-| L7 | NVIDIA install dialog on first need, not at launch (open question Q3). | `store.ts` | S | Low | Med |
+| L1 | **Done (c3c5685).** **Preview point (engine).** The preview can show the picture entering a chosen filter, or the camera input, while a gesture runs. The output to apps does not change. | `fx/mod.rs`, `engine.rs`, `preview.rs`, `commands.rs`, `api.ts`, `Preview.tsx` | M–L | Med | High (enables L2–L4) |
+| L2 | **Done (commit id: add when committed).** **Eyedropper** for Chroma Key and Color Key: "Pick from preview", click the backdrop, the key colour is set. | `FilterCard.tsx`, `Preview.tsx`, new `src/components/PickOverlay.tsx`, `src/ui/eyedropper.ts`, `src/ui/previewTool.ts` | M | Low | High |
+| L3 | **Done (commit id: add when committed).** **Crop, zoom and pan on the picture.** "Edit on picture" on a Crop/Pad card shows the uncropped input with a frame and 8 handles; drag inside to pan, wheel to zoom. Writes the same params. | `FilterCard.tsx`, `Preview.tsx`, new `src/components/CropOverlay.tsx`, `src/ui/cropRect.ts` | M–L | Med | High |
+| L4 | **Done (c3c5685).** **Hold to compare.** Press and hold "Compare" on the preview to see the camera input. | `Preview.tsx` | S | Low | Med |
+| L5 | **Done (ce49ac6).** **Insert at a position.** Drag a filter out of the Add menu into the chain, or use a "+" in the gap between cards. | `AddFilter.tsx`, `store.ts`, `chainDrag.ts` | M | Low | Med |
+| L6 | **Not built (owner's choice).** **Pop-out preview** in its own resizable window. Needs a second webview; the engine has one preview stream, so the main preview pauses while popped out. | Rust + new window | L | Med | Med |
+| L7 | **Done (ce49ac6).** NVIDIA install dialog on first need, not at launch (open question Q3). | `store.ts` | S | Low | Med |
 | — | Not recommended now: a split before/after view (needs the engine to composite two pictures), a rotation handle (the slider is enough), a global undo stack for every parameter change. | | | | |
 
 ### Recommended order
@@ -461,6 +461,12 @@ Stacked (900–1099 px)
 - Minimum crop window: 16×16 source pixels. Shift locks the aspect ratio.
 - Wheel over the picture zooms the window about the pointer, keeping the output aspect; arrow keys nudge by 1 px (Shift: 10).
 - Writes go through `setParam`; `pushChain` already folds them to one call per frame (`store.ts:253-283`). One Undo entry per gesture.
+
+**As built (L2, L3).**
+- One tool at a time lives in the store (`previewTool`, set with `startPreviewTool`); it owns `previewPoint` and ends when the point does. While it runs, the preview bar (fps, Compare, Preview switch) is hidden and Compare is disabled, so no chip sits over a handle or a pick. Esc or the card's Done / Cancel pick ends it.
+- A source-size change ends the tool, and a drag under way is put back; frames in the first 600 ms after the start only set the baseline (`sourceChange`, `src/ui/previewTool.ts`).
+- Crop: a pan, a wheel zoom or an arrow key moves every edge, so it writes them all inside the picture (a padded edge becomes the picture edge); a handle drag writes only the edges it moved. Handles on the picture's edge sit 6 px inside it so their whole hit area is on the preview. A window within one pixel of the whole picture snaps to it when zooming out. Wheel and arrow-key bursts are one Undo each (450 ms of stillness ends a burst).
+- The eyedropper averages 5×5 preview pixels of the last frame and sets `key_color` (alpha byte kept) and `key_color_type: "custom"` in one change, one Undo.
 
 **L4, hold to compare.** A "Compare" button in the preview bar: while it is held (pointer, or Space with it focused), the preview point is `"input"` and the label reads "Before". Release goes back.
 
