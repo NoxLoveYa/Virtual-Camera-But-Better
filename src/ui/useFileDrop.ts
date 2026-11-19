@@ -12,8 +12,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { useStore } from "../store";
 import type { AutoStatus } from "../camera/schema";
-import { insertionIndex } from "./chainDrag";
+import { gapAt } from "./chainGeometry";
 import { fieldAt, firstSupported, hintFor, routeDrop, type DropTarget, type FieldTarget } from "./fileDrop";
+import { focusNavRow } from "./navFocus";
 
 /** `npm run tauri dev` (the Vite dev server); false in a release build. The project has no `vite/client` types. */
 const IS_DEV_BUILD = (import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV === true;
@@ -30,32 +31,12 @@ export interface Chooser {
 export interface FileDropView {
   /** The pill above the footer; `null` when no usable file is being dragged. */
   hint: string | null;
-  /** Where the drop line goes in `.chain-block` while the pointer is over the chain, else `null`. */
+  /** Where the drop line goes in the navigator's filter block while the pointer is over the chain, else `null`. */
   lineTop: number | null;
   chooser: Chooser | null;
 }
 
 const IDLE: FileDropView = { hint: null, lineTop: null, chooser: null };
-
-/** The gap of the chain under client `y`, and where its line goes (relative to `.chain-block`). `null` without a chain block. */
-function chainGap(block: Element, y: number): { gap: number; lineTop: number } | null {
-  const ol = block.querySelector(".chain");
-  if (!ol) return null;
-  const items = Array.from(ol.children) as HTMLElement[];
-  if (items.length === 0) return null;
-  // An empty chain shows its hint between the terminals: the line goes at the top of that box, not through the text.
-  const empty = ol.querySelector(".empty");
-  if (empty && !items.some((li) => li.classList.contains("step"))) {
-    return { gap: 0, lineTop: Math.round(empty.getBoundingClientRect().top - block.getBoundingClientRect().top - 1) };
-  }
-  const cards = items.filter((li) => li.classList.contains("step")).map((li) => (li.querySelector(".card") ?? li).getBoundingClientRect());
-  const first = items[0].getBoundingClientRect();
-  const last = items[items.length - 1].getBoundingClientRect();
-  const gap = insertionIndex(cards.map((r) => r.top + r.height / 2), y);
-  const above = gap === 0 ? first.bottom : cards[gap - 1].bottom;
-  const below = gap === cards.length ? last.top : cards[gap].top;
-  return { gap, lineTop: Math.round((above + below) / 2 - block.getBoundingClientRect().top - 1) };
-}
 
 interface Under {
   target: DropTarget;
@@ -63,12 +44,15 @@ interface Under {
   lineTop: number | null;
 }
 
-/** What is at the CSS point (x, y): a path field, the chain (with its gap), or the rest of the window. */
+/**
+ * What is at the CSS point (x, y): a path field (one in the inspector, or a navigator row whose filter has exactly one),
+ * the chain (with its gap), or the rest of the window.
+ */
 function under(x: number, y: number): Under {
   const el = document.elementFromPoint(x, y);
   const field = fieldAt(el);
   const block = el?.closest('[data-drop="chain"]');
-  const hit = block ? chainGap(block, y) : null;
+  const hit = block ? gapAt(block, y) : null;
   return { target: { field: field?.kind, gap: hit?.gap ?? null }, field, lineTop: hit?.lineTop ?? null };
 }
 
@@ -135,7 +119,7 @@ export function useFileDrop() {
     setView((v) => ({ ...v, chooser: null }));
     if (!use) return;
     const s = useStore.getState();
-    s.addFilter(use, c.at, { image_path: c.path });
+    focusNavRow(s.addFilter(use, c.at, { image_path: c.path }));
     if (c.note) s.addNotice(c.note);
   }, []);
 
@@ -153,7 +137,7 @@ export function useFileDrop() {
           if (note) s.notify(note);
           return;
         case "add":
-          s.addFilter(action.filter, action.at, { image_path: action.path });
+          focusNavRow(s.addFilter(action.filter, action.at, { image_path: action.path }));
           if (note) s.addNotice(note);
           return;
         case "choose":

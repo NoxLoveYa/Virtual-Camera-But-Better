@@ -2,16 +2,17 @@ import { memo, useCallback, type PointerEvent as ReactPointerEvent } from "react
 import { useStore } from "../store";
 import { stripCodes } from "../camera/schema";
 import { defOf, extIdOf, extOf, isExtKind, labelOf, type ExtensionInfo, type ParamValue } from "../filters/schema";
-import { AddHere } from "./AddFilter";
 import { Icon } from "./Icon";
 import { ParamField } from "./ParamField";
+import { focusSelectedRow } from "../ui/navFocus";
 import { toolBlock, toolOf } from "../ui/previewTool";
 import { moveWithFocus, type ChainHandlers, type DragView } from "../ui/useChainDrag";
 
 /**
- * The props are the card's id, how it is being dragged (`null` for most cards) and the handlers (one object for the
- * life of the chain): all stable while another card's slider moves. The card reads its own filter, its place and the
- * rest from the store, so a change of another card's params does not render it.
+ * The inspector's body for one filter: its header and its parameters. The props are the filter's id, how it is being
+ * dragged (`null` most of the time) and the handlers (one object for the life of the chain). The card reads its own
+ * filter, its place and the rest from the store, so a change of another filter's params does not render it. Its root
+ * carries `data-inspects`, not `data-filter-id`: the reorder code finds the navigator row by the latter.
  */
 interface Props {
   id: string;
@@ -37,7 +38,6 @@ export const FilterCard = memo(function FilterCard({ id, dragMode: mode, reorder
   const count = useStore((s) => s.chain.length);
   const extensions = useStore((s) => s.extensions);
   const extensionsRead = useStore((s) => s.extensionsRead);
-  const folded = useStore((s) => s.collapsed[id] === true);
   const error = useStore((s) => s.filterErrors[id]);
   const status = useStore((s) => s.filterStatus[id]);
   const gpu = useStore((s) => s.gpu);
@@ -71,27 +71,19 @@ export const FilterCard = memo(function FilterCard({ id, dragMode: mode, reorder
   const gripDown = (e: ReactPointerEvent<HTMLElement>) => reorder.onPointerDown(e, id);
 
   return (
-    <li
-      className={`step${filter.enabled ? " on" : ""}${movable ? " movable" : ""}${mode === "pointer" ? " dragging" : ""}${mode === "keyboard" ? " lifted" : ""}${tool ? " tooling" : ""}`}
-      data-filter-id={id}
+    <section
+      className={`card filter-card${filter.enabled ? "" : " off"}${tool ? " tooling" : ""}`}
+      data-inspects={id}
+      aria-label={label}
       onKeyDown={(e) => reorder.onCardKeyDown(e, id)}
     >
-      {/* The "+" of the gap above this card. It sits over the gap without taking room, and shows on hover and focus (always on touch). */}
-      {index > 0 && (
-        <div className="gap-add">
-          <AddHere at={index} />
-        </div>
-      )}
-      <span className="num" title={`Step ${index + 1} of ${count}`}>
-        {String(index + 1).padStart(2, "0")}
-      </span>
-      <div className="card">
+      <div>
         <div className="card-head">
           <button
             type="button"
             className="grip"
             data-act="grip"
-            title="Drag to reorder. From the keyboard: Space lifts the card, the arrow keys move it, Space drops it, Escape cancels."
+            title="Drag to reorder. From the keyboard: Space lifts the filter, the arrow keys move it, Space drops it, Escape cancels."
             aria-label={`Move ${label}, step ${index + 1} of ${count}`}
             aria-pressed={mode === "keyboard"}
             aria-disabled={!movable}
@@ -101,11 +93,8 @@ export const FilterCard = memo(function FilterCard({ id, dragMode: mode, reorder
           >
             <Icon name="grip" />
           </button>
-          <h3 className={`card-title${folded ? " folded" : ""}`}>
-            <button aria-expanded={!folded} title={folded ? "Expand" : "Collapse"} onClick={() => act().toggleCollapsed(id)}>
-              <Icon name="chevron" />
-              {label}
-            </button>
+          <h3 className="card-title" title={label}>
+            {label}
           </h3>
           {ext && ext.state !== "error" && (
             <span className="ext-badge" title={`${ext.name} ${ext.version}${ext.author ? ` by ${ext.author}` : ""}`}>
@@ -128,7 +117,15 @@ export const FilterCard = memo(function FilterCard({ id, dragMode: mode, reorder
             title={filter.enabled ? "Bypass" : "Enable"}
             onClick={() => act().toggleFilter(id)}
           />
-          <button className="ghost icon" onClick={() => act().removeFilter(id)} title="Remove" aria-label="Remove">
+          <button
+            className="ghost icon"
+            onClick={() => {
+              act().removeFilter(id);
+              focusSelectedRow();
+            }}
+            title="Remove"
+            aria-label="Remove"
+          >
             <Icon name="close" />
           </button>
         </div>
@@ -161,7 +158,7 @@ export const FilterCard = memo(function FilterCard({ id, dragMode: mode, reorder
             )}
           </>
         )}
-        {toolKind && !folded && !needs && (
+        {toolKind && !needs && (
           <div className="card-tool">
             <button
               type="button"
@@ -188,7 +185,7 @@ export const FilterCard = memo(function FilterCard({ id, dragMode: mode, reorder
             )}
           </div>
         )}
-        {def && def.params.length > 0 && !folded && (
+        {def && def.params.length > 0 && (
           <div className={`params${def.layout ? ` layout-${def.layout}` : ""}`}>
             {def.params.map((p) => (
               <ParamField key={p.key} def={p} params={filter.params} onChange={onChange} />
@@ -196,6 +193,6 @@ export const FilterCard = memo(function FilterCard({ id, dragMode: mode, reorder
           </div>
         )}
       </div>
-    </li>
+    </section>
   );
 });

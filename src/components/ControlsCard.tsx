@@ -33,18 +33,16 @@ export function ControlsCard() {
   const state = useStore((s) => s.engine.state);
   const stored = useStore((s) => s.controls);
   const autoStatus = useStore((s) => s.autoStatus);
-  // Remembered across launches (`Saved.ui`); a folded card does not read the camera.
-  const open = useStore((s) => s.ui.controls);
-  const { refreshControls, resetAllControls, setUi } = useStore.getState();
+  const { refreshControls, resetAllControls } = useStore.getState();
 
   const cam = cameras ? findCamera(cameras, deviceId) : null;
   const shown = cam && controlsFor === cam.id ? infos : null;
-  // The camera is read when it is open for sure (live) or closed for good (stopped), and only while somebody looks: a
-  // read without an open camera lights the camera's LED for a moment.
+  // The camera is read when it is open for sure (live) or closed for good (stopped), and only while somebody looks (this is
+  // mounted only while Camera controls is selected): a read without an open camera lights the camera's LED for a moment.
   const settled = state === "live" || state === "stopped" ? state : null;
 
   useEffect(() => {
-    if (!open || !cam || !settled) return;
+    if (!cam || !settled) return;
     const read = () => {
       if (!document.hidden) void refreshControls();
     };
@@ -52,7 +50,7 @@ export function ControlsCard() {
     document.addEventListener("visibilitychange", read);
     return () => document.removeEventListener("visibilitychange", read);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, cam?.id, settled]);
+  }, [cam?.id, settled]);
 
   let body;
   if (!cameras) body = <p className="ctl-note">Looking for cameras…</p>;
@@ -80,11 +78,8 @@ export function ControlsCard() {
   return (
     <section className="card controls" aria-label="Camera controls">
       <div className="card-head">
-        <h3 className={`card-title${open ? "" : " folded"}`}>
-          <button aria-expanded={open} title={open ? "Collapse" : "Expand"} onClick={() => setUi({ controls: !open })}>
-            <Icon name="chevron" />
-            <span className="label">Camera controls</span>
-          </button>
+        <h3 className="card-title">
+          <span className="label">Camera controls</span>
         </h3>
         <span className="fill" />
         <button
@@ -97,7 +92,7 @@ export function ControlsCard() {
           Reset all
         </button>
       </div>
-      {open && body}
+      {body}
     </section>
   );
 }

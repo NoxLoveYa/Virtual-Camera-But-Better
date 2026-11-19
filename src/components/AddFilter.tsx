@@ -3,21 +3,9 @@ import { useStore } from "../store";
 import { FILTERS, FILTER_HINTS, type BuiltinKind, type FilterKind } from "../filters/schema";
 import { beginInsertDrag } from "../ui/insertDragSession";
 import { gapLabel } from "../ui/insertDrag";
+import { focusNavRow } from "../ui/navFocus";
 import { Icon } from "./Icon";
 import { Popover } from "./Popover";
-
-/** After the next frame, focuses the card at `index` (its fold button) and keeps it in view: the filter that was just added. */
-function focusCardAt(index: number) {
-  const { chain, nvidiaPrompt } = useStore.getState();
-  const id = chain[Math.min(index, chain.length - 1)]?.id;
-  if (!id || nvidiaPrompt) return;
-  requestAnimationFrame(() => {
-    const card = document.querySelector<HTMLElement>(`[data-filter-id="${CSS.escape(id)}"]`);
-    const target = card?.querySelector<HTMLElement>(".card-title button");
-    target?.focus({ preventScroll: true });
-    card?.scrollIntoView({ block: "nearest" });
-  });
-}
 
 /** The arrow keys walk the menu's items (the menu is in a portal, so Tab alone would leave it). */
 function walkMenu(e: ReactKeyboardEvent<HTMLElement>) {
@@ -36,11 +24,14 @@ interface MenuProps {
   setOpen: (open: boolean) => void;
   anchor: ReactNode;
   align: "left" | "right";
-  /** Opened from a "+" in the chain: the focus goes into the menu, and to the new card afterwards. */
+  /** Opened from a "+" in the chain: the focus goes into the menu. */
   here?: boolean;
 }
 
-/** The menu of filters, shared by the toolbar's Add filter and the "+" between two cards. A filter can also be dragged out of it into the chain. */
+/**
+ * The menu of filters, shared by the navigator's "+" and Add filter row and the "+" between two rows. A filter can also be
+ * dragged out of it into the chain. The new filter is selected (the store does that) and its row takes the focus.
+ */
 function AddMenu({ at, open, setOpen, anchor, align, here }: MenuProps) {
   const addFilter = useStore((s) => s.addFilter);
   // The NVIDIA filters can still be added without an RTX GPU (a preset may carry them); the menu says what they need.
@@ -51,14 +42,13 @@ function AddMenu({ at, open, setOpen, anchor, align, here }: MenuProps) {
 
   const add = (kind: FilterKind) => {
     setOpen(false);
-    addFilter(kind, at);
-    if (here && at !== undefined) focusCardAt(at);
+    focusNavRow(addFilter(kind, at));
   };
   /** A press on an item is a click until the pointer moves: then the menu closes and the filter follows the pointer into the chain. */
   const press = (kind: FilterKind) => (e: ReactPointerEvent<HTMLElement>) => beginInsertDrag(e, kind, () => setOpen(false));
 
   return (
-    <Popover open={open} onClose={() => setOpen(false)} align={align} className="add-menu" anchor={anchor} autoFocusFirst={here} flip={here}>
+    <Popover open={open} onClose={() => setOpen(false)} align={align} className="add-menu" anchor={anchor} autoFocusFirst={here} flip>
       {(Object.keys(FILTERS) as BuiltinKind[]).map((kind) => {
         const rtxOnly = noRtx && FILTERS[kind].rtx === true;
         return (
@@ -97,16 +87,16 @@ function AddMenu({ at, open, setOpen, anchor, align, here }: MenuProps) {
   );
 }
 
-/** The toolbar's Add filter: adds at the end, or drag an item into the chain. */
+/** The "Add filter" row at the end of the navigator's list: adds at the end, or drag an item into the chain. */
 export function AddFilter() {
   const [open, setOpen] = useState(false);
   return (
     <AddMenu
       open={open}
       setOpen={setOpen}
-      align="right"
+      align="left"
       anchor={
-        <button data-add-filter aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen(!open)}>
+        <button className="nav-add" data-add-filter aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen(!open)}>
           <Icon name="plus" /> Add filter
         </button>
       }
@@ -114,7 +104,24 @@ export function AddFilter() {
   );
 }
 
-/** The "+" in the gap above the card at index `at` (so between step `at` and `at + 1`): opens the same menu and inserts there. */
+/** The 24 px "+" on the FILTERS heading: the same menu, adds at the end. */
+export function AddPlus() {
+  const [open, setOpen] = useState(false);
+  return (
+    <AddMenu
+      open={open}
+      setOpen={setOpen}
+      align="left"
+      anchor={
+        <button className="nav-plus ghost" aria-haspopup="menu" aria-expanded={open} aria-label="Add filter" title="Add filter" onClick={() => setOpen(!open)}>
+          <Icon name="plus" />
+        </button>
+      }
+    />
+  );
+}
+
+/** The "+" in the gap above the row at index `at` (so between step `at` and `at + 1`): opens the same menu and inserts there. */
 export function AddHere({ at }: { at: number }) {
   const [open, setOpen] = useState(false);
   return (

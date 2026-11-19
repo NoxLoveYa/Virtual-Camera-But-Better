@@ -3,7 +3,7 @@ import { api, type EngineState, type NvidiaGpu, type NvidiaInstallProgress, type
 import { defOf, defaultChain, labelOf, makeFilter, type ExtensionInfo, type FilterCfg, type FilterKind, type ParamValue } from "./filters/schema";
 import { normalizeChain, presetChain, refreshExtParams, signature } from "./filters/chain";
 import { presetNameFor, stemOf } from "./ui/fileDrop";
-import { DEFAULT_UI, normalizeUi, type UiState } from "./ui/layout";
+import { DEFAULT_UI, filterSelection, normalizeUi, selectedFilterId, selectionAfter, type UiState } from "./ui/layout";
 import { pointFilter, samePoint, type PreviewPoint } from "./ui/previewFrame";
 import { toolBlock, toolOf, type PreviewTool } from "./ui/previewTool";
 import { keyColorOf } from "./ui/eyedropper";
@@ -73,8 +73,6 @@ interface Saved {
   /** Only the camera controls the user changed, per camera. Re-applied by the engine on every open. */
   controls: StoredControls;
   chain: FilterCfg[];
-  /** Filter cards folded in the chain, by filter id (ids are saved with the chain, so this survives a restart). */
-  collapsed: Record<string, boolean>;
   closeToTray: boolean;
   /** Whether the "launch on startup" default has been applied once; after that the OS entry is the truth. */
   autostartDefaulted: boolean;
@@ -87,7 +85,7 @@ interface Saved {
   wasRunning: boolean;
   /** The live preview in the window; off saves the IPC and the CPU it costs. */
   previewOn: boolean;
-  /** The column split and which panels are open (Camera, Camera controls, Output, Advanced). */
+  /** The region widths, the selected item (`ui.selected`) and whether Advanced is open. Ids in `selected` are saved with the chain. */
   ui: UiState;
 }
 
@@ -122,7 +120,6 @@ const loadSaved = (): Saved => {
     output: DEFAULT_OUTPUT,
     controls: {},
     chain: defaultChain(),
-    collapsed: {},
     closeToTray: false,
     autostartDefaulted: false,
     nvidiaPromptDismissed: false,
@@ -136,13 +133,14 @@ const loadSaved = (): Saved => {
     const s = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "");
     if (s && typeof s === "object") {
       const chain = Array.isArray(s.chain) ? normalizeChain(s.chain) : fresh.chain;
-      const folded = s.collapsed && typeof s.collapsed === "object" ? (s.collapsed as Record<string, unknown>) : {};
+      const ui = normalizeUi(s.ui);
+      // A saved selection that names no filter of the chain is the Camera. (An old `collapsed` key is ignored.)
+      const id = selectedFilterId(ui.selected);
       return {
         source: normalizeSource(s.source),
         output: normalizeOutput(s.output),
         controls: normalizeControls(s.controls),
         chain,
-        collapsed: Object.fromEntries(chain.filter((f) => folded[f.id] === true).map((f) => [f.id, true])),
         closeToTray: s.closeToTray === true,
         autostartDefaulted: s.autostartDefaulted === true,
         nvidiaPromptDismissed: s.nvidiaPromptDismissed === true,
@@ -150,7 +148,7 @@ const loadSaved = (): Saved => {
         presetBaseline: typeof s.presetBaseline === "string" ? s.presetBaseline : null,
         wasRunning: s.wasRunning === true,
         previewOn: s.previewOn !== false,
-        ui: normalizeUi(s.ui),
+        ui: id !== null && !chain.some((f) => f.id === id) ? { ...ui, selected: DEFAULT_UI.selected } : ui,
       };
     }
   } catch {
@@ -296,8 +294,10 @@ interface State extends Saved {
   checkpoint: () => Snapshot;
   /** A toast with an Undo that restores `before`. */
   sayUndo: (text: string, before: Snapshot) => void;
-  /** Remembers the column split or a panel's fold (see `Saved.ui`). */
+  /** Remembers a region width, the rail flag or Advanced (see `Saved.ui`); a value out of range is repaired. */
   setUi: (patch: Partial<UiState>) => void;
+  /** Selects the item the inspector shows: "camera", "controls", "output" or `filter:<id>` (`filterSelection`). Saved. */
+  select: (selected: string) => void;
   dismissError: () => void;
   dismissNotice: () => void;
   undoChain: () => void;
@@ -306,14 +306,16 @@ interface State extends Saved {
   notify: (text: string) => void;
   /** Adds a sentence to the toast on screen, or shows it alone when there is none (the note on a drop of several files). */
   addNotice: (text: string) => void;
-  /** Adds a filter at gap `at` of the chain (default: the end) with some of its params set (a dropped file's path). */
-  addFilter: (kind: FilterKind, at?: number | null, params?: Record<string, ParamValue>) => void;
+  /**
+   * Adds a filter at gap `at` of the chain (default: the end) with some of its params set (a dropped file's path), selects
+   * it (`options.select: false` leaves the selection alone) and returns its id, so the caller can focus its row.
+   */
+  addFilter: (kind: FilterKind, at?: number | null, params?: Record<string, ParamValue>, options?: { select?: boolean }) => string;
+  /** Removes a filter. If it was the selected one, the next filter is selected, else the previous one, else Output. */
   removeFilter: (id: string) => void;
   moveFilter: (from: number, to: number) => void;
   toggleFilter: (id: string) => void;
   setParam: (id: string, key: string, value: ParamValue) => void;
-  toggleCollapsed: (id: string) => void;
-  setAllCollapsed: (on: boolean) => void;
 
   /** Takes a new extension list: coerces the `ext:` cards to the manifests (a reloaded extension may have other params). */
   applyExtensions: (list: ExtensionInfo[]) => void;
@@ -340,18 +342,15 @@ interface State extends Saved {
 export const useStore = create<State>((set, get) => {
   const write = () => {
     const { source, output, controls, chain, closeToTray, autostartDefaulted, nvidiaPromptDismissed, activePreset, presetBaseline, wasRunning, previewOn, ui } = get();
-    // Only the folded cards that still exist; entries of removed filters and "expanded" flags are not worth keeping.
-    const folded = get().collapsed;
-    const collapsed = Object.fromEntries(chain.filter((f) => folded[f.id]).map((f) => [f.id, true]));
     localStorage.setItem(
       STORAGE_KEY,
-      JSON.stringify({ source, output, controls, chain, collapsed, closeToTray, autostartDefaulted, nvidiaPromptDismissed, activePreset, presetBaseline, wasRunning, previewOn, ui }),
+      JSON.stringify({ source, output, controls, chain, closeToTray, autostartDefaulted, nvidiaPromptDismissed, activePreset, presetBaseline, wasRunning, previewOn, ui }),
     );
   };
   // A slider drag changes the state many times a second and each save serialises everything: saves are folded into one
   // write at most every SAVE_GAP_MS (it reads the state when it runs, so the stored value is the newest one).
   const saver = createSaver(write, SAVE_GAP_MS);
-  /** For changes that come in bursts (sliders, colour pickers, the splitter, folding). */
+  /** For changes that come in bursts (sliders, colour pickers, the splitters). */
   const persist = saver.schedule;
   /** For the rare ones that other code or the next launch relies on at once (the engine's run state, a saved preset). */
   const persistNow = saver.now;
@@ -436,10 +435,14 @@ export const useStore = create<State>((set, get) => {
     // A status line belongs to the card: it goes with it.
     const statuses = get().filterStatus;
     const keptStatus = Object.fromEntries(Object.entries(statuses).filter(([id]) => chain.some((f) => f.id === id)));
+    // The selected filter is gone: the next one takes its place, else the previous one, else Output (`selectionAfter`).
+    const ui = get().ui;
+    const selected = selectionAfter(before, chain, ui.selected);
     set({
       chain,
       ...(Object.keys(kept).length !== Object.keys(errors).length && { filterErrors: kept }),
       ...(Object.keys(keptStatus).length !== Object.keys(statuses).length && { filterStatus: keptStatus }),
+      ...(selected !== ui.selected && { ui: { ...ui, selected } }),
     });
     // The preview point names a card: it ends with the card (the engine puts the output back by itself as well).
     const pointId = pointFilter(get().previewPoint);
@@ -902,7 +905,7 @@ export const useStore = create<State>((set, get) => {
       window.addEventListener("focus", () => void get().refreshNvidia());
       await Promise.all([get().refreshCameras(), get().refreshPresets()]).catch(fail);
 
-      // Work out which saved preset (if any) the restored chain still matches, so the toolbar shows the right name.
+      // Work out which saved preset (if any) the restored chain still matches, so the title bar shows the right name.
       const { presets } = get();
       if (get().activePreset && !presets.includes(get().activePreset!)) set({ activePreset: null, presetBaseline: null });
       if (!get().activePreset) {
@@ -1213,6 +1216,14 @@ export const useStore = create<State>((set, get) => {
       set((s) => ({ ui: normalizeUi({ ...s.ui, ...patch }) }));
       persist();
     },
+    select: (selected) => {
+      if (selected === get().ui.selected) return;
+      const id = selectedFilterId(selected);
+      // Only an item that exists can be selected: a filter that is not in the chain is not.
+      if (id !== null && !get().chain.some((f) => f.id === id)) return;
+      set((s) => ({ ui: normalizeUi({ ...s.ui, selected }) }));
+      persist();
+    },
 
     dismissError: () => set({ error: null, errorKind: null, notice: null, undo: null }),
     dismissNotice: () => set({ notice: null, undo: null }),
@@ -1227,18 +1238,20 @@ export const useStore = create<State>((set, get) => {
     addNotice: (text) =>
       set((s) => (s.notice ? { notice: `${s.notice} ${text}`, noticeSeq: s.noticeSeq + 1 } : { notice: text, undo: null, noticeSeq: s.noticeSeq + 1 })),
 
-    addFilter: (kind, at, params) => {
+    addFilter: (kind, at, params, options) => {
       const prev = snapshot();
       const { extensions } = get();
       const made = makeFilter(kind, true, extensions);
       const filter = params ? { ...made, params: { ...made.params, ...params } } : made;
       const index = at == null ? prev.chain.length : Math.max(0, Math.min(prev.chain.length, at));
       setChain([...prev.chain.slice(0, index), filter, ...prev.chain.slice(index)]);
+      if (options?.select !== false) get().select(filterSelection(filter.id));
       say(`Added ${labelOf(kind, extensions)} as step ${index + 1}`, prev);
       // The first NVIDIA filter on an RTX machine without the runtime: offer the install now ("Not now" is remembered; the
       // card keeps its "Install it now"). A preset or a file drop that carries one does not ask.
       const { gpu, nvidia, nvidiaPromptDismissed } = get();
       if (defOf(kind, extensions)?.rtx && gpu && nvidia && !nvidia.available && !nvidiaPromptDismissed) get().openNvidiaPrompt();
+      return filter.id;
     },
     removeFilter: (id) => {
       const prev = snapshot();
@@ -1258,15 +1271,6 @@ export const useStore = create<State>((set, get) => {
     toggleFilter: (id) => setChain(get().chain.map((f) => (f.id === id ? { ...f, enabled: !f.enabled } : f))),
     setParam: (id, key, value) =>
       setChain(get().chain.map((f) => (f.id === id ? { ...f, params: { ...f.params, [key]: value } } : f)), true),
-
-    toggleCollapsed: (id) => {
-      set((s) => ({ collapsed: { ...s.collapsed, [id]: !s.collapsed[id] } }));
-      persist();
-    },
-    setAllCollapsed: (on) => {
-      set((s) => ({ collapsed: Object.fromEntries(s.chain.map((f) => [f.id, on])) }));
-      persist();
-    },
 
     applyExtensions: (list) => {
       set({ extensions: list, extensionsRead: true });
