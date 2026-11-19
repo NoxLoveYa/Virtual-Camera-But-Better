@@ -386,6 +386,11 @@ same(requestedFps({ res_type: "custom", frame_interval: -1 }, { fps: "source" },
 same(requestedFps({ res_type: "custom", frame_interval: 0 }, { fps: "source" }, w4gs, { ...open720, format: "yuy2" }), 1e7 / 333333, "rates of that format only");
 same(requestedFps({ res_type: "custom", frame_interval: 0 }, { fps: "source" }, w4gs, null), null, "nothing open");
 same(requestedFps({ res_type: "preferred", frame_interval: 166667 }, { fps: "source" }, w4gs, open720), null, "device default: unknown");
+// the open media type's own rate (stats.capture.rate) answers for every setting, Device default included
+same(requestedFps({ res_type: "preferred", frame_interval: 0 }, { fps: "source" }, w4gs, { ...open720, rate: 30 }), 30, "device default: the open type's rate");
+same(requestedFps({ res_type: "preferred", frame_interval: 0 }, { fps: "source" }, null, { ...open720, rate: 60 }), 60, "device default, camera list not loaded");
+same(requestedFps({ res_type: "custom", frame_interval: 166667 }, { fps: "source" }, w4gs, { ...open720, rate: 30 }), 30, "what opened wins over what was saved");
+same(requestedFps({ res_type: "preferred", frame_interval: 0 }, { fps: "source" }, w4gs, { ...open720, rate: 0 }), null, "no rate open: unknown");
 same(cameraIsSlow(14.3, 60), true, "14 of 60");
 same(cameraIsSlow(55, 60), false, "92 % is not slow");
 same(cameraIsSlow(53.9, 60), true, "just under 90 %");

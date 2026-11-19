@@ -59,7 +59,7 @@ export interface EnginePaused {
 }
 
 export interface Stats {
-  capture: { width: number; height: number; format: string; fps: number; decode: "hw" | "sw" | "none" };
+  capture: { width: number; height: number; format: string; fps: number; rate: number; decode: "hw" | "sw" | "none" };
   output: { width: number; height: number; fps: number };
   gpu_ms: number;
   dropped: number;

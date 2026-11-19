@@ -1,7 +1,10 @@
 import { useStats, useStore } from "../store";
 import { formatLabel, measuredFps } from "../camera/schema";
+import { useSlowCamera } from "./AutoControls";
 
 const CHOOSE = "choose “Better Cam” as the camera in your video app";
+const SLOW_FOOTER =
+  "the camera makes fewer frames than it is asked for. In dim light its own auto exposure does that: set Exposure mode to Better Cam auto in Camera controls to keep the rate";
 
 /** One line in the footer: who uses Better Cam first, then what comes in and goes out, how long it takes. */
 export function Stats() {
@@ -9,6 +12,7 @@ export function Stats() {
   const reason = useStore((s) => s.engine.reason);
   const paused = useStore((s) => s.paused);
   const stats = useStats((s) => s.stats);
+  const slow = useSlowCamera();
 
   let text: string;
   let title: string | undefined;
@@ -25,7 +29,9 @@ export function Stats() {
     const decode = c.decode === "hw" ? " (HW)" : c.decode === "sw" ? " (software decode)" : "";
     const size = `${c.width}×${c.height}`;
     const out = `${o.width}×${o.height}`;
-    const tail = [`${measuredFps(o.fps)} fps`, `GPU ${stats.gpu_ms.toFixed(1)} ms`, `${Math.round(stats.latency_p95_ms)} ms latency`];
+    // The camera makes less than it is asked for: the number the footer shows is the camera's, and the tooltip says why.
+    const camera = slow ? [`camera ${measuredFps(slow.measured)} of ${measuredFps(slow.requested)} fps`] : [];
+    const tail = [`${measuredFps(o.fps)} fps`, ...camera, `GPU ${stats.gpu_ms.toFixed(1)} ms`, `${Math.round(stats.latency_p95_ms)} ms latency`];
     // With nobody using the camera the line says what to do about it, and leaves the format to the tooltip.
     text =
       consumers === 0
@@ -39,6 +45,7 @@ export function Stats() {
       `repeated ${stats.repeated}`,
       "latency is the 95th percentile",
     ].join(" · ");
+    if (slow) title += ` · ${SLOW_FOOTER}`;
     if (c.decode === "sw") title += " · software decoding (hardware decoding is off or failed for this format)";
   }
 

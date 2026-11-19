@@ -1008,17 +1008,20 @@ export const longestOptions = (range: { min: number; max: number }, fps: number 
 };
 
 /**
- * The frame rate the camera is asked for, as far as the saved settings say (the card shows a hint while Camera auto
- * holds the rate far below it): Custom with a rate is that rate; "Highest FPS" and "Match output FPS" (the nearest
- * rate the camera has to the output's, "Same as camera" counting as highest) are read from the rates of the format
- * that is open (`opened`, the `stats.capture` of the engine). Device default has no known rate: `null`.
+ * The frame rate the camera is asked for (the card shows a hint while Camera auto holds the rate far below it). The
+ * media type that is open says it for every setting, Device default included (`opened.rate`, the `stats.capture` of
+ * the engine; the settings may be ahead of it or behind it, after a format fallback). Without it, from the saved
+ * settings: Custom with a rate is that rate; "Highest FPS" and "Match output FPS" (the nearest rate the camera has to
+ * the output's, "Same as camera" counting as highest) are read from the rates of the format that is open. Device
+ * default then has no known rate: `null`.
  */
 export const requestedFps = (
   source: Pick<SourceCfg, "res_type" | "frame_interval">,
   output: Pick<OutputCfg, "fps">,
   cam: CameraInfo | null,
-  opened: { width: number; height: number; format: string } | null,
+  opened: { width: number; height: number; format: string; rate?: number } | null,
 ): number | null => {
+  if (opened && opened.rate !== undefined && opened.rate > 0) return opened.rate;
   if (source.res_type !== "custom") return null;
   if (source.frame_interval > 0) return intervalFps(source.frame_interval);
   if (!cam || !opened) return null;

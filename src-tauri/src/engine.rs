@@ -440,6 +440,9 @@ pub struct EngineStats {
     pub capture_width: u32,
     pub capture_height: u32,
     pub capture_format: String,
+    /// The frame rate of the media type that is open: what the camera was asked for, and what its own auto exposure
+    /// may keep it from (`capture_fps` is what it delivers).
+    pub capture_rate: f64,
     /// `"hw"`, `"sw"` or `"none"`.
     pub decode: &'static str,
     pub capture_fps: f64,
@@ -557,6 +560,9 @@ pub struct CaptureStatsEvent {
     pub height: u32,
     pub format: String,
     pub fps: f64,
+    /// The frame rate of the media type that is open (0 while not live): the rate the camera is asked for, whatever
+    /// the settings say (Device default has none), against `fps`, the rate it delivers.
+    pub rate: f64,
     /// `"hw"`, `"sw"` or `"none"`.
     pub decode: String,
 }
@@ -2593,6 +2599,7 @@ impl Control {
                     String::new()
                 },
                 fps: if live { s.capture_fps } else { 0.0 },
+                rate: if live { s.capture_rate } else { 0.0 },
                 decode: if live {
                     s.decode.to_string()
                 } else {
@@ -3948,6 +3955,7 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                 i.format.clone(),
                 i.decode,
                 i.link.clone(),
+                i.fps,
             ),
         )
     };
@@ -4026,6 +4034,7 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
         capture_width: capture_info.0,
         capture_height: capture_info.1,
         capture_format: capture_info.2,
+        capture_rate: capture_info.5,
         decode: capture_info.3,
         ..EngineStats::default()
     };
@@ -7355,6 +7364,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(800));
         assert_eq!(stats(&rig).len(), 1, "events while stopped");
         assert_eq!(stats(&rig)[0].capture.width, 0);
+        assert_eq!(stats(&rig)[0].capture.rate, 0.0);
 
         // live: the numbers come, each different from the one before
         rig.engine.start(settings(bars(30), false));
@@ -7372,6 +7382,10 @@ mod tests {
         rig.engine.set_window_visible(true);
         rig.wait("an event for the returning window", Duration::from_millis(800), |r| stats(r).len() == n + 1);
         assert_eq!(stats(&rig).last().unwrap().capture.width, 320);
+        // the rate of the open media type (what the camera is asked for) is in every live event, apart from the rate
+        // it delivers
+        assert!(live.iter().filter(|s| s.capture.width == 320).all(|s| s.capture.rate == 30.0), "{live:?}");
+        assert_eq!(stats(&rig).last().unwrap().capture.rate, 30.0);
     }
 
     #[test]

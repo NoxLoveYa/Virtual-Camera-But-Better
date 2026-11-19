@@ -203,17 +203,14 @@ export function ExposureAuto({ info, ctx }: { info: ControlInfo; ctx: AutoCtx })
 }
 
 /**
- * Under the exposure row while it is in Camera auto: the camera's own auto lengthens the exposure in dim light and the
- * frame rate falls with it, and Better Cam auto cannot change that from outside. After 3 s with the measured capture
- * rate under 0.9 × the rate asked for, say so and offer Better Cam auto (only where it is offered); it goes away when
- * the rate recovers.
+ * The camera delivers far less than the rate it is asked for (the open media type's, so also with Device default), for
+ * at least `SLOW_CAMERA_AFTER` seconds: the two rates, else `null`. The card's hint and the footer read it.
  */
-export function CameraAutoHint({ info }: { info: ControlInfo }) {
+export function useSlowCamera(): { measured: number; requested: number } | null {
   const stats = useStats((s) => s.stats);
   const source = useStore((s) => s.source);
   const output = useStore((s) => s.output);
   const cameras = useStore((s) => s.cameras);
-  const setControlMode = useStore((s) => s.setControlMode);
   const cam = cameras ? findCamera(cameras, source.video_device_id) : null;
   const requested = stats ? requestedFps(source, output, cam, stats.capture) : null;
   const measured = stats?.capture.fps ?? 0;
@@ -227,10 +224,22 @@ export function CameraAutoHint({ info }: { info: ControlInfo }) {
     const t = setTimeout(() => setShown(true), SLOW_CAMERA_AFTER * 1000);
     return () => clearTimeout(t);
   }, [slow]);
-  if (!shown || !slow || requested === null || info.app == null) return null;
+  return shown && slow && requested !== null ? { measured, requested } : null;
+}
+
+/**
+ * Under the exposure row while it is in Camera auto: the camera's own auto lengthens the exposure in dim light and the
+ * frame rate falls with it, and Better Cam auto cannot change that from outside. After 3 s with the measured capture
+ * rate under 0.9 × the rate asked for, say so and offer Better Cam auto (only where it is offered); it goes away when
+ * the rate recovers.
+ */
+export function CameraAutoHint({ info }: { info: ControlInfo }) {
+  const setControlMode = useStore((s) => s.setControlMode);
+  const slow = useSlowCamera();
+  if (!slow || info.app == null) return null;
   return (
     <p className="ctl-hint" role="status" aria-live="polite" data-hint="slow-camera">
-      {slowCameraText(measured, requested)}
+      {slowCameraText(slow.measured, slow.requested)}
       <button type="button" className="link" onClick={() => void setControlMode("exposure", "app")}>
         Use Better Cam auto
       </button>
