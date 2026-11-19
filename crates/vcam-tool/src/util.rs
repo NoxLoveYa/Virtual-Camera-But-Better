@@ -31,6 +31,34 @@ pub fn run_output_here(verb: &str, started: SystemTime) -> Vec<String> {
     run_output(&Paths::system(), verb, started)
 }
 
+/// A folder below the temp folder for one test, removed with everything in it when dropped, also when the test
+/// panics. A frame file is 37 MB: a test that leaves its files behind costs that much on every run. Declare it before
+/// the writers and mappings of the test, so they are dropped (and the files free to delete) first.
+#[cfg(test)]
+pub struct ScratchDir(std::path::PathBuf);
+
+#[cfg(test)]
+impl ScratchDir {
+    /// `what` names the test; it must be unique among the tests of one process.
+    pub fn new(what: &str) -> ScratchDir {
+        let dir = std::env::temp_dir().join(format!("bettercam-{what}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        ScratchDir(dir)
+    }
+
+    pub fn join(&self, name: &str) -> std::path::PathBuf {
+        self.0.join(name)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

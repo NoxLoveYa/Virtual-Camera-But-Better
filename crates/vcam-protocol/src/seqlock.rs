@@ -178,8 +178,8 @@ impl Shared {
     /// Reset the whole header and publish it: magic last, so a reader never sees a half-built header.
     /// Fails when the mapping is smaller than [`FILE_SIZE`] or read-only.
     ///
-    /// The whole header is zeroed, the frame event fields (`features`, the nonce, `signal_seq` and the DLL's `wake_*`
-    /// diagnostics, bytes 448..512) included, in this version and in every older one alike: an older app that starts
+    /// The whole header is zeroed, the frame event fields (`features`, both nonces, `signal_seq` and the DLL's `wake_*`
+    /// diagnostics, bytes 448..528) included, in this version and in every older one alike: an older app that starts
     /// over the file of a newer one clears the advert, so a reader falls back to polling. A newer app advertises its
     /// events afterwards ([`Shared::advertise_frame_event`]).
     pub fn init_writer(
@@ -188,6 +188,18 @@ impl Shared {
         qpc_frequency: u64,
         now_qpc: u64,
     ) -> Result<(), PublishError> {
+        self.init_writer_with(pid, qpc_frequency, now_qpc, &|| {})
+    }
+
+    /// [`init_writer`](Self::init_writer); `before_wipe` runs after the advert was withdrawn and before the header is
+    /// wiped (a test looks at the file there).
+    fn init_writer_with(
+        &self,
+        pid: u32,
+        qpc_frequency: u64,
+        now_qpc: u64,
+        before_wipe: &dyn Fn(),
+    ) -> Result<(), PublishError> {
         if !self.writable {
             return Err(PublishError::ReadOnly);
         }
@@ -195,9 +207,31 @@ impl Shared {
             return Err(PublishError::TooLarge);
         }
         self.a32(off::MAGIC).store(0, Ordering::Release);
-        // SAFETY: the header is inside the mapping; atomics are not used on these bytes while we are the only
-        // initialiser (readers see magic == 0 and stay away).
-        unsafe { std::ptr::write_bytes(self.base.add(4), 0, HEADER_SIZE - 4) };
+        // The stores of the wipe below (relaxed atomics and a plain `write_bytes`) may become visible in any order on a
+        // weakly ordered CPU (ARM64). A reader that loads a nonce, `features` and the nonce again could then see a
+        // half-wiped nonce (`hi` already 0, `lo` still the old value: a different, non-zero nonce) next to the old
+        // `features`, and accept it. With `features` cleared and released first, a reader that sees any wiped byte sees
+        // `features == 0` after it. (The nonce at 512..528 is wiped by the same loop and is covered the same way.)
+        self.a32(off::FEATURES).store(0, Ordering::Relaxed);
+        fence(Ordering::Release);
+        before_wipe();
+        // The frame event fields are read through atomics by readers that do not look at `magic` first (the DLL polls
+        // them while the file is being started over), so they are wiped with atomic stores, not by the plain
+        // `write_bytes` below (a non-atomic write that races an atomic read is a data race). Bytes 448..528 are whole
+        // `u64`s: `features` (with its padding), nonce `.0`, `signal_seq`, the DLL's `wake_*` and nonce `.1`.
+        for o in (off::FEATURES..off::EVENT_NONCE1_HI + 8).step_by(8) {
+            self.a64(o).store(0, Ordering::Relaxed);
+        }
+        // SAFETY: the rest of the header is inside the mapping; atomics are not used on these bytes while we are the
+        // only initialiser (readers see magic == 0 and stay away).
+        unsafe {
+            std::ptr::write_bytes(self.base.add(4), 0, off::FEATURES - 4);
+            std::ptr::write_bytes(
+                self.base.add(off::EVENT_NONCE1_HI + 8),
+                0,
+                HEADER_SIZE - (off::EVENT_NONCE1_HI + 8),
+            );
+        }
         self.a32(off::PROTOCOL)
             .store(crate::PROTOCOL_VERSION, Ordering::Relaxed);
         self.a32(off::HEADER_SIZE)
@@ -244,27 +278,35 @@ impl Shared {
         }
     }
 
-    /// Tell readers that the frame events named by `nonce` exist ([`crate::signal`]): the nonce first, `features` last
-    /// with release ordering, so a reader that sees the bit finds the nonce. `signal_seq` is not touched: it starts at 0
-    /// with [`init_writer`](Self::init_writer). Ignored on a read-only view. A zero nonce is not an advert and clears
-    /// the bit instead.
-    pub fn advertise_frame_event(&self, nonce: u128) {
+    /// Tell readers that the frame events named by `nonces` (`nonces[i]` names event `.i`) exist
+    /// ([`crate::signal`]): the nonces first, `features` last with release ordering, so a reader that sees the bit
+    /// finds the nonces. `signal_seq` is not touched: it starts at 0 with [`init_writer`](Self::init_writer). Ignored
+    /// on a read-only view. A zero nonce is not an advert and clears the bit instead.
+    pub fn advertise_frame_event(&self, nonces: [u128; 2]) {
         if !self.writable {
             return;
         }
-        if nonce == 0 {
+        if nonces.contains(&0) {
             self.clear_features();
             return;
         }
+        // An advert that is already up (another call on a live file) is taken down first: a reader that sees any of the
+        // new nonce bytes then sees `features == 0` after them, as with `init_writer`, never the old bit with a mix.
+        self.a32(off::FEATURES).store(0, Ordering::Relaxed);
+        fence(Ordering::Release);
         self.a64(off::EVENT_NONCE_LO)
-            .store(nonce as u64, Ordering::Release);
+            .store(nonces[0] as u64, Ordering::Release);
         self.a64(off::EVENT_NONCE_HI)
-            .store((nonce >> 64) as u64, Ordering::Release);
+            .store((nonces[0] >> 64) as u64, Ordering::Release);
+        self.a64(off::EVENT_NONCE1_LO)
+            .store(nonces[1] as u64, Ordering::Release);
+        self.a64(off::EVENT_NONCE1_HI)
+            .store((nonces[1] >> 64) as u64, Ordering::Release);
         self.a32(off::FEATURES)
             .store(FEATURE_FRAME_EVENT, Ordering::Release);
     }
 
-    /// Withdraw the advert: `features` becomes 0 (the nonce stays; readers need the bit).
+    /// Withdraw the advert: `features` becomes 0 (the nonces stay; readers need the bit).
     pub fn clear_features(&self) {
         if self.writable {
             self.a32(off::FEATURES).store(0, Ordering::Release);
@@ -597,7 +639,10 @@ mod tests {
         let s = heap.shared(true);
         // an earlier writer left an advert and the DLL left diagnostics
         s.init_writer(1, 1_000_000, 1).unwrap();
-        s.advertise_frame_event(0xAAAA_BBBB_CCCC_DDDD_1111_2222_3333_4444);
+        s.advertise_frame_event([
+            0xAAAA_BBBB_CCCC_DDDD_1111_2222_3333_4444,
+            0x5555_6666_7777_8888_9999_0000_1234_5678,
+        ]);
         s.set_signal_seq(9);
         s.set_wake_stats(1, 2, 3, 4);
         let h = s.header();
@@ -607,31 +652,75 @@ mod tests {
             (0x1111_2222_3333_4444, 0xAAAA_BBBB_CCCC_DDDD)
         );
         assert_eq!(
+            (h.event_nonce1_lo, h.event_nonce1_hi),
+            (0x9999_0000_1234_5678, 0x5555_6666_7777_8888)
+        );
+        assert_eq!(
             (h.event_nonce_lo_again, h.event_nonce_hi_again),
             (h.event_nonce_lo, h.event_nonce_hi)
         );
+        assert_eq!(
+            (h.event_nonce1_lo_again, h.event_nonce1_hi_again),
+            (h.event_nonce1_lo, h.event_nonce1_hi)
+        );
         assert_eq!((h.signal_seq, h.wake_mode), (9, 1));
         assert_eq!((h.wake_events, h.wake_missed, h.wake_spurious), (2, 3, 4));
-        // a new init (this version's, and the old one's was the same `write_bytes`) clears 448..512
-        for o in (off::FEATURES..512).step_by(8) {
+        // the second nonce sits at 512..528
+        assert_eq!(off::EVENT_NONCE1_LO, 512);
+        assert_eq!(off::EVENT_NONCE1_HI, 520);
+        // a new init (this version's, and the old one's was the same `write_bytes`) clears 448..528
+        for o in (off::FEATURES..528).step_by(8) {
             s.poke64(o, u64::MAX);
         }
         s.init_writer(2, 1_000_000, 2).unwrap();
         let h = s.header();
         assert_eq!((h.features, h.signal_seq, h.wake_mode), (0, 0, 0));
         assert_eq!((h.event_nonce_lo, h.event_nonce_hi), (0, 0));
+        assert_eq!((h.event_nonce1_lo, h.event_nonce1_hi), (0, 0));
         assert_eq!((h.wake_events, h.wake_missed, h.wake_spurious), (0, 0, 0));
         assert_eq!(valid(&s).wake, None);
-        // the advert is valid again after an advertise; clearing keeps the nonce but drops the bit
-        s.advertise_frame_event(5);
-        assert_eq!(valid(&s).wake.map(|w| w.nonce), Some(5));
+        // the advert is valid again after an advertise; clearing keeps the nonces but drops the bit
+        s.advertise_frame_event([5, 6]);
+        assert_eq!(valid(&s).wake.map(|w| w.nonces), Some([5, 6]));
         s.clear_features();
         assert_eq!(valid(&s).wake, None);
         assert_eq!(s.header().event_nonce_lo, 5);
-        // a zero nonce is no advert
-        s.advertise_frame_event(7);
-        s.advertise_frame_event(0);
+        assert_eq!(s.header().event_nonce1_lo, 6);
+        // a zero nonce, in either place, is no advert
+        s.advertise_frame_event([7, 8]);
+        s.advertise_frame_event([0, 8]);
         assert_eq!(valid(&s).wake, None);
+        s.advertise_frame_event([7, 8]);
+        s.advertise_frame_event([7, 0]);
+        assert_eq!(valid(&s).wake, None);
+    }
+
+    #[test]
+    fn init_withdraws_the_advert_before_it_wipes_the_nonces() {
+        // On a weakly ordered CPU the wipe's plain stores can become visible in any order. `features` has to be 0 (and
+        // released) before the first of them, or a reader could accept a half-wiped nonce next to the old bit.
+        let mut heap = Heap::new();
+        let s = heap.shared(true);
+        s.init_writer(1, 1_000_000, 1).unwrap();
+        s.advertise_frame_event([0x11, 0x22]);
+        assert_eq!(s.header().features, FEATURE_FRAME_EVENT);
+        let looked = std::cell::Cell::new(false);
+        s.init_writer_with(2, 1_000_000, 2, &|| {
+            let h = s.header();
+            assert_eq!(
+                h.features, 0,
+                "the advert was not withdrawn before the wipe"
+            );
+            assert_eq!(
+                (h.event_nonce_lo, h.event_nonce1_lo),
+                (0x11, 0x22),
+                "the nonces were wiped before the hook"
+            );
+            looked.set(true);
+        })
+        .unwrap();
+        assert!(looked.get());
+        assert_eq!(s.header().event_nonce_lo, 0);
     }
 
     #[test]
@@ -639,15 +728,16 @@ mod tests {
         let mut heap = Heap::new();
         let w = heap.shared(true);
         w.init_writer(1, 1_000_000, 1).unwrap();
-        w.advertise_frame_event(3);
+        w.advertise_frame_event([3, 30]);
         w.set_signal_seq(4);
         let ro = heap.shared(false);
-        ro.advertise_frame_event(99);
+        ro.advertise_frame_event([99, 98]);
         ro.clear_features();
         ro.set_signal_seq(100);
         ro.set_wake_stats(1, 1, 1, 1);
         let h = ro.header();
         assert_eq!((h.features, h.event_nonce_lo, h.signal_seq), (1, 3, 4));
+        assert_eq!(h.event_nonce1_lo, 30);
         assert_eq!((h.wake_mode, h.wake_events), (0, 0));
     }
 

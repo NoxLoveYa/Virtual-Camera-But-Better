@@ -9,6 +9,7 @@ mod feed;
 mod gen_slates;
 mod stats;
 mod status;
+mod storm;
 mod util;
 
 use std::path::PathBuf;
@@ -35,9 +36,13 @@ const USAGE: &str = "usage: vcam-tool <command>
   capture-test [--frames N] [--format nv12|rgb32] [--size WxH] [--fps N]
                [--expect feed|slate|slate-paused|slate-starting|feed-to-slate]
                              open the camera with a Source Reader and check what it shows
-  feed [--size WxH] [--fps N] [--seconds S] [--state live|paused|starting]
-                             write the test pattern into frames.bin like the app would
-  stats                      print the counters in frames.bin
+  feed [--size WxH] [--fps N] [--seconds S] [--state live|paused|starting] [--no-signal] [--file PATH]
+                             write the test pattern into frames.bin like the app would; --no-signal makes no frame
+                             events (an app from before them); --file writes a scratch file instead
+  stats [--file PATH]        print the counters in frames.bin, the writer's frame event advert and the DLL's wake
+                             diagnostics
+  signal-storm [--seconds N] [--file PATH]
+                             development only: set the writer's live frame events in a loop (hostile-signaller check)
   gen-slates [--preview DIR] render the slates into crates/vcam-source/assets/slates";
 
 struct ElevatedArgs {
@@ -242,7 +247,8 @@ fn main() {
         "status" => status::run(),
         "capture-test" => capture::run(rest),
         "feed" => feed::run(rest),
-        "stats" => stats::run(),
+        "stats" => stats::run(rest),
+        "signal-storm" => storm::run(rest),
         "gen-slates" => gen_slates::run(rest),
         _ => {
             eprintln!("{USAGE}");

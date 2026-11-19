@@ -1517,7 +1517,7 @@ mod tests {
 
     /// A fresh folder under the temp dir, with the temp dir itself as trusted root.
     fn sandbox(name: &str) -> (PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!("bettercam-secure-{}", std::process::id()));
+        let root = crate::test_dir("secure");
         let dir = root.join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

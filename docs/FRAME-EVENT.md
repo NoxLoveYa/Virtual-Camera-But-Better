@@ -1,21 +1,26 @@
 # FRAME-EVENT: wake the camera service's pump on a new frame instead of polling
 
-Design only; nothing here is built yet. Written 2026-11-18 against the working tree on top of `ce45acc`. That tree includes the
+Status 2026-11-19: phase 1 (`feed98c`) and phase 2 (app and tool side) are built; phase 3 (the DLL pump) is not. Phase 1's
+review fixes: public names (no secret nonce), a second nonce for `.1`, `ERROR_INVALID_HANDLE` as a taken name, `features`
+cleared before the header wipe. The rest of this document is the design as first written on 2026-11-18 against the working
+tree on top of `ce45acc`. That tree includes the
 uncommitted engine/DLL review fixes: `Writer::clear_latest`, "a frame captured before the stream attached is never shown",
 and the stamping of bypass frames in `frames.rs`. Facts that could not be checked are marked **(unverified)**.
 
 ## Summary
 
 * **Mechanism.** The app's `Writer` creates **two manual-reset events** named `Global\BetterCam.FrameEvent.<128-bit random
-  hex>.0` and `.1`. It signals them in turn after every publish and every writer-state change. It writes the random part and a
-  signal counter into new fields of the `frames.bin` header, which only the installing user, LOCAL SERVICE and
-  administrators can read.
+  hex>.0` and `Global\BetterCam.FrameEvent.<another, independent 128-bit random hex>.1`. It signals them in turn after every
+  publish and every writer-state change. It writes the two random parts and a signal counter into new fields of the
+  `frames.bin` header. **The nonces are not secrets** (see "What protects the events"): `\BaseNamedObjects` lets every local
+  process, low integrity included, list the names. The protection is the unpredictable name plus each event's DACL.
 * **DLL side.** The pump in the camera service opens both events with `SYNCHRONIZE` only. It waits on the one that the
   next signal will set, together with its own stop event and a high-resolution timer for the state machine's next
   deadline. The seqlock stays the only source of truth: an event only says "look now".
-* **No protocol version bump, no installer change.** The new fields sit in unused header bytes (448..512). Old apps and
+* **No protocol version bump, no installer change.** The new fields sit in unused header bytes (448..528). Old apps and
   old DLLs ignore them, and an old app's `init_writer` zeroes them. A feature bit says "events present". The app sets the
-  event's security descriptor itself; the existing `frames.bin` DACL keeps the name away from other users.
+  event's security descriptor itself, in the create call; that DACL (not the `frames.bin` DACL, and not a secret name) is
+  what keeps other users and low-integrity processes from signalling.
 * **Bounded under attack.** A signaller that misbehaves cannot drive the pump faster than one event-driven poll per
   millisecond, which is today's worst case. Wake-ups without a new signal ("spurious") or frames published without a
   wake-up ("missed") switch the stream back to today's polling for 30 s. Failing to open the events also means polling.
@@ -30,7 +35,7 @@ and the stamping of bypass frames in `frames.rs`. Facts that could not be checke
 ## Recommendation
 
 Build the **writer-created, randomly named pair of manual-reset events**, signalled in turn ("parity pair"), with a
-`features` bit, a 128-bit nonce and a `signal_seq` counter in the header. The DLL opens the events with `SYNCHRONIZE`
+`features` bit, two independent 128-bit nonces (one per event) and a `signal_seq` counter in the header. The DLL opens the events with `SYNCHRONIZE`
 only and uses them only while the writer is Live. Each wait combines the event with a timer for the state machine's own
 deadline (the repeat deadline, the slate pacing or the "starting" point), capped at 100 ms. There is no blind safety
 poll. The DLL enforces three guards: at most one event-driven poll per millisecond; back to polling for 30 s after
@@ -55,7 +60,7 @@ context switches and a fitted cost per wake-up, not measurements of an event bui
 | After a live frame, `poll` answers `Until(next_ok)`, where `next_ok` = last capture + 3/4 period (no frame can qualify earlier). From then on it answers `Soon` until a frame arrives. With frames on show it also answers `Soon` past the repeat deadline (last new frame + 1.5 periods) until `last_emit + period` allows the repeat. | `frames.rs` `poll_inner` (end), `min_capture_gap`, `try_repeat` |
 | So, at the writer's own rate, the pump polls from 3/4 period after a capture until the next publish (capture + period + ~1 ms): about 5 to 6 polls a frame at 60 fps and about 10 at 30 fps. That is **about 330 to 360 wake-ups/s in both cases**. A writer slower than 1/1.5 of the consumer rate keeps the pump at **~1000 polls/s** between repeats. These counts are derived from the code; WPR will confirm them. **(unverified)** | same |
 | Every poll calls `validate_header`, which loads about 60 header atomics and builds a new `Vec` in `validate_advertised`: one allocation per poll. | `validate.rs`, `seqlock.rs` `header()` |
-| The header ends at byte 448 (`SLOTS` 304 + 3 x 48). Bytes 448..4096 are unused. `init_writer` zeroes the whole header on every writer open, in old and new apps alike. | `header.rs`, `seqlock.rs` `init_writer` |
+| The header ends at byte 448 (`SLOTS` 304 + 3 x 48). Bytes 448..4096 were unused; the frame event uses 448..528. `init_writer` zeroes the whole header on every writer open, in old and new apps alike. | `header.rs`, `seqlock.rs` `init_writer` |
 | `validate_header` requires `protocol == PROTOCOL_VERSION` (1). A version bump makes an old DLL show the slate for a new app's file, and the reverse. | `validate.rs` |
 | Writers: the engine (`Writer::create_default`, one `Arc<Writer>` for the life of the engine; `publish` on the render thread, `set_state` on the render and control threads), `vcam-tool feed`, and the tests. All go through `vcam_protocol::Writer`. | `engine.rs` 815, `output_writer.rs` `publish_planes`, `vcam-tool/src/feed.rs` |
 | `frames.bin` DACL: SYSTEM and Administrators full; LOCAL SERVICE and the installing user `0x12008f` (read, write data, read attributes, `READ_CONTROL`). Other users have no access. The file has no explicit integrity label (implicit medium, no-write-up), so a low-integrity process of the same user can read it **(unverified for this file; standard MIC behaviour)**. | `SPIKE-VCAM.md` P-hardening 3 |
@@ -89,7 +94,7 @@ From the brief, the plan and the code:
 | Option | Verdict | Why |
 |---|---|---|
 | **A. Writer creates a pair of manual-reset events with a random 128-bit name in `Global\`; DLL opens them with `SYNCHRONIZE`; parity signalling** | **Chosen** | No privilege needed to create (checked). The app knows its own SID and writes an exact DACL. A random name cannot be taken in advance. Manual-reset wakes every waiter in every process, and a waiter cannot steal a wake-up from anyone. The DLL only opens by a name it formats itself and only waits. Everything fails safe to polling. |
-| B. One auto-reset event | Rejected | An auto-reset event wakes exactly one waiter, so a second pump (another stream, another Frame Server process, two DLL builds) misses frames. Anyone with `SYNCHRONIZE` (any LocalService service, a low-integrity process of the user that read the nonce) can **steal** wake-ups simply by waiting. Fixing the fan-out needs an extra hub thread in the DLL. |
+| B. One auto-reset event | Rejected | An auto-reset event wakes exactly one waiter, so a second pump (another stream, another Frame Server process, two DLL builds) misses frames. Anyone with `SYNCHRONIZE` (any LocalService service, a low-integrity process of the user that listed the name) can **steal** wake-ups simply by waiting. Fixing the fan-out needs an extra hub thread in the DLL. |
 | C. One manual-reset event, set by the writer, reset by the writer at the next publish | Rejected | The event stays set from one publish until the next, so a pump that has taken the frame and waits again returns at once and spins. |
 | D. Semaphore released once per known waiter | Rejected | Wake-ups can be stolen as in B; the waiter count in the header races; it accumulates under errors. |
 | E. DLL creates the event (LocalService owner); app opens it | Rejected | LocalService does not know the user. The DACL would have to grant Interactive or Authenticated Users, so any user could signal, or the installer would have to put the SID in HKLM for the DLL to read. The DLL would create `Global\` objects inside Frame Server, which is new privileged behaviour. The object would live only while a pump runs, so the app has to chase it. Several pumps or processes need several names. |
@@ -107,16 +112,18 @@ From the brief, the plan and the code:
 
 * Two **manual-reset** events per writer: `E0` and `E1`. Created non-signalled by the writer process when it opens the
   frame file (`Writer::open_file`, after `init_writer`), closed when the `Writer` is dropped.
-* Name: `Global\BetterCam.FrameEvent.<nonce>.<i>`, where `<nonce>` is 32 lowercase hex digits of a 128-bit value from the
-  system RNG (`BCryptGenRandom` with `BCRYPT_USE_SYSTEM_PREFERRED_RNG`) and `<i>` is `0` or `1`. The prefix is a constant
-  in `vcam-protocol`. The DLL **never takes a name string from the file**: it reads two `u64`, refuses zero, and formats
-  the name itself. A hostile writer can therefore only name objects under our own prefix. Waiting on such an object
-  changes nothing, and opening one of another type fails (`ERROR_INVALID_HANDLE`).
+* Name: `Global\BetterCam.FrameEvent.<nonce_i>.<i>`, where `<nonce_i>` is 32 lowercase hex digits of a 128-bit value from
+  the system RNG (`BCryptGenRandom` with `BCRYPT_USE_SYSTEM_PREFERRED_RNG`) and `<i>` is `0` or `1`. **Each event has its
+  own nonce** (`nonce_0` for `.0`, `nonce_1` for `.1`, drawn independently), so the name of `.0`, which anyone can list,
+  says nothing about the name of `.1`, and nobody can create `.1` in the gap between the two creates. The prefix is a
+  constant in `vcam-protocol`. The DLL **never takes a name string from the file**: it reads four `u64`, refuses a zero
+  nonce, and formats the names itself. A hostile writer can therefore only name objects under our own prefix. Waiting on
+  such an object changes nothing, and opening one of another type fails (`ERROR_INVALID_HANDLE`).
 * Creation: `CreateEventExW(sa, name, CREATE_EVENT_MANUAL_RESET, EVENT_MODIFY_STATE | SYNCHRONIZE)`. If either name
-  already exists (`ERROR_ALREADY_EXISTS`, or `ERROR_ACCESS_DENIED` for an object we cannot open), close both handles,
-  draw a new nonce and retry, at most 3 times. After that the writer runs without events (`features` bit off, poll mode
-  in the DLL) and logs one line. With 128 random bits a collision means somebody is enumerating and racing the
-  namespace, not chance.
+  is taken (`ERROR_ALREADY_EXISTS`; `ERROR_ACCESS_DENIED` for an object we cannot open; `ERROR_INVALID_HANDLE` for a name
+  held by an object of another type, such as a mutex), close both handles, draw two new nonces and retry, at most 3
+  attempts. After that the writer runs without events (`features` bit off, poll mode in the DLL) and logs one line. With
+  128 random bits a collision means somebody is enumerating and racing the namespace, not chance.
 * Namespace: `Global\`, because the pump runs in session 0 and the app in the user's session; `Local\` names differ
   between them. Creating a `Global\` event needs no privilege (checked above). Opening it from Frame Server is
   **(unverified)** and is the first live check of Phase 4. If the open fails, the stream stays in poll mode and logs once.
@@ -129,18 +136,28 @@ Made by the app at creation (in the create call, never applied afterwards), from
 ```text
 O:<user SID>
 D:P(A;;0x00120002;;;<user SID>)     user: EVENT_MODIFY_STATE | SYNCHRONIZE | READ_CONTROL
-   (A;;0x00100000;;;S-1-5-19)        LOCAL SERVICE: SYNCHRONIZE only
+   (A;;0x00120000;;;S-1-5-19)        LOCAL SERVICE: SYNCHRONIZE | READ_CONTROL (wait; read the owner)
    (A;;0x00020000;;;S-1-3-4)         OWNER RIGHTS: READ_CONTROL only (removes the owner's implicit WRITE_DAC)
 S:(ML;;NW;;;ME)                      medium integrity, no write-up
 ```
 
-* **Other users** get nothing (no ACE). They cannot learn the nonce from `frames.bin` (no access). They can see the name
-  only by listing `\BaseNamedObjects`, which standard users may be able to do **(unverified)**. By then the object exists
-  with this DACL, so the name gives them nothing.
-* **Low-integrity processes of the same user** can read the nonce from `frames.bin` (see above), but the label blocks
-  `EVENT_MODIFY_STATE`. They can get `SYNCHRONIZE` and wait, which on a manual-reset event changes nothing for anyone.
-* **LOCAL SERVICE** (the pump, and any other LocalService service) can only wait: it cannot set, reset or re-secure the
-  events.
+* **The names are public.** `\BaseNamedObjects` lets Everyone, and low-integrity processes, list the names in it. So any
+  local process (another user, a low-integrity process) can read both nonces as soon as the events exist, whatever the
+  DACL of `frames.bin` says. **The nonce is not a secret and the `frames.bin` DACL does not protect it.** What protects the
+  events is (1) the **unpredictable name** (nobody can create the name beforehand, and the `.1` name is independent of the
+  `.0` name) and (2) the **event DACL** below. The reader (phase 3) therefore treats the name as public: its guards (open
+  only while the writer is Live with a fresh heartbeat, the demotion rule, open pacing) are **hard requirements, also
+  against other users**, not only against the installing user's own processes.
+* **Other users** get nothing (no ACE): opening an event they listed is access denied.
+* **Low-integrity processes of the same user** can list the names too, but the label blocks `EVENT_MODIFY_STATE`. They
+  can get `SYNCHRONIZE` and wait, which on a manual-reset event changes nothing for anyone. (An object with no label is
+  also treated as medium, no-write-up: the behaviour does not prove the label; `signal/tests.rs` reads the explicit label
+  back.)
+* **LOCAL SERVICE** (the pump, and any other LocalService service) can wait and read the descriptor (`SYNCHRONIZE |
+  READ_CONTROL`): it cannot set, reset or re-secure the events. `READ_CONTROL` is there for the **owner check** of
+  phase 3 (below): the DACL protects only objects the writer made, and the pump must be able to tell those from objects
+  somebody else created under the same name after the writer was gone. It adds nothing a LocalService service could
+  not already see: the descriptor is the one printed above, and the names are public anyway.
 * **Administrators and SYSTEM** are not granted anything; they can take ownership with their privileges, as with
   anything.
 * The owner is set explicitly to the user. An elevated admin token's default owner is Administrators, and `O:` makes
@@ -150,9 +167,10 @@ S:(ML;;NW;;;ME)                      medium integrity, no write-up
 * Needs the `Win32_Security_Authorization` and `Win32_Security_Cryptography` features of `windows` in `vcam-protocol`
   (writer side only; the DLL links but never calls them).
 
-**Installer: no change.** The events are not files and are not persistent. Their security comes from the creating app,
-and the secrecy of the nonce comes from the existing `frames.bin` DACL. The elevated helper, the data-folder ACL model
-and the HKLM keys stay as they are. Nothing new runs elevated.
+**Installer: no change.** The events are not files and are not persistent. Their security comes from the creating app
+(an unpredictable name and the DACL it sets in the create call), not from the `frames.bin` DACL: the names are listable by
+every local process. The elevated helper, the data-folder ACL model and the HKLM keys stay as they are. Nothing new runs
+elevated.
 
 ### Protocol change
 
@@ -161,23 +179,25 @@ asserts) and `RawHeader`:
 
 | Offset | Field | Type | Written by | Meaning |
 |---|---|---|---|---|
-| 448 | `features` | u32 | app | Bit 0 `FEATURE_FRAME_EVENT`: `E0`/`E1` exist and are signalled per the rules below. Other bits are reserved: writers write 0, readers ignore them. Stored **last** with Release, after the nonce. Cleared to 0 by `Writer::close` before the state goes `Closed`. |
+| 448 | `features` | u32 | app | Bit 0 `FEATURE_FRAME_EVENT`: `E0`/`E1` exist and are signalled per the rules below. Other bits are reserved: writers write 0, readers ignore them. Stored **last** with Release, after both nonces. Cleared to 0 by `Writer::close` before the state goes `Closed`, and by `init_writer` before it wipes the header (Release fence, so a reader that sees a wiped byte sees `features == 0` after it, also on ARM64). |
 | 452 | `reserved3` | u32 | - | 0 |
-| 456 | `event_nonce_lo` | u64 | app | Low 64 bits of the nonce |
-| 464 | `event_nonce_hi` | u64 | app | High 64 bits. The nonce is valid only when both halves together are non-zero. |
+| 456 | `event_nonce_lo` | u64 | app | Low 64 bits of the nonce of event `.0` |
+| 464 | `event_nonce_hi` | u64 | app | High 64 bits. A nonce is valid only when both halves together are non-zero. |
 | 472 | `signal_seq` | u64 | app | Number of signals since `init_writer` (starts at 0). Changed only between the reset and the set (below). |
 | 480 | `wake_mode` | u32 | DLL | Diagnostics: 0 polling (no advert, or the writer is not Live), 1 event, 2 polling after spurious wake-ups, 3 polling after missed wake-ups, 4 polling because the events could not be opened |
 | 484 | `reserved4` | u32 | - | 0 |
 | 488 | `wake_events` | u64 | DLL | Event wake-ups of the stream (diagnostics) |
 | 496 | `wake_missed` | u64 | DLL | Missed wake-ups counted (diagnostics) |
 | 504 | `wake_spurious` | u64 | DLL | Spurious wake-ups counted (diagnostics) |
+| 512 | `event_nonce1_lo` | u64 | app | Low 64 bits of the nonce of event `.1` (its own random value, not derived from the first) |
+| 520 | `event_nonce1_hi` | u64 | app | High 64 bits. The header's frame event fields end at 528. |
 
 The DLL writes its fields only while `header_ok` (the existing rule), like the statistics. With several pumps the last
 writer wins, as for `delivered` today.
 
 **Parsing.** `validate_header` does **not** reject a header for any of these fields. A malformed advert must never turn
-into a slate. A separate result `ValidHeader::wake: Option<WakeAdvert { nonce: u128, signal_seq: u64 }>` is `Some` only
-when bit 0 is set and the nonce is non-zero. The nonce is read as `lo, hi, features, lo, hi` and accepted only when both
+into a slate. A separate result `ValidHeader::wake: Option<WakeAdvert { nonces: [u128; 2], signal_seq: u64 }>` is `Some` only
+when bit 0 is set and both nonces are non-zero. The nonces are read as `lo0, hi0, lo1, hi1, features, lo0, hi0, lo1, hi1` and accepted only when both
 reads agree (a re-init in progress gives `None`). `writer_frames` is already in `RawHeader`; `ValidHeader` gains it for
 the miss check.
 
@@ -255,7 +275,7 @@ equivalence.
   the timer is precise; dropping the period request in event mode saves the machine its 1 kHz timer interrupt when
   nothing else asks for it **(effect unmeasured)**. If the high-resolution timer cannot be created, the pump stays in
   polling mode with today's fallback (`sleep(1 ms)`).
-* the frame events (`Option<[OwnedHandle; 2]>` plus the nonce they belong to), and the mode machine:
+* the frame events (`Option<[OwnedHandle; 2]>` plus the two nonces they belong to), and the mode machine:
 
 | Mode | Enters when | Waits |
 |---|---|---|
@@ -275,11 +295,40 @@ Constants (in `wake.rs`, documented with these reasons):
 | `DEMOTE_FOR` | 30 s | Polling time after a demotion, then event mode is tried again (logged, sampled). |
 | `OPEN_RETRY` | 500 ms per changed nonce, 30 s for the same nonce | The same pacing as the file re-open. A writer that changes the nonce on every frame cannot make the pump call `OpenEventW` more than twice a second. |
 
-`OpenEventW(SYNCHRONIZE, FALSE, name)` for both names, done by the pump thread only (never at activation, never in
-`DllGetClassObject` or in `CreatePresentationDescriptor`). Both handles are closed when the nonce changes, the writer
-leaves Live for longer than `WAIT_CAP`, the mode demotes, or the pump ends. They are `OwnedHandle`s, so every path out,
-a panic included, closes them. No owner check is made: the name comes from the file, which only the user, LocalService
-and administrators can write, so the events are exactly as trusted as the frames.
+`OpenEventW(SYNCHRONIZE | READ_CONTROL, FALSE, name)` for both names, done by the pump thread only (never at activation,
+never in `DllGetClassObject` or in `CreatePresentationDescriptor`), followed by the **owner check** below. Both handles
+are closed when the nonce changes, the writer leaves Live for longer than `WAIT_CAP`, the mode demotes, or the pump ends.
+They are `OwnedHandle`s, so every path out, a panic included, closes them.
+
+**Owner check (hard requirement).** The name comes from the file, but the *object* under a name is not necessarily the
+writer's: the events vanish with their last handle, so after an app that died without `close` (the header keeps the
+advert) anyone who listed the names can create them again with a DACL of their own, or put an object symbolic link
+there. The pump must therefore check, on each opened handle (not on a path), that **the owner of the object is the
+expected user**, and treat any other owner, or a failed read of the owner, as `OpenFailed` (poll, sampled log line,
+usual pacing). The owner is read with `GetSecurityInfo(handle, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION)`, which
+needs the `READ_CONTROL` that the descriptor gives LOCAL SERVICE.
+
+*Where the expected owner comes from:* **the user ACE of the DACL of `frames.bin`**, which the installer wrote (an
+administrator, once). That DACL is protected and holds SYSTEM, Administrators, LOCAL SERVICE and, when the installer was
+given the user (`vcam-install` `acl.rs`; `0x12008f` for the last two), the installing user. The pump maps the pinned
+`frames.bin` already; it reads the DACL (`GetSecurityInfo(..., DACL_SECURITY_INFORMATION)`; the file's `0x12008f` for
+LOCAL SERVICE includes `READ_CONTROL`, but the DLL's open uses `ACCESS_READ` = `0x81`, so this needs a handle opened
+with `READ_CONTROL` added, or a second one) and takes the single access-allowed trustee that is none of `S-1-5-18`,
+`S-1-5-32-544`, `S-1-5-19`. None, or more than one, means no expected owner: **no events, polling**. Why this source
+and no other:
+
+* Only an administrator can change that DACL (the file is owned by Administrators; the user and LOCAL SERVICE have no
+  `WRITE_DAC`), so nobody who can create an object in `\BaseNamedObjects` can make the expected value be theirs.
+* **Not a SID recorded by the writer in the header.** The header is written by whoever may write `frames.bin` and is
+  exactly what a hostile writer controls; the trust anchor must not come from the file whose advert is being checked.
+  (It would also need a new header field.)
+* Not the owner of `frames.bin` (Administrators, not the user), not the token of the pump (LOCAL SERVICE), and not "the
+  logged-on user" (several sessions can exist; the camera service serves all of them).
+
+*What it leaves:* an event owned by the right user can only be made by that user's own processes, which is the
+"malware running as the installing user" row below, answered by the demotion rule. If the app runs as another account
+than the one the installer named (a different admin account in an elevated install, say), the owners differ and the
+camera polls: a safe failure, visible as `wake_mode` 4.
 
 **`stream.rs`.** `pump_loop_with` replaces `timer.wait_1ms()` and the condvar `Until` wait with `wake.wait(poll_wait,
 &src_report)`. `PumpShared` gains the stop event. `TimerPeriod` moves into `Wake` (held only in polling mode). The token
@@ -303,8 +352,8 @@ reads it once a frame.
 | App | DLL | Result |
 |---|---|---|
 | new | new | Event mode while Live |
-| old (no `features`) | new | `init_writer` of the old app zeroed bytes 448..512, so there is no advert: polling mode, exactly today's behaviour (`timeBeginPeriod` included) |
-| new | old | The old DLL ignores bytes 448..512 and polls. The new app signals events that nobody waits on (two syscalls per frame). |
+| old (no `features`) | new | `init_writer` of the old app zeroed bytes 448..528, so there is no advert: polling mode, exactly today's behaviour (`timeBeginPeriod` included) |
+| new | old | The old DLL ignores bytes 448..528 and polls. The new app signals events that nobody waits on (two syscalls per frame). |
 | new app restarts while a new DLL streams | | `init_writer` zeroes the advert, so the pump falls back to polling. The new nonce appears, the pump closes the old handles and opens the new ones (at most once per 500 ms). |
 | two DLL builds loaded after an "Update virtual camera" | | Each pump has its own handles; manual-reset wakes both. |
 | `vcam-tool feed` while the app runs (two writers; unsupported today too) | | The last `init_writer` owns the nonce. The other writer's signals bump `signal_seq` without setting the awaited event, which counts as missed and leads to polling: correct and bounded. |
@@ -316,16 +365,17 @@ build is already "outdated" by its content tag, so Update brings the new DLL.
 
 | Case | What happens | Bound |
 |---|---|---|
-| Hostile process pre-creates the name | Impossible in advance: the nonce is 128 random bits written only to a file other users cannot read. If a create still finds the name, the writer retries with a new nonce, 3 times, then runs without events. | Polling, as today |
-| Hostile process of another user opens the events | No ACE for them: access denied. | none |
-| Low-integrity process of the user | It can read the nonce from `frames.bin`, but the label refuses `EVENT_MODIFY_STATE`. `SYNCHRONIZE` lets it wait, which on a manual-reset event changes nothing for anybody. | none |
-| Another LocalService service waits on the events | It can only wait; on manual-reset events it cannot take a wake-up away. | none |
+| Hostile process pre-creates the names | Impossible in advance: each name carries its own 128 random bits. Once the writer has created `.0`, the name is **listable by everyone** (`\BaseNamedObjects`), but the name of `.1` is independent of it, so nobody can squat `.1` between the two creates. If a create still finds a name taken (an event, an object of another type, an object we may not open), the writer retries with two new nonces, 3 attempts, then runs without events. | Polling, as today |
+| App dies without `close`; somebody who listed the names creates them again, or puts an object symlink under them | The header keeps the advert and the events vanish with their last handle (the writer's), so the names are free again. Another user can create them with a DACL of their own (or link them to an object of their own); a pump that opens in the rest of the fresh-heartbeat window (up to 1 s), or restarts and finds that heartbeat, would wait on their objects: spurious wake-ups (demotion) or none (the pump's own deadline). The DACL cannot prevent it: it exists only on objects the writer made. **Phase 3 checks the owner of each opened event** against the user ACE of the `frames.bin` DACL (see "DLL changes"); a mismatch is `OpenFailed`. Without the check: bounded by the demotion rule and open pacing. | With the check: polling. Without it: ≤ 8 extra polls, then polling for 30 s |
+| Hostile process of another user lists the names and opens the events | The names are public, but the DACL has no ACE for another user: access denied, so it can neither signal nor wait. It can still create objects under our prefix with other names, which the pump never opens (it opens only the two names in the file). The reader's guards (events opened only while the writer is Live with a fresh heartbeat, the demotion rule, open pacing) stay hard requirements against other users too, not only against the installing user's processes. | none |
+| Low-integrity process of the user | It can list the names, but the label refuses `EVENT_MODIFY_STATE`. `SYNCHRONIZE` lets it wait, which on a manual-reset event changes nothing for anybody. | none |
+| Another LocalService service waits on the events | It can wait and read the owner; on manual-reset events it cannot take a wake-up away. | none |
 | Hostile writer (malware running as the installing user) sets both events and never resets them | Every event wake-up finds `signal_seq` unchanged, so they are spurious. More than 8 in 1 s demotes to polling for 30 s. The 1 ms gap applies in the meantime. | At most 8 extra polls, then today's polling; again every 30 s |
 | Hostile writer signals constantly and bumps `signal_seq` (not spurious) | The 1 ms gap: at most 1000 event-driven polls/s. That is today's polling ceiling, which a stalled writer already reaches today. The seqlock and the decimation decide what is emitted. | ≤ 1 kHz polls |
 | Hostile writer advertises events and never signals | At the deadline polls a moved `writer_frames` with the awaited event unset counts as missed. 3 in 10 s demote to polling. Before that, each such frame is taken at the next deadline: at most half a period late, never dropped. | ≤ 3 late frames per 30 s |
 | Hostile writer changes the nonce constantly | Open attempts at most once per 500 ms. Meanwhile polling. | ≤ 4 opens/s per pump |
-| Hostile writer puts a nonce that names a foreign object | The name is always `Global\BetterCam.FrameEvent.<hex>.<i>`, so only objects under our prefix. Another type fails to open. A squatted event is only waited on. | Polling, or spurious leads to demotion |
-| Header re-init while the pump reads the advert | The nonce is read twice around `features`; a disagreement gives no advert this time. | One poll in polling mode |
+| Hostile writer puts nonces that name a foreign object | The name is always `Global\BetterCam.FrameEvent.<hex>.<i>`, so only objects under our prefix. Another type fails to open. A squatted event is only waited on, and its owner is checked (the row above). | Polling, or spurious leads to demotion |
+| Header re-init while the pump reads the advert | Both nonces are read twice around `features`; a disagreement gives no advert this time. `init_writer` clears `features` (Release) before the wipe, so on a weakly ordered CPU a half-wiped nonce is never accepted next to the old bit. | One poll in polling mode |
 | App crash between publish and `SetEvent`, or between `ResetEvent` and `SetEvent` | No wake-up for that frame. The pump wakes at its deadline (≤ half a period later) and takes the frame or a repeat. The heartbeat goes stale and gives the slate after 1 s. The events stay alive as long as pumps hold handles, then go away. | One late frame, then the slate as today |
 | App crash, new app starts | `init_writer` zeroes the advert and a new nonce is published. The pump closes the old handles at the nonce change. | none |
 | Frame Server restart or crash | Pumps end and close their handles. The new pumps open by the nonce in the file. The app is not affected: its handles keep the events alive. | none |
@@ -404,16 +454,18 @@ wake-up (tens of µs, estimate), so the header's `latency_p50_us` should fall by
 ### Protocol (`vcam-protocol`, unit tests)
 
 * Layout: `offset_of!` asserts for every new field; u64 fields 8-aligned; all below `HEADER_SIZE`.
-* Parsing: an all-zero header extension gives no advert; bit 0 with a zero nonce gives none; unknown feature bits are
-  ignored; a header with a broken advert still validates (never a slate); the nonce read twice disagreeing gives none.
+* Parsing: an all-zero header extension gives no advert; bit 0 with a zero nonce (either of the two) gives none; unknown
+  feature bits are ignored; a header with a broken advert still validates (never a slate); either nonce read twice
+  disagreeing gives none.
 * Names: format, length, lowercase hex only, fixed prefix. The function takes a `u128` and cannot be given a string.
 * `FrameSignal` create: both events exist with the SD above, read back through `GetKernelObjectSecurity` on the
   creator's handle and checked ACE by ACE with `EqualSid` (as `acl::check` does): owner, three ACEs, protected, medium
   no-write-up label. An `AccessCheck` with a **low-integrity duplicate of the test's own token** is refused
   `EVENT_MODIFY_STATE` and granted `SYNCHRONIZE`. An `AccessCheck` for LocalService (well-known SID in a constructed
   check, or by reading the DACL) grants `SYNCHRONIZE` only.
-* Collisions: an injected nonce source that returns a name the test created first gets a new nonce. Three collisions
-  give `features = 0`, and no handle leaks (process handle count before and after).
+* Collisions: an injected nonce source that returns a name the test created first (an event, an object we may not
+  open, or a mutex: `ERROR_INVALID_HANDLE`) gets two new nonces. Three collisions give `features = 0`, and no handle
+  leaks (process handle count before and after). Each event has its own nonce.
 * Signal order: a recording stand-in for the event calls shows `Reset(E[(n+1)%2])`, then `store(n)`, then
   `Set(E[n%2])`, for publish, `set_state` and close. `close` clears `features` before `Closed`. `heartbeat` and
   `clear_latest` do not signal.
@@ -422,7 +474,7 @@ wake-up (tens of µs, estimate), so the header's `latency_p50_us` should fall by
   load-to-wait window; after any lost wake-up the next deadline poll sees the frame.
 * Real threads: a writer thread at 60 Hz and at 1 kHz, a reader thread using the real events and the reader rules, for
   2 s. At 60 Hz every signal is seen with no miss and no spurious wake-up; at 1 kHz the reader's polls are ≤ 1000/s.
-* `init_writer` (old and new) zeroes 448..512; `Writer::drop` closes the event handles.
+* `init_writer` (old and new) zeroes 448..528 and clears `features` before the wipe; `Writer::drop` closes the event handles.
 
 ### DLL (`vcam-source`, the in-process rig of `tests.rs` and the `frames`/`stream` tests)
 
@@ -481,13 +533,25 @@ phase needs an independent audit session afterwards, before the next phase build
 | # | Phase | Files | Decisions taken in it | Checks | Privileged |
 |---|---|---|---|---|---|
 | 0 | **Measure first** (gate) | none in the product; harness scripts in `%TEMP%\opencode\perf*`; results added to `docs/PERF.md` | none | PERF method at 1080p60 and 4K30 (3 runs each) plus the live 14 fps run; per-thread split of the FrameServer svchost; WPR trace (elevated) of one 1080p60 run: pump wake-ups/s, CPU per wake-up, copy share, Frame Server's own share. Report whether 1 % is reachable and what the event can save. | no |
-| 1 | **Protocol and writer** | `crates/vcam-protocol/src/header.rs` (fields, offsets, layout asserts, `FEATURE_FRAME_EVENT`), `validate.rs` (`WakeAdvert`, `writer_frames` in `ValidHeader`, double nonce read), `seqlock.rs` (loads, writer setters, DLL diagnostic setters, `init_writer` unchanged except the docs), new `signal.rs` (name formatting, `FrameSignal` create/notify/close with the SD, nonce source with a test hook, reader `open_frame_events(nonce)` with `SYNCHRONIZE`, the in-memory model and its test), `map.rs` (`Writer` holds `Option<FrameSignal>`; notify in `publish`/`set_state`/`close`; `features = 0` on close; `WriterOptions { signal: bool }` for tools and tests), `lib.rs`, `Cargo.toml` (two `windows` features) | SD exactly as above; 3 nonce tries; notify under a mutex | `cargo test -p vcam-protocol` (all the protocol tests above), `cargo clippy -p vcam-protocol --all-targets` 0 warnings, `cargo fmt -p vcam-protocol --check`, `cargo check -p vcam-source -p vcam-tool -p better-cam` | **yes**: header parsing and `open_frame_events` run in the service; the writer half does not, but lives in the same crate. **Audit after.** |
+| 1 | **Protocol and writer** | `crates/vcam-protocol/src/header.rs` (fields, offsets, layout asserts, `FEATURE_FRAME_EVENT`), `validate.rs` (`WakeAdvert`, `writer_frames` in `ValidHeader`, double nonce read), `seqlock.rs` (loads, writer setters, DLL diagnostic setters; `init_writer` clears `features` and fences first, wipes 448..528 with atomic stores and the rest with `write_bytes`; `advertise_frame_event` clears `features` and fences first), new `signal.rs` (name formatting, `FrameSignal` create/notify/close with the SD (LOCAL SERVICE `SYNCHRONIZE | READ_CONTROL`), nonce source with a test hook, reader `open_frame_events(nonces)` with `SYNCHRONIZE`, the in-memory model and its test), `RawHeader::from_bytes` (a plain read never carries the advert: `features` is 0), `map.rs` (`Writer` holds `Option<FrameSignal>`; notify in `publish`/`set_state`/`close`; `features = 0` on close; `WriterOptions { signal, scratch }` for tools and tests; a path other than the default one never opens a file in `%ProgramData%\BetterCam`, and `scratch` takes an existing file only if it is empty or already a frame file), `lib.rs`, `Cargo.toml` (two `windows` features) | SD exactly as above; 3 attempts, two nonces each; notify under a mutex | `cargo test -p vcam-protocol` (all the protocol tests above), `cargo clippy -p vcam-protocol --all-targets` 0 warnings, `cargo fmt -p vcam-protocol --check`, `cargo check -p vcam-source -p vcam-tool -p better-cam` | **yes**: header parsing and `open_frame_events` run in the service; the writer half does not, but lives in the same crate. **Audit after.** |
 | 2 | **App and tool** | `crates/vcam-tool/src/stats.rs` (print the new fields), `feed.rs` (`--no-signal`), new dev subcommand `signal-storm` (opens the live events with the user's rights and sets them in a loop for N seconds; refuses without a live advert), `src-tauri/src/engine.rs` (one log line at writer creation: events on or off and why; no behaviour change) | `signal-storm` ships in the dev tool only | `cargo test -p vcam-tool`, `cargo test -p better-cam` (the engine's writer tests create real events in temp-file writers), clippy, fmt | no |
-| 3 | **DLL pump** | `crates/vcam-source/src/frames.rs` (`Wait::Frame`, the Live/advert/`signal_seq`/`writer_frames` report, diagnostics written only while `header_ok`), new `wake.rs` (modes, constants, stop event, high-resolution timer for every timed wait, `timeBeginPeriod` only in polling mode), `stream.rs` (pump loop uses `Wake`; `Pump::stop` sets the stop event), `log.rs` (two sampled slots), `tests.rs` (rig tests above) | the constants table; events only while Live | `cargo test -p vcam-source` 7 runs with no flake; the "old behaviour put back" runs; clippy, fmt; `cargo test -p vcam-protocol` again | **yes**, the whole phase. **Audit after.** |
+| 3 | **DLL pump** | `crates/vcam-source/src/frames.rs` (`Wait::Frame`, the Live/advert/`signal_seq`/`writer_frames` report, diagnostics written only while `header_ok`), new `wake.rs` (modes, constants, stop event, high-resolution timer for every timed wait, `timeBeginPeriod` only in polling mode, the owner check of the opened events), `stream.rs` (pump loop uses `Wake`; `Pump::stop` sets the stop event), `log.rs` (two sampled slots), `tests.rs` (rig tests above) | the constants table; events only while Live | `cargo test -p vcam-source` 7 runs with no flake; the "old behaviour put back" runs; clippy, fmt; `cargo test -p vcam-protocol` again | **yes**, the whole phase. **Audit after.** |
 | 4 | **Live, measure, document** | `docs/SPIKE-VCAM.md` (new section "P-frame-event": what changed, live results, machine state), `docs/PERF.md` (after-numbers next to Phase 0), `docs/PLAN.md` 2.5 "Sync" paragraph (now: event plus polling fallback) | none; reports against the gate | Update from the app (one UAC prompt); the live checks above; the measurement plan; nothing left running | no new code; touches the machine's registration |
 
 Phases 1 and 3 can only be audited separately if Phase 1 keeps the reader half of `signal.rs` small (format a name,
 open with `SYNCHRONIZE`, nothing else) and the DLL's whole decision logic stays in `wake.rs`.
+
+**Phase 3 hard requirements (the nonces are public, see "Security descriptor"):** the pump opens the events only while the
+writer is Live with a fresh heartbeat (never from a slate state, never at activation); it applies the demotion rule
+(spurious and missed wake-ups) and the open pacing (one attempt per 500 ms per changed pair, 30 s for the same pair); it
+never lets an event replace the seqlock check; and it opens exactly the two names built from the two nonces in the file.
+They hold against other users and low-integrity processes as much as against the installing user's own processes.
+
+It also **checks the owner of each event it opened**, with `SYNCHRONIZE | READ_CONTROL`: the owner must be the single
+non-system user ACE in the DACL of `frames.bin` (the installer's), else `OpenFailed` and polling. The names can be taken
+over after an app that died without `close` (see "Behaviour under failure and hostile cases"). A test creates events
+as another owner where the account may (an `O:` owner the token can assign, such as Administrators from an elevated
+test) and one as the right owner, and the fake-owner case must poll.
 
 ## Open questions for the owner
 

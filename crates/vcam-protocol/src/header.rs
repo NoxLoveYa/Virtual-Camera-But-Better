@@ -86,11 +86,11 @@ pub mod off {
     pub const LATEST_SLOT: usize = 296;
     pub const SLOTS: usize = 304;
     // -- frame event (see `crate::signal`); the header ends at 448 without it --
-    /// u32, app: feature bits ([`FEATURE_FRAME_EVENT`](super::FEATURE_FRAME_EVENT)). Stored last, after the nonce.
+    /// u32, app: feature bits ([`FEATURE_FRAME_EVENT`](super::FEATURE_FRAME_EVENT)). Stored last, after both nonces.
     pub const FEATURES: usize = 448;
-    /// u64, app: low 64 bits of the event nonce.
+    /// u64, app: low 64 bits of the nonce of event `.0` (the nonce of `.1` is at [`EVENT_NONCE1_LO`]).
     pub const EVENT_NONCE_LO: usize = 456;
-    /// u64, app: high 64 bits of the event nonce.
+    /// u64, app: high 64 bits of the nonce of event `.0`.
     pub const EVENT_NONCE_HI: usize = 464;
     /// u64, app: signals since `init_writer`.
     pub const SIGNAL_SEQ: usize = 472;
@@ -104,6 +104,12 @@ pub mod off {
     pub const WAKE_MISSED: usize = 496;
     /// u64: spurious wake-ups counted.
     pub const WAKE_SPURIOUS: usize = 504;
+    // -- frame event, second nonce (app) --
+    /// u64, app: low 64 bits of the nonce of event `.1`. Each event has its own nonce, so the name of `.0` (which any
+    /// process may list in `\BaseNamedObjects`) says nothing about the name of `.1`.
+    pub const EVENT_NONCE1_LO: usize = 512;
+    /// u64, app: high 64 bits of the nonce of event `.1`.
+    pub const EVENT_NONCE1_HI: usize = 520;
 
     /// Offsets inside one [`Format`](super::Format).
     pub const FMT_WIDTH: usize = 0;
@@ -189,6 +195,8 @@ struct HeaderLayout {
     wake_events: u64,
     wake_missed: u64,
     wake_spurious: u64,
+    event_nonce1_lo: u64,
+    event_nonce1_hi: u64,
 }
 
 // The offsets above are the contract; the compiler checks them against the struct.
@@ -227,9 +235,12 @@ const _: () = {
     assert!(offset_of!(HeaderLayout, wake_events) == off::WAKE_EVENTS);
     assert!(offset_of!(HeaderLayout, wake_missed) == off::WAKE_MISSED);
     assert!(offset_of!(HeaderLayout, wake_spurious) == off::WAKE_SPURIOUS);
+    assert!(offset_of!(HeaderLayout, event_nonce1_lo) == off::EVENT_NONCE1_LO);
+    assert!(offset_of!(HeaderLayout, event_nonce1_hi) == off::EVENT_NONCE1_HI);
     // the new fields start where the slots end and use the old header's unused bytes only
     assert!(off::FEATURES == off::SLOTS + SLOT_COUNT * off::SLOT_SIZE);
-    assert!(off::WAKE_SPURIOUS + 8 == 512);
+    assert!(off::WAKE_SPURIOUS + 8 == off::EVENT_NONCE1_LO);
+    assert!(off::EVENT_NONCE1_HI + 8 == 528);
     assert!(size_of::<FormatLayout>() == off::FMT_SIZE);
     assert!(offset_of!(FormatLayout, height) == off::FMT_HEIGHT);
     assert!(offset_of!(FormatLayout, fps_num) == off::FMT_FPS_NUM);
@@ -257,6 +268,7 @@ const _: () = {
         off::EVENT_NONCE_LO % 8 == 0 && off::EVENT_NONCE_HI % 8 == 0 && off::SIGNAL_SEQ % 8 == 0
     );
     assert!(off::WAKE_EVENTS % 8 == 0 && off::WAKE_MISSED % 8 == 0 && off::WAKE_SPURIOUS % 8 == 0);
+    assert!(off::EVENT_NONCE1_LO % 8 == 0 && off::EVENT_NONCE1_HI % 8 == 0);
 };
 
 /// Video format: used for the advertised list, `negotiated`, and slot descriptors.
@@ -368,13 +380,18 @@ pub struct RawHeader {
     pub latest_slot: u32,
     /// Feature bits ([`FEATURE_FRAME_EVENT`]); unknown bits are not an error.
     pub features: u32,
-    /// The event nonce, read before `features`.
+    /// The nonce of event `.0`, read before `features`.
     pub event_nonce_lo: u64,
     pub event_nonce_hi: u64,
-    /// The event nonce read again after `features`: [`crate::validate_header`] accepts an advert only when both reads
+    /// The nonce of event `.1` (bytes 512..528), read before `features`.
+    pub event_nonce1_lo: u64,
+    pub event_nonce1_hi: u64,
+    /// Both nonces read again after `features`: [`crate::validate_header`] accepts an advert only when both reads
     /// agree (a writer that starts over in the middle of the read gives a different nonce, or none).
     pub event_nonce_lo_again: u64,
     pub event_nonce_hi_again: u64,
+    pub event_nonce1_lo_again: u64,
+    pub event_nonce1_hi_again: u64,
     pub signal_seq: u64,
     /// Written by the DLL (diagnostics): see [`wake_mode`].
     pub wake_mode: u32,
@@ -403,12 +420,16 @@ impl RawHeader {
             *a = fmt(off::ADVERTISED + i * off::FMT_SIZE);
         }
         // The writer stores `features` last (Release) after the nonce, so a reader that sees the bit and then reads
-        // the nonce again gets the final value. The order of these loads is the point: nonce, features, nonce.
+        // the nonces again gets the final values (`features` is also cleared first by a re-init, see `init_writer`). The order of these loads is the point: nonces, features, nonces.
         let event_nonce_lo = get64(off::EVENT_NONCE_LO);
         let event_nonce_hi = get64(off::EVENT_NONCE_HI);
+        let event_nonce1_lo = get64(off::EVENT_NONCE1_LO);
+        let event_nonce1_hi = get64(off::EVENT_NONCE1_HI);
         let features = get32(off::FEATURES);
         let event_nonce_lo_again = get64(off::EVENT_NONCE_LO);
         let event_nonce_hi_again = get64(off::EVENT_NONCE_HI);
+        let event_nonce1_lo_again = get64(off::EVENT_NONCE1_LO);
+        let event_nonce1_hi_again = get64(off::EVENT_NONCE1_HI);
         RawHeader {
             magic: get32(off::MAGIC),
             protocol: get32(off::PROTOCOL),
@@ -435,8 +456,12 @@ impl RawHeader {
             features,
             event_nonce_lo,
             event_nonce_hi,
+            event_nonce1_lo,
+            event_nonce1_hi,
             event_nonce_lo_again,
             event_nonce_hi_again,
+            event_nonce1_lo_again,
+            event_nonce1_hi_again,
             signal_seq,
             wake_mode: get32(off::WAKE_MODE),
             wake_events: get64(off::WAKE_EVENTS),
@@ -446,13 +471,20 @@ impl RawHeader {
     }
 
     /// Parse the first [`HEADER_SIZE`] bytes of a plain read. `None` when `bytes` is shorter.
+    ///
+    /// The frame event advert is **not** read from bytes: `features` is 0 in the result. The advert is checked by
+    /// reading the nonces, `features` and the nonces again in that order, and a copy in memory has only one moment, so
+    /// its "second read" would equal the first and prove nothing (a copy taken while the writer starts over could pass).
+    /// The advert is valid only from the live mapping ([`crate::Shared::header`], [`RawHeader::load`]).
     pub fn from_bytes(bytes: &[u8]) -> Option<RawHeader> {
         if bytes.len() < HEADER_SIZE {
             return None;
         }
         let g32 = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
         let g64 = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
-        Some(RawHeader::load(&g32, &g64))
+        let mut h = RawHeader::load(&g32, &g64);
+        h.features = 0;
+        Some(h)
     }
 }
 
@@ -584,5 +616,76 @@ mod tests {
         assert!(RawHeader::from_bytes(&[0u8; 100]).is_none());
         let h = RawHeader::from_bytes(&vec![0u8; HEADER_SIZE]).unwrap();
         assert_eq!(h.magic, 0);
+    }
+
+    /// The order of the loads is the protocol: both nonces, then `features`, then both nonces again (the writer stores
+    /// `features` last and clears it first, so a reader that sees the bit and finds both reads of each nonce equal read
+    /// one advert). A recording stand-in for the mapping pins it down.
+    #[test]
+    fn load_reads_both_nonces_then_features_then_both_nonces_again() {
+        let log = std::cell::RefCell::new(Vec::<usize>::new());
+        let g32 = |o: usize| {
+            log.borrow_mut().push(o);
+            0
+        };
+        let g64 = |o: usize| {
+            log.borrow_mut().push(o);
+            0
+        };
+        RawHeader::load(&g32, &g64);
+        let log = log.into_inner();
+        let at = |o: usize| -> Vec<usize> {
+            log.iter()
+                .enumerate()
+                .filter(|(_, &x)| x == o)
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let features = at(off::FEATURES);
+        assert_eq!(features.len(), 1, "`features` is loaded once");
+        for (name, o) in [
+            ("nonce 0 lo", off::EVENT_NONCE_LO),
+            ("nonce 0 hi", off::EVENT_NONCE_HI),
+            ("nonce 1 lo", off::EVENT_NONCE1_LO),
+            ("nonce 1 hi", off::EVENT_NONCE1_HI),
+        ] {
+            let reads = at(o);
+            assert_eq!(reads.len(), 2, "{name} is loaded before and after");
+            assert!(
+                reads[0] < features[0] && features[0] < reads[1],
+                "{name}: loads at {reads:?}, `features` at {}",
+                features[0]
+            );
+        }
+    }
+
+    /// The advert is valid only from the live mapping: a plain copy has one moment, so the two reads of the nonces
+    /// cannot disagree in it, and `from_bytes` never reports the feature bit.
+    #[test]
+    fn a_plain_read_never_carries_an_advert() {
+        let mut b = vec![0u8; HEADER_SIZE];
+        b[off::FEATURES..off::FEATURES + 4].copy_from_slice(&FEATURE_FRAME_EVENT.to_le_bytes());
+        for o in [
+            off::EVENT_NONCE_LO,
+            off::EVENT_NONCE_HI,
+            off::EVENT_NONCE1_LO,
+            off::EVENT_NONCE1_HI,
+        ] {
+            b[o..o + 8].copy_from_slice(&0x1234_5678_9abc_def0u64.to_le_bytes());
+        }
+        // the same bytes, loaded as the mapping loads them (a closure over the copy), do give an advert ...
+        let g32 = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let g64 = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let loaded = RawHeader::load(&g32, &g64);
+        assert_eq!(loaded.features, FEATURE_FRAME_EVENT);
+        assert!(crate::validate_wake(&loaded).is_some());
+        // ... which a plain read must not
+        let plain = RawHeader::from_bytes(&b).unwrap();
+        assert_eq!(plain.features, 0);
+        assert_eq!(crate::validate_wake(&plain), None);
+        assert_eq!(
+            plain.event_nonce_lo, 0x1234_5678_9abc_def0,
+            "the rest is read"
+        );
     }
 }

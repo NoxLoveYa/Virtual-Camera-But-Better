@@ -1,16 +1,21 @@
 //! `feed`: act as the app's writer. Publishes the checkerboard + moving stripe pattern into `frames.bin` so the
 //! virtual camera shows it, following the size and format the DLL negotiated (the DLL never scales).
 //!
-//! `feed --size WxH --fps N --seconds S [--state live|paused|starting]`. `paused` and `starting` publish no frames;
-//! they only hold that state (with heartbeats) so the DLL shows the matching slate.
+//! `feed --size WxH --fps N --seconds S [--state live|paused|starting] [--no-signal] [--file PATH]`. `paused` and
+//! `starting` publish no frames; they only hold that state (with heartbeats) so the DLL shows the matching slate.
+//! `--no-signal` makes no frame events, like an app from before the frame event (the DLL then polls). `--file`
+//! writes a scratch frame file instead of `%ProgramData%\BetterCam\frames.bin` (for tests; the camera does not read it).
+//! It takes only a file that is not there, is empty or is already a frame file, and never one in the folder of the real
+//! frame file, however the path is spelled (`vcam_protocol::WriterOptions::scratch`).
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use vcam_protocol::pattern;
 use vcam_protocol::{
-    advertised_for_output, qpc_frequency, qpc_now, Format, SlotFormat, Writer, WriterState,
-    SUBTYPE_NV12, SUBTYPE_RGB32,
+    advertised_for_output, qpc_frequency, qpc_now, Format, SlotFormat, Writer, WriterOptions,
+    WriterState, SUBTYPE_NV12, SUBTYPE_RGB32,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
@@ -19,8 +24,7 @@ use windows::Win32::System::Threading::{
     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
 };
 
-pub const USAGE: &str =
-    "usage: vcam-tool feed [--size WxH] [--fps N] [--seconds S] [--state live|paused|starting]";
+pub const USAGE: &str = "usage: vcam-tool feed [--size WxH] [--fps N] [--seconds S] [--state live|paused|starting] [--no-signal] [--file PATH]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -36,6 +40,10 @@ pub struct Args {
     pub fps: u32,
     pub seconds: f64,
     pub state: State,
+    /// Make and signal the frame events (off with `--no-signal`).
+    pub signal: bool,
+    /// A scratch frame file instead of the real one.
+    pub file: Option<PathBuf>,
 }
 
 pub fn parse_args(args: &[String]) -> Result<Args, String> {
@@ -45,6 +53,8 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
         fps: 30,
         seconds: 10.0,
         state: State::Live,
+        signal: true,
+        file: None,
     };
     let mut it = args.iter();
     while let Some(k) = it.next() {
@@ -66,6 +76,8 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
                     o => return Err(format!("unknown state '{o}' (live|paused|starting)")),
                 }
             }
+            "--no-signal" => a.signal = false,
+            "--file" => a.file = Some(PathBuf::from(val()?)),
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
@@ -162,12 +174,22 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let writer = match Writer::create_default() {
+    let path = a.file.clone().unwrap_or_else(vcam_protocol::frames_path);
+    // a typed path is a scratch file: it must not take over an existing file that is not a frame file
+    let opts = WriterOptions {
+        signal: a.signal,
+        scratch: a.file.is_some(),
+    };
+    let writer = match Writer::create_with(&path, &opts) {
         Ok(w) => w,
+        Err(e) if vcam_protocol::secure::is_refused(&e) => {
+            eprintln!("refusing {}: {e}", path.display());
+            return 1;
+        }
         Err(e) => {
             eprintln!(
                 "cannot create {}: {e}\n(run 'vcam-tool register' once so the folder has the right ACL)",
-                vcam_protocol::frames_path().display()
+                path.display()
             );
             return 1;
         }
@@ -178,14 +200,15 @@ pub fn run(args: &[String]) -> i32 {
     let advertised = advertised_for_output(a.width, a.height, a.fps);
     writer.set_advertised(&advertised);
     println!(
-        "feeding {}: {}x{} @{} fps for {} s, state {:?}; advertised {} types",
-        vcam_protocol::frames_path().display(),
+        "feeding {}: {}x{} @{} fps for {} s, state {:?}; advertised {} types; frame event {:?}",
+        path.display(),
         a.width,
         a.height,
         a.fps,
         a.seconds,
         a.state,
-        advertised.len()
+        advertised.len(),
+        writer.frame_event_status()
     );
 
     let began = Instant::now();
@@ -299,6 +322,7 @@ pub fn run(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::ScratchDir;
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
@@ -322,6 +346,71 @@ mod tests {
             (1280, 720, 60, 2.5, State::Paused)
         );
         assert_eq!(parse_args(&[]).unwrap().width, 1920);
+    }
+
+    #[test]
+    fn no_signal_and_the_scratch_file_are_options_and_signalling_is_the_default() {
+        let a = parse_args(&[]).unwrap();
+        assert!(a.signal && a.file.is_none());
+        let a = parse_args(&s(&["--no-signal", "--file", r"C:\x\scratch.bin"])).unwrap();
+        assert!(!a.signal);
+        assert_eq!(a.file, Some(PathBuf::from(r"C:\x\scratch.bin")));
+        assert!(parse_args(&s(&["--file"])).is_err());
+        assert!(USAGE.contains("--no-signal"));
+    }
+
+    /// The header of the file a finished `run` left (the writer is closed by then, so the advert is withdrawn; the nonces
+    /// and the count of signals stay).
+    fn left_behind(path: &std::path::Path) -> vcam_protocol::RawHeader {
+        vcam_protocol::MappedFile::open(path, vcam_protocol::Access::ReadOnly)
+            .unwrap()
+            .shared()
+            .header()
+    }
+
+    /// `--no-signal` is the old app: through `run`, the writer it makes has no events: no nonce in the header, and no
+    /// signal for the state change and the close, which a writer with events makes.
+    #[test]
+    fn run_with_no_signal_makes_no_events_and_without_it_makes_them() {
+        let dir = ScratchDir::new("feed-signal");
+        for (flags, signal) in [(&[][..], true), (&["--no-signal"][..], false)] {
+            let path = dir.join(&format!("signal-{signal}.bin"));
+            let mut args = s(&["--state", "paused", "--seconds", "0.2", "--file"]);
+            args.push(path.display().to_string());
+            args.extend(s(flags));
+            assert_eq!(run(&args), 0);
+            let h = left_behind(&path);
+            assert_eq!(h.writer_state, WriterState::Closed as u32);
+            assert_eq!(h.event_nonce_lo != 0, signal, "nonce in the header");
+            assert_eq!(h.signal_seq > 0, signal, "signals made: {}", h.signal_seq);
+        }
+    }
+
+    /// `--file` takes a scratch file only: a file that exists and is not a frame file is refused and left alone.
+    #[test]
+    fn run_refuses_a_file_that_is_not_a_frame_file_and_leaves_it_alone() {
+        let dir = ScratchDir::new("feed-refuse");
+        let notes = dir.join("notes.txt");
+        std::fs::write(&notes, b"my notes").unwrap();
+        let args = s(&["--seconds", "0.2", "--file", &notes.display().to_string()]);
+        assert_eq!(run(&args), 1);
+        assert_eq!(std::fs::read(&notes).unwrap(), b"my notes");
+        // a frame file of an earlier run is reused
+        let fresh = dir.join("fresh.bin");
+        let args = s(&[
+            "--state",
+            "paused",
+            "--seconds",
+            "0.2",
+            "--file",
+            &fresh.display().to_string(),
+        ]);
+        assert_eq!(run(&args), 0);
+        assert_eq!(run(&args), 0);
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().len(),
+            vcam_protocol::FILE_SIZE
+        );
     }
 
     #[test]

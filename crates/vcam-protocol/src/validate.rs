@@ -55,13 +55,14 @@ impl From<FormatError> for SlotError {
 }
 
 /// What the writer says about its frame events ([`crate::signal`]): present only when `features` has
-/// [`FEATURE_FRAME_EVENT`] and the nonce is non-zero and was read the same twice.
+/// [`FEATURE_FRAME_EVENT`] and both nonces are non-zero and were read the same twice.
 ///
-/// The header never names the events, it only holds 128 bits: the reader formats the name itself
+/// The header never names the events, it only holds two 128-bit values: the reader formats the names itself
 /// ([`crate::signal::event_name`]), so a hostile file can only point it at objects under our own prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WakeAdvert {
-    pub nonce: u128,
+    /// The nonces of event `.0` and event `.1`: `nonces[parity]` names the event `parity`.
+    pub nonces: [u128; 2],
     /// `signal_seq` as loaded with the header.
     pub signal_seq: u64,
 }
@@ -85,18 +86,23 @@ pub struct ValidHeader {
     pub advertised: Vec<Format>,
 }
 
-/// The frame event advert of `h`, or `None`: the bit is set, the nonce is not zero, and the two reads of the nonce
+/// The frame event advert of `h`, or `None`: the bit is set, neither nonce is zero, and the two reads of each nonce
 /// (one before and one after `features`) agree. Unknown feature bits are ignored.
 pub fn validate_wake(h: &RawHeader) -> Option<WakeAdvert> {
     if h.features & FEATURE_FRAME_EVENT == 0 {
         return None;
     }
-    if h.event_nonce_lo != h.event_nonce_lo_again || h.event_nonce_hi != h.event_nonce_hi_again {
+    if h.event_nonce_lo != h.event_nonce_lo_again
+        || h.event_nonce_hi != h.event_nonce_hi_again
+        || h.event_nonce1_lo != h.event_nonce1_lo_again
+        || h.event_nonce1_hi != h.event_nonce1_hi_again
+    {
         return None;
     }
-    let nonce = (h.event_nonce_hi as u128) << 64 | h.event_nonce_lo as u128;
-    (nonce != 0).then_some(WakeAdvert {
-        nonce,
+    let n0 = (h.event_nonce_hi as u128) << 64 | h.event_nonce_lo as u128;
+    let n1 = (h.event_nonce1_hi as u128) << 64 | h.event_nonce1_lo as u128;
+    (n0 != 0 && n1 != 0).then_some(WakeAdvert {
+        nonces: [n0, n1],
         signal_seq: h.signal_seq,
     })
 }
@@ -548,8 +554,12 @@ mod tests {
         h.features = FEATURE_FRAME_EVENT;
         h.event_nonce_lo = 0x1122_3344_5566_7788;
         h.event_nonce_hi = 0x99aa_bbcc_ddee_ff00;
+        h.event_nonce1_lo = 0x0102_0304_0506_0708;
+        h.event_nonce1_hi = 0x1112_1314_1516_1718;
         h.event_nonce_lo_again = h.event_nonce_lo;
         h.event_nonce_hi_again = h.event_nonce_hi;
+        h.event_nonce1_lo_again = h.event_nonce1_lo;
+        h.event_nonce1_hi_again = h.event_nonce1_hi;
         h.signal_seq = 41;
         f(&mut h);
         h
@@ -566,31 +576,56 @@ mod tests {
             h.event_nonce_hi = 0;
             h.event_nonce_lo_again = 0;
             h.event_nonce_hi_again = 0;
+            h.event_nonce1_lo = 0;
+            h.event_nonce1_hi = 0;
+            h.event_nonce1_lo_again = 0;
+            h.event_nonce1_hi_again = 0;
         });
         assert_eq!(validate_wake(&h), None);
         let h = with_advert(|h| h.features = 0);
         assert_eq!(validate_wake(&h), None);
+        // the first nonce alone is no advert: a writer of the first design (one nonce) has no second one
+        let h = with_advert(|h| {
+            h.event_nonce1_lo = 0;
+            h.event_nonce1_hi = 0;
+            h.event_nonce1_lo_again = 0;
+            h.event_nonce1_hi_again = 0;
+        });
+        assert_eq!(validate_wake(&h), None);
+        let h = with_advert(|h| {
+            h.event_nonce_lo = 0;
+            h.event_nonce_hi = 0;
+            h.event_nonce_lo_again = 0;
+            h.event_nonce_hi_again = 0;
+        });
+        assert_eq!(validate_wake(&h), None);
     }
 
     #[test]
-    fn a_good_advert_gives_the_nonce_and_the_signal_count() {
+    fn a_good_advert_gives_both_nonces_and_the_signal_count() {
         let v = validate_header(&with_advert(|_| {}), FILE_SIZE, None, None).unwrap();
         let w = v.wake.expect("advert");
-        assert_eq!(w.nonce, 0x99aa_bbcc_ddee_ff00_1122_3344_5566_7788);
+        assert_eq!(
+            w.nonces,
+            [
+                0x99aa_bbcc_ddee_ff00_1122_3344_5566_7788,
+                0x1112_1314_1516_1718_0102_0304_0506_0708
+            ]
+        );
         assert_eq!(w.signal_seq, 41);
         // either half alone is a valid nonce
         let h = with_advert(|h| {
             h.event_nonce_hi = 0;
             h.event_nonce_hi_again = 0;
         });
-        assert_eq!(validate_wake(&h).unwrap().nonce, 0x1122_3344_5566_7788);
+        assert_eq!(validate_wake(&h).unwrap().nonces[0], 0x1122_3344_5566_7788);
         let h = with_advert(|h| {
-            h.event_nonce_lo = 0;
-            h.event_nonce_lo_again = 0;
+            h.event_nonce1_lo = 0;
+            h.event_nonce1_lo_again = 0;
         });
         assert_eq!(
-            validate_wake(&h).unwrap().nonce,
-            0x99aa_bbcc_ddee_ff00_0000_0000_0000_0000
+            validate_wake(&h).unwrap().nonces[1],
+            0x1112_1314_1516_1718_0000_0000_0000_0000
         );
     }
 
@@ -607,13 +642,12 @@ mod tests {
 
     #[test]
     fn a_nonce_that_changed_between_the_two_reads_gives_no_advert() {
-        for flip in 0..2 {
-            let h = with_advert(|h| {
-                if flip == 0 {
-                    h.event_nonce_lo_again ^= 1;
-                } else {
-                    h.event_nonce_hi_again ^= 1 << 63;
-                }
+        for flip in 0..4 {
+            let h = with_advert(|h| match flip {
+                0 => h.event_nonce_lo_again ^= 1,
+                1 => h.event_nonce_hi_again ^= 1 << 63,
+                2 => h.event_nonce1_lo_again ^= 1,
+                _ => h.event_nonce1_hi_again ^= 1 << 63,
             });
             assert_eq!(validate_wake(&h), None, "flip {flip}");
         }
@@ -621,6 +655,11 @@ mod tests {
         let h = with_advert(|h| {
             h.event_nonce_lo_again = 0;
             h.event_nonce_hi_again = 0;
+        });
+        assert_eq!(validate_wake(&h), None);
+        let h = with_advert(|h| {
+            h.event_nonce1_lo_again = 0;
+            h.event_nonce1_hi_again = 0;
         });
         assert_eq!(validate_wake(&h), None);
     }
@@ -642,6 +681,10 @@ mod tests {
             h.event_nonce_hi = hi;
             h.event_nonce_lo_again = lo2;
             h.event_nonce_hi_again = hi2;
+            h.event_nonce1_lo = hi;
+            h.event_nonce1_hi = lo;
+            h.event_nonce1_lo_again = hi2;
+            h.event_nonce1_hi_again = lo2;
             h.signal_seq = seq;
             h.wake_mode = u32::MAX;
             h.wake_events = u64::MAX;

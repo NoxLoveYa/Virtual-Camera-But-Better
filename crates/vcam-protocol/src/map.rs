@@ -18,7 +18,7 @@ use windows::Win32::System::Memory::{
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 use crate::header::{
-    Format, RawHeader, SlotMeta, WriterState, FILE_SIZE, HEADER_SIZE, MAX_FILE_SIZE,
+    Format, RawHeader, SlotMeta, WriterState, FILE_SIZE, HEADER_SIZE, MAGIC, MAX_FILE_SIZE,
 };
 use crate::secure;
 use crate::seqlock::{PublishError, Shared, SlotFormat};
@@ -79,6 +79,54 @@ fn win_err(e: windows::core::Error) -> io::Error {
 fn is_default_path(path: &Path) -> bool {
     path.to_string_lossy()
         .eq_ignore_ascii_case(&frames_path().to_string_lossy())
+}
+
+/// Refuse the file behind `file` when it really lies in `dir` or below it. `dir` is resolved with every link followed
+/// and the file by its final path (`GetFinalPathNameByHandleW`, which gives the long name of the opened object), so no
+/// spelling of the path and no junction in a parent gets round it. A `dir` that does not exist holds no file.
+fn refuse_inside(file: HANDLE, dir: &Path) -> io::Result<()> {
+    let mut prefix = match secure::canonical_dir(dir) {
+        Ok(d) => d.to_lowercase(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    while prefix.ends_with('\\') {
+        prefix.pop();
+    }
+    prefix.push('\\');
+    let got = secure::final_path(file)?;
+    if got.to_lowercase().starts_with(&prefix) {
+        return Err(secure::refused(format!(
+            "{got} is in {}, the folder of the real frame file: only its own path opens it",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse the file behind `file` unless it is empty or a frame file: exactly [`FILE_SIZE`] bytes that start with
+/// [`MAGIC`]. Read through the handle itself (an offset read; the file pointer is not moved).
+fn refuse_unless_frame_file(file: HANDLE) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    use std::os::windows::io::FromRawHandle;
+    let mut size = 0i64;
+    unsafe { GetFileSizeEx(file, &mut size) }.map_err(win_err)?;
+    if size == 0 {
+        return Ok(());
+    }
+    // SAFETY: a borrow of the caller's handle; `ManuallyDrop` keeps `File` from closing it.
+    let f = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(file.0) });
+    let mut magic = [0u8; 4];
+    let is_frame_file = size as u64 == FILE_SIZE
+        && f.seek_read(&mut magic, 0).is_ok_and(|n| n == magic.len())
+        && u32::from_le_bytes(magic) == MAGIC;
+    if is_frame_file {
+        Ok(())
+    } else {
+        Err(secure::refused(format!(
+            "it exists and is not a frame file ({size} bytes, or not starting with BCAM): not overwriting it"
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -352,11 +400,20 @@ pub struct WriterOptions {
     /// Make and signal the frame events (default). Off for a writer that stands in for an old app (`vcam-tool feed
     /// --no-signal`, tests of a reader against a writer without events).
     pub signal: bool,
+    /// For a path somebody typed (`vcam-tool feed --file`), used with [`Writer::create_with`] on a path that is not
+    /// the production one: an existing file is used only when it is empty or already a frame file (exactly
+    /// [`FILE_SIZE`] bytes, starting with the magic); anything else is refused before a byte of it is grown or written.
+    /// The check reads through the handle that is then used, so it cannot be raced. Off by default: [`Writer::create`]
+    /// takes any existing file (a larger one as it is).
+    pub scratch: bool,
 }
 
 impl Default for WriterOptions {
     fn default() -> Self {
-        WriterOptions { signal: true }
+        WriterOptions {
+            signal: true,
+            scratch: false,
+        }
     }
 }
 
@@ -402,14 +459,30 @@ impl Writer {
     }
 
     /// [`Writer::create`] with options.
+    ///
+    /// A path other than the default one is never the real frame file, however it reaches it: once opened, the file
+    /// must not lie in [`data_dir`] (compared by the final path of the opened handle, so a junction in the parents,
+    /// `\\?\`, an 8.3 name or a different spelling of `%ProgramData%` do not get round it), or the open is refused
+    /// ([`secure::is_refused`]). Only the exact default path is the production file, with its pin.
     pub fn create_with(path: &Path, opts: &WriterOptions) -> io::Result<Writer> {
         if is_default_path(path) {
-            return Self::open_precreated_with(path, Some(&secure::program_data_dir()), opts);
+            // the installer's file is not a scratch file: its pin is the check
+            let opts = WriterOptions {
+                scratch: false,
+                ..*opts
+            };
+            return Self::open_precreated_with(path, Some(&secure::program_data_dir()), &opts);
         }
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        Self::open_file(path, secure::DISP_OPEN_ALWAYS, None, opts)
+        Self::open_file(
+            path,
+            secure::DISP_OPEN_ALWAYS,
+            None,
+            opts,
+            Some(&data_dir()),
+        )
     }
 
     /// Open the file the installer made at `path` (it must exist), as [`Writer::create`] does for the default path.
@@ -424,7 +497,7 @@ impl Writer {
         pin: Option<&Path>,
         opts: &WriterOptions,
     ) -> io::Result<Writer> {
-        Self::open_file(path, secure::DISP_OPEN_EXISTING, pin, opts).map_err(|e| {
+        Self::open_file(path, secure::DISP_OPEN_EXISTING, pin, opts, None).map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
                 io::Error::new(
                     io::ErrorKind::NotFound,
@@ -439,11 +512,13 @@ impl Writer {
         })
     }
 
+    /// `keep_out`: a folder the opened file must not lie in ([`refuse_inside`]).
     fn open_file(
         path: &Path,
         disposition: windows::Win32::Storage::FileSystem::FILE_CREATION_DISPOSITION,
         pin: Option<&Path>,
         opts: &WriterOptions,
+        keep_out: Option<&Path>,
     ) -> io::Result<Writer> {
         let expect = match pin {
             Some(root) => Some(secure::expected_path(root, path)?),
@@ -459,6 +534,13 @@ impl Writer {
             FILE_ATTRIBUTE_TEMPORARY.0,
         )?;
         secure::verify_file(secure::raw(&h), expect.as_deref())?;
+        // both checks are on the handle that is used next (and drop it on failure), before the file is grown or written
+        if let Some(dir) = keep_out {
+            refuse_inside(secure::raw(&h), dir)?;
+        }
+        if opts.scratch {
+            refuse_unless_frame_file(secure::raw(&h))?;
+        }
         let file = HANDLE(h.into_raw_handle());
         let mut size = 0i64;
         let grow = unsafe { GetFileSizeEx(file, &mut size) }.and_then(|_| {
@@ -521,9 +603,9 @@ impl Writer {
         &self.event_status
     }
 
-    /// The nonce the frame events are named by, when there are events.
-    pub fn frame_event_nonce(&self) -> Option<u128> {
-        self.signal.as_ref().map(|s| s.nonce())
+    /// The nonces the frame events are named by (`[i]` names event `.i`), when there are events.
+    pub fn frame_event_nonces(&self) -> Option<[u128; 2]> {
+        self.signal.as_ref().map(|s| s.nonces())
     }
 
     /// One signal for a reader that waits, if there are events. Called with the write gate held.
@@ -724,14 +806,14 @@ mod tests {
     use windows::Win32::Storage::FileSystem::GetFileAttributesW;
 
     fn temp_file(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("bettercam-proto-{}", std::process::id()));
+        let dir = crate::test_dir("proto");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
     }
 
     /// A fresh folder for one test, with the temp dir below it as the trusted root of a pin.
     fn sandbox(name: &str) -> (PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!("bettercam-writer-{}", std::process::id()));
+        let root = crate::test_dir("writer");
         let dir = root.join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -913,6 +995,142 @@ mod tests {
             assert!(secure::is_refused(&e), "{e}");
             assert_eq!(std::fs::metadata(&target).unwrap().len(), 8192);
         }
+    }
+
+    fn scratch() -> WriterOptions {
+        WriterOptions {
+            scratch: true,
+            ..WriterOptions::default()
+        }
+    }
+
+    /// What a typed `--file` may do to an existing file: nothing but reuse a frame file. Every refusal leaves the
+    /// file exactly as it was.
+    #[test]
+    fn a_scratch_writer_refuses_an_existing_file_that_is_not_a_frame_file() {
+        let (_root, dir) = sandbox("scratch");
+        let bytes_of = |p: &Path| std::fs::read(p).unwrap();
+
+        // something that is not a frame file, of any size
+        let notes = dir.join("notes.txt");
+        std::fs::write(&notes, b"my notes").unwrap();
+        let e = Writer::create_with(&notes, &scratch()).err().unwrap();
+        assert!(secure::is_refused(&e), "{e}");
+        assert_eq!(bytes_of(&notes), b"my notes", "must not be touched");
+
+        // exactly the size of a frame file but without the magic (a file of somebody else's, or the installer's)
+        let sized = dir.join("sized.bin");
+        {
+            let f = std::fs::File::create(&sized).unwrap();
+            f.set_len(FILE_SIZE).unwrap();
+        }
+        let e = Writer::create_with(&sized, &scratch()).err().unwrap();
+        assert!(secure::is_refused(&e), "{e}");
+        assert_eq!(std::fs::metadata(&sized).unwrap().len(), FILE_SIZE);
+        assert_eq!(&bytes_of(&sized)[..HEADER_SIZE], &[0u8; HEADER_SIZE][..]);
+
+        // the magic but another size: shorter, and longer than a frame file
+        for (name, len) in [("short.bin", 8192u64), ("long.bin", FILE_SIZE + 4096)] {
+            let p = dir.join(name);
+            {
+                use std::io::Write;
+                let mut f = std::fs::File::create(&p).unwrap();
+                f.write_all(&MAGIC.to_le_bytes()).unwrap();
+                f.set_len(len).unwrap();
+            }
+            let e = Writer::create_with(&p, &scratch()).err().unwrap();
+            assert!(secure::is_refused(&e), "{name}: {e}");
+            assert_eq!(std::fs::metadata(&p).unwrap().len(), len, "{name}");
+            assert_eq!(&bytes_of(&p)[..4], &MAGIC.to_le_bytes(), "{name}");
+        }
+
+        // what it does use: a file that is not there, an empty one, and the frame file of an earlier writer
+        let fresh = dir.join("fresh.bin");
+        drop(Writer::create_with(&fresh, &scratch()).unwrap());
+        assert_eq!(std::fs::metadata(&fresh).unwrap().len(), FILE_SIZE);
+        let empty = dir.join("empty.bin");
+        std::fs::write(&empty, b"").unwrap();
+        drop(Writer::create_with(&empty, &scratch()).unwrap());
+        assert_eq!(std::fs::metadata(&empty).unwrap().len(), FILE_SIZE);
+        let again = Writer::create_with(&fresh, &scratch()).unwrap();
+        assert_eq!(again.header().magic, MAGIC);
+
+        // without the option the same notes file is taken over: the option is what protects it
+        let e = Writer::create_with(&notes, &WriterOptions::default());
+        assert!(e.is_ok(), "{:?}", e.err());
+        assert_eq!(std::fs::metadata(&notes).unwrap().len(), FILE_SIZE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The real frame file may be reached only by its own path: whatever else leads to the folder that holds it is
+    /// refused after the open, by where the opened handle really is. `keep` stands in for `%ProgramData%\BetterCam`
+    /// (the production call passes [`data_dir`]; a test must not open files in the real one).
+    #[test]
+    fn a_path_that_leads_into_the_kept_out_folder_is_refused_whatever_it_looks_like() {
+        let (_root, dir) = sandbox("keep-out");
+        let keep = dir.join("BetterCam");
+        std::fs::create_dir_all(&keep).unwrap();
+        let real = keep.join("frames.bin");
+        let w = Writer::open_file(&real, secure::DISP_OPEN_ALWAYS, None, &scratch(), None).unwrap();
+        w.set_state(WriterState::Live);
+        let before = w.header();
+
+        let by_junction = dir.join("alias");
+        junction(&by_junction, &keep);
+        let by_junction_in_parent = dir.join("alias2");
+        junction(&by_junction_in_parent, &dir);
+        let aliases = [
+            ("the path itself", real.clone()),
+            (
+                "another case",
+                PathBuf::from(real.to_string_lossy().to_uppercase()),
+            ),
+            (
+                "the verbatim form",
+                PathBuf::from(format!(r"\\?\{}", real.display())),
+            ),
+            ("a dot segment", keep.join(".").join("frames.bin")),
+            ("a junction to the folder", by_junction.join("frames.bin")),
+            (
+                "a junction above the folder",
+                by_junction_in_parent.join("BetterCam").join("frames.bin"),
+            ),
+            ("another name in the folder", keep.join("other.bin")),
+        ];
+        for (what, p) in &aliases {
+            for opts in [WriterOptions::default(), scratch()] {
+                let e = Writer::open_file(p, secure::DISP_OPEN_ALWAYS, None, &opts, Some(&keep))
+                    .err()
+                    .unwrap_or_else(|| panic!("{what}: opened"));
+                assert!(secure::is_refused(&e), "{what}: {e}");
+            }
+        }
+        // the real file is as the first writer left it: nothing grew, nothing was rewritten
+        assert_eq!(std::fs::metadata(&real).unwrap().len(), FILE_SIZE);
+        assert_eq!(w.header(), before, "an alias wiped the header");
+
+        // a file next to the folder, or in a folder of the same name elsewhere, is not the real one
+        for p in [
+            dir.join("scratch.bin"),
+            dir.join("a").join("BetterCam").join("frames.bin"),
+        ] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            let v = Writer::open_file(&p, secure::DISP_OPEN_ALWAYS, None, &scratch(), Some(&keep));
+            assert!(v.is_ok(), "{}: {:?}", p.display(), v.err());
+        }
+        // a folder that is not there holds nothing: nothing to keep out of
+        let v = Writer::open_file(
+            &dir.join("fine.bin"),
+            secure::DISP_OPEN_ALWAYS,
+            None,
+            &scratch(),
+            Some(&dir.join("no-such-folder")),
+        );
+        assert!(v.is_ok(), "{:?}", v.err());
+        drop(w);
+        let _ = std::fs::remove_dir(&by_junction);
+        let _ = std::fs::remove_dir(&by_junction_in_parent);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1402,18 +1620,22 @@ mod tests {
         let w = Writer::create(&path).unwrap();
         assert_eq!(w.frame_event_status(), &FrameEventStatus::On);
         let h = w.header();
-        let nonce = w.frame_event_nonce().unwrap();
+        let nonces = w.frame_event_nonces().unwrap();
         assert_eq!(h.features, FEATURE_FRAME_EVENT);
         assert_eq!(
-            ((h.event_nonce_hi as u128) << 64) | h.event_nonce_lo as u128,
-            nonce
+            [
+                ((h.event_nonce_hi as u128) << 64) | h.event_nonce_lo as u128,
+                ((h.event_nonce1_hi as u128) << 64) | h.event_nonce1_lo as u128
+            ],
+            nonces
         );
+        assert_ne!(nonces[0], nonces[1], "each event has its own nonce");
         assert_eq!(h.signal_seq, 0, "nothing is signalled by opening");
         // a reader validates it as an advert
         let m = MappedFile::open(&path, Access::ReadOnly).unwrap();
         let v = validate_header(&m.shared().header(), m.len() as u64, None, None).unwrap();
-        assert_eq!(v.wake.map(|w| (w.nonce, w.signal_seq)), Some((nonce, 0)));
-        let ev = open_frame_events(nonce).unwrap();
+        assert_eq!(v.wake.map(|w| (w.nonces, w.signal_seq)), Some((nonces, 0)));
+        let ev = open_frame_events(nonces).unwrap();
         drop(ev);
         // the DLL's diagnostics start at zero
         assert_eq!((h.wake_mode, h.wake_events), (wake_mode::POLLING, 0));
@@ -1579,26 +1801,34 @@ mod tests {
     fn a_writer_whose_events_cannot_be_made_works_as_before() {
         let path = temp_file("ev-fail.bin");
         let _ = std::fs::remove_file(&path);
-        // every nonce the generator offers has a taken name
-        let nonces: Vec<u128> = (1..=3).map(|i| 0xDEAD_0000 + i).collect();
-        let _squatters: Vec<_> = nonces.iter().map(|&n| squat(n, 0, None)).collect();
-        let w = with_nonces(nonces.iter().map(|&n| Ok(n)).collect(), || {
+        // every pair of nonces the generator offers has a taken name (the first event of each)
+        let pairs: Vec<[u128; 2]> = (1..=3)
+            .map(|i| [0xDEAD_0000 + 2 * i, 0xDEAD_0000 + 2 * i + 1])
+            .collect();
+        let _squatters: Vec<_> = pairs.iter().map(|p| squat(p[0], 0, None)).collect();
+        let w = with_nonces(pairs.iter().flatten().map(|&n| Ok(n)).collect(), || {
             Writer::create(&path).unwrap()
         });
         match w.frame_event_status() {
             FrameEventStatus::Failed(why) => assert!(why.contains("taken"), "{why}"),
             other => panic!("{other:?}"),
         }
-        assert_eq!(w.frame_event_nonce(), None);
+        assert_eq!(w.frame_event_nonces(), None);
         let h = w.header();
         assert_eq!(h.features, 0, "the feature bit is set without events");
         assert_eq!(
-            (h.event_nonce_lo, h.event_nonce_hi, h.signal_seq),
-            (0, 0, 0)
+            (
+                h.event_nonce_lo,
+                h.event_nonce_hi,
+                h.event_nonce1_lo,
+                h.event_nonce1_hi,
+                h.signal_seq
+            ),
+            (0, 0, 0, 0, 0)
         );
         // nothing was left open under the names the writer tried
-        for &n in &nonces {
-            assert!(not_found(&open_for(n, 1, MODIFY_OR_WAIT)));
+        for p in &pairs {
+            assert!(not_found(&open_for(p[1], 1, MODIFY_OR_WAIT)));
         }
         // and it publishes, changes state, leases and closes exactly as before, advertising nothing
         w.set_advertised(&crate::advertised_for_output(1280, 720, 30));
@@ -1623,7 +1853,14 @@ mod tests {
     fn a_writer_without_signals_is_the_old_writer() {
         let path = temp_file("ev-disabled.bin");
         let _ = std::fs::remove_file(&path);
-        let w = Writer::create_with(&path, &WriterOptions { signal: false }).unwrap();
+        let w = Writer::create_with(
+            &path,
+            &WriterOptions {
+                signal: false,
+                ..WriterOptions::default()
+            },
+        )
+        .unwrap();
         assert_eq!(w.frame_event_status(), &FrameEventStatus::Disabled);
         w.set_state(WriterState::Live);
         w.publish(fmt16(), 1, |d| d.fill(1)).unwrap();
@@ -1634,7 +1871,13 @@ mod tests {
             (0, 0, 0, 0)
         );
         assert_eq!(h.writer_frames, 1);
-        assert_eq!(WriterOptions::default(), WriterOptions { signal: true });
+        assert_eq!(
+            WriterOptions::default(),
+            WriterOptions {
+                signal: true,
+                scratch: false
+            }
+        );
     }
 
     #[test]
@@ -1644,23 +1887,40 @@ mod tests {
         let first = Writer::create(&path).unwrap();
         first.set_state(WriterState::Live);
         first.publish(fmt16(), 1, |d| d.fill(1)).unwrap();
-        let n1 = first.frame_event_nonce().unwrap();
+        let n1 = first.frame_event_nonces().unwrap();
         assert_eq!(first.header().signal_seq, 2);
         // an old app (no events) starts over the same file: its init zeroes the advert and the count
-        let old = Writer::create_with(&path, &WriterOptions { signal: false }).unwrap();
+        let old = Writer::create_with(
+            &path,
+            &WriterOptions {
+                signal: false,
+                ..WriterOptions::default()
+            },
+        )
+        .unwrap();
         let h = old.header();
         assert_eq!(
-            (h.features, h.event_nonce_lo, h.event_nonce_hi, h.signal_seq),
-            (0, 0, 0, 0)
+            (
+                h.features,
+                h.event_nonce_lo,
+                h.event_nonce_hi,
+                h.event_nonce1_lo,
+                h.event_nonce1_hi,
+                h.signal_seq
+            ),
+            (0, 0, 0, 0, 0, 0)
         );
-        // a new app starts over it: a new nonce, the count from 0
+        // a new app starts over it: new nonces, the count from 0
         let second = Writer::create(&path).unwrap();
-        let n2 = second.frame_event_nonce().unwrap();
+        let n2 = second.frame_event_nonces().unwrap();
         assert_ne!(n1, n2);
         let h = second.header();
         assert_eq!(h.features, FEATURE_FRAME_EVENT);
         assert_eq!(
-            ((h.event_nonce_hi as u128) << 64) | h.event_nonce_lo as u128,
+            [
+                ((h.event_nonce_hi as u128) << 64) | h.event_nonce_lo as u128,
+                ((h.event_nonce1_hi as u128) << 64) | h.event_nonce1_lo as u128
+            ],
             n2
         );
         assert_eq!(h.signal_seq, 0);
@@ -1668,12 +1928,82 @@ mod tests {
         assert!(open_frame_events(n1).is_ok() && open_frame_events(n2).is_ok());
     }
 
+    /// Removes a file at the end of a test, also when it panics.
+    struct RemoveOnDrop(PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// A writer that keeps starting the file over, a reader that keeps reading the advert from the live mapping: an
+    /// advert the reader accepts is one a writer made, never a mix of two (nonces from different starts, or a half-wiped
+    /// one). The writer records each pair it advertised after `create` returns, so the reader's set is checked once
+    /// both have stopped. A stress test: on a strongly ordered CPU a broken order may still pass it.
+    #[test]
+    fn every_advert_a_reader_accepts_is_one_a_writer_made_while_the_file_starts_over() {
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Mutex;
+        let path = temp_file("ev-torn.bin");
+        let _ = std::fs::remove_file(&path);
+        let _cleanup = RemoveOnDrop(path.clone());
+        // the first writer makes the file; the reader maps it once and sees every later start over
+        let first = Writer::create(&path).unwrap();
+        let m = MappedFile::open(&path, Access::ReadOnly).unwrap();
+        let made: Mutex<HashSet<[u128; 2]>> = Mutex::new(HashSet::new());
+        made.lock()
+            .unwrap()
+            .insert(first.frame_event_nonces().unwrap());
+        let stop = AtomicBool::new(false);
+        let (seen, starts) = std::thread::scope(|s| {
+            let writer = s.spawn(|| {
+                let mut starts = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let w = Writer::create(&path).unwrap();
+                    made.lock().unwrap().insert(w.frame_event_nonces().unwrap());
+                    starts += 1;
+                }
+                starts
+            });
+            let reader = s.spawn(|| {
+                let mut seen: HashSet<[u128; 2]> = HashSet::new();
+                let began = std::time::Instant::now();
+                while began.elapsed() < std::time::Duration::from_millis(1500) {
+                    if let Some(w) = crate::validate_wake(&m.shared().header()) {
+                        seen.insert(w.nonces);
+                    }
+                }
+                stop.store(true, Ordering::Relaxed);
+                seen
+            });
+            let seen = reader.join().unwrap();
+            (seen, writer.join().unwrap())
+        });
+        let made = made.into_inner().unwrap();
+        eprintln!(
+            "{starts} starts, {} adverts seen, {} made",
+            seen.len(),
+            made.len()
+        );
+        assert!(
+            starts > 20,
+            "the writer only started the file {starts} times"
+        );
+        assert!(!seen.is_empty(), "the reader never saw an advert");
+        let bad: Vec<_> = seen.difference(&made).collect();
+        assert!(
+            bad.is_empty(),
+            "adverts no writer made were accepted: {bad:x?}"
+        );
+    }
+
     #[test]
     fn dropping_the_writer_and_its_leases_closes_the_event_handles() {
         let path = temp_file("ev-drop.bin");
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
-        let n = w.frame_event_nonce().unwrap();
+        let n = w.frame_event_nonces().unwrap();
         let lease = w.lease();
         // a reader's handles keep the events alive; the writer's do not
         let reader = open_frame_events(n).unwrap();
@@ -1689,19 +2019,20 @@ mod tests {
         );
         drop(reader);
         assert!(
-            not_found(&open_for(n, 0, MODIFY_OR_WAIT))
-                && not_found(&open_for(n, 1, MODIFY_OR_WAIT)),
+            not_found(&open_for(n[0], 0, MODIFY_OR_WAIT))
+                && not_found(&open_for(n[1], 1, MODIFY_OR_WAIT)),
             "an event handle of the writer leaked"
         );
         // 50 writers on one file, each dropped: no event of any of them is left
         let mut nonces = Vec::new();
         for _ in 0..50 {
             let w = Writer::create(&path).unwrap();
-            nonces.push(w.frame_event_nonce().unwrap());
+            nonces.push(w.frame_event_nonces().unwrap());
             w.set_state(WriterState::Live);
         }
         for n in nonces {
-            assert!(not_found(&open_for(n, 0, MODIFY_OR_WAIT)));
+            assert!(not_found(&open_for(n[0], 0, MODIFY_OR_WAIT)));
+            assert!(not_found(&open_for(n[1], 1, MODIFY_OR_WAIT)));
         }
     }
 }

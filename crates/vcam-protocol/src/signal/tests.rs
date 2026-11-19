@@ -82,7 +82,7 @@ pub(crate) fn with_nonces<R>(nonces: Vec<io::Result<u128>>, run: impl FnOnce() -
 // ---- helpers ---------------------------------------------------------------------------------------------------
 
 fn temp_file(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("bettercam-signal-{}", std::process::id()));
+    let dir = crate::test_dir("signal");
     std::fs::create_dir_all(&dir).unwrap();
     dir.join(name)
 }
@@ -360,8 +360,14 @@ fn the_events_carry_exactly_the_descriptor_of_the_design() {
         unsafe { ResetEvent(s.handle(parity)) }.unwrap();
         assert!(!is_set(s.handle(parity)));
 
+        // the access the reader asks for to wait and check the owner (SYNCHRONIZE | READ_CONTROL) opens it
+        close(
+            open_for(s.nonces()[parity], parity, 0x0012_0000)
+                .expect("a reader may wait and read the owner"),
+        );
         // read it back through the kernel, on a handle opened for READ_CONTROL
-        let h = open_for(s.nonce(), parity, 0x0002_0000).expect("the user may read the descriptor");
+        let h = open_for(s.nonces()[parity], parity, 0x0002_0000)
+            .expect("the user may read the descriptor");
         let sd = read_sd(h);
         close(h);
         let psd = sd.psd();
@@ -391,10 +397,16 @@ fn the_events_carry_exactly_the_descriptor_of_the_design() {
                 .filter(|a| is_sid(a.2, sid))
                 .fold(0, |m, a| m | a.1)
         };
-        // the user: modify, wait, read the descriptor; nothing that changes it
+        // the user: modify, wait, read the descriptor (and so the owner); nothing that changes it
         assert_eq!(mask_of(&user), 0x0012_0002);
-        // LOCAL SERVICE: wait only
-        assert_eq!(mask_of("S-1-5-19"), 0x0010_0000);
+        // LOCAL SERVICE: wait and read the descriptor (to check the owner), nothing that sets, resets or re-secures
+        let ls = mask_of("S-1-5-19");
+        assert_eq!(ls, 0x0012_0000, "SYNCHRONIZE | READ_CONTROL only");
+        assert_eq!(
+            ls & (0x0000_0002 | 0x0004_0000 | 0x0008_0000),
+            0,
+            "LOCAL SERVICE may modify, write the DACL or take ownership"
+        );
         // OWNER RIGHTS: READ_CONTROL only, which takes the owner's implicit WRITE_DAC away
         assert_eq!(mask_of("S-1-3-4"), 0x0002_0000);
         // everyone else gets nothing
@@ -428,7 +440,7 @@ fn the_events_carry_exactly_the_descriptor_of_the_design() {
 fn the_descriptor_text_is_the_one_in_the_design() {
     assert_eq!(
         descriptor_text("S-1-5-21-1-2-3-1001"),
-        "O:S-1-5-21-1-2-3-1001D:P(A;;0x00120002;;;S-1-5-21-1-2-3-1001)(A;;0x00100000;;;S-1-5-19)(A;;0x00020000;;;S-1-3-4)S:(ML;;NW;;;ME)"
+        "O:S-1-5-21-1-2-3-1001D:P(A;;0x00120002;;;S-1-5-21-1-2-3-1001)(A;;0x00120000;;;S-1-5-19)(A;;0x00020000;;;S-1-3-4)S:(ML;;NW;;;ME)"
     );
 }
 
@@ -490,10 +502,23 @@ fn as_low_integrity<R: Send>(f: impl FnOnce() -> R + Send) -> R {
 #[test]
 fn a_low_integrity_process_of_the_user_may_wait_but_not_signal() {
     let s = FrameSignal::create().unwrap();
-    let n = s.nonce();
+    let n = s.nonces()[0];
     // the same user at medium integrity may modify (the control of this test)
     let h = open_for(n, 0, 0x0000_0002).expect("the user may modify the event");
     close(h);
+    // NOTE: the behaviour below does not prove the label. An object with no mandatory label is treated as medium
+    // integrity with no-write-up, so a low-integrity caller is refused `EVENT_MODIFY_STATE` with or without our label.
+    // The only check that fails without the explicit label is the one that reads the SACL back: do it here, so this
+    // test cannot pass for the wrong reason.
+    let h = open_for(n, 0, 0x0002_0000).expect("the user may read the descriptor");
+    let sd = read_sd(h);
+    close(h);
+    let (mut present, mut sacl, mut def) = (BOOL(0), std::ptr::null_mut(), BOOL(0));
+    unsafe { GetSecurityDescriptorSacl(sd.psd(), &mut present, &mut sacl, &mut def) }.unwrap();
+    assert!(
+        present.as_bool() && !sacl.is_null() && unsafe { (*sacl).AceCount } == 1,
+        "the event has no explicit mandatory label: the low-integrity result below is the implicit default"
+    );
     // a HANDLE is not `Send`: the thread hands back its address and the error as plain numbers
     let plain = |r: windows::core::Result<HANDLE>| r.map(|h| h.0 as usize);
     let (modify, wait, read) = as_low_integrity(|| {
@@ -525,7 +550,7 @@ fn a_low_integrity_process_of_the_user_may_wait_but_not_signal() {
 #[test]
 fn a_reader_handle_waits_and_cannot_signal() {
     let s = FrameSignal::create().unwrap();
-    let ev = open_frame_events(s.nonce()).unwrap();
+    let ev = open_frame_events(s.nonces()).unwrap();
     // opened with SYNCHRONIZE only: the kernel refuses a set, a reset and a descriptor read
     let h = HANDLE(ev[0].as_raw_handle());
     let e = unsafe { SetEvent(h) }.unwrap_err();
@@ -537,25 +562,32 @@ fn a_reader_handle_waits_and_cannot_signal() {
     assert_eq!(unsafe { WaitForSingleObject(h, 0) }, WAIT_OBJECT_0);
 }
 
+fn two_nonces() -> [u128; 2] {
+    [system_nonce().unwrap(), system_nonce().unwrap()]
+}
+
 #[test]
-fn opening_needs_a_nonzero_nonce_and_both_events_of_the_right_type() {
-    assert_eq!(
-        open_frame_events(0).unwrap_err().kind(),
-        io::ErrorKind::InvalidInput
-    );
+fn opening_needs_nonzero_nonces_and_both_events_of_the_right_type() {
+    let good = two_nonces();
+    for bad in [[0, good[1]], [good[0], 0], [0, 0]] {
+        assert_eq!(
+            open_frame_events(bad).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
     // no such events
-    let e = open_frame_events(system_nonce().unwrap()).unwrap_err();
+    let e = open_frame_events(two_nonces()).unwrap_err();
     assert_eq!(e.kind(), io::ErrorKind::NotFound, "{e}");
     // only one of the two
-    let n = system_nonce().unwrap();
-    let _one = squat(n, 0, None);
+    let n = two_nonces();
+    let _one = squat(n[0], 0, None);
     assert!(open_frame_events(n).is_err());
     // the name of something that is not an event (a mutex): opening an event of that name fails
-    let m = system_nonce().unwrap();
-    let name = event_name_wide(m, 0);
+    let m = two_nonces();
+    let name = event_name_wide(m[0], 0);
     let mutex = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }.unwrap();
     let _mutex = unsafe { OwnedHandle::from_raw_handle(mutex.0) };
-    let _e1 = squat(m, 1, None);
+    let _e1 = squat(m[1], 1, None);
     let e = open_frame_events(m).unwrap_err();
     assert_eq!(
         e.raw_os_error(),
@@ -564,67 +596,149 @@ fn opening_needs_a_nonzero_nonce_and_both_events_of_the_right_type() {
     );
 }
 
+#[test]
+fn each_event_has_its_own_nonce_so_the_name_of_one_gives_the_other_away_to_nobody() {
+    let s = FrameSignal::create().unwrap();
+    let n = s.nonces();
+    assert_ne!(n[0], 0);
+    assert_ne!(n[1], 0);
+    assert_ne!(n[0], n[1]);
+    // the names are not related: neither nonce is the other, or a function of it that a name hands out
+    assert_ne!(event_name(n[0], 1), event_name(n[1], 1));
+    // somebody who lists `.0` and guesses that `.1` carries the same nonce finds nothing
+    assert!(not_found(&open_for(n[0], 1, 0x0010_0000)));
+    assert!(open_frame_events([n[0], n[0]]).is_err());
+    assert!(open_frame_events([n[1], n[1]]).is_err());
+    // the real pair opens, and each handle is the event of its own name
+    assert!(open_for(n[0], 0, 0x0010_0000).is_ok_and(|h| {
+        close(h);
+        true
+    }));
+    assert!(open_frame_events(n).is_ok());
+    // the events of many writers: every second nonce is new, and none repeats the first of any
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..200 {
+        let p = two_nonces();
+        assert!(seen.insert(p[0]) && seen.insert(p[1]), "a nonce repeated");
+    }
+}
+
 // ---- collisions ------------------------------------------------------------------------------------------------
 
-#[test]
-fn a_taken_name_gets_a_new_nonce_and_nothing_stays_open() {
-    let n1 = system_nonce().unwrap();
-    let n2 = system_nonce().unwrap();
-    let n3 = system_nonce().unwrap();
-    let ok = system_nonce().unwrap();
-    // n1: the second name is taken, so the first one was made and must be closed again
-    let _t1 = squat(n1, 1, None);
-    // n2: the first name is taken by an object we may not even open
-    let _t2 = squat(n2, 0, Some("D:P"));
-    // n3: the second name is taken again
-    let _t3 = squat(n3, 1, None);
+/// `with_nonces` list of the draws of several attempts: two per attempt.
+fn draws(pairs: &[[u128; 2]]) -> Vec<io::Result<u128>> {
+    pairs.iter().flatten().map(|&n| Ok(n)).collect()
+}
 
-    // the three first nonces are all refused: no events, a clear error, no leak
-    let e = with_nonces(vec![Ok(n1), Ok(n2), Ok(n3)], || FrameSignal::create().err());
+#[test]
+fn a_taken_name_gets_new_nonces_and_nothing_stays_open() {
+    let p1 = two_nonces();
+    let p2 = two_nonces();
+    let p3 = two_nonces();
+    let ok = two_nonces();
+    // p1: the second name is taken, so the first one was made and must be closed again
+    let _t1 = squat(p1[1], 1, None);
+    // p2: the first name is taken by an object we may not even open
+    let _t2 = squat(p2[0], 0, Some("D:P"));
+    // p3: the second name is taken again
+    let _t3 = squat(p3[1], 1, None);
+
+    // the three first attempts are all refused: no events, a clear error, no leak
+    let e = with_nonces(draws(&[p1, p2, p3]), || FrameSignal::create().err());
     let e = e.expect("three collisions");
     assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
-    for (n, p) in [(n1, 0), (n2, 1), (n3, 0)] {
-        let r = open_for(n, p, 0x0010_0000);
+    for (p, parity) in [(p1, 0), (p2, 1), (p3, 0)] {
+        let r = open_for(p[parity], parity, 0x0010_0000);
         assert!(
             not_found(&r),
-            "an event of a refused nonce stayed open ({p}): {r:?}"
+            "an event of a refused attempt stayed open ({parity}): {r:?}"
         );
     }
 
-    // the fourth nonce would have worked, but only three are tried
-    let e = with_nonces(vec![Ok(n1), Ok(n2), Ok(n3), Ok(ok)], || {
-        FrameSignal::create().err()
-    });
+    // the fourth attempt would have worked, but only three are made
+    let e = with_nonces(draws(&[p1, p2, p3, ok]), || FrameSignal::create().err());
     assert!(e.is_some());
-    assert!(not_found(&open_for(ok, 0, 0x0010_0000)));
+    assert!(not_found(&open_for(ok[0], 0, 0x0010_0000)));
 
-    // a collision and then a free name works, and the refused nonce left nothing behind
-    let s = with_nonces(vec![Ok(n1), Ok(ok)], || FrameSignal::create().unwrap());
-    assert_eq!(s.nonce(), ok);
-    assert!(not_found(&open_for(n1, 0, 0x0010_0000)));
+    // a collision and then a free pair works, and the refused attempt left nothing behind
+    let s = with_nonces(draws(&[p1, ok]), || FrameSignal::create().unwrap());
+    assert_eq!(s.nonces(), ok);
+    assert!(not_found(&open_for(p1[0], 0, 0x0010_0000)));
     assert!(open_frame_events(ok).is_ok());
     drop(s);
     assert!(
-        not_found(&open_for(ok, 0, 0x0010_0000)),
+        not_found(&open_for(ok[0], 0, 0x0010_0000)) && not_found(&open_for(ok[1], 1, 0x0010_0000)),
         "the events outlive the writer that made them"
     );
 }
 
 #[test]
-fn a_zero_draw_costs_a_try_and_a_failing_generator_fails_at_once() {
-    let ok = system_nonce().unwrap();
-    let s = with_nonces(vec![Ok(0), Ok(ok)], || FrameSignal::create().unwrap());
-    assert_eq!(s.nonce(), ok);
+fn a_name_held_by_an_object_of_another_type_is_a_taken_name_not_the_end_of_the_attempts() {
+    // `CreateEventExW` on a name held by a mutex fails with ERROR_INVALID_HANDLE (6), not ERROR_ALREADY_EXISTS
+    let first = two_nonces();
+    let good = two_nonces();
+    let name = event_name_wide(first[1], 1);
+    let mutex = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }.unwrap();
+    let _mutex = unsafe { OwnedHandle::from_raw_handle(mutex.0) };
+    let s = with_nonces(draws(&[first, good]), || {
+        FrameSignal::create().expect("the second attempt must be made and must work")
+    });
+    assert_eq!(s.nonces(), good);
+    assert!(open_frame_events(good).is_ok());
+    // the first event of the refused attempt was closed again
+    assert!(not_found(&open_for(first[0], 0, 0x0010_0000)));
+    // the same for the first event of the pair
+    let first = two_nonces();
+    let name = event_name_wide(first[0], 0);
+    let mutex = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }.unwrap();
+    let _mutex0 = unsafe { OwnedHandle::from_raw_handle(mutex.0) };
+    let again = two_nonces();
+    let s = with_nonces(draws(&[first, again]), || FrameSignal::create().unwrap());
+    assert_eq!(s.nonces(), again);
+    // three mutexes in a row end the attempts with the usual error
+    let three = [two_nonces(), two_nonces(), two_nonces()];
+    let _held: Vec<_> = three
+        .iter()
+        .map(|p| {
+            let name = event_name_wide(p[1], 1);
+            let m = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }.unwrap();
+            unsafe { OwnedHandle::from_raw_handle(m.0) }
+        })
+        .collect();
+    let e = with_nonces(draws(&three), || FrameSignal::create().err()).expect("three collisions");
+    assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
+}
+
+#[test]
+fn a_zero_or_equal_draw_costs_a_try_and_a_failing_generator_fails_at_once() {
+    let ok = two_nonces();
+    // a pair with a zero in it is skipped, either place
+    for bad in [[0, ok[1]], [ok[0], 0]] {
+        let s = with_nonces(draws(&[bad, ok]), || FrameSignal::create().unwrap());
+        assert_eq!(s.nonces(), ok);
+    }
+    // two equal draws are skipped too
+    let s = with_nonces(draws(&[[ok[0], ok[0]], ok]), || {
+        FrameSignal::create().unwrap()
+    });
+    assert_eq!(s.nonces(), ok);
     drop(s);
-    let e = with_nonces(vec![Ok(0), Ok(0), Ok(0), Ok(ok)], || {
+    let e = with_nonces(draws(&[[0, 0], [0, 0], [0, 0], ok]), || {
         FrameSignal::create().err()
     });
     assert_eq!(e.unwrap().kind(), io::ErrorKind::AlreadyExists);
-    let e = with_nonces(vec![Err(io::Error::other("no entropy")), Ok(ok)], || {
+    let e = with_nonces(vec![Err(io::Error::other("no entropy")), Ok(ok[0])], || {
         FrameSignal::create().err()
     });
     assert!(e.unwrap().to_string().contains("no entropy"));
-    assert!(not_found(&open_for(ok, 0, 0x0010_0000)));
+    assert!(not_found(&open_for(ok[0], 0, 0x0010_0000)));
+    // a generator that fails on the second draw of an attempt
+    let e = with_nonces(
+        vec![Ok(ok[0]), Err(io::Error::other("no more entropy"))],
+        || FrameSignal::create().err(),
+    );
+    assert!(e.unwrap().to_string().contains("no more entropy"));
+    assert!(not_found(&open_for(ok[0], 0, 0x0010_0000)));
 }
 
 // ---- the order of a signal -------------------------------------------------------------------------------------
@@ -906,13 +1020,14 @@ fn follow(path: &std::path::Path, stop: &AtomicBool) -> ReaderStats {
             v.writer_frames,
         )
     };
-    let ev = open_frame_events(advert(&m).0.nonce).unwrap();
+    let ev = open_frame_events(advert(&m).0.nonces).unwrap();
     let mut st = ReaderStats::default();
     while !stop.load(Ordering::Relaxed) {
         st.loops += 1;
         let (w, f) = advert(&m);
         let h = HANDLE(ev[awaited_event(w.signal_seq)].as_raw_handle());
         if unsafe { WaitForSingleObject(h, 100) } == WAIT_OBJECT_0 {
+            // a wake-up with no signal behind it (the count is where the loop loaded it) is spurious
             if m.shared().header().signal_seq == w.signal_seq {
                 st.spurious += 1;
             } else {
@@ -921,6 +1036,7 @@ fn follow(path: &std::path::Path, stop: &AtomicBool) -> ReaderStats {
         } else {
             st.timeouts += 1;
             let (_, f2) = advert(&m);
+            // the timeout passed with a new frame and no event set: a wake-up was lost
             if f2 != f && !is_set(h) {
                 st.missed += 1;
             }
@@ -929,7 +1045,8 @@ fn follow(path: &std::path::Path, stop: &AtomicBool) -> ReaderStats {
     st
 }
 
-fn run_pair(name: &str, period: Duration, run_for: Duration) -> (u64, ReaderStats) {
+/// (frames published, the writer's final signal count, what the reader saw).
+fn run_pair(name: &str, period: Duration, run_for: Duration) -> (u64, u64, ReaderStats) {
     let path = temp_file(name);
     let _ = std::fs::remove_file(&path);
     let w = Arc::new(Writer::create(&path).unwrap());
@@ -975,33 +1092,38 @@ fn run_pair(name: &str, period: Duration, run_for: Duration) -> (u64, ReaderStat
     // a final signal wakes a reader that waits
     w.set_state(WriterState::Paused);
     let st = reader.join().unwrap();
-    (published.load(Ordering::Relaxed), st)
+    (published.load(Ordering::Relaxed), w.header().signal_seq, st)
 }
 
 #[test]
 fn a_reader_sees_every_signal_of_a_60_hz_writer_with_no_miss_and_no_spurious_wake_up() {
-    let (published, st) = run_pair(
+    let (published, total, st) = run_pair(
         "pair-60.bin",
         Duration::from_micros(16_667),
         Duration::from_secs(2),
     );
-    eprintln!("60 Hz: published {published}, reader {st:?}");
+    eprintln!("60 Hz: published {published}, signals {total}, reader {st:?}");
     assert!(published >= 100);
     assert_eq!(
         st.spurious, 0,
         "a correct writer causes no spurious wake-up"
     );
+    // `missed` and `spurious` (above) are the reader's checks; `total == published + 2` is the writer's: it signalled
+    // once for every frame, once for the state change to Live (before the reader loaded) and once for Paused at the
+    // end. A loaded machine delays the reader, so one wake-up may cover several signals: the number of wake-ups is not
+    // a measure, only that there were some.
     assert_eq!(st.missed, 0, "a frame was published and no wake-up came");
-    assert!(
-        st.events * 10 >= published * 9,
-        "the reader woke {} times for {published} frames",
-        st.events
+    assert_eq!(
+        total,
+        published + 2,
+        "a publish did not signal exactly once"
     );
+    assert!(st.events > 0, "the reader was never woken");
 }
 
 #[test]
 fn a_1_khz_writer_makes_no_spurious_wake_up_and_no_more_wake_ups_than_signals() {
-    let (published, st) = run_pair(
+    let (published, _total, st) = run_pair(
         "pair-1k.bin",
         Duration::from_millis(1),
         Duration::from_secs(2),
