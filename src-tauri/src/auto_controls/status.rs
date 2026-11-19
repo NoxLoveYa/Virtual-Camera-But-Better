@@ -94,6 +94,7 @@ pub fn white_balance_message(f: &WhiteBalanceFacts) -> Option<String> {
             kelvin(f.kelvin),
             if f.warm_limit { "warmer" } else { "cooler" }
         )),
+        WhiteBalanceState::NoSignal => Some(format!("Nothing to measure (too dark). Keeping {}.", kelvin(f.kelvin))),
         WhiteBalanceState::NoPicture => (f.no_picture_for > super::watchdog::NO_PICTURE_TEXT_AFTER)
             .then(|| "No picture to measure.".to_string()),
         WhiteBalanceState::Paused => Some("Paused.".to_string()),
@@ -123,6 +124,8 @@ pub struct ExposureFacts {
     pub max_gain: Option<i32>,
     pub e_min: i32,
     pub gain_min: i32,
+    /// The camera has a gain control but Most gain is at its minimum: the loop works in whole stops on purpose.
+    pub gain_off: bool,
     pub cap: i32,
     pub cap_reason: CapReason,
     pub fps: f64,
@@ -155,12 +158,17 @@ pub fn exposure_message(f: &ExposureFacts) -> Option<String> {
             let fps = f.fps.round();
             Some(match (f.gain, f.max_gain) {
                 (Some(g), Some(m)) => format!("Holding {fps:.0} fps · gain {g} of {m}"),
+                _ if f.gain_off => format!("Holding {fps:.0} fps · {} · gain off", exposure_time(f.exposure)),
                 _ => format!("Holding {fps:.0} fps · {}", exposure_time(f.exposure)),
             })
         }
         ExposureState::LimitGain => Some(format!(
             "Gain at its maximum ({}). Add light, allow more gain, or allow a longer exposure.",
             f.max_gain.unwrap_or_default()
+        )),
+        ExposureState::LimitExposure if f.gain_off => Some(format!(
+            "Exposure at the {:.0} fps limit and gain is off. Add light, allow more gain, or allow a longer exposure.",
+            f.target_fps.round()
         )),
         ExposureState::LimitExposure => Some(format!(
             "Exposure at the {:.0} fps limit and this camera has no gain. Add light or allow a longer exposure.",
@@ -209,6 +217,7 @@ mod tests {
             max_gain: Some(75),
             e_min: -13,
             gain_min: 0,
+            gain_off: false,
             cap: -5,
             cap_reason: CapReason::Fps,
             fps: 30.0,
@@ -242,6 +251,24 @@ mod tests {
         f.no_picture_for = 10.5;
         assert_eq!(exposure_message(&f).as_deref(), Some("No picture to measure."));
         assert_eq!(STRIPES_NOTE, "Short exposures under mains light can show stripes.");
+    }
+
+    #[test]
+    fn gain_off_has_its_own_words() {
+        // Most gain at its minimum on a camera that has a gain: not "no gain".
+        let mut f = facts(ExposureState::LimitExposure);
+        f.gain = None;
+        f.max_gain = None;
+        f.gain_off = true;
+        assert_eq!(
+            exposure_message(&f).as_deref(),
+            Some("Exposure at the 30 fps limit and gain is off. Add light, allow more gain, or allow a longer exposure.")
+        );
+        let mut f = facts(ExposureState::Holding);
+        f.gain = None;
+        f.max_gain = None;
+        f.gain_off = true;
+        assert_eq!(exposure_message(&f).as_deref(), Some("Holding 30 fps · 1/32 s · gain off"));
     }
 
     #[test]
@@ -305,6 +332,10 @@ mod tests {
         assert_eq!(t(WhiteBalanceState::Holding).as_deref(), Some("Holding · 4650 K"));
         assert_eq!(t(WhiteBalanceState::Paused).as_deref(), Some("Paused."));
         assert_eq!(t(WhiteBalanceState::Closed).as_deref(), Some("Starts when the camera opens."));
+        assert_eq!(
+            t(WhiteBalanceState::NoSignal).as_deref(),
+            Some("Nothing to measure (too dark). Keeping 4650 K.")
+        );
         let mut f = wb(WhiteBalanceState::AtLimit);
         f.kelvin = 2800;
         assert_eq!(

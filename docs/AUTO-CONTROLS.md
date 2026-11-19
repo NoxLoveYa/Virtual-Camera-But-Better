@@ -174,11 +174,16 @@ hunt. Hence step-and-settle: one move, wait for proof, decide again.
 - **Frame-rate rule:** `E_rate = floor(log2(0.95 / F))`. F = 30 → −5 (31.25 ms ≤ 31.7 ms); F = 60 → −6 (15.6 ms);
   F = 25 → −5; F = 15 → −4.
 - **Longest exposure** (user): `fit` (default) uses `E_rate`; a whole stop `n` uses `n` (may be longer than the frame
-  time: the user accepts a lower rate; the option text says which rate, e.g. "1/16 s (camera drops to ≈ 15 fps)").
+  time: the user accepts a lower rate; the option text says which rate, e.g. "1/16 s (camera drops to ≈ 16 fps)").
+  **Follow-up F3:** the shown rate is `min(F, 1/τ)` rounded to a whole number (it was `0.95 / τ`, which said 15 where
+  W4GS measured 16.2 fps at 1/16 s); `longestOptions` in `src/camera/schema.ts` is the one place that makes the text.
 - **Learned cap** (2.5.8): `E_learned[F]`, only applies with `fit`.
 - `E_cap = clamp(min(longest, E_learned[F] if any), E_min, E_max)`.
 - **Most gain** (user): `G_cap`, default `G_min + round(0.75 · (G_max − G_min))` (75 on W4GS). `Gs_cap = gs(G_cap)`.
-  Most gain = `G_min` turns gain off (exposure-only behaviour).
+  Most gain = `G_min` turns gain off (exposure-only behaviour). **Follow-up F1:** "off" also drives the device gain to
+  `G_min`: the loop treats it like a constraint (the allocation with `Gs_cap = 0`, one gain write, no samples needed,
+  exposure takes the stops the gain gave as far as whole stops allow), also when Most gain is changed while the loop
+  runs. The status then says "gain is off" (4.2), not "no gain": that wording is for cameras without a gain control.
 
 #### 2.5.3 Order of preference
 
@@ -298,6 +303,11 @@ On engagement (user picks Better Cam auto, or a camera open with the mode stored
 The resume point (`E`, `G`, Kelvin) is stored when the loop enters `holding`, at most once per 10 s. The camera also
 keeps values across a reopen (measured on W4GS), so a reopen shows no flash.
 
+**Follow-up F2:** it is also stored when the loop has sat in a limit state (`limit_gain`, `limit_exposure`,
+`too_bright`; white balance `at_limit`) for 3 s, under the same once-per-10-s rule. A dark room never reaches
+`holding`; without this each reopen climbed from the seed (-6, 0) for about 2 s. The stored point rides the `resume`
+of the status while the state lasts (not before the 3 s are over).
+
 ### 2.6 The white balance loop
 
 - Device setting `K` (Kelvin), worked as mired `M = 10⁶ / K`. Model: `c ≈ α · (M − M_light)`, `α > 0`: a setting
@@ -305,7 +315,9 @@ keeps values across a reopen (measured on W4GS), so a reopen shows no flash.
   **(unverified)**, learned like `S` (ρ = observed Δc / (α·ΔM), same bounds and exponent), `α ∈ [0.002, 0.02]`, stored
   as `learned.wb_alpha`.
 - Samples valid when `capture_time ≥ t_done + 0.3 s`. `ê_wb` = median of last 3 valid `e_wb`; `σ_wb` as above.
-- Hold when `conf_wb < 0.3` (a scene of one colour, a dark scene).
+- Hold when `conf_wb < 0.3` (a scene of one colour, a dark scene). **Follow-up F4:** the state is then `no_signal`
+  ("Nothing to measure (too dark). Keeping 4600 K."), not `holding`: nothing was checked. It leaves the state when the
+  confidence is back and measures from the wide band (`adjusting`) like after a write.
 - Band: `B_out = max(0.04, 3σ_wb)`, `B_in = max(0.015, 1.5σ_wb)`, same holding/adjusting states.
 - Move: `ΔM = clamp(−k_wb · ê_wb / α, −ΔM_max, +ΔM_max)`; `K' = round_to_step(10⁶ / (M + ΔM))`, clamped to
   `K_min..K_max`; skip if `|K' − K| < step`.
@@ -476,7 +488,14 @@ Focus                                         512                      Auto (○
   shows a tick at Most gain, range beyond shaded.
 - Longest exposure options: "Fit the frame rate (1/32 s at 30 fps)", then every whole stop of the camera's range from
   shortest to longest, each with what it means: "1/64 s (sharper motion, more gain)", "1/16 s (camera drops to
-  ≈ 15 fps)".
+  ≈ 16 fps)" (2.5.2: `min(F, 1/τ)`).
+- **Slow-camera hint (F6).** Better Cam auto cannot change the camera's own auto. While exposure is in **Camera auto**
+  and the measured capture rate (`stats.capture.fps`, about once a second) stays under 0.9 × the rate asked for for
+  3 s, the exposure row shows "Camera auto is slowing the camera to N fps in this light. Better Cam auto keeps F fps."
+  with a button "Use Better Cam auto" (only when Better Cam auto is offered for this camera); it goes away when the
+  rate recovers (or the mode changes). The rate asked for is known to the card for **Custom** format with a rate, and
+  for "Highest FPS" / "Match output FPS" read from the rates of the open format (`requestedFps` in `schema.ts`); with
+  Device default the card does not know it and shows no hint.
 - Most gain: slider over the gain range; "Off" at the minimum.
 - Status line: `role="status"`, `aria-live="polite"`, a dot coloured by state (neutral: adjusting/holding;
   warning: a limit; error: handed back or paused by conflict). One line, wraps on narrow windows.
@@ -490,7 +509,10 @@ Focus                                         512                      Auto (○
 | `starting` | "Adjusting…" |
 | `adjusting` | "Adjusting…" |
 | `holding` (exposure) | "Holding 30 fps · gain 48 of 75" (whole stops: "Holding 30 fps · 1/32 s") |
+| `holding` (exposure, gain off, F1) | "Holding 30 fps · 1/32 s · gain off" |
 | `holding` (WB) | "Holding · 4650 K" |
+| `no_signal` (WB, F4) | "Nothing to measure (too dark). Keeping 4650 K." |
+| `limit_exposure`, gain off (F1) | "Exposure at the 30 fps limit and gain is off. Add light, allow more gain, or allow a longer exposure." |
 | `limit_gain` | "Gain at its maximum (75). Add light, allow more gain, or allow a longer exposure." |
 | `limit_exposure` | "Exposure at the 30 fps limit and this camera has no gain. Add light or allow a longer exposure." |
 | `too_bright` | "Too bright: exposure at its shortest (1/8192 s) and gain at 0." |
@@ -968,7 +990,7 @@ the session temp folder), not committed.
 No other constant is contradicted by the live data. `E_rate`'s `0.95` stays (changing it would cost a stop of light at
 30 fps for nothing).
 
-### 9.5 Follow-ups found (not constants, not done in A6)
+### 9.5 Follow-ups found in A6 (all six done afterwards: see the table below the list)
 
 - **F1, Most gain "Off".** With Most gain at its minimum the loop switches to whole stops, but the device gain stays at
   its last driven value (75 here) instead of going to its minimum, and the status says "this camera has no gain"
@@ -985,6 +1007,18 @@ No other constant is contradicted by the live data. `E_rate`'s `0.95` stays (cha
 - **F6, camera facts for the owner.** Camera auto at **60 fps requested** gives **14.3 fps** in this room; at 30 fps
   16.5. W4GS answers an exposure write at 60 fps in 0.8-1.1 s for some values (the loop copes: `gap` grows with the
   write time, 2.9).
+
+**Follow-ups F1-F6 done (2026-11-19, after the A6 run).** Each is in the section named; tests are in
+`auto_controls/tests.rs` (F1, F2, F4), `status.rs`, `camera_controls.rs` and `src/camera/schema.test.ts`.
+
+| # | Change | Where | Live proof (W4GS, same dark room, debug build, test mode) |
+|---|---|---|---|
+| F1 | Most gain "Off" drives the device gain to `G_min`; status "gain is off" | 2.5.2, 4.2 | Most gain → 0 with the loop at gain 75: device gain read **0** in 3.5 s, one gain write; after 9 s `limit_exposure` "Exposure at the 30 fps limit and gain is off. Add light, allow more gain, or allow a longer exposure."; Most gain back to 75 → gain 75, `limit_gain` |
+| F2 | The resume point is also stored 3 s into `limit_gain` / `limit_exposure` / `too_bright` / `at_limit`, once per 10 s | 2.5.11 | The stored record read `exposure -5, gain 75` (A6: the seed -6 / 0). Stop → Start: LIVE in 0.77 s, `stored controls applied after open: exposure=-5, gain=75`, **0 `[auto]` writes** after the reopen (A6: a 1.7 s climb), `limit_gain` shown 4.4 s after the click (3 s of saturation, as before) |
+| F3 | Longest exposure text is `min(F, 1/τ)`: "1/16 s (camera drops to ≈ 16 fps)" | 2.5.2, 4.1 | Unit test (the measured 16.2 fps of 9.5) |
+| F4 | White balance with `conf_wb < 0.3` is `no_signal`: "Nothing to measure (too dark). Keeping 4600 K." (warning dot) | 2.6, 4.2 | Exposure Manual -13, gain 0 (the camera's black level): `no_signal`, the card shows the text with the warning dot. **Not changed:** the A6 picture (E -5, gain 75: a flat lifted black, display luma 17) still reads `Holding · 4600 K`, because `conf_wb` is high there (computed, not logged: the trusted-cell weight at coded luma 0.067 is 15 % of the total, above the 12 % where `conf_wb` is 1) and the gray-world error of a flat grey is 0. Whether a flat lifted black should count as "too dark" (a mean-luma gate in `measure_white_balance`) is left open: it changes the 2.4 meter |
+| F5 | One `[apply] t=… <key> <value> -> <read-back> (… ms)` line per write of `apply_on_open` (`t` = seconds since the re-apply began; also `auto on/off` and `failed`) | `camera_controls.rs` | After the reopen: `[apply] t=0.0 exposure auto off -> -5 (17 ms)`, `exposure -5 -> -5 (5 ms)`, `gain auto off -> 75 (22 ms)`, `gain 75 -> 75 (2 ms)` (the camera was warm; the 200-700 ms first write did not recur in this run) |
+| F6 | Slow-camera hint under the exposure row in Camera auto, with a button to Better Cam auto | 4.1 | Camera auto at the saved 30 fps (1280×720 MJPEG Custom 30): hint "Camera auto is slowing the camera to 17 fps in this light. Better Cam auto keeps 30 fps." with "Use Better Cam auto"; the button switched exposure to Better Cam auto and the hint went. The 60 fps case was not run (the saved format was kept); the same code path with `requestedFps` = 60 |
 
 **A5's card, checked live (all as designed unless noted).**
 

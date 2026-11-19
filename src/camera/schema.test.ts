@@ -29,6 +29,7 @@ import {
   autoAction,
   autoCfgOf,
   autoTone,
+  cameraIsSlow,
   controlsRecord,
   forgetControls,
   hasModeList,
@@ -41,11 +42,14 @@ import {
   normalizeControls,
   normalizeLearned,
   rememberControl,
+  requestedFps,
   showsStatus,
+  slowCameraText,
   statusOf,
   withAutoCfg,
   withLearned,
   withResume,
+  type CameraInfo,
   type ControlInfo,
   type SourceCfg,
   type StoredControls,
@@ -341,7 +345,11 @@ same(stops[0], { value: "fit", label: "Fit the frame rate (1/32 s at 30 fps)" },
 same(stops.length, 14, "fit and 13 whole stops");
 same(stops.find((o) => o.value === "-6")?.label, "1/64 s (sharper motion, more gain)", "shorter than the frame time");
 same(stops.find((o) => o.value === "-5")?.label, "1/32 s (the frame-rate limit)", "at the frame time");
-same(stops.find((o) => o.value === "-4")?.label, "1/16 s (camera drops to ≈ 15 fps)", "longer than the frame time");
+same(stops.find((o) => o.value === "-4")?.label, "1/16 s (camera drops to ≈ 16 fps)", "longer than the frame time: min(F, 1/τ), 16.2 fps measured");
+same(stops.find((o) => o.value === "-3")?.label, "1/8 s (camera drops to ≈ 8 fps)", "1/8 s");
+same(stops.find((o) => o.value === "-1")?.label, "1/2 s (camera drops to ≈ 2 fps)", "1/2 s");
+// A rate below what the frame time alone gives is never above the asked rate (F = 15: the limit is 1/16 s, 1/8 s is 8).
+same(longestOptions({ min: -6, max: -1 }, 15).find((o) => o.value === "-3")?.label, "1/8 s (camera drops to ≈ 8 fps)", "slow camera");
 same(longestOptions({ min: -13, max: -1 }, 60)[0].label, "Fit the frame rate (1/64 s at 60 fps)", "fit at 60 fps");
 same(longestOptions({ min: -3, max: -1 }, null).map((o) => o.label), ["Fit the frame rate", "1/8 s", "1/4 s", "1/2 s"], "no frame rate: no meanings");
 same(maxGainValue(null, { min: 0, max: 100, step: 1 }), 75, "default most gain: 75 % of the range");
@@ -350,5 +358,29 @@ same(maxGainValue(500, { min: 0, max: 100, step: 1 }), 100, "most gain clamped")
 same(limitFraction(-5, { min: -13, max: -1 }), 8 / 12, "limit tick position");
 same(limitFraction(5, { min: -13, max: -1 }), null, "a limit outside the range has no tick");
 same(limitFraction(null, { min: 0, max: 1 }), null, "no limit");
+
+// the slow-camera hint (F6): the rate asked for, and when Camera auto is slowing the camera
+const w4gs: CameraInfo = {
+  id: "cam",
+  name: "W4GS",
+  formats: [
+    { format: "mjpeg", width: 1280, height: 720, intervals: [166667, 333333] },
+    { format: "yuy2", width: 1280, height: 720, intervals: [333333] },
+  ],
+};
+const open720 = { width: 1280, height: 720, format: "mjpeg" };
+same(requestedFps({ res_type: "custom", frame_interval: 166667 }, { fps: "source" }, w4gs, open720), 1e7 / 166667, "custom rate");
+same(requestedFps({ res_type: "custom", frame_interval: 0 }, { fps: "source" }, w4gs, open720), 1e7 / 166667, "highest rate of the open format");
+same(requestedFps({ res_type: "custom", frame_interval: -1 }, { fps: 30 }, w4gs, open720), 1e7 / 333333, "nearest rate to the output's");
+same(requestedFps({ res_type: "custom", frame_interval: -1 }, { fps: "source" }, w4gs, open720), 1e7 / 166667, "same as camera: highest");
+same(requestedFps({ res_type: "custom", frame_interval: 0 }, { fps: "source" }, w4gs, { ...open720, format: "yuy2" }), 1e7 / 333333, "rates of that format only");
+same(requestedFps({ res_type: "custom", frame_interval: 0 }, { fps: "source" }, w4gs, null), null, "nothing open");
+same(requestedFps({ res_type: "preferred", frame_interval: 166667 }, { fps: "source" }, w4gs, open720), null, "device default: unknown");
+same(cameraIsSlow(14.3, 60), true, "14 of 60");
+same(cameraIsSlow(55, 60), false, "92 % is not slow");
+same(cameraIsSlow(53.9, 60), true, "just under 90 %");
+same(cameraIsSlow(0, 60), false, "no frames is not a slow camera");
+same(cameraIsSlow(14, null), false, "no rate asked for");
+same(slowCameraText(14.3, 60), "Camera auto is slowing the camera to 14 fps in this light. Better Cam auto keeps 60 fps.", "hint text");
 
 console.log("ok");

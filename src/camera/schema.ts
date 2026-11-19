@@ -971,8 +971,8 @@ export const autoText = (s: { message: string | null }): string | null => (s.mes
 /** The frame-rate limit of the exposure loop: the longest whole stop that fits `fps` (2.5.2). */
 export const rateStop = (fps: number): number => Math.floor(Math.log2(0.95 / fps));
 
-/** What a camera that is asked for a longer exposure than the frame time runs at, about. */
-const droppedFps = (stop: number): number => Math.max(1, Math.round(0.95 * 2 ** -stop));
+/** What a camera that is asked for a longer exposure than the frame time runs at, about: one frame per exposure, `min(F, 1/τ)` (measured on W4GS: 1/16 s gave 16.2 fps). */
+const droppedFps = (stop: number, fps: number): number => Math.max(1, Math.round(Math.min(fps, 2 ** -stop)));
 
 /** `"fit"` or a whole stop, as the Select widget's text, and back. */
 export const longestKey = (v: "fit" | number): string => String(v);
@@ -987,11 +987,49 @@ export const longestOptions = (range: { min: number; max: number }, fps: number 
   const fit = limit === null ? "Fit the frame rate" : `Fit the frame rate (${exposureText(limit)} at ${Math.round(fps!)} fps)`;
   const out: Option[] = [{ value: "fit", label: fit }];
   for (let n = Math.round(range.min); n <= Math.round(range.max); n++) {
-    const meaning = limit === null ? "" : n < limit ? " (sharper motion, more gain)" : n === limit ? " (the frame-rate limit)" : ` (camera drops to ≈ ${droppedFps(n)} fps)`;
+    const meaning = limit === null ? "" : n < limit ? " (sharper motion, more gain)" : n === limit ? " (the frame-rate limit)" : ` (camera drops to ≈ ${droppedFps(n, fps!)} fps)`;
     out.push({ value: longestKey(n), label: `${exposureText(n)}${meaning}` });
   }
   return out;
 };
+
+/**
+ * The frame rate the camera is asked for, as far as the saved settings say (the card shows a hint while Camera auto
+ * holds the rate far below it): Custom with a rate is that rate; "Highest FPS" and "Match output FPS" (the nearest
+ * rate the camera has to the output's, "Same as camera" counting as highest) are read from the rates of the format
+ * that is open (`opened`, the `stats.capture` of the engine). Device default has no known rate: `null`.
+ */
+export const requestedFps = (
+  source: Pick<SourceCfg, "res_type" | "frame_interval">,
+  output: Pick<OutputCfg, "fps">,
+  cam: CameraInfo | null,
+  opened: { width: number; height: number; format: string } | null,
+): number | null => {
+  if (source.res_type !== "custom") return null;
+  if (source.frame_interval > 0) return intervalFps(source.frame_interval);
+  if (!cam || !opened) return null;
+  const rates = cam.formats
+    .filter((f) => f.width === opened.width && f.height === opened.height && f.format.toLowerCase() === opened.format.toLowerCase())
+    .flatMap((f) => f.intervals)
+    .sort((a, b) => a - b);
+  if (rates.length === 0) return null;
+  if (source.frame_interval === MATCH_OUTPUT_FPS && typeof output.fps === "number" && output.fps > 0) {
+    const near = nearestInterval(rates, 1e7 / output.fps);
+    return near === null ? null : intervalFps(near);
+  }
+  return intervalFps(rates[0]);
+};
+
+/** Camera auto is slowing the camera: the measured rate is under 0.9 × the rate asked for. */
+export const SLOW_CAMERA_RATIO = 0.9;
+/** How long the rate must stay low before the card says so (seconds). */
+export const SLOW_CAMERA_AFTER = 3;
+export const cameraIsSlow = (measured: number, requested: number | null): boolean =>
+  requested !== null && requested > 0 && measured > 0 && measured < SLOW_CAMERA_RATIO * requested;
+
+/** The hint under the exposure row while Camera auto holds the rate down (docs/AUTO-CONTROLS.md 4.1). */
+export const slowCameraText = (measured: number, requested: number): string =>
+  `Camera auto is slowing the camera to ${Math.round(measured)} fps in this light. Better Cam auto keeps ${Math.round(requested)} fps.`;
 
 /** The tooltip of the limit tick on the exposure slider. */
 export const capText = (reason: ExposureStatus["cap_reason"], fps: number): string =>

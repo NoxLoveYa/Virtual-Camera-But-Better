@@ -58,6 +58,8 @@ const LEARN_EXPONENT: f64 = 0.3;
 const JUDGE_CONFIDENCE: f64 = 0.5;
 const JUDGE_PATIENCE: f64 = 3.0;
 const RESUME_EVERY: f64 = 10.0;
+/// The resume point is also reported once the loop has sat in `at_limit` this long (2.5.11).
+const LIMIT_STORE_AFTER: f64 = 3.0;
 
 /// The response presets of 2.5.4 (white balance columns).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -203,6 +205,9 @@ pub struct WhiteBalanceLoop {
     batch: Option<Batch>,
     last_resume_at: f64,
     resume_out: Option<Resume>,
+    /// Since when the state is `at_limit`, and whether the resume point of this stay is stored.
+    limit_state_since: Option<f64>,
+    limit_stored: bool,
     no_picture: Option<f64>,
     retake: Option<i32>,
     watchdog: Watchdog,
@@ -235,6 +240,8 @@ impl WhiteBalanceLoop {
             batch: None,
             last_resume_at: f64::NEG_INFINITY,
             resume_out: None,
+            limit_state_since: None,
+            limit_stored: false,
             no_picture: None,
             retake: None,
             watchdog: Watchdog::new(Unit::Mired),
@@ -295,6 +302,8 @@ impl WhiteBalanceLoop {
         self.band = Band::Adjusting;
         self.state = WhiteBalanceState::Starting;
         self.limit_since = None;
+        self.limit_state_since = None;
+        self.limit_stored = false;
         self.batch = None;
         self.resumed_at = f64::NEG_INFINITY;
         self.last_arrival = f64::NEG_INFINITY;
@@ -459,6 +468,7 @@ impl WhiteBalanceLoop {
         }
         let quiet = self.watchdog.quiet(now, self.last_arrival);
         self.no_picture = (quiet >= NO_PICTURE_AFTER).then_some(quiet);
+        self.track_limit(now);
         if self.pending.is_some() || now < self.watchdog.retry_at() || self.no_picture.is_some() {
             return Vec::new();
         }
@@ -575,7 +585,15 @@ impl WhiteBalanceLoop {
             }
         }
         if r.conf < HOLD_BELOW {
+            // Nothing to measure: keep the Kelvin and say so (it is not `holding`: nothing was checked).
+            self.state = WhiteBalanceState::NoSignal;
+            self.limit_since = None;
             return Vec::new();
+        }
+        if self.state == WhiteBalanceState::NoSignal {
+            // The signal is back: measure from the wide band again, as after a write.
+            self.state = WhiteBalanceState::Adjusting;
+            self.band = Band::Adjusting;
         }
         let alpha = learned.wb_alpha.unwrap_or(ALPHA_INITIAL).clamp(ALPHA_MIN, ALPHA_MAX);
         let bands = self.watchdog.band_scale(now);
@@ -649,6 +667,28 @@ impl WhiteBalanceLoop {
         }
     }
 
+    /// 2.5.11: also store the resume point after `LIMIT_STORE_AFTER` in `at_limit`, at most once per `RESUME_EVERY`.
+    fn track_limit(&mut self, now: f64) {
+        if self.state != WhiteBalanceState::AtLimit || self.no_picture.is_some() {
+            self.limit_state_since = None;
+            self.limit_stored = false;
+            return;
+        }
+        let since = *self.limit_state_since.get_or_insert(now);
+        if !self.limit_stored
+            && self.pending.is_none()
+            && now - since >= LIMIT_STORE_AFTER
+            && now - self.last_resume_at >= RESUME_EVERY
+        {
+            self.last_resume_at = now;
+            self.limit_stored = true;
+            self.resume_out = Some(Resume {
+                white_balance: Some(self.k),
+                ..Resume::default()
+            });
+        }
+    }
+
     /// Learn `α` from the batch before: `ρ = observed / predicted`, bounded and slow like `S`.
     fn learn(&mut self, r: &Reading, learned: &mut Learned) {
         let Some(b) = &mut self.batch else { return };
@@ -713,7 +753,12 @@ impl WhiteBalanceLoop {
     // Output
 
     pub fn resume_report(&self) -> Option<Resume> {
-        if self.engaged() && self.state == WhiteBalanceState::Holding {
+        let reportable = match self.state {
+            WhiteBalanceState::Holding => true,
+            WhiteBalanceState::AtLimit => self.limit_stored,
+            _ => false,
+        };
+        if self.engaged() && reportable {
             self.resume_out
         } else {
             None

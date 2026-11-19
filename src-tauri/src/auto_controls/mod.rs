@@ -372,6 +372,8 @@ pub enum WhiteBalanceState {
     Adjusting,
     Holding,
     AtLimit,
+    /// Too little colour to measure (a dark picture, one colour): the Kelvin is kept.
+    NoSignal,
     NoPicture,
     Paused,
     Closed,
@@ -397,7 +399,7 @@ pub struct AutoStatus {
     pub exposure: Option<ExposureStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub white_balance: Option<WhiteBalanceStatus>,
-    /// Present on entering `holding` (at most once per 10 s): the store persists it.
+    /// Present on entering `holding`, or after 3 s in a limit state (at most once per 10 s): the store persists it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume: Option<Resume>,
     /// Present when the learned values changed since the last emitted status: the store persists them.

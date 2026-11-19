@@ -653,6 +653,7 @@ impl ControlsHub {
                 let dev = Cancellable {
                     inner: device.as_ref(),
                     cancel,
+                    began: Instant::now(),
                 };
                 // What Better Cam auto drives goes last, exposure first (2.5.11: the slow first write, then gain),
                 // as a manual value at the resume point. Everything else as always: Auto flags, then values.
@@ -1356,10 +1357,13 @@ impl ControlsHub {
     }
 }
 
-/// Lets a re-apply stop at the next control once the camera is closing.
+/// Lets a re-apply stop at the next control once the camera is closing, and logs every write with its time (the
+/// first write after an open takes 200-700 ms, later ones 2-27 ms; docs/AUTO-CONTROLS.md 9.2 check 9).
 struct Cancellable<'a> {
     inner: &'a dyn CameraControls,
     cancel: &'a AtomicBool,
+    /// When the re-apply began: the `t=` of its log lines.
+    began: Instant,
 }
 
 impl Cancellable<'_> {
@@ -1372,6 +1376,22 @@ impl Cancellable<'_> {
             Ok(())
         }
     }
+
+    /// One `[apply]` line for a write that took `from..now`.
+    fn log(&self, key: ControlKey, what: &str, result: &Result<ControlInfo, ControlError>, from: Instant) {
+        let t = from.saturating_duration_since(self.began).as_secs_f64();
+        let ms = from.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("{}", apply_line(t, key, what, result.as_ref().map(|i| i.value).map_err(ToString::to_string), ms));
+    }
+}
+
+/// `[apply] t=0.4 exposure -5 -> -5 (412 ms)`: the same style as the runner's `[auto]` lines, `t` in seconds since the
+/// re-apply began. `->` is what the device read back right after the write.
+fn apply_line(t: f64, key: ControlKey, what: &str, result: Result<i32, String>, ms: f64) -> String {
+    match result {
+        Ok(back) => format!("[apply] t={t:.1} {key} {what} -> {back} ({ms:.0} ms)"),
+        Err(e) => format!("[apply] t={t:.1} {key} {what} failed: {e} ({ms:.0} ms)"),
+    }
 }
 
 impl ControlDevice for Cancellable<'_> {
@@ -1381,11 +1401,17 @@ impl ControlDevice for Cancellable<'_> {
     }
     fn set_auto(&self, key: ControlKey, auto: bool) -> Result<ControlInfo, ControlError> {
         self.check()?;
-        self.inner.set_auto(key, auto)
+        let from = Instant::now();
+        let r = self.inner.set_auto(key, auto);
+        self.log(key, if auto { "auto on" } else { "auto off" }, &r, from);
+        r
     }
     fn set_value(&self, key: ControlKey, value: i32) -> Result<ControlInfo, ControlError> {
         self.check()?;
-        self.inner.set_value(key, value)
+        let from = Instant::now();
+        let r = self.inner.set_value(key, value);
+        self.log(key, &value.to_string(), &r, from);
+        r
     }
 }
 
@@ -1560,6 +1586,18 @@ mod tests {
             closed: closed.clone(),
         }));
         (hub, camera, opened, closed)
+    }
+
+    #[test]
+    fn apply_lines_have_the_style_of_the_auto_lines() {
+        assert_eq!(
+            apply_line(0.4, ControlKey::Exposure, "-5", Ok(-5), 412.4),
+            "[apply] t=0.4 exposure -5 -> -5 (412 ms)"
+        );
+        assert_eq!(
+            apply_line(1.0, ControlKey::Gain, "auto on", Err("nope".into()), 3.0),
+            "[apply] t=1.0 gain auto on failed: nope (3 ms)"
+        );
     }
 
     fn record(entries: Value) -> ControlSnapshot {

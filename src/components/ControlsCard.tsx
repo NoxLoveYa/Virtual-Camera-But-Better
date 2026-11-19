@@ -18,7 +18,7 @@ import {
   type ControlInfo,
   type ControlMode,
 } from "../camera/schema";
-import { ExposureAuto, LimitMark, LoopStatus, WhiteBalanceAuto, type AutoCtx } from "./AutoControls";
+import { CameraAutoHint, ExposureAuto, LimitMark, LoopStatus, WhiteBalanceAuto, type AutoCtx } from "./AutoControls";
 import { Icon } from "./Icon";
 import { Select, type SelectOption } from "./Select";
 
@@ -202,6 +202,7 @@ function ControlRow({ info, ctx }: { info: ControlInfo; ctx: AutoCtx }) {
           onChange={(v) => setControl(info.key, { value: Number(v) })}
         />
       )}
+      {loop === "exposure" && mode === "camera" && ctx.live && <CameraAutoHint info={info} />}
       {loop === "exposure" && app && <ExposureAuto info={info} ctx={ctx} />}
       {loop === "white_balance" && app && <WhiteBalanceAuto ctx={ctx} />}
       {/* After a hand-back the line stays (with Try again) while the control is where it was handed to. */}

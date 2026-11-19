@@ -1,18 +1,23 @@
-import type { CSSProperties, ReactNode } from "react";
-import { useStore } from "../store";
+import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
+import { useStats, useStore } from "../store";
 import {
   DEFAULT_AUTO,
+  SLOW_CAMERA_AFTER,
   SPEED_OPTIONS,
   TARGET_MAX,
   TARGET_MIN,
   autoAction,
   autoText,
   autoTone,
+  cameraIsSlow,
   exposureText,
+  findCamera,
   longestKey,
   longestOptions,
   maxGainValue,
   parseLongest,
+  requestedFps,
+  slowCameraText,
   type AutoCfg,
   type AutoLoop,
   type AutoState,
@@ -193,6 +198,42 @@ export function ExposureAuto({ info, ctx }: { info: ControlInfo; ctx: AutoCtx })
       {lowLight && <p className="ctl-hint">{LOW_LIGHT}</p>}
       <p className="ctl-hint">{AFTER_SENSOR}</p>
     </div>
+  );
+}
+
+/**
+ * Under the exposure row while it is in Camera auto: the camera's own auto lengthens the exposure in dim light and the
+ * frame rate falls with it, and Better Cam auto cannot change that from outside. After 3 s with the measured capture
+ * rate under 0.9 × the rate asked for, say so and offer Better Cam auto (only where it is offered); it goes away when
+ * the rate recovers.
+ */
+export function CameraAutoHint({ info }: { info: ControlInfo }) {
+  const stats = useStats((s) => s.stats);
+  const source = useStore((s) => s.source);
+  const output = useStore((s) => s.output);
+  const cameras = useStore((s) => s.cameras);
+  const setControlMode = useStore((s) => s.setControlMode);
+  const cam = cameras ? findCamera(cameras, source.video_device_id) : null;
+  const requested = stats ? requestedFps(source, output, cam, stats.capture) : null;
+  const measured = stats?.capture.fps ?? 0;
+  const slow = cameraIsSlow(measured, requested);
+  const [shown, setShown] = useState(false);
+  useEffect(() => {
+    if (!slow) {
+      setShown(false);
+      return;
+    }
+    const t = setTimeout(() => setShown(true), SLOW_CAMERA_AFTER * 1000);
+    return () => clearTimeout(t);
+  }, [slow]);
+  if (!shown || !slow || requested === null || info.app == null) return null;
+  return (
+    <p className="ctl-hint" role="status" aria-live="polite" data-hint="slow-camera">
+      {slowCameraText(measured, requested)}
+      <button type="button" className="link" onClick={() => void setControlMode("exposure", "app")}>
+        Use Better Cam auto
+      </button>
+    </p>
   );
 }
 

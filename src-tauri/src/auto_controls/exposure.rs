@@ -70,6 +70,8 @@ const GUARD_LOW_FOR: f64 = 3.0;
 const GUARD_VERIFY: f64 = 3.0;
 /// The resume point is reported at most this often (2.5.11).
 const RESUME_EVERY: f64 = 10.0;
+/// The resume point is also reported once the loop has sat in a limit state this long (2.5.11).
+const LIMIT_STORE_AFTER: f64 = 3.0;
 /// W3 (2.7): a sample counts as "confident and unclipped" for judging a batch.
 const JUDGE_CONFIDENCE: f64 = 0.5;
 const JUDGE_CLIP: f64 = 0.05;
@@ -338,6 +340,9 @@ pub struct ExposureLoop {
     dropped_to: Option<f64>,
     last_resume_at: f64,
     resume_out: Option<Resume>,
+    /// Since when the state is a limit state, and whether the resume point of this stay is stored (2.5.11).
+    limit_state_since: Option<f64>,
+    limit_stored: bool,
     /// The error of the last decision's reading; infinite before the first.
     last_e: f64,
     /// Seconds without a sample, when it is long enough to matter (W5).
@@ -385,6 +390,8 @@ impl ExposureLoop {
             dropped_to: None,
             last_resume_at: f64::NEG_INFINITY,
             resume_out: None,
+            limit_state_since: None,
+            limit_stored: false,
             last_e: f64::INFINITY,
             no_picture: None,
             retakes: Vec::new(),
@@ -458,6 +465,8 @@ impl ExposureLoop {
         self.guard = Guard::Watching { low_since: None };
         self.guard_spent = false;
         self.dropped_to = None;
+        self.limit_state_since = None;
+        self.limit_stored = false;
         self.resumed_at = f64::NEG_INFINITY;
         self.last_arrival = f64::NEG_INFINITY;
         self.last_e = f64::INFINITY;
@@ -571,6 +580,16 @@ impl ExposureLoop {
             self.e > self.caps.e_min
         };
         room.then_some(1.0)
+    }
+
+    /// The camera has a gain control, `Most gain` is at its minimum (gain off), and the gain is somewhere else.
+    fn gain_stuck(&self, lim: &Limits) -> bool {
+        self.caps.gain.is_some_and(|gc| !lim.gain_usable && self.g != gc.min)
+    }
+
+    /// The camera has a gain control that the loop does not use: `Most gain` is at its minimum.
+    fn gain_off(&self, lim: &Limits) -> bool {
+        self.caps.gain.is_some() && !lim.gain_usable
     }
 
     /// The most light the limits allow, and the least.
@@ -797,6 +816,7 @@ impl ExposureLoop {
         let quiet = self.watchdog.quiet(now, self.last_arrival);
         self.no_picture = (quiet >= NO_PICTURE_AFTER).then_some(quiet);
         self.guard_step(now, learned);
+        self.track_limit(now);
         if !self.pending.is_empty() || now < self.watchdog.retry_at() || self.no_picture.is_some() || other_busy {
             return Vec::new();
         }
@@ -1009,8 +1029,9 @@ impl ExposureLoop {
     fn decide(&mut self, now: f64, lim: &Limits, pace: &Pace, learned: &mut Learned) -> Vec<Action> {
         let s = lim.s;
         // A constraint (frame rate or the user's limit changed): move to the cap, brightness-neutral, no samples
-        // needed and not bounded by `step_max`.
-        if self.e > lim.e_cap {
+        // needed and not bounded by `step_max`. Most gain at its minimum is one too (2.5.2: `Gs_cap = 0`): gain goes
+        // to `G_min` and exposure takes the stops it gave, as far as whole stops allow.
+        if self.e > lim.e_cap || self.gain_stuck(lim) {
             let (e2, g2) = self.allocate(self.x(s), lim);
             return self.move_to(e2, g2, lim, None, None).unwrap_or_default();
         }
@@ -1239,6 +1260,34 @@ impl ExposureLoop {
         }
     }
 
+    /// 2.5.11: the resume point is also stored when the loop has sat in a limit state for `LIMIT_STORE_AFTER`, at
+    /// most once per `RESUME_EVERY`: a dark room never reaches `holding`, and each reopen would climb from the seed.
+    fn track_limit(&mut self, now: f64) {
+        let limit = matches!(
+            self.state,
+            ExposureState::LimitGain | ExposureState::LimitExposure | ExposureState::TooBright
+        ) && self.no_picture.is_none();
+        if !limit {
+            self.limit_state_since = None;
+            self.limit_stored = false;
+            return;
+        }
+        let since = *self.limit_state_since.get_or_insert(now);
+        if !self.limit_stored
+            && self.pending.is_empty()
+            && now - since >= LIMIT_STORE_AFTER
+            && now - self.last_resume_at >= RESUME_EVERY
+        {
+            self.last_resume_at = now;
+            self.limit_stored = true;
+            self.resume_out = Some(Resume {
+                exposure: Some(self.e),
+                gain: self.caps.gain.map(|_| self.g),
+                white_balance: None,
+            });
+        }
+    }
+
     /// 2.5.7: a gain-only batch tells how many stops the gain really gave.
     fn learn(&mut self, r: &Reading, learned: &mut Learned) {
         let Some(p) = self.probe.take() else { return };
@@ -1313,7 +1362,12 @@ impl ExposureLoop {
     // Output
 
     pub fn resume_report(&self) -> Option<Resume> {
-        if self.engaged() && self.state == ExposureState::Holding {
+        let reportable = match self.state {
+            ExposureState::Holding => true,
+            ExposureState::LimitGain | ExposureState::LimitExposure | ExposureState::TooBright => self.limit_stored,
+            _ => false,
+        };
+        if self.engaged() && reportable {
             self.resume_out
         } else {
             None
@@ -1347,6 +1401,7 @@ impl ExposureLoop {
             max_gain,
             e_min: self.caps.e_min,
             gain_min: self.caps.gain.map_or(0, |g| g.min),
+            gain_off: self.gain_off(&lim),
             cap: lim.e_cap,
             cap_reason: lim.reason,
             fps: self.capture_fps,

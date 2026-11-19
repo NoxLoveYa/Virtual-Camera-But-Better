@@ -193,6 +193,126 @@ fn case_03_darker_than_the_limits_allow() {
 }
 
 #[test]
+fn most_gain_off_drives_the_gain_to_its_minimum() {
+    // F1: the slider says Off, so the device gain must follow (it stayed at its last driven value, 75), and the
+    // status must not claim the camera has no gain.
+    let cfg = SimCfg {
+        start_e: -5,
+        start_g: 0,
+        ..SimCfg::default()
+    };
+    let mut sim = Sim::new(cfg, dim(-1.0));
+    let mut ctrl = engage(&sim, resume(-5, 0), true);
+    sim.run(&mut ctrl, 8.0);
+    assert_eq!(sim.device(), (-5, 75), "the gain did not climb to Most gain first");
+    assert_eq!(state(&ctrl), ExposureState::LimitGain);
+    // The user drags Most gain to its minimum.
+    let mut cfg = AutoCfg::default();
+    cfg.exposure.max_gain = Some(0);
+    ctrl.set_cfg(cfg);
+    let off_at = sim.t;
+    sim.run(&mut ctrl, off_at + 8.0);
+    assert_eq!(sim.device().1, 0, "device gain stays at {}", sim.device().1);
+    let gain_writes: Vec<_> = sim
+        .writes_between(off_at, off_at + 8.0)
+        .into_iter()
+        .filter(|w| w.key == ControlKey::Gain)
+        .collect();
+    assert_eq!(gain_writes.len(), 1, "{gain_writes:?}");
+    let st = ctrl.status().exposure.unwrap();
+    assert_eq!(st.state, ExposureState::LimitExposure);
+    assert_eq!(st.max_gain, None);
+    assert_eq!(
+        st.message.as_deref(),
+        Some("Exposure at the 30 fps limit and gain is off. Add light, allow more gain, or allow a longer exposure.")
+    );
+    // Quiet afterwards: no further writes.
+    let n = sim.writes.len();
+    sim.run(&mut ctrl, off_at + 16.0);
+    assert_eq!(sim.writes.len(), n);
+}
+
+#[test]
+fn most_gain_off_from_the_start_never_raises_the_gain() {
+    let mut cfg = AutoCfg::default();
+    cfg.exposure.max_gain = Some(0);
+    let sim_cfg = SimCfg {
+        start_e: -5,
+        start_g: 40,
+        ..SimCfg::default()
+    };
+    let mut sim = Sim::new(sim_cfg, dim(-1.0));
+    // A resume point from the days Most gain was 75.
+    let mut ctrl = engage_with(&sim, cfg, resume(-5, 40), true);
+    sim.run(&mut ctrl, 8.0);
+    assert_eq!(sim.device().1, 0);
+    assert!(sim.writes.iter().filter(|w| w.key == ControlKey::Gain).all(|w| w.value == 0));
+}
+
+#[test]
+fn the_resume_point_is_stored_after_three_seconds_at_a_limit() {
+    // F2: a dark room never reaches `holding`; each reopen climbed from the seed again.
+    let mut sim = Sim::new(SimCfg::default(), dim(-1.0));
+    let mut ctrl = engage(&sim, resume(-6, 0), false);
+    let (mut limit_at, mut stored_at) = (None, None);
+    while sim.t < 20.0 {
+        sim.run(&mut ctrl, sim.t + 0.1);
+        let st = ctrl.status();
+        if limit_at.is_none() && st.exposure.as_ref().unwrap().state == ExposureState::LimitGain {
+            limit_at = Some(sim.t);
+        }
+        if stored_at.is_none() && st.resume.is_some() {
+            stored_at = Some(sim.t);
+            assert_eq!(
+                st.resume,
+                Some(Resume {
+                    exposure: Some(-5),
+                    gain: Some(75),
+                    white_balance: None
+                })
+            );
+            assert_eq!(st.exposure.unwrap().state, ExposureState::LimitGain);
+        }
+    }
+    let (limit_at, stored_at) = (limit_at.expect("no limit_gain"), stored_at.expect("resume point never stored"));
+    assert!(
+        (3.0..=3.4).contains(&(stored_at - limit_at)),
+        "limit_gain at {limit_at}, stored at {stored_at}"
+    );
+    // It rides an emitted status (the runner hands it to the store).
+    assert!(sim.emitted.iter().any(|s| s.resume.is_some()));
+    // A reopen with it starts at the limit: no climb, the seed is the stored point.
+    let sim2 = Sim::new(
+        SimCfg {
+            start_e: -5,
+            start_g: 75,
+            ..SimCfg::default()
+        },
+        dim(-1.0),
+    );
+    let ctrl2 = engage(&sim2, resume(-5, 75), true);
+    assert_eq!(ctrl2.seeds(30.0).exposure, Some((-5, Some(75))));
+}
+
+#[test]
+fn the_resume_point_at_a_limit_is_stored_at_most_every_ten_seconds() {
+    // The point is stored once for the stay; a stay that ends and begins again within 10 s waits for the 10 s.
+    let mut sim = Sim::new(SimCfg::default(), dim(-1.0));
+    let mut ctrl = engage(&sim, resume(-6, 0), false);
+    let mut firsts = Vec::new();
+    let mut had = false;
+    while sim.t < 30.0 {
+        sim.run(&mut ctrl, sim.t + 0.1);
+        let has = ctrl.status().resume.is_some();
+        if has && !had {
+            firsts.push(sim.t);
+        }
+        had = has;
+    }
+    assert_eq!(firsts.len(), 1, "stored again at {firsts:?}");
+}
+
+#[test]
 fn case_04_bright_scene() {
     // Needs E = -11 with gain at its minimum.
     let mut sim = Sim::new(SimCfg::default(), dim(-11.0));
@@ -1051,6 +1171,62 @@ fn white_balance_holds_on_a_picture_of_one_colour() {
     assert!(
         !actions.iter().any(|a| matches!(a, Action::Write { .. })),
         "{actions:?}"
+    );
+}
+
+#[test]
+fn white_balance_on_a_black_picture_says_nothing_to_measure() {
+    // F4: a picture too dark for colour is not "holding": nothing was checked. The Kelvin is kept, and the text says so.
+    let cfg = SimCfg {
+        wb: Some(WbSim {
+            alpha_true: 0.008,
+            start_k: 4600,
+            can_auto: true,
+        }),
+        start_e: -5,
+        start_g: 33,
+        slow_first_write: false,
+        ..SimCfg::default()
+    };
+    let light: Light = Box::new(|t| if t < 6.0 { (-8.0f64).exp2() } else { 16.0 });
+    let mut sim = Sim::new(cfg, light).with_temperature(kelvin(4600.0));
+    let mut ctrl = wb_ctrl(&sim, 4600, true);
+    sim.run(&mut ctrl, 4.0);
+    assert_eq!(wb_state(&ctrl), WhiteBalanceState::NoSignal);
+    assert_eq!(
+        ctrl.status().white_balance.unwrap().message.as_deref(),
+        Some("Nothing to measure (too dark). Keeping 4600 K.")
+    );
+    assert!(wb_writes(&sim).is_empty());
+    // Light: the loop measures again and holds.
+    sim.run(&mut ctrl, 12.0);
+    assert_eq!(wb_state(&ctrl), WhiteBalanceState::Holding);
+    assert_eq!(
+        ctrl.status().white_balance.unwrap().message.as_deref(),
+        Some("Holding · 4600 K")
+    );
+}
+
+#[test]
+fn the_white_balance_resume_point_is_stored_after_three_seconds_at_its_limit() {
+    // F2 for white balance: a light the camera cannot correct sits in `at_limit`.
+    let mut sim = wb_sim(0.008, 3500, kelvin(2000.0));
+    let mut ctrl = wb_ctrl(&sim, 3500, true);
+    let (mut limit_at, mut stored_at) = (None, None);
+    while sim.t < 20.0 {
+        sim.run(&mut ctrl, sim.t + 0.1);
+        if limit_at.is_none() && wb_state(&ctrl) == WhiteBalanceState::AtLimit {
+            limit_at = Some(sim.t);
+        }
+        if stored_at.is_none() && ctrl.status().resume.is_some() {
+            stored_at = Some(sim.t);
+            assert_eq!(ctrl.status().resume.unwrap().white_balance, Some(2800));
+        }
+    }
+    let (limit_at, stored_at) = (limit_at.expect("no at_limit"), stored_at.expect("never stored"));
+    assert!(
+        (3.0..=3.4).contains(&(stored_at - limit_at)),
+        "at_limit at {limit_at}, stored at {stored_at}"
     );
 }
 
