@@ -41,7 +41,8 @@ export function Splitter({ side, total, workspaceRef }: Props) {
     drag.current = { x: e.clientX, start: width, range, width };
     e.currentTarget.setPointerCapture(e.pointerId);
     document.body.classList.add("col-resizing");
-    e.preventDefault();
+    e.preventDefault(); // (no focus move by default) so the splitter takes it by hand: Escape then cancels the drag
+    e.currentTarget.focus({ preventScroll: true });
   };
   const onPointerMove = (e: PointerEvent<HTMLDivElement>) => {
     const d = drag.current;
@@ -62,6 +63,7 @@ export function Splitter({ side, total, workspaceRef }: Props) {
   };
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
     if (e.key === "Escape" && drag.current) {
+      e.preventDefault(); // cancelling the drag uses the Escape up: Compare skips it
       end(false);
       return;
     }

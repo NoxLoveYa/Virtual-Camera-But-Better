@@ -438,7 +438,9 @@ export function Preview() {
     const stops = [useCompare.subscribe(apply), useStore.subscribe(apply)];
     return () => stops.forEach((stop) => stop());
   }, []);
-  // Esc turns Compare off, the orientation key turns the bar.
+  // Esc turns Compare off, the orientation key turns the bar. Compare gets only an Escape nothing else used: a menu, the nav flyout,
+  // a dialog and a drag preventDefault theirs, and in the inspector Escape goes back to the navigator (Inspector.tsx). So the first
+  // Escape closes the thing in front; Compare goes off when focus is in the preview, the navigator or nowhere.
   useEffect(() => {
     if (!compareOn) return;
     const onKey = (e: KeyboardEvent) => {

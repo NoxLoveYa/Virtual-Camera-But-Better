@@ -34,7 +34,8 @@ React, and runs on Windows 11 only.
 - Preview tools: show the picture as it enters a chosen filter. Compare is a toggle: a bar appears over the preview
   with the camera picture (before the filters) on one side and the result (what apps get) on the other; drag it, or
   drag anywhere on the picture, to wipe between them. Arrow keys move the bar (Shift for big steps), `O` turns it
-  from left-right to up-down, Esc turns Compare off. An eyedropper picks key colours from the preview (Chroma Key,
+  from left-right to up-down. Esc turns Compare off when nothing else uses it: an open menu, the navigator flyout
+  or a dialog closes first, and in the inspector Esc takes the focus back to the navigator and leaves Compare on. An eyedropper picks key colours from the preview (Chroma Key,
   Color Key). Crop/Pad can be edited on the picture: drag to pan, mouse wheel to zoom.
 - Drop files from Explorer: a LUT, a picture or a preset (`.json`) onto a field, the chain or the window.
 - Output: resolution, frame rate, aspect, background color, and an option to also offer 720p and 360p.

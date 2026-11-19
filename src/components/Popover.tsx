@@ -60,6 +60,8 @@ export function Popover({ open, onClose, anchor, children, align = "left", match
     const away = (e: MouseEvent) => !inside(e.target) && close.current();
     const esc = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
+      // The Escape is used up here: Compare (Preview.tsx) and the inspector's "back to the navigator" skip a prevented Escape.
+      e.preventDefault();
       close.current();
       if (returnFocus.current) ref.current?.querySelector<HTMLElement>("button, input, [tabindex]")?.focus();
     };

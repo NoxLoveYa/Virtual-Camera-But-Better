@@ -53,7 +53,11 @@ export function ExtensionsPanel() {
   useEffect(() => {
     if (!open) return;
     close.current?.focus({ preventScroll: true });
-    const esc = (e: KeyboardEvent) => e.key === "Escape" && setExtensionsOpen(false);
+    const esc = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault(); // used up here: Compare skips a prevented Escape
+      setExtensionsOpen(false);
+    };
     document.addEventListener("keydown", esc);
     return () => document.removeEventListener("keydown", esc);
   }, [open, setExtensionsOpen]);

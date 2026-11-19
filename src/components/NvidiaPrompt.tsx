@@ -19,7 +19,11 @@ export function NvidiaPrompt() {
 
   useEffect(() => {
     if (!nvidiaPrompt || busy) return;
-    const esc = (e: KeyboardEvent) => e.key === "Escape" && closeNvidiaPrompt();
+    const esc = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault(); // used up here: Compare skips a prevented Escape
+      closeNvidiaPrompt();
+    };
     document.addEventListener("keydown", esc);
     return () => document.removeEventListener("keydown", esc);
   }, [nvidiaPrompt, busy, closeNvidiaPrompt]);
