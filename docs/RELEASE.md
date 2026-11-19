@@ -1,7 +1,10 @@
 # Release readiness: Better Cam 0.1.0
 
-Built 2026-11-19 from commit `ac02150` (`fix(vcam): harden the frame-event pump; live results (phase 4)`), on the
-development PC (Windows 11 Pro 10.0.26200). Nothing was uploaded, tagged or published.
+Latest build: 2026-11-19 from commit `f68c15a` (`fix(fx): Auto Adjust white balance stops flipping on a face`), on the
+development PC (Windows 11 Pro 10.0.26200). The working tree was clean. Nothing was uploaded, tagged or published.
+
+An earlier build the same day came from commit `ac02150`; its install test is the one recorded below. Its hashes are
+superseded by the ones in the table.
 
 ## Build
 
@@ -10,13 +13,25 @@ publisher NoxLoveYa, per-machine NSIS installer.
 
 | File | Size (bytes) | SHA-256 |
 |---|---|---|
-| `target\release\bundle\nsis\Better Cam_0.1.0_x64-setup.exe` | 3,731,802 (3.56 MiB) | `73F978F94BFDE0A4931A5A11943915E1912760E888E4E02A142A0241813545A5` |
-| `target\release\bundle\portable\Better-Cam-0.1.0-portable.zip` | 5,081,714 | `BF9496CD5F2B6EA76FA675972BBEC2561FDF40FCF3F5D5BCC383D2D1E08B128F` |
-| `better-cam.exe` (inside both) | 14,437,376 | `DEA0CBDCA7B66358BEF12B778FD039F2A31A9F9D9D294E45FBBEE50B2F3A5291` |
-| `better_cam_vcam.dll` (inside both; build id `282bb805`) | 809,472 | `516CB5AFB8DF42B19A81D40EC9195370F693A2FBF65C879E73ADF16D3DE1E074` |
+| `target\release\bundle\nsis\Better Cam_0.1.0_x64-setup.exe` | 3,734,351 (3.56 MiB) | `8F544B30C5D8B71E990F37CD9C889FA3CA14D41EBB9CA06DD608AB289A2E31F5` |
+| `target\release\bundle\portable\Better-Cam-0.1.0-portable.zip` | 5,088,954 | `1B81142C609F919C96FB860A24B1A9AF545820F88B4092071EC0DAC284C6AEED` |
+| `better-cam.exe` (in the zip; the installer packs the same file) | 14,449,152 | `D93785926493CBDAE517CD4262EC54FD57B02CA9E0A9485C9469ED308BA68770` |
+| `better_cam_vcam.dll` (in the zip; the installer packs the same file; build id `282bb805`) | 809,472 | `516CB5AFB8DF42B19A81D40EC9195370F693A2FBF65C879E73ADF16D3DE1E074` |
 
-The zip holds `better-cam.exe`, `vcam/better_cam_vcam.dll`, `LICENSE` and `README.txt`; the exe and the DLL in it have
-the hashes above. The zip's exe has no `--version` switch, so it was not started (it would take the camera).
+The zip holds `better-cam.exe`, `vcam/better_cam_vcam.dll`, `LICENSE` and `README.txt` (checked by unzipping it into a
+temp folder, since deleted); the exe and the DLL in it match `target\release\better-cam.exe` and
+`target\release\better_cam_vcam.dll`. The virtual camera DLL is byte for byte the same as in the earlier build (same hash,
+same build id). The installer's inner copy of the exe was not extracted and compared. The zip's exe has no `--version`
+switch, so it was not started (it would take the camera).
+
+### Changes since the previous build (`ac02150`)
+
+Only app code changed; the virtual camera and the installer did not.
+
+- `3fa0ba2` docs: README for the new features, and the first version of these release notes.
+- `eed7ca5` The app now explains a slow camera for any format choice, not only some.
+- `0ee222d` Automatic white balance no longer hunts back and forth on a face in a dim room.
+- `f68c15a` The Auto Adjust white balance effect no longer flips back and forth on a face.
 
 Build warnings (none affects the result):
 
@@ -25,9 +40,14 @@ Build warnings (none affects the result):
 - Linker: `LNK4104: export of symbol 'DllCanUnloadNow' / 'DllGetClassObject' should be PRIVATE` for the virtual camera DLL.
   Cosmetic.
 
-The working tree had an uncommitted `README.md` change; it does not enter the build.
-
 ## Tests on this PC
+
+These install and uninstall tests were run on the earlier build from commit `ac02150` (`Better Cam_0.1.0_x64-setup.exe`
+with SHA-256 `73F978F9...3545A5`), and were **not repeated** for the latest build from `f68c15a`. The installer code
+(`src-tauri/windows`, the `bundle` part of `src-tauri/tauri.conf.json`, `crates/vcam-install`, `scripts`) is unchanged
+between `3fa0ba2` and `f68c15a` (`git diff 3fa0ba2 HEAD --stat` on those paths is empty), and the virtual camera DLL has
+the same hash, so the results below still describe the installer. The installed app code is newer, and it has not been
+started from an installer.
 
 Both the dev virtual camera and the installer use the same folder and the same DLL name
 (`C:\Program Files\Better Cam\vcam\better_cam_vcam_1.282bb805.dll`), so the dev camera was registered with the very same
