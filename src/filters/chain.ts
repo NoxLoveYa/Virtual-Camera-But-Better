@@ -1,6 +1,5 @@
 import {
   defOf,
-  defaultChain,
   isBuiltinKind,
   isFilterKind,
   type ExtensionInfo,
@@ -20,8 +19,6 @@ const part = (list: FilterCfg[]) =>
  */
 export const signature = (chain: FilterCfg[], overlays: FilterCfg[] = []): string =>
   JSON.stringify(overlays.length === 0 ? part(chain) : { chain: part(chain), overlays: part(overlays) });
-
-export const DEFAULT_SIGNATURE = signature(defaultChain());
 
 const finite = (v: unknown): number | null => {
   if (typeof v === "number") return Number.isFinite(v) ? v : null;
@@ -125,33 +122,3 @@ export const refreshExtParams = (chain: FilterCfg[], extensions: readonly Extens
 
 /** Same rule the backend enforces for preset file names. */
 export const PRESET_NAME = /^[\p{L}\p{N} _-]+$/u;
-
-type PresetEntry = { kind: string; enabled: boolean; params: Record<string, ParamValue> };
-
-/** The preset file of plan 5.4: the chain without ids. Presets hold filters only, never device controls. */
-export interface PresetFile {
-  app: "better-cam";
-  version: 1;
-  chain: PresetEntry[];
-  /** The overlays above the output, in the same form. Written only when there are some; an older version ignores it. */
-  overlays?: PresetEntry[];
-}
-
-const entry = ({ kind, enabled, params }: FilterCfg): PresetEntry => ({ kind, enabled, params });
-
-export const presetFile = (chain: FilterCfg[], overlays: FilterCfg[] = []): PresetFile => ({
-  app: "better-cam",
-  version: 1,
-  chain: chain.map(entry),
-  ...(overlays.length > 0 && { overlays: overlays.map(entry) }),
-});
-
-/**
- * The chain inside a preset file: the object of plan 5.4 or the old bare array. Other sections (`camera`, `overlays`)
- * are ignored. `extensions` coerces the `ext:` entries of installed extensions (see `normalizeChain`).
- */
-export const presetChain = (raw: unknown, extensions: readonly ExtensionInfo[] = []): FilterCfg[] => {
-  const list = Array.isArray(raw) ? raw : isObject(raw) ? raw.chain : undefined;
-  if (!Array.isArray(list)) throw new Error("This is not a Better Cam preset");
-  return normalizeChain(list, extensions);
-};

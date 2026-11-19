@@ -1,7 +1,26 @@
 import { create } from "zustand";
 import { api, type EngineState, type NvidiaGpu, type NvidiaInstallProgress, type NvidiaStatus, type Stats, type VcamStatus } from "./api";
 import { defOf, defaultChain, labelOf, makeFilter, type ExtensionInfo, type FilterCfg, type FilterKind, type ParamValue } from "./filters/schema";
-import { normalizeChain, presetChain, refreshExtParams, signature } from "./filters/chain";
+import { normalizeChain, refreshExtParams } from "./filters/chain";
+import {
+  defaultState,
+  migrateBaseline,
+  parsePreset,
+  planControls,
+  planNotes,
+  presetCamera,
+  presetFileOf,
+  presetFileOfParsed,
+  presetMatches,
+  presetNotes,
+  presetSignature,
+  presetStateOf,
+  withPresetCamera,
+  type ControlStep,
+  type ParsedPreset,
+  type PresetCamera,
+  type PresetState,
+} from "./presets/preset";
 import { presetNameFor, stemOf } from "./ui/fileDrop";
 import { DEFAULT_UI, filterSelection, normalizeUi, selectedFilterId, selectionAfter, type UiState } from "./ui/layout";
 import { pointFilter, samePoint, type PreviewPoint } from "./ui/previewFrame";
@@ -11,6 +30,7 @@ import { colorToHex, toColorInt } from "./filters/values";
 import { createSaver } from "./ui/saver";
 import { createReadGate, wantsVcamPoll } from "./ui/vcamPoll";
 import {
+  CAPTURE_KEYS,
   DEFAULT_OUTPUT,
   DEFAULT_SOURCE,
   autoCfgOf,
@@ -80,6 +100,7 @@ interface Saved {
   nvidiaPromptDismissed: boolean;
   /** The preset the chain was last loaded from or saved as, and what it looked like then (see `signature`). */
   activePreset: string | null;
+  /** What the state looked like then (`presetSignature`); `null` after "Reset to defaults" and when an old baseline no longer fits. */
   presetBaseline: string | null;
   /** Whether the engine was running when the app last ran, so the next launch starts it again. */
   wasRunning: boolean;
@@ -89,11 +110,12 @@ interface Saved {
   ui: UiState;
 }
 
-/** What "Undo" restores after loading a preset or resetting. */
+/** What "Undo" restores: the chain and the active preset; after a preset load, a reset or an import also the camera, its controls, Better Cam auto and the output (`full`). */
 export interface Snapshot {
   chain: FilterCfg[];
   activePreset: string | null;
   presetBaseline: string | null;
+  full?: PresetState;
 }
 
 /** What the virtual camera is being asked to do (the button that was pressed). */
@@ -189,6 +211,10 @@ interface State extends Saved {
   /** The eyedropper or the crop frame while one runs (L2, L3): it owns `previewPoint` and ends when the point goes. Not saved. */
   previewTool: PreviewTool | null;
   presets: string[];
+  /** The name a preset load or reset is working on (the title bar shows a spinner and it); `null` when none runs. Not saved. */
+  presetLoading: string | null;
+  /** The camera controls of a preset the camera could not take yet (it was not open): they are written at its next `live`. Not saved. */
+  pendingControls: { camId: string; camera: PresetCamera } | null;
   /** The extensions the app found (Settings → Extensions); empty until `extensionsRead`. Not saved: the folder is the truth. */
   extensions: ExtensionInfo[];
   /** `extensions` has been read once, so a card of an extension that is not in it is "not installed" and not "not read yet". */
@@ -326,17 +352,21 @@ interface State extends Saved {
   setExtensionsOpen: (open: boolean) => void;
 
   refreshPresets: () => Promise<void>;
-  /** Saves the current chain under `name` (replacing any preset with that name) and makes it the active preset. */
+  /** Saves everything a preset holds (the chain, the camera and its controls, Better Cam auto, the output) under `name`, replacing any preset with that name, and makes it the active preset. */
   savePreset: (name: string) => Promise<void>;
   saveActivePreset: () => Promise<void>;
+  /** Applies a preset (see `applyState`); one Undo brings back what it changed. A failure is a toast. */
   loadPreset: (name: string) => Promise<void>;
   /**
-   * Imports a preset file from anywhere (a drop): saves it as a preset under its file name ("Name 2" on a clash) and
-   * loads it, with Undo for the chain. The file stays. A failure is a toast.
+   * Imports a preset file from anywhere (a drop): saves it as a preset under its file name ("Name 2" on a clash), as it
+   * was (an old filters-only file stays one), and loads it, with Undo. The file stays. A failure is a toast.
    */
   importPreset: (path: string) => Promise<void>;
   deletePreset: (name: string) => Promise<void>;
-  resetChain: () => void;
+  /** Renames a preset file; the active preset follows. A refusal (the name is taken) is a toast. */
+  renamePreset: (from: string, to: string) => Promise<void>;
+  /** Back to the defaults (no filters, the device default format, no changed controls, Better Cam auto and output at their defaults); the camera stays. One Undo. */
+  resetAll: () => Promise<void>;
 }
 
 export const useStore = create<State>((set, get) => {
@@ -646,6 +676,223 @@ export const useStore = create<State>((set, get) => {
     }, 80);
   };
 
+  /** Who drives `key` from now on (see `setControlMode`); false when the camera refused (`onError` says why, by default a toast). */
+  const changeMode = async (key: ControlKey, mode: ControlMode, onError: (text: string) => void = say): Promise<boolean> => {
+    const cam = selectedCam();
+    const info = get().controlInfos?.find((i) => i.key === key);
+    if (!cam || !info || get().controlsFor !== cam.id || modeOf(info) === mode) return true;
+    const keys: ControlKey[] = key === "exposure" ? ["exposure", "gain"] : [key];
+    // The card follows at once; the answer (the rows as the device reports them, after the first slow write) replaces it.
+    set((s) => ({
+      controlInfos: (s.controlInfos ?? []).map((i) => {
+        if (i.key === key) return { ...i, mode, auto: mode === "camera" };
+        if (key === "exposure" && i.key === "gain" && (mode === "app" || i.driven_by === "exposure")) {
+          const { driven_by: _by, ...rest } = i;
+          return mode === "app" ? { ...rest, mode: "app", auto: false, driven_by: "exposure" } : { ...rest, mode: "manual" };
+        }
+        return i;
+      }),
+    }));
+    try {
+      await settleWrites(keys);
+      const changed = await api.setControlMode(cam.id, key, mode);
+      if (get().controlsFor === cam.id) set((s) => ({ controlInfos: sortControls((s.controlInfos ?? []).map((i) => changed.find((c) => c.key === i.key) ?? i)) }));
+      let controls = get().controls;
+      for (const c of changed) controls = rememberControl(controls, cam, c);
+      set({ controls });
+      persist();
+      pushSource();
+      return true;
+    } catch (e) {
+      onError(`${key.replace(/_/g, " ")}: ${String(e)}`);
+      void get().refreshControls();
+      return false;
+    }
+  };
+
+  /** A control edit, another load or a camera change ends the wait of a preset's controls for the camera (`pendingControls`). */
+  const dropPending = () => {
+    if (get().pendingControls) set({ pendingControls: null });
+  };
+
+  // ---- presets (docs/LAYOUT-INSPECTOR.md section 3): a load, a reset, an import and an Undo all run `applyState`.
+  const stateNow = (): PresetState => {
+    const s = get();
+    return presetStateOf(s.chain, s.source, s.output, s.controls, s.cameras);
+  };
+  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+  /** How long a load waits for the camera to be open before it leaves the controls for the next `live`. */
+  const SETTLE_MS = 10_000;
+
+  /**
+   * Waits until the engine is `live` (the camera is open) or `stopped` (closed for good), at most SETTLE_MS; false on a timeout. `reopens`:
+   * a capture change was just sent, so a `live` from before it does not count until the engine has left it (or 1.5 s passed).
+   */
+  const settled = async (reopens: boolean): Promise<boolean> => {
+    const t0 = performance.now();
+    let left = false;
+    while (performance.now() - t0 < SETTLE_MS) {
+      const st = get().engine.state;
+      if (st === "stopped") return true;
+      if (st !== "live") left = true;
+      else if (!reopens || left || performance.now() - t0 > 1500) return true;
+      await sleep(100);
+    }
+    return false;
+  };
+
+  /** One step of a plan, written to the camera; the store follows what the camera answers. A key with a slider write waiting is the user's now and is left alone. */
+  const runStep = async (cam: { id: string; name: string }, step: ControlStep, errors: string[]) => {
+    if (queued(step.key)) return;
+    if (step.op === "mode") {
+      await changeMode(step.key, step.mode, (text) => errors.push(text));
+      return;
+    }
+    try {
+      const info = await api.setCameraControl(cam.id, step.key, step.value, step.auto);
+      if (get().controlsFor === cam.id) putControl(info);
+      set({ controls: rememberControl(get().controls, cam, info) });
+      persist();
+    } catch (e) {
+      errors.push(`${step.key.replace(/_/g, " ")}: ${String(e)}`);
+      void get().refreshControls();
+    }
+  };
+
+  /** Steps 6 to 9 of 3.3: read the camera, send Better Cam auto's settings, then write the controls (leave Better Cam auto, plain controls, engage Better Cam auto). */
+  const applyDevice = async (cam: { id: string; name: string }, camera: PresetCamera, notes: string[]) => {
+    await get().refreshControls();
+    const infos = get().controlsFor === cam.id && !get().controlsError ? get().controlInfos : null;
+    if (!infos) {
+      notes.push("The camera's controls could not be read, so they were not applied.");
+      return;
+    }
+    await api.setAutoConfig(cam.id, camera.auto).catch((e) => notes.push(`Better Cam auto: ${String(e)}`));
+    const plan = planControls(infos, camera.controls);
+    const errors: string[] = [];
+    for (const step of [...plan.a, ...plan.b, ...plan.c]) {
+      if (selectedCam()?.id !== cam.id) break;
+      await runStep(cam, step, errors);
+    }
+    notes.push(...planNotes(plan), ...errors.slice(0, 1));
+  };
+
+  /** Steps 4 and 5 (and 6 to 9 when the preset's camera is connected): the camera, its capture settings, its controls and Better Cam auto. */
+  const applyCamera = async (camera: PresetCamera, notes: string[]) => {
+    const cams = get().cameras ?? [];
+    const hit = presetCamera(cams, camera.device);
+    const cur = selectedCam();
+    let id = get().source.video_device_id;
+    let controls = get().controls;
+    // Whose record gets the preset's controls: the preset's camera when it is connected, or (nothing is connected) when it is only stored.
+    let owner: { id: string; name: string } | null = null;
+    if (hit) {
+      id = hit.id;
+      owner = hit;
+    } else if (cams.length === 0 && camera.device) {
+      id = camera.device.id;
+      owner = camera.device;
+      notes.push("No camera connected: camera settings apply when one is.");
+    } else {
+      if (camera.device) notes.push(`“${camera.device.name}” is not connected: camera controls were not applied.`);
+      // The camera that stays takes the other Better Cam auto settings; the most gain is in this camera's own units.
+      if (cur) controls = withAutoCfg(controls, cur, { ...camera.auto, exposure: { ...camera.auto.exposure, max_gain: autoCfgOf(controls, cur).exposure.max_gain } });
+    }
+    // The controls go in as Manual at their value where the loops are engaged later (step 9), so that write is not a no-op.
+    if (owner) controls = withPresetCamera(controls, owner, camera.controls, camera.auto, hit !== null);
+    const before = get().source;
+    const fixed = repairSource({ ...camera.capture, video_device_id: id }, cams);
+    const reopens = CAPTURE_KEYS.some((k) => before[k] !== fixed[k]);
+    set({ source: fixed, controls, ...(reopens && get().inUse !== null && { inUse: null }) });
+    persistNow();
+    // Always, also while stopped or when the source is the same: it sets the backend's record of the camera's controls.
+    await api.setSource(runningSource(), record()).catch(fail);
+    if (!hit) {
+      if (cur) pushAutoConfig();
+      return;
+    }
+    if (!(await settled(reopens))) {
+      // In use by another app, reconnecting or slow to open: the rest waits for its next `live`. The record says what the preset says
+      // (Better Cam auto included), so the next open starts the loops itself.
+      set({ controls: withPresetCamera(get().controls, hit, camera.controls, camera.auto, false), pendingControls: { camId: hit.id, camera } });
+      persist();
+      await api.setSource(runningSource(), record()).catch(fail);
+      notes.push("Camera controls apply when the camera opens.");
+      return;
+    }
+    await applyDevice(hit, camera, notes);
+  };
+
+  interface Finish {
+    activePreset: string | null;
+    /** `"now"`: the signature of the state when the apply is done (after the repairs), so a repaired value is not "unsaved". */
+    baseline: string | null | "now";
+  }
+
+  /**
+   * The one apply of docs/LAYOUT-INSPECTOR.md 3.3: chain, output, then the camera (device and capture in one source change,
+   * the record of its controls, Better Cam auto, the writes to the camera), then the active preset and its baseline. A
+   * section the target does not have (an old file) is left as it is. Returns the Undo snapshot taken before anything changed.
+   */
+  const applyState = async (
+    t: { chain: FilterCfg[]; camera: PresetCamera | null; output: OutputCfg | null },
+    fin: Finish,
+  ): Promise<{ prev: Snapshot; notes: string[] }> => {
+    const prev: Snapshot = { ...snapshot(), full: stateNow() };
+    const notes: string[] = [];
+    set({ pendingControls: null });
+    setChain(t.chain);
+    if (t.output) {
+      set({ output: { ...t.output } });
+      persistNow();
+      pushOutput();
+    }
+    if (t.camera) await applyCamera(t.camera, notes);
+    set({ activePreset: fin.activePreset, presetBaseline: fin.baseline === "now" ? presetSignature(stateNow()) : fin.baseline });
+    persistNow();
+    return { prev, notes };
+  };
+
+  // One apply at a time; a load that arrives meanwhile waits, and only the latest waiting one runs (the others end at once).
+  let applying = false;
+  let waiting: { label: string | null; job: () => Promise<void>; done: () => void } | null = null;
+  const serial = (label: string | null, job: () => Promise<void>) =>
+    new Promise<void>((done) => {
+      if (applying) {
+        waiting?.done();
+        waiting = { label, job, done };
+        return;
+      }
+      void (async () => {
+        applying = true;
+        let cur: typeof waiting = { label, job, done };
+        while (cur) {
+          if (cur.label) set({ presetLoading: cur.label });
+          try {
+            await cur.job();
+          } catch (e) {
+            fail(e);
+          }
+          cur.done();
+          cur = waiting;
+          waiting = null;
+        }
+        applying = false;
+        set({ presetLoading: null });
+      })();
+    });
+
+  /** The camera opened (`live`) while a load's controls were waiting for it. */
+  const runPending = async () => {
+    const p = get().pendingControls;
+    const cam = selectedCam();
+    if (!p || !cam || cam.id !== p.camId) return;
+    set({ pendingControls: null });
+    const notes: string[] = [];
+    await applyDevice(cam, p.camera, notes);
+    say(["Camera controls applied.", ...notes].join(" "));
+  };
+
   const finish = async () => {
     try {
       await api.stopEngine();
@@ -674,6 +921,8 @@ export const useStore = create<State>((set, get) => {
     previewPoint: null,
     previewTool: null,
     presets: [],
+    presetLoading: null,
+    pendingControls: null,
     extensions: [],
     extensionsRead: false,
     extensionsOpen: false,
@@ -820,6 +1069,8 @@ export const useStore = create<State>((set, get) => {
           // No picture to look at: a gesture that was showing another one is over.
           endPreviewPoint();
         }
+        // A preset's controls that waited for the camera to open (3.3).
+        if (e.state === "live" && get().pendingControls) void serial(null, runPending);
       });
       await api.onEnginePaused(({ paused }) => set({ paused }));
       await api.onEngineError((error) => {
@@ -908,12 +1159,18 @@ export const useStore = create<State>((set, get) => {
       // Work out which saved preset (if any) the restored chain still matches, so the title bar shows the right name.
       const { presets } = get();
       if (get().activePreset && !presets.includes(get().activePreset!)) set({ activePreset: null, presetBaseline: null });
+      // A baseline saved by the filters-only build is a chain fingerprint: it becomes a full one when it still fits the chain, else it goes.
+      else if (get().activePreset) set({ presetBaseline: migrateBaseline(get().presetBaseline, stateNow()) });
       if (!get().activePreset) {
-        const sig = signature(get().chain);
+        // A v2 file matches on everything it holds, an old file on its filters.
+        const now = stateNow();
         for (const name of presets) {
-          const saved = await api.loadPreset(name, get().extensions).catch(() => null);
-          if (saved && signature(saved) === sig) {
-            set({ activePreset: name, presetBaseline: sig });
+          const saved = await api
+            .loadPresetRaw(name)
+            .then((raw) => parsePreset(raw, get().extensions))
+            .catch(() => null);
+          if (saved && presetMatches(saved, now)) {
+            set({ activePreset: name, presetBaseline: presetSignature(now) });
             break;
           }
         }
@@ -988,6 +1245,7 @@ export const useStore = create<State>((set, get) => {
       const info = get().controlInfos?.find((i) => i.key === key);
       // Better Cam auto sets the control (the gain with the exposure): the card shows it, the user does not change it.
       if (!cam || !info || get().controlsFor !== cam.id || modeOf(info) === "app") return;
+      dropPending();
       const value = patch.value === undefined ? info.value : Math.min(info.max, Math.max(info.min, Math.round(patch.value)));
       const auto = patch.auto ?? (patch.value === undefined ? info.auto : false);
       if (value === info.value && auto === info.auto) return;
@@ -999,6 +1257,7 @@ export const useStore = create<State>((set, get) => {
       const cam = selectedCam();
       const info = get().controlInfos?.find((i) => i.key === key);
       if (!cam || !info || get().controlsFor !== cam.id || modeOf(info) === "app") return;
+      dropPending();
       showControl(cam, { ...info, value: info.def, auto: info.can_auto, mode: info.can_auto ? "camera" : "manual" });
       // The device's default value first, so the manual value behind an Auto control is the default too, then Auto.
       queueControl(key, cam.id, [{ value: info.def, auto: false }, ...(info.can_auto ? [{ value: info.def, auto: true }] : [])]);
@@ -1007,6 +1266,7 @@ export const useStore = create<State>((set, get) => {
     resetAllControls: async () => {
       const cam = selectedCam();
       if (!cam || get().controlsResetting) return;
+      dropPending();
       set({ controlsResetting: true });
       try {
         for (const p of pumps.values()) {
@@ -1029,34 +1289,8 @@ export const useStore = create<State>((set, get) => {
     },
 
     setControlMode: async (key, mode) => {
-      const cam = selectedCam();
-      const info = get().controlInfos?.find((i) => i.key === key);
-      if (!cam || !info || get().controlsFor !== cam.id || modeOf(info) === mode) return;
-      const keys: ControlKey[] = key === "exposure" ? ["exposure", "gain"] : [key];
-      // The card follows at once; the answer (the rows as the device reports them, after the first slow write) replaces it.
-      set((s) => ({
-        controlInfos: (s.controlInfos ?? []).map((i) => {
-          if (i.key === key) return { ...i, mode, auto: mode === "camera" };
-          if (key === "exposure" && i.key === "gain" && (mode === "app" || i.driven_by === "exposure")) {
-            const { driven_by: _by, ...rest } = i;
-            return mode === "app" ? { ...rest, mode: "app", auto: false, driven_by: "exposure" } : { ...rest, mode: "manual" };
-          }
-          return i;
-        }),
-      }));
-      try {
-        await settleWrites(keys);
-        const changed = await api.setControlMode(cam.id, key, mode);
-        if (get().controlsFor === cam.id) set((s) => ({ controlInfos: sortControls((s.controlInfos ?? []).map((i) => changed.find((c) => c.key === i.key) ?? i)) }));
-        let controls = get().controls;
-        for (const c of changed) controls = rememberControl(controls, cam, c);
-        set({ controls });
-        persist();
-        pushSource();
-      } catch (e) {
-        say(`${key.replace(/_/g, " ")}: ${String(e)}`);
-        void get().refreshControls();
-      }
+      dropPending();
+      await changeMode(key, mode);
     },
 
     setAutoConfig: (patch) => {
@@ -1118,6 +1352,7 @@ export const useStore = create<State>((set, get) => {
       const fixed = cameras ? repairSource(next, cameras) : next;
       const picked = get().inUse !== null && touchesCapture(patch);
       if (JSON.stringify(fixed) === JSON.stringify(prev) && !picked) return;
+      if (fixed.video_device_id !== prev.video_device_id) dropPending();
       set({ source: fixed, ...(picked && { inUse: null }) });
       persist();
       pushSource();
@@ -1230,8 +1465,18 @@ export const useStore = create<State>((set, get) => {
     undoChain: () => {
       const u = get().undo;
       if (!u) return;
-      replaceChain(u.chain, u.activePreset, u.presetBaseline);
-      say("Undone");
+      const full = u.full;
+      if (!full) {
+        replaceChain(u.chain, u.activePreset, u.presetBaseline);
+        say("Undone");
+        return;
+      }
+      // A preset load, a reset or an import: the camera, its controls, Better Cam auto and the output go back too.
+      set({ undo: null });
+      void serial(u.activePreset ?? "Undo", async () => {
+        const { notes } = await applyState(full, { activePreset: u.activePreset, baseline: u.presetBaseline });
+        say(["Undone.", ...notes].join(" "));
+      });
     },
 
     notify: (text) => say(text),
@@ -1303,10 +1548,10 @@ export const useStore = create<State>((set, get) => {
 
     refreshPresets: async () => set({ presets: await api.listPresets() }),
     savePreset: async (name) => {
-      const { chain } = get();
+      const state = stateNow();
       try {
-        await api.savePreset(name, chain);
-        set({ activePreset: name, presetBaseline: signature(chain) });
+        await api.savePresetFile(name, presetFileOf(state));
+        set({ activePreset: name, presetBaseline: presetSignature(state) });
         persistNow();
         await get().refreshPresets();
         say(`Saved “${name}”`);
@@ -1319,25 +1564,45 @@ export const useStore = create<State>((set, get) => {
       if (name) await get().savePreset(name);
     },
     loadPreset: async (name) => {
+      let parsed: ParsedPreset;
       try {
-        const chain = await api.loadPreset(name, get().extensions);
-        const prev = snapshot();
-        replaceChain(chain, name, signature(chain));
-        say(`Loaded “${name}”`, signature(prev.chain) === signature(chain) ? null : prev);
+        parsed = parsePreset(await api.loadPresetRaw(name), get().extensions);
       } catch (e) {
         fail(e);
+        return;
       }
+      await serial(name, async () => {
+        const { prev, notes } = await applyState(parsed, { activePreset: name, baseline: "now" });
+        // A load that changed nothing has nothing to undo.
+        const same = presetSignature(prev.full!) === presetSignature(stateNow());
+        say([`Loaded “${name}”.`, ...presetNotes(parsed, name), ...notes].join(" "), same ? null : prev);
+      });
     },
     importPreset: async (path) => {
       try {
-        const chain = presetChain(await api.readPresetFile(path), get().extensions);
+        const parsed = parsePreset(await api.readPresetFile(path), get().extensions);
         await get().refreshPresets();
         const name = presetNameFor(stemOf(path), get().presets);
-        await api.savePreset(name, chain);
+        // As the file was: an old filters-only file stays one.
+        await api.savePresetFile(name, presetFileOfParsed(parsed));
         await get().refreshPresets();
-        const prev = snapshot();
-        replaceChain(chain, name, signature(chain));
-        say(`Imported “${name}”`, prev);
+        await serial(name, async () => {
+          const { prev, notes } = await applyState(parsed, { activePreset: name, baseline: "now" });
+          say([`Imported “${name}”.`, ...presetNotes(parsed, name), ...notes].join(" "), prev);
+        });
+      } catch (e) {
+        say(e instanceof Error ? e.message : String(e));
+      }
+    },
+    renamePreset: async (from, to) => {
+      try {
+        await api.renamePreset(from, to);
+        if (get().activePreset === from) {
+          set({ activePreset: to });
+          persistNow();
+        }
+        await get().refreshPresets();
+        say(`Renamed “${from}” to “${to}”`);
       } catch (e) {
         say(e instanceof Error ? e.message : String(e));
       }
@@ -1355,10 +1620,11 @@ export const useStore = create<State>((set, get) => {
         fail(e);
       }
     },
-    resetChain: () => {
-      const prev = snapshot();
-      replaceChain(defaultChain(), null, null);
-      say("Reset to the default chain", prev);
+    resetAll: async () => {
+      await serial("Default", async () => {
+        const { prev, notes } = await applyState(defaultState(selectedCam()), { activePreset: null, baseline: null });
+        say(["Reset to defaults.", ...notes].join(" "), prev);
+      });
     },
   };
 });

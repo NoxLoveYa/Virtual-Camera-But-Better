@@ -234,8 +234,8 @@ export const nearestInterval = (intervals: number[], target: number): number | n
 // Finding the camera a config names
 
 /** The link without its reference string (`\global`), lower case: the part Windows keeps stable. */
-const linkKey = (id: string) => id.toLowerCase().replace(/\\[^\\]*$/, "");
-const vidPid = (id: string) => /vid_[0-9a-f]{4}&pid_[0-9a-f]{4}/i.exec(id)?.[0].toLowerCase() ?? null;
+export const linkKey = (id: string) => id.toLowerCase().replace(/\\[^\\]*$/, "");
+export const vidPid = (id: string) => /vid_[0-9a-f]{4}&pid_[0-9a-f]{4}/i.exec(id)?.[0].toLowerCase() ?? null;
 
 /** The camera `id` names: the same link, else the only camera with the same vid/pid (the device moved to another port). */
 export const findCamera = (cams: CameraInfo[], id: string | null): CameraInfo | null => {
@@ -747,6 +747,10 @@ export const autoCfgOf = (stored: StoredControls, cam: { id: string; name: strin
 /** `stored` with the Better Cam auto settings of `cam` (the defaults are not kept). */
 export const withAutoCfg = (stored: StoredControls, cam: { id: string; name: string }, cfg: AutoCfg): StoredControls =>
   editDevice(stored, cam, (d) => ({ ...d, auto: JSON.stringify(cfg) === JSON.stringify(DEFAULT_AUTO) ? undefined : cfg }));
+
+/** `stored` with the changed controls of `cam` replaced by `values` (a preset load). Its Better Cam auto settings and learned values stay. */
+export const withControlValues = (stored: StoredControls, cam: { id: string; name: string }, values: StoredDevice["values"]): StoredControls =>
+  editDevice(stored, cam, (d) => ({ ...d, values: { ...values } }));
 
 /** `stored` with what the controller learned about `cam` (an empty `learned` removes it). */
 export const withLearned = (stored: StoredControls, cam: { id: string; name: string }, learned: unknown): StoredControls => {

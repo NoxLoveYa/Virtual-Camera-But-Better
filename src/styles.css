@@ -137,6 +137,10 @@ body {
 .pm-row.confirm { gap: 8px; height: 42px; padding: 0 6px 0 10px; }
 .pm-row.confirm span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pm-row.confirm button { height: 28px; }
+.pm-rename { display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 4px 6px; }
+.pm-rename small { grid-column: 1 / -1; color: var(--dim); }
+.pm-rename small.bad { color: var(--danger); }
+.pm-note { margin: 0; padding: 6px 10px 2px; color: var(--faint); font-size: 11px; }
 .pm-sep { height: 1px; margin: 4px 0; background: var(--line); }
 .pm-save { display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 6px; }
 .pm-save small { grid-column: 1 / -1; color: var(--dim); }
@@ -306,8 +310,9 @@ input[type="color"]::-webkit-color-swatch { border: 0; border-radius: 2px; }
 /* The preset trigger sits in the title bar: it grows with the window between 150 and 260 px. */
 .preset-trigger { display: flex; align-items: center; gap: 10px; width: clamp(150px, 22vw, 260px); }
 .preset-trigger .label { flex: none; }
-.pt-name { flex: 1; min-width: 0; text-align: left; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.pt-mod { flex: none; color: var(--warn); font-size: 10px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; }
+.pt-label { flex: 1; min-width: 0; display: flex; align-items: baseline; text-align: left; font-weight: 600; }
+.pt-name { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pt-mod { flex: none; margin-left: 1px; color: var(--warn); font-weight: 700; }
 .preset-trigger svg { flex: none; color: var(--dim); }
 
 /* ---------- navigator ---------- */

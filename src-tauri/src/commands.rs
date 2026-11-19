@@ -314,35 +314,65 @@ pub fn set_close_to_tray(state: State<AppState>, on: bool) {
     state.close_to_tray.store(on, Ordering::Relaxed);
 }
 
-fn preset_path(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
+/// The file of preset `name` inside the presets folder `dir`; the name is checked (it becomes a file name).
+fn preset_file_in(dir: &std::path::Path, name: &str) -> Result<PathBuf, String> {
     let ok = !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_'));
     if !ok {
         return Err("preset names may only contain letters, digits, spaces, '-' and '_'".into());
     }
-    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?.join("presets");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir.join(format!("{name}.json")))
 }
 
-#[tauri::command]
-pub fn list_presets(app: AppHandle) -> Result<Vec<String>, String> {
-    let dir = preset_path(&app, "x")?.parent().unwrap().to_path_buf();
+/// The presets folder (created when missing).
+fn presets_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?.join("presets");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
+fn preset_path(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
+    preset_file_in(&presets_dir(app)?, name)
+}
+
+/// The names of the presets in `dir`, sorted: the `.json` files only, so the `.json.tmp` an interrupted save may leave
+/// behind is never listed.
+fn list_in(dir: &std::path::Path) -> Result<Vec<String>, String> {
     let mut v: Vec<String> = std::fs::read_dir(dir)
         .map_err(|e| e.to_string())?
         .flatten()
-        .filter_map(|e| e.path().file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("json")))
+        .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
         .collect();
     v.sort();
     Ok(v)
 }
 
-/// The preset object of plan 5.4 around a chain list: `{ "app", "version", "chain" }`.
-fn preset_object(chain: Vec<serde_json::Value>) -> serde_json::Value {
-    serde_json::json!({ "app": "better-cam", "version": 1, "chain": chain })
+#[tauri::command]
+pub fn list_presets(app: AppHandle) -> Result<Vec<String>, String> {
+    list_in(&presets_dir(&app)?)
 }
 
-/// What `save_preset` writes: the chain of the given preset object without ids (presets hold the filters only, never
-/// device controls and never a camera section).
+/// The preset object around a chain list: `{ "app", "version", "chain" }` and, when given, the `camera` and `output`
+/// sections. `version` is 2 when a section is there (a version 2 file), else 1 (filters only).
+fn preset_object(chain: Vec<serde_json::Value>, camera: Option<serde_json::Value>, output: Option<serde_json::Value>) -> serde_json::Value {
+    let version = if camera.is_some() || output.is_some() { 2 } else { 1 };
+    let mut o = serde_json::json!({ "app": "better-cam", "version": version, "chain": chain });
+    for (key, section) in [("camera", camera), ("output", output)] {
+        if let Some(s) = section {
+            o[key] = s;
+        }
+    }
+    o
+}
+
+/// A section of a preset object when it is a JSON object; the frontend normalises what is inside, Rust keeps it opaque.
+fn section(preset: &serde_json::Value, key: &str) -> Option<serde_json::Value> {
+    preset.get(key).filter(|s| s.is_object()).cloned()
+}
+
+/// What `save_preset` writes: the chain of the given preset object without ids, and its `camera` and `output` sections
+/// when they are objects. Any other key is dropped (`overlays` and unknown ones).
 fn preset_to_write(preset: &serde_json::Value) -> Result<serde_json::Value, String> {
     let list = preset.get("chain").and_then(|c| c.as_array()).ok_or("a preset needs a \"chain\" list")?;
     let chain = list
@@ -353,26 +383,46 @@ fn preset_to_write(preset: &serde_json::Value) -> Result<serde_json::Value, Stri
             Ok(serde_json::Value::Object(f))
         })
         .collect::<Result<Vec<_>, &str>>()?;
-    Ok(preset_object(chain))
+    Ok(preset_object(chain, section(preset, "camera"), section(preset, "output")))
 }
 
-/// What `load_preset` returns for the file's content: the object format, or the older bare array wrapped in it. Other
-/// sections (a future `camera`) are ignored.
+/// What `load_preset` returns for the file's content: the object format with its `camera` and `output` (when they are
+/// objects), or the older bare array wrapped in it as version 1. A file that says it is a newer version than this one
+/// writes keeps that number, so the page can say so; everything else is read as version 1 or 2.
 fn preset_from_file(content: serde_json::Value) -> Result<serde_json::Value, String> {
     match content {
-        serde_json::Value::Array(chain) => Ok(preset_object(chain)),
-        serde_json::Value::Object(mut o) => match o.remove("chain") {
-            Some(serde_json::Value::Array(chain)) => Ok(preset_object(chain)),
+        serde_json::Value::Array(chain) => Ok(preset_object(chain, None, None)),
+        serde_json::Value::Object(ref o) => match o.get("chain") {
+            Some(serde_json::Value::Array(chain)) => {
+                let mut preset = preset_object(chain.clone(), section(&content, "camera"), section(&content, "output"));
+                if let Some(v) = o.get("version").and_then(|v| v.as_u64()).filter(|v| *v > 2) {
+                    preset["version"] = v.into();
+                }
+                Ok(preset)
+            }
             _ => Err("this preset file has no \"chain\" list".into()),
         },
         _ => Err("this file is not a Better Cam preset".into()),
     }
 }
 
+/// Writes `preset` to `path` without a moment in which the file is half written: the text goes to `<file>.tmp`, which
+/// then replaces the file (a rename over an existing file replaces it on Windows).
+fn write_atomic(path: &std::path::Path, preset: &serde_json::Value) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(preset).map_err(|e| e.to_string())?;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })
+}
+
 #[tauri::command]
 pub fn save_preset(app: AppHandle, name: String, preset: serde_json::Value) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(&preset_to_write(&preset)?).map_err(|e| e.to_string())?;
-    std::fs::write(preset_path(&app, &name)?, json).map_err(|e| e.to_string())
+    write_atomic(&preset_path(&app, &name)?, &preset_to_write(&preset)?)
 }
 
 #[tauri::command]
@@ -384,6 +434,28 @@ pub fn load_preset(app: AppHandle, name: String) -> Result<serde_json::Value, St
 #[tauri::command]
 pub fn delete_preset(app: AppHandle, name: String) -> Result<(), String> {
     std::fs::remove_file(preset_path(&app, &name)?).map_err(|e| e.to_string())
+}
+
+/// Renames preset `from` to `to` inside `dir`. Refused when `from` does not exist or `to` is another preset; a change
+/// of letter case only ("studio" to "Studio") is the same preset and goes through.
+fn rename_in(dir: &std::path::Path, from: &str, to: &str) -> Result<(), String> {
+    let src = preset_file_in(dir, from)?;
+    let dst = preset_file_in(dir, to)?;
+    if !src.is_file() {
+        return Err(format!("There is no preset named \"{from}\""));
+    }
+    if from == to {
+        return Ok(());
+    }
+    if dst.exists() && from.to_lowercase() != to.to_lowercase() {
+        return Err(format!("A preset named \"{to}\" already exists"));
+    }
+    std::fs::rename(&src, &dst).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn rename_preset(app: AppHandle, from: String, to: String) -> Result<(), String> {
+    rename_in(&presets_dir(&app)?, &from, &to)
 }
 
 /// A preset file may be at most this big. Real ones are a few KiB; the cap keeps a wrong file (a video dropped on the
@@ -459,19 +531,35 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn a_saved_preset_is_the_object_without_ids_or_other_sections() {
+    fn a_saved_preset_keeps_camera_and_output_but_not_ids_or_other_keys() {
+        let camera = json!({ "device": { "id": "cam", "name": "Cam" }, "capture": { "res_type": "custom" }, "controls": {}, "auto": {} });
+        let output = json!({ "resolution": "1280x720", "fps": 30 });
         let given = json!({
-            "app": "other", "version": 9, "camera": { "gain": 3 },
+            "app": "other", "version": 9, "camera": camera, "output": output, "overlays": [{ "kind": "x" }], "extra": 1,
             "chain": [{ "id": "a1", "kind": "color_filter", "enabled": true, "params": { "saturation": -1 } }]
         });
         let want = json!({
-            "app": "better-cam", "version": 1,
+            "app": "better-cam", "version": 2, "camera": camera, "output": output,
             "chain": [{ "kind": "color_filter", "enabled": true, "params": { "saturation": -1 } }]
         });
         assert_eq!(preset_to_write(&given).unwrap(), want);
+        // A section that is not an object is dropped, and with both gone the file is a version 1 file.
+        let bad = json!({ "chain": [], "camera": "no", "output": [1] });
+        assert_eq!(preset_to_write(&bad).unwrap(), json!({ "app": "better-cam", "version": 1, "chain": [] }));
         assert!(preset_to_write(&json!({ "chain": "no" })).is_err());
         assert!(preset_to_write(&json!([1, 2])).is_err());
         assert!(preset_to_write(&json!({ "chain": [5] })).is_err());
+    }
+
+    #[test]
+    fn the_version_is_2_when_there_is_a_camera_or_an_output() {
+        let section = Some(json!({ "x": 1 }));
+        assert_eq!(preset_object(vec![], None, None)["version"], 1);
+        assert_eq!(preset_object(vec![], section.clone(), None)["version"], 2);
+        assert_eq!(preset_object(vec![], None, section.clone())["version"], 2);
+        assert_eq!(preset_object(vec![], section.clone(), section)["version"], 2);
+        // No section, no key.
+        assert!(preset_object(vec![], None, None).get("camera").is_none());
     }
 
     #[test]
@@ -480,11 +568,38 @@ mod tests {
         let want = json!({ "app": "better-cam", "version": 1, "chain": [entry.clone()] });
         assert_eq!(preset_from_file(json!([entry.clone()])).unwrap(), want);
         assert_eq!(preset_from_file(want.clone()).unwrap(), want);
-        // A camera section is ignored.
-        let with_camera = json!({ "app": "better-cam", "version": 1, "chain": [entry], "camera": { "gain": 3 } });
-        assert_eq!(preset_from_file(with_camera).unwrap(), want);
+        // A camera section that is not an object (an old test's `{ "gain": 3 }` is one, and the page ignores it) or
+        // that is unknown is passed on only when it is an object.
+        let junk_camera = json!({ "app": "better-cam", "version": 1, "chain": [entry.clone()], "camera": "no", "output": 5, "other": 1 });
+        assert_eq!(preset_from_file(junk_camera).unwrap(), want);
         assert!(preset_from_file(json!({ "app": "better-cam" })).is_err());
+        assert!(preset_from_file(json!({ "chain": "no" })).is_err());
         assert!(preset_from_file(json!("text")).is_err());
+    }
+
+    #[test]
+    fn loading_keeps_camera_and_output() {
+        let entry = json!({ "kind": "color_filter", "enabled": true, "params": {} });
+        let camera = json!({ "device": null, "capture": {}, "controls": { "brightness": { "value": 140, "auto": false } }, "auto": {} });
+        let output = json!({ "fps": 30 });
+        let file = json!({ "app": "better-cam", "version": 2, "chain": [entry], "camera": camera, "output": output });
+        assert_eq!(preset_from_file(file.clone()).unwrap(), file);
+        // A file without a version still gets the one that matches what it holds.
+        let mut no_version = file.clone();
+        no_version.as_object_mut().unwrap().remove("version");
+        assert_eq!(preset_from_file(no_version).unwrap(), file);
+        // An older file that holds a section is a version 2 file, whatever it says.
+        let mut says_1 = file.clone();
+        says_1["version"] = json!(1);
+        assert_eq!(preset_from_file(says_1).unwrap(), file);
+        // A newer version keeps its number so the page can tell the user.
+        let mut newer = file.clone();
+        newer["version"] = json!(3);
+        newer["future"] = json!({ "x": 1 });
+        let got = preset_from_file(newer).unwrap();
+        assert_eq!(got["version"], 3);
+        assert_eq!(got["camera"], file["camera"]);
+        assert!(got.get("future").is_none());
     }
 
     /// A scratch folder that goes away with the test.
@@ -559,6 +674,82 @@ mod tests {
         // Exactly at the limit is still read.
         let padding = " ".repeat(PRESET_FILE_MAX_BYTES as usize - 2);
         std::fs::write(&path, format!("[]{padding}")).unwrap();
-        assert_eq!(read_preset_at(&path).unwrap(), preset_object(vec![]));
+        assert_eq!(read_preset_at(&path).unwrap(), preset_object(vec![], None, None));
+    }
+
+    #[test]
+    fn read_preset_file_keeps_camera_and_output() {
+        let dir = TempDir::new("read-preset-v2");
+        let file = json!({
+            "app": "better-cam", "version": 2, "chain": [],
+            "camera": { "device": null, "capture": {}, "controls": {}, "auto": {} }, "output": { "fps": 30 }
+        });
+        let path = dir.0.join("v2.json");
+        std::fs::write(&path, serde_json::to_string(&file).unwrap()).unwrap();
+        assert_eq!(read_preset_at(&path).unwrap(), file);
+    }
+
+    fn write_preset_named(dir: &TempDir, name: &str, preset: &serde_json::Value) {
+        write_atomic(&preset_file_in(&dir.0, name).unwrap(), &preset_to_write(preset).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_saved_preset_is_written_whole_and_replaces_the_old_file() {
+        let dir = TempDir::new("save-preset");
+        let first = json!({ "chain": [{ "id": "a", "kind": "color_filter", "enabled": true, "params": {} }], "camera": { "capture": {} } });
+        write_preset_named(&dir, "Studio light", &first);
+        let path = dir.0.join("Studio light.json");
+        let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved, preset_to_write(&first).unwrap());
+        assert!(saved["chain"][0].get("id").is_none());
+        assert_eq!(saved["version"], 2);
+        // No temp file is left, and a second save replaces the first.
+        assert!(!dir.0.join("Studio light.json.tmp").exists());
+        write_preset_named(&dir, "Studio light", &json!({ "chain": [] }));
+        assert_eq!(read_preset_at(&path).unwrap(), json!({ "app": "better-cam", "version": 1, "chain": [] }));
+        assert_eq!(list_in(&dir.0).unwrap(), vec!["Studio light".to_string()]);
+    }
+
+    #[test]
+    fn the_list_has_the_json_files_only() {
+        let dir = TempDir::new("list-presets");
+        write_preset_named(&dir, "beta", &json!({ "chain": [] }));
+        write_preset_named(&dir, "alpha", &json!({ "chain": [] }));
+        // What an interrupted save leaves, and other files.
+        std::fs::write(dir.0.join("alpha.json.tmp"), "{").unwrap();
+        std::fs::write(dir.0.join("gamma.json.tmp"), "{").unwrap();
+        std::fs::write(dir.0.join("notes.txt"), "x").unwrap();
+        assert_eq!(list_in(&dir.0).unwrap(), vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn a_preset_is_renamed_unless_the_new_name_is_another_preset() {
+        let dir = TempDir::new("rename-preset");
+        write_preset_named(&dir, "one", &json!({ "chain": [], "output": { "fps": 30 } }));
+        write_preset_named(&dir, "two", &json!({ "chain": [] }));
+        let names = || list_in(&dir.0).unwrap();
+
+        // Refusals change nothing.
+        assert!(rename_in(&dir.0, "missing", "three").unwrap_err().contains("There is no preset named \"missing\""));
+        assert!(rename_in(&dir.0, "one", "two").unwrap_err().contains("A preset named \"two\" already exists"));
+        assert!(rename_in(&dir.0, "one", "TWO").unwrap_err().contains("already exists"));
+        assert!(rename_in(&dir.0, "one", "a/b").is_err());
+        assert!(rename_in(&dir.0, "one", "").is_err());
+        assert!(rename_in(&dir.0, "../one", "three").is_err());
+        assert_eq!(names(), vec!["one".to_string(), "two".to_string()]);
+
+        // A plain rename keeps the content.
+        rename_in(&dir.0, "one", "three").unwrap();
+        assert_eq!(names(), vec!["three".to_string(), "two".to_string()]);
+        assert_eq!(read_preset_at(&dir.0.join("three.json")).unwrap()["output"], json!({ "fps": 30 }));
+
+        // The same name is not a clash with itself.
+        rename_in(&dir.0, "three", "three").unwrap();
+        assert_eq!(names(), vec!["three".to_string(), "two".to_string()]);
+
+        // A change of letter case only is allowed.
+        rename_in(&dir.0, "three", "Three").unwrap();
+        assert_eq!(names(), vec!["Three".to_string(), "two".to_string()]);
+        assert_eq!(read_preset_at(&dir.0.join("Three.json")).unwrap()["output"], json!({ "fps": 30 }));
     }
 }
