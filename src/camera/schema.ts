@@ -878,7 +878,7 @@ export function normalizeControls(raw: unknown): StoredControls {
 
 /** The exposure loop's state (`auto-status.exposure.state`); the white balance loop has `at_limit` instead of the three limits. */
 export type AutoState =
-  | "starting" | "adjusting" | "holding" | "limit_gain" | "limit_exposure" | "too_bright" | "no_signal" | "at_limit"
+  | "starting" | "adjusting" | "holding" | "limit_gain" | "limit_exposure" | "too_bright" | "no_signal" | "at_limit" | "slow"
   | "no_picture" | "paused" | "closed" | "conflict" | "ignored" | "no_response" | "not_answering" | "hunting";
 
 /** Where a hand-back put the control. */

@@ -1792,6 +1792,22 @@ fn auto_adjust_a_picture_of_one_colour_is_never_corrected_past_no_correction() {
 }
 
 #[test]
+fn auto_adjust_warmth_applies_on_a_picture_of_one_colour() {
+    // A red wall has almost no confidence (the light is hardly corrected), and the Warmth setting still applies in
+    // full: blue against red moves by the aim's `c*` (docs/AUTO-WHITE-BALANCE.md 10.4.5).
+    let stats = scenes::shoot("red_wall", 5500.0, 4600.0);
+    let conf = awb::estimate_light(&stats).conf;
+    assert!(conf <= 0.1, "conf {conf}");
+    let blue_over_red = |warmth: f32| {
+        let g = settled_gains(&stats, white_aim(warmth, 0.0));
+        (g[2] / g[0]).ln()
+    };
+    let moved = blue_over_red(0.5) - blue_over_red(0.0);
+    let want = crate::auto_controls::meter::warmth_target(0.5);
+    assert!((moved - want).abs() <= 0.02, "moved {moved}, c* {want}");
+}
+
+#[test]
 fn auto_adjust_white_balance_holds_on_a_dark_scene_and_a_clipped_one() {
     let dark = Stats { cells: vec![[0.001, 0.001, 0.0008, 1.0]; CELLS] };
     assert_eq!(white_balance_target(&dark, [0.1, 0.0, -0.1], NEUTRAL_AIM), [0.1, 0.0, -0.1]);

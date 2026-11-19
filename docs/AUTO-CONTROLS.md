@@ -329,21 +329,37 @@ of the status while the state lasts (not before the 3 s are over).
   ("Nothing to measure (too dark). Keeping 4600 K."), not `holding`: nothing was checked. It leaves the state when the
   confidence is back and measures from the wide band (`adjusting`) like after a write.
   **Note W3 (text by reason, rule changed):** the state stays `no_signal`, the text follows the estimator's reason:
-  `dark` (also the mean-luma gate of 2.4) "Nothing to measure (too dark). Keeping 4650 K."; `one_colour` "The picture
-  is mostly one colour (a face or a wall): keeping 4650 K." Before W3 the second case also said "too dark", which was
-  wrong. The hold itself (`conf_wb < 0.3`) is unchanged, but under a strong orange cast the confidence is no longer
-  low: `a_cast_with_nothing_neutral_to_trust_is_held` (6.2, the 0.012 camera at 3000 K) is reversed into
-  `a_strong_cast_is_followed`.
+  `dark` (also the mean-luma gate of 2.4) "Nothing to measure (too dark). Keeping 4650 K."; `one_colour` "Mostly one
+  colour (a face or a wall): nothing neutral to measure. Staying at 4650 K; Warmth still applies." (the text of W3 was
+  "The picture is mostly one colour (a face or a wall): keeping 4650 K."; changed by V1, AUTO-WHITE-BALANCE.md 10.4.4).
+  Before W3 the second case also said "too dark", which was wrong. The hold itself is unchanged, but under a strong
+  orange cast the confidence is no longer low: `a_cast_with_nothing_neutral_to_trust_is_held` (6.2, the 0.012 camera at
+  3000 K) is reversed into `a_strong_cast_is_followed`.
+  **Note V2 (rule changed):** the hold is for a dark picture and a true one-colour picture only (the estimator's own
+  confidence under 0.3: the skin guard, little neutral surface), because a closed loop on a biased reading goes all the
+  way to the wrong answer. A picture with two answers no longer holds: see the slow lane below.
 - Band: `B_out = max(0.06, 3σ_wb)`, `B_in = max(0.015, 1.5σ_wb)`, same holding/adjusting states. **Note (live finding,
   constant changed): `B_out` floor 0.04 → 0.06.** The estimate of a person at a desk wanders by ±0.03-0.05 on its own;
   with 0.04 the loop followed it, reversed, and W4 handed back. See AUTO-WHITE-BALANCE.md 9.
 - **Note (live finding, rule changed): the loop's `ê_wb` is the mean of the estimator's two answers and a picture with
-  two answers holds.** `e_wb = (t + t_alt)/2 − c*`, and `conf_wb = conf · (1 − smoothstep(0.02, 0.06, apart))`, where
-  `apart` is how far the median-start answer lies from the shades-of-gray one (`fx::awb`, 3.1 step 3). A bright face
-  beside dim walls has two stable answers; before, the loop took whichever the frame landed on (`t` 0, −0.27, −0.55
-  within a second on a still picture). Texts: the hold says "mostly one colour" (`conf < 0.3`, reason `OneColour`).
+  two answers is not followed at once.** `e_wb = (t + t_alt)/2 − c*`, and
+  `conf_wb = conf · (1 − smoothstep(0.02, 0.06, apart))`, where `apart` is how far the median-start answer lies from
+  the shades-of-gray one (`fx::awb`, 3.1 step 3). A bright face beside dim walls has two stable answers; before, the
+  loop took whichever the frame landed on (`t` 0, −0.27, −0.55 within a second on a still picture).
+  **Note V2 (rule changed, AUTO-WHITE-BALANCE.md 10.4.2): it no longer holds, it slows.** The meter's reason for
+  `conf_wb < 0.3` with a sure estimator (`light_conf ≥ 0.3`) is the new `TwoAnswers` (not `OneColour`). The slow lane
+  keeps a confidence-weighted average of `e_wb` (time constant 8 s at full weight, 32 s with no confidence left; a gap
+  counts as at most 0.5 s; the lane survives 2 s without evidence), writes only when the average passes `B_out` (0.06),
+  then shifts it by the move's expected effect (`α·ΔM`). The state is `slow`, text "Unsure of the light (a bright face
+  or two lights): adjusting slowly · 4650 K". A doubt of a second or two moves nothing; a doubt that lasts follows the
+  middle of the two answers in small steps. A dark picture, or a sample whose estimator has little light of its own
+  (`light_conf < 0.3`), is no evidence and still holds (`no_signal`).
 - Move: `ΔM = clamp(−k_wb · ê_wb / α, −ΔM_max, +ΔM_max)`; `K' = round_to_step(10⁶ / (M + ΔM))`, clamped to
   `K_min..K_max`; skip if `|K' − K| < step`.
+- **Warmth feed-forward (V1, AUTO-WHITE-BALANCE.md 10.4.3).** A change of the Warmth setting always moves the
+  camera, in every state: `ΔM = Δc*/α_ff` with `α_ff = max(α, 0.0105)`, written on the next tick whatever the reading
+  says and without waiting for the exposure quiet time, the gap or the reading (only for an exposure write in flight).
+  The loop then measures from the narrow band; it is not counted as a swing by W4 and not judged by W3.
 - White balance never writes in the same 0.3 s as an exposure batch, and waits while the exposure loop is
   `adjusting` with `|ê| > 1` stop: confounded measurements would teach `α` wrong and gray world is unreliable in a
   badly exposed picture. Exposure has priority.
@@ -537,7 +553,8 @@ Focus                                         512                      Auto (○
 | `holding` (exposure, gain off, F1) | "Holding 30 fps · 1/32 s · gain off" |
 | `holding` (WB) | "Holding · 4650 K" |
 | `no_signal` (WB, F4, reason `dark`) | "Nothing to measure (too dark). Keeping 4650 K." |
-| `no_signal` (WB, W3, reason `one_colour`) | "The picture is mostly one colour (a face or a wall): keeping 4650 K." |
+| `no_signal` (WB, W3, reason `one_colour`; text changed in V1) | "Mostly one colour (a face or a wall): nothing neutral to measure. Staying at 4650 K; Warmth still applies." |
+| `slow` (WB, V2, reason `two_answers`; neutral dot, no resume point) | "Unsure of the light (a bright face or two lights): adjusting slowly · 4650 K" |
 | `limit_exposure`, gain off (F1) | "Exposure at the 30 fps limit and gain is off. Add light, allow more gain, or allow a longer exposure." |
 | `limit_gain` | "Gain at its maximum (75). Add light, allow more gain, or allow a longer exposure." |
 | `limit_exposure` | "Exposure at the 30 fps limit and this camera has no gain. Add light or allow a longer exposure." |
@@ -686,6 +703,8 @@ interface AutoStatus {
     message: string | null;           // the text of 4.2, made in Rust so tests can check it
     handed_back?: "camera" | "manual";
   };
+  // state: the exposure states without the three limits, plus "at_limit" and (V2) "slow": the picture has two
+  // answers and the Kelvin follows their middle slowly. The card draws "slow" with the neutral dot.
   white_balance?: { state: string; kelvin: number; message: string | null; handed_back?: "camera" | "manual" };
   learned?: Learned;                  // present when it changed: the store persists it
   resume?: { exposure?: number; gain?: number; white_balance?: number }; // present on entering "holding"
@@ -815,6 +834,16 @@ Notes W3 (2026-11-19): cases 15-17 run twice, on the grey wall and in the colour
 (`ESTIMATOR_BIAS = 0.042` in `ln(B/R)`, AUTO-WHITE-BALANCE.md 3.5): case 15 there allows a settle of up to 12 mired
 before the light changes and judges `|e_wb| < 0.03 + 0.042`. New cases B1-B8 and the lifted black: AUTO-WHITE-BALANCE.md
 5.2 and the W3 note in 6.
+
+Notes V2 (2026-11-19, AUTO-WHITE-BALANCE.md 10.6): the cases above are unchanged. New tests of the slow lane, on the
+recorded desk: `a_face_that_stays_in_doubt_is_followed_slowly` (the doubtful 1.4 s of the recording played forward and
+back on a camera at 6500 K: `slow` with its text by 3 s, no write before 5 s, every write toward a higher mired, the
+middle of the two answers within 0.07 at 150 s, no hand-back, at Slow, Normal and Fast),
+`a_face_that_stays_in_doubt_at_its_kelvin_stays_close` (the same from 6261 K: at most 3 writes and 15 mired in 180 s,
+one way, no hand-back), `a_picture_with_two_answers_says_so` (meter, `TwoAnswers` / `OneColour` / `Ok` / `Dark`), and
+the warmth tests of V1 (`a_small_warmth_change_moves_the_camera_at_once`, `warmth_applies_while_the_picture_is_one_colour`,
+`warmth_applies_while_the_picture_reads_two_ways`, `a_warmth_drag_is_not_a_swing`). Case
+`a_face_in_a_dim_room_does_not_make_the_loop_hunt_or_hand_back` is unchanged (at most 1 write after 20 s).
 
 Hub integration (`cargo test -p better-cam camera_controls`), with `FakeControls` wrapped by the sim response:
 

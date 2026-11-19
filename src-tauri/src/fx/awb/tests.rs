@@ -350,6 +350,58 @@ fn the_aim_moves_the_result() {
     assert!(out[0] > out[2], "{out:?}");
 }
 
+/// `gains` as it was before the aim was taken out of the confidence (docs/AUTO-WHITE-BALANCE.md 10.4.5): the whole
+/// log gain, the aim included, scaled by the confidence.
+fn gains_with_the_aim_scaled(light: [f64; 3], aim: [f32; 3], conf: f64, (lo, hi): (f64, f64)) -> [f64; 3] {
+    let y = luma(light);
+    let g0 = [0, 1, 2].map(|k| f64::from(aim[k]) / light[k]);
+    let keep = y / luma([g0[0] * light[0], g0[1] * light[1], g0[2] * light[2]]);
+    let g = g0.map(|g| (conf.clamp(0.0, 1.0) * (g * keep).ln()).exp());
+    let raw = g.map(|g| g.clamp(lo, hi));
+    let keep = y / luma([raw[0] * light[0], raw[1] * light[1], raw[2] * light[2]]);
+    let out = raw.map(|g| (g * keep).clamp(lo, hi));
+    if out.iter().all(|g| g.ln().abs() < 1e-9) {
+        [1.0; 3]
+    } else {
+        out
+    }
+}
+
+#[test]
+fn gains_apply_the_aim_in_full_whatever_the_confidence() {
+    let light = estimate_light(&shoot("office", 5500.0, CAM)).light;
+    let aim = crate::fx::auto_adjust::white_aim(0.5, 0.0);
+    // No confidence: the aim at the picture's luma, the light is not corrected.
+    let g = gains(light, aim, 0.0, LIMITS);
+    let raw = aim.map(f64::from);
+    let keep = luma(light) / luma([raw[0] * light[0], raw[1] * light[1], raw[2] * light[2]]);
+    for k in 0..3 {
+        assert!((g[k] - raw[k] * keep).abs() < 1e-9, "{k}: {g:?} vs {raw:?} x {keep}");
+    }
+    // The warmth moves blue against red by its own `c*` at every confidence.
+    let c_star = crate::auto_controls::meter::warmth_target(0.5);
+    let neutral = crate::fx::auto_adjust::white_aim(0.0, 0.0);
+    for conf in [0.0, 0.3, 1.0] {
+        let (warm, flat) = (gains(light, aim, conf, LIMITS), gains(light, neutral, conf, LIMITS));
+        let moved = (warm[2] / warm[0]).ln() - (flat[2] / flat[0]).ln();
+        assert!((moved - c_star).abs() < 0.005, "conf {conf}: {moved} vs {c_star}");
+    }
+}
+
+#[test]
+fn a_neutral_aim_gives_the_gains_of_scaling_the_whole_correction() {
+    // `aim = [1; 3]`: the two formulas differ by a common factor that the luma keep removes.
+    for (name, t) in [("office", 2700.0), ("grey_room", 4000.0), ("checker", 5500.0), ("office_dark_skin", 6500.0)] {
+        let light = estimate_light(&shoot(name, t, CAM)).light;
+        for conf in [0.0, 0.5, 1.0] {
+            let (new, old) = (gains(light, [1.0; 3], conf, LIMITS), gains_with_the_aim_scaled(light, [1.0; 3], conf, LIMITS));
+            for k in 0..3 {
+                assert!((new[k] - old[k]).abs() < 1e-9, "{name} {t} K, conf {conf}: {new:?} vs {old:?}");
+            }
+        }
+    }
+}
+
 /// Prints the table of the report (`cargo test -p better-cam --lib fx::awb::tests::report -- --ignored --nocapture`).
 #[test]
 #[ignore]

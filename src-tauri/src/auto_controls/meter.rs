@@ -151,6 +151,9 @@ pub struct WhiteBalanceReading {
     pub confidence: f64,
     /// Why the confidence is low (`Ok` when it is not): picks the text of the hold.
     pub reason: Reason,
+    /// `0..=1`: the estimator's own confidence, before the doubt of two answers took any of it. The slow lane
+    /// (docs/AUTO-WHITE-BALANCE.md 10.4.2) follows a picture whose `light_conf` is sure but whose `confidence` is not.
+    pub light_conf: f64,
 }
 
 /// `c*`: the blue-red signal `ln(B/R)` a neutral surface should have for `warmth` (`-1..=1`, +1 = warmer).
@@ -170,7 +173,8 @@ pub fn warmth_target(warmth: f64) -> f64 {
 pub const MIN_MEAN_LUMA: f64 = 0.10;
 
 /// `LightEstimate::apart` (in `t`) from which the loop doubts the reading: no doubt below the first edge, none of
-/// the confidence left at the second.
+/// the confidence left at the second. Doubt slows the loop (the slow lane of docs/AUTO-WHITE-BALANCE.md 10.4.2), it
+/// does not hold it.
 pub const TWO_ANSWERS: (f64, f64) = (0.02, 0.06);
 
 /// The centre weighted mean coded luma of the cells that have a picture, `None` when there are none.
@@ -197,13 +201,16 @@ pub fn measure_white_balance(stats: &Stats, warmth: f64) -> WhiteBalanceReading 
             error: 0.0,
             confidence: 0.0,
             reason: Reason::Dark,
+            light_conf: 0.0,
         };
     }
     // A picture with two answers (a bright face beside the walls: the estimator's two starts end `apart` from each
-    // other) is not measured: the loop would follow whichever the next frame lands on (docs/AUTO-WHITE-BALANCE.md 9).
+    // other) is not followed at once: the loop would take whichever the next frame lands on (docs/AUTO-WHITE-BALANCE.md
+    // 9). Its middle is still a measurement: the slow lane averages it (10.4.2), so the reason says "two answers", not
+    // "one colour".
     let confidence = est.conf * (1.0 - smoothstep(TWO_ANSWERS.0, TWO_ANSWERS.1, est.apart));
     let reason = if est.reason == Reason::Ok && confidence < crate::fx::awb::LOW_CONFIDENCE {
-        Reason::OneColour
+        Reason::TwoAnswers
     } else {
         est.reason
     };
@@ -211,6 +218,7 @@ pub fn measure_white_balance(stats: &Stats, warmth: f64) -> WhiteBalanceReading 
         error: 0.5 * (est.t + est.t_alt) - warmth_target(warmth),
         confidence,
         reason,
+        light_conf: est.conf,
     }
 }
 
@@ -303,6 +311,37 @@ mod tests {
         };
         let r = measure_white_balance(&red, 0.0);
         assert!(r.confidence < 0.3 && r.reason == Reason::OneColour, "{r:?}");
+        let black = Stats {
+            cells: vec![[0.0, 0.0, 0.0, 1.0]; GRID * GRID],
+        };
+        assert_eq!(measure_white_balance(&black, 0.0).reason, Reason::Dark);
+    }
+
+    #[test]
+    fn a_picture_with_two_answers_says_so() {
+        // The owner's desk: at 112.79-113.6 s a bright face beside the walls gives two answers, each sure of itself.
+        let mut two = 0;
+        for f in real::between(112.79, 113.6) {
+            let r = measure_white_balance(&f.stats, 0.0);
+            assert!(r.reason == Reason::TwoAnswers, "{:.3} s: {r:?}", f.t);
+            assert!(r.light_conf >= 0.9 && r.confidence < 0.3, "{:.3} s: {r:?}", f.t);
+            two += 1;
+        }
+        assert!(two >= 5, "{two} frames");
+        // 112.44-112.68 s: the estimator itself has little to go on (skin guard).
+        for f in real::between(112.44, 112.68) {
+            let r = measure_white_balance(&f.stats, 0.0);
+            assert_eq!(r.reason, Reason::OneColour, "{:.3} s: {r:?}", f.t);
+        }
+        // 40-44 s: a plain reading.
+        for f in real::between(40.0, 44.0) {
+            let r = measure_white_balance(&f.stats, 0.0);
+            assert_eq!(r.reason, Reason::Ok, "{:.3} s: {r:?}", f.t);
+        }
+        let red = Stats {
+            cells: vec![[0.4, 0.02, 0.02, 1.0]; GRID * GRID],
+        };
+        assert_eq!(measure_white_balance(&red, 0.0).reason, Reason::OneColour);
         let black = Stats {
             cells: vec![[0.0, 0.0, 0.0, 1.0]; GRID * GRID],
         };

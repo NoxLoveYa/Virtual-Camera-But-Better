@@ -81,6 +81,9 @@ pub enum Reason {
     Dark,
     /// The picture is mostly one colour (a face, a wall) that does not look like a cast.
     OneColour,
+    /// The picture has two answers (a bright face beside the walls, two lights): each is sure, they disagree. Set by
+    /// the device meter only (`auto_controls::meter`); [`estimate_light`] never returns it.
+    TwoAnswers,
 }
 
 /// What [`estimate_light`] concludes.
@@ -123,7 +126,8 @@ impl LightEstimate {
         }
     }
 
-    /// The gains that take this light to `aim` (see [`gains`]), scaled by the confidence.
+    /// The gains that take this light to `aim` (see [`gains`]); the correction of the light is scaled by the
+    /// confidence, the aim is not.
     pub fn gains(&self, aim: [f32; 3], limits: (f64, f64)) -> [f64; 3] {
         gains(self.light, aim, self.conf, limits)
     }
@@ -146,9 +150,10 @@ impl LightEstimate {
     }
 
     /// Like [`gains`](Self::gains), for a picture that may have two answers: aimed from the light between them and
-    /// scaled by the confidence times [`undoubted`](Self::undoubted), so a picture whose answer depends on the
-    /// frame is corrected little instead of following the flips (docs/AUTO-WHITE-BALANCE.md 9.4). The same as
-    /// `gains` when the two answers are the same.
+    /// the correction of the light scaled by the confidence times [`undoubted`](Self::undoubted), so a picture
+    /// whose answer depends on the frame is corrected little instead of following the flips
+    /// (docs/AUTO-WHITE-BALANCE.md 9.4); the aim still applies in full (10.4.5). The same as `gains` when the two
+    /// answers are the same.
     pub fn steady_gains(&self, aim: [f32; 3], limits: (f64, f64)) -> [f64; 3] {
         gains(self.middle_light(), aim, self.conf * self.undoubted(), limits)
     }
@@ -351,17 +356,19 @@ fn estimate_core(stats: &Stats) -> (LightEstimate, Vec<f64>) {
 }
 
 /// The per-channel gains (linear light) that take an estimated `light` (linear RGB, luma 1) to `aim` (the colour a
-/// neutral surface should get, see `auto_adjust::white_aim`), keeping the luma, scaled by `conf` in the log domain
-/// (a picture that does not look like a cast is corrected only as far as the evidence goes), and limited to
-/// `limits = (lo, hi)` per channel. The luma is kept again after the first limit, then the limit applies again.
-/// A correction smaller than 1e-9 in the log is exactly 1.
+/// neutral surface should get, see `auto_adjust::white_aim`), keeping the luma, and limited to `limits = (lo, hi)` per
+/// channel. The luma is kept again after the first limit, then the limit applies again. A correction smaller than
+/// 1e-9 in the log is exactly 1.
+///
+/// The `conf` scales only the correction of the light, in the log domain (a picture that does not look like a cast is
+/// corrected only as far as the evidence goes): `ln g = ln aim - conf ln light`. The aim is the user's Warmth and
+/// applies in full whatever the confidence (docs/AUTO-WHITE-BALANCE.md 10.4.5); with `conf = 0` the gains are the aim
+/// at the picture's luma. With a neutral aim the result is the same as scaling the whole gain by `conf`.
 pub fn gains(light: [f64; 3], aim: [f32; 3], conf: f64, limits: (f64, f64)) -> [f64; 3] {
     let (lo, hi) = limits;
     let y = luma(light);
-    let g0 = [0, 1, 2].map(|k| f64::from(aim[k]) / light[k]);
-    let keep = y / luma([g0[0] * light[0], g0[1] * light[1], g0[2] * light[2]]);
     let conf = conf.clamp(0.0, 1.0);
-    let g = g0.map(|g| (conf * (g * keep).ln()).exp());
+    let g = [0, 1, 2].map(|k| (f64::from(aim[k]).ln() - conf * light[k].ln()).exp());
     let raw = g.map(|g| g.clamp(lo, hi));
     let keep = y / luma([raw[0] * light[0], raw[1] * light[1], raw[2] * light[2]]);
     let out = raw.map(|g| (g * keep).clamp(lo, hi));

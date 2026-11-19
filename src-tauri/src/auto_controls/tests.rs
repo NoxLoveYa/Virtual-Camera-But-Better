@@ -1229,7 +1229,7 @@ fn white_balance_holds_on_a_picture_of_one_colour() {
     assert_eq!(wb_state(&ctrl), WhiteBalanceState::NoSignal);
     assert_eq!(
         ctrl.status().white_balance.unwrap().message.as_deref(),
-        Some("The picture is mostly one colour (a face or a wall): keeping 5000 K.")
+        Some("Mostly one colour (a face or a wall): nothing neutral to measure. Staying at 5000 K; Warmth still applies.")
     );
 }
 
@@ -1380,7 +1380,7 @@ fn b5_a_face_or_a_wall_filling_the_frame_is_held_with_its_own_text() {
         assert!(wb_writes(&sim).len() <= 1, "{scene}: {:?}", wb_writes(&sim));
         assert_eq!(
             ctrl.status().white_balance.unwrap().message.as_deref(),
-            Some("The picture is mostly one colour (a face or a wall): keeping 4600 K."),
+            Some("Mostly one colour (a face or a wall): nothing neutral to measure. Staying at 4600 K; Warmth still applies."),
             "{scene}"
         );
     }
@@ -1535,6 +1535,296 @@ fn the_white_balance_resume_point_is_stored_after_three_seconds_at_its_limit() {
         (3.0..=3.4).contains(&(stored_at - limit_at)),
         "at_limit at {limit_at}, stored at {stored_at}"
     );
+}
+
+// --- warmth that always applies (docs/AUTO-WHITE-BALANCE.md 10.4.3) ---
+
+fn set_warmth(ctrl: &mut AutoController, warmth: f64) {
+    let mut cfg = ctrl.cfg;
+    cfg.white_balance.warmth = warmth;
+    ctrl.set_cfg(cfg);
+}
+
+/// The Kelvin the feed-forward writes for a warmth change from `from` to `to` on a camera at `k` (10.4.3).
+fn feed_forward_kelvin(k: i32, from: f64, to: f64, learned: &Learned) -> f64 {
+    let alpha = learned.wb_alpha.unwrap_or(0.006).max(0.0105);
+    1e6 / (mired(k) + (meter::warmth_target(to) - meter::warmth_target(from)) / alpha)
+}
+
+/// The white balance writes that started in `from..until`.
+fn wb_writes_between(sim: &Sim, from: f64, until: f64) -> Vec<WriteRec> {
+    wb_writes(sim).into_iter().filter(|w| w.started >= from && w.started < until).collect()
+}
+
+#[test]
+fn a_small_warmth_change_moves_the_camera_at_once() {
+    // A grey wall under a 5000 K light on a camera at 5000 K, holding: a step of 0.05 is inside the loop's own band
+    // (`c*` moves 0.034 against `B_out` 0.06), so before the feed-forward it was swallowed half of the time.
+    let mut sim = wb_sim(0.0105, 5000, kelvin(5000.0));
+    let mut ctrl = wb_ctrl(&sim, 5000, true);
+    sim.run(&mut ctrl, 10.0);
+    assert_eq!(wb_state(&ctrl), WhiteBalanceState::Holding);
+    let mut warmth = 0.0;
+    for to in [0.05, -0.05, 0.1] {
+        let (t0, k) = (sim.t, sim.device_k());
+        let want = feed_forward_kelvin(k, warmth, to, ctrl.learned());
+        set_warmth(&mut ctrl, to);
+        sim.run(&mut ctrl, t0 + 0.5);
+        let first = *wb_writes_between(&sim, t0, t0 + 0.5).first().unwrap_or_else(|| panic!("{warmth} -> {to}: no write"));
+        assert!((f64::from(first.value) - want).abs() <= 1.0, "{warmth} -> {to}: wrote {} K, want {want:.1} K", first.value);
+        sim.run(&mut ctrl, t0 + 6.0);
+        let err = sim.history.last().expect("ran").wb_err;
+        assert!(err.abs() <= 0.03, "{warmth} -> {to}: |wb_err| {err}");
+        assert_eq!(wb_state(&ctrl), WhiteBalanceState::Holding, "{warmth} -> {to}");
+        // No reversal: whatever the loop adds after the feed-forward goes the same way.
+        let mut prev = k;
+        let signs: Vec<f64> = wb_writes_between(&sim, t0, t0 + 6.0)
+            .iter()
+            .map(|w| {
+                let dm = mired(w.value) - mired(prev);
+                prev = w.value;
+                dm.signum()
+            })
+            .collect();
+        assert!(signs.windows(2).all(|s| s[0] == s[1]), "{warmth} -> {to}: {signs:?}");
+        warmth = to;
+    }
+}
+
+#[test]
+fn warmth_applies_while_the_picture_is_one_colour() {
+    // The red wall holds (nothing neutral to measure): the Warmth setting still moves the camera, once.
+    let (mut sim, mut ctrl) = kit("red_wall", 4600, kelvin(5500.0));
+    sim.run(&mut ctrl, 10.0);
+    assert_eq!(wb_state(&ctrl), WhiteBalanceState::NoSignal);
+    let (t0, k) = (sim.t, sim.device_k());
+    let want = feed_forward_kelvin(k, 0.0, 0.5, ctrl.learned());
+    set_warmth(&mut ctrl, 0.5);
+    sim.run(&mut ctrl, t0 + 0.5);
+    let first = wb_writes_between(&sim, t0, t0 + 0.5);
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert!((f64::from(first[0].value) - want).abs() <= 1.0, "wrote {} K, want {want:.1} K", first[0].value);
+    sim.run(&mut ctrl, t0 + 4.5);
+    assert_eq!(wb_writes_between(&sim, t0, t0 + 4.5).len(), 1, "{:?}", wb_writes_between(&sim, t0, t0 + 4.5));
+    assert_eq!(wb_state(&ctrl), WhiteBalanceState::NoSignal);
+    let st = ctrl.status().white_balance.unwrap();
+    assert_eq!(
+        st.message,
+        Some(format!("Mostly one colour (a face or a wall): nothing neutral to measure. Staying at {} K; Warmth still applies.", st.kelvin))
+    );
+}
+
+#[test]
+fn warmth_applies_while_the_picture_reads_two_ways() {
+    // The recorded face that gives two answers for a second or two, played forward and back (the doubt room: from
+    // 6500 K the picture reads `TwoAnswers`, from 5200 K it is `OneColour`, see 10.9). The loop is in `slow` at 30 s
+    // and the warmth changes there: the move is made all the same. A cooler aim is used: a warmer one would ask for
+    // more than the 6500 K the camera has.
+    let (mut sim, mut ctrl) = doubt_room(Speed::Normal, 0.009, 6500, 30.0);
+    assert_eq!(wb_state(&ctrl), WhiteBalanceState::Slow, "{:?}", ctrl.status().white_balance);
+    let k = sim.device_k();
+    let want = feed_forward_kelvin(k, 0.0, -0.3, ctrl.learned());
+    set_warmth(&mut ctrl, -0.3);
+    sim.run(&mut ctrl, 30.5);
+    let first = *wb_writes_between(&sim, 30.0, 30.5).first().expect("no write within 0.5 s");
+    assert!((f64::from(first.value) - want).abs() <= 1.0, "wrote {} K, want {want:.1} K", first.value);
+    // Nothing the lane or the loop writes afterwards takes the move back.
+    sim.run(&mut ctrl, 90.0);
+    let mut prev = k;
+    for w in wb_writes_between(&sim, 30.0, 90.0) {
+        assert!(w.value <= prev, "a write that raises K: {prev} -> {} at {:.1} s", w.value, w.started);
+        prev = w.value;
+    }
+    assert!(sim.handbacks.is_empty(), "{:?}", sim.handbacks);
+    assert_ne!(wb_state(&ctrl), WhiteBalanceState::Hunting);
+}
+
+/// The doubtful 1.4 s of the recorded desk (two answers on most frames), played forward and back for `seconds`: a
+/// doubt that lasts, on a camera of `alpha_true` that starts at `start_k`.
+fn doubt_room(speed: Speed, alpha_true: f64, start_k: i32, seconds: f64) -> (Sim, AutoController) {
+    let cfg = SimCfg {
+        wb: Some(WbSim { alpha_true, start_k, can_auto: true }),
+        start_e: -5,
+        start_g: 33,
+        slow_first_write: false,
+        replay: Some(Replay::new(crate::fx::awb::real::between(112.4, 113.8))),
+        ..SimCfg::default()
+    };
+    let mut sim = Sim::new(cfg, dim(-4.0));
+    let mut autocfg = AutoCfg::default();
+    autocfg.white_balance.speed = speed;
+    let mut ctrl = AutoController::new(&sim.caps(), autocfg, Learned::default(), wb_modes(start_k, true));
+    sim.run(&mut ctrl, seconds);
+    (sim, ctrl)
+}
+
+#[test]
+fn a_face_that_stays_in_doubt_is_followed_slowly() {
+    // The doubtful 1.4 s of the desk, on a camera at 6500 K (the picture 0.08-0.24 too orange on the middle of its two
+    // answers) and two answers for as long as the face stays: the loop used to hold at 6500 K for good (`no_signal`).
+    // Now it says it is unsure and follows the middle of the two answers, slowly, toward a higher mired.
+    for speed in [Speed::Slow, Speed::Normal, Speed::Fast] {
+        let what = format!("{speed:?}");
+        let (mut sim, mut ctrl) = doubt_room(speed, 0.009, 6500, 3.0);
+        let st = ctrl.status().white_balance.unwrap();
+        assert_eq!(st.state, WhiteBalanceState::Slow, "{what}: {st:?}");
+        assert_eq!(
+            st.message,
+            Some(format!("Unsure of the light (a bright face or two lights): adjusting slowly · {} K", st.kelvin)),
+            "{what}"
+        );
+        assert!(wb_writes_between(&sim, 0.0, 5.0).is_empty(), "{what}: {:?}", wb_writes_between(&sim, 0.0, 5.0));
+        sim.run(&mut ctrl, 150.0);
+        let writes = wb_writes(&sim);
+        assert!(!writes.is_empty(), "{what}: the lane never wrote");
+        let mut k = 6500;
+        for w in &writes {
+            assert!(w.value < k, "{what}: a write that raises K: {k} -> {} at {:.1} s", w.value, w.started);
+            k = w.value;
+        }
+        // The middle of the two answers over one more pass of the replay (a single frame flips between the answers).
+        let (mut sum, mut n) = (0.0, 0);
+        let mut t = 150.0;
+        while t < 152.8 {
+            t += 0.05;
+            sim.run(&mut ctrl, t);
+            let r = meter::measure_white_balance(&sim.picture(), 0.0);
+            if r.reason == meter::Reason::TwoAnswers {
+                sum += r.error;
+                n += 1;
+            }
+        }
+        let mean = sum / f64::from(n.max(1));
+        assert!(n >= 20 && mean.abs() <= 0.07, "{what}: mean error {mean:+.3} over {n} frames at {} K, {writes:?}", sim.device_k());
+        assert!(sim.handbacks.is_empty(), "{what}: {:?}", sim.handbacks);
+        assert_ne!(wb_state(&ctrl), WhiteBalanceState::Hunting, "{what}");
+    }
+}
+
+#[test]
+fn a_face_that_stays_in_doubt_at_its_kelvin_stays_close() {
+    // The same room on a camera that has the recording's own Kelvin (the walls are neutral): the middle of the two
+    // answers sits about 0.12 off, so the slow lane moves a little toward it, a compromise of the two answers, one
+    // way and never back. Measured (180 s, the lane working with `α` 0.0105): Slow 5 writes, 8.6 mired; Normal 3,
+    // 8.6; Fast 2, 8.0 (steps of 2, 3, 4 mired).
+    for speed in [Speed::Slow, Speed::Normal, Speed::Fast] {
+        let (sim, _) = doubt_room(speed, 0.009, 6261, 180.0);
+        let writes = wb_writes(&sim);
+        let (mut k, mut total, mut signs) = (6261, 0.0, Vec::new());
+        for w in &writes {
+            let dm = mired(w.value) - mired(k);
+            total += dm.abs();
+            signs.push(dm.signum());
+            k = w.value;
+        }
+        assert!(writes.len() <= 5, "{speed:?}: {} writes in 180 s: {writes:?}", writes.len());
+        assert!(total <= 10.0, "{speed:?}: {total:.1} mired in all: {writes:?}");
+        assert!(signs.windows(2).all(|s| s[0] == s[1]), "{speed:?}: {signs:?}");
+        assert!(sim.handbacks.is_empty(), "{speed:?}: {:?}", sim.handbacks);
+    }
+}
+
+#[test]
+fn a_warmth_drag_is_not_a_swing() {
+    // The slider dragged back and forth every 1.5 s: each step is the user's move, not the loop's reversal. The camera
+    // answers more strongly (0.014) than the feed-forward's 0.0105 assumes, so the loop takes back a third of each
+    // move before the next one; without `forget_direction` those take-backs count as a swing and the loop hands back.
+    let mut sim = wb_sim(0.014, 5000, kelvin(5000.0));
+    let mut ctrl = wb_ctrl(&sim, 5000, true);
+    sim.run(&mut ctrl, 10.0);
+    let mut never_hunting = true;
+    let mut t = sim.t;
+    for warmth in [0.3, -0.3, 0.3, -0.3, 0.3, -0.3, 0.3, -0.3, 0.3] {
+        set_warmth(&mut ctrl, warmth);
+        for _ in 0..15 {
+            t += 0.1;
+            sim.run(&mut ctrl, t);
+            never_hunting &= wb_state(&ctrl) != WhiteBalanceState::Hunting;
+        }
+    }
+    sim.run(&mut ctrl, t + 20.0);
+    assert!(never_hunting);
+    assert!(sim.handbacks.is_empty(), "{:?}", sim.handbacks);
+    assert_ne!(wb_state(&ctrl), WhiteBalanceState::Hunting);
+    let err = sim.history.last().expect("ran").wb_err;
+    assert!(err.abs() <= 0.03, "|wb_err| {err} on the last aim");
+}
+
+#[test]
+fn a_warmth_change_whose_write_failed_is_written_again() {
+    // The red wall holds, so only the feed-forward moves the camera. The camera refuses its write once: the change is
+    // not lost, the next try writes it.
+    let (mut sim, mut ctrl) = kit("red_wall", 4600, kelvin(5500.0));
+    sim.run(&mut ctrl, 10.0);
+    assert_eq!(wb_state(&ctrl), WhiteBalanceState::NoSignal);
+    let (t0, k) = (sim.t, sim.device_k());
+    let want = feed_forward_kelvin(k, 0.0, 0.5, ctrl.learned());
+    sim.faults.fail = true;
+    set_warmth(&mut ctrl, 0.5);
+    sim.run(&mut ctrl, t0 + 0.3);
+    assert!(sim.attempts.iter().any(|w| w.key == ControlKey::WhiteBalance && w.started >= t0), "no attempt");
+    assert_eq!(sim.device_k(), k, "the failed write must not land");
+    sim.faults.fail = false;
+    sim.run(&mut ctrl, t0 + 4.0);
+    let writes = wb_writes_between(&sim, t0, t0 + 4.0);
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    assert!((f64::from(writes[0].value) - want).abs() <= 1.0, "wrote {} K, want {want:.1} K", writes[0].value);
+    assert!(sim.handbacks.is_empty(), "{:?}", sim.handbacks);
+}
+
+#[test]
+fn a_warmth_drag_writes_at_most_four_times_a_second_and_loses_nothing() {
+    // The slider sends a value every 80 ms for 2 s: the writes are 0.25 s apart at least, and the last one carries
+    // what the ones before held back.
+    let (mut sim, mut ctrl) = kit("red_wall", 4600, kelvin(5500.0));
+    sim.run(&mut ctrl, 10.0);
+    assert_eq!(wb_state(&ctrl), WhiteBalanceState::NoSignal);
+    let (t0, k0) = (sim.t, sim.device_k());
+    let steps = 25;
+    let mut warmth = 0.0;
+    for i in 1..=steps {
+        warmth = 0.3 * f64::from(i) / f64::from(steps);
+        set_warmth(&mut ctrl, warmth);
+        sim.run(&mut ctrl, t0 + 0.08 * f64::from(i));
+    }
+    sim.run(&mut ctrl, t0 + 4.0);
+    let writes = wb_writes_between(&sim, t0, t0 + 4.0);
+    assert!(!writes.is_empty() && writes.len() <= 9, "{} writes: {writes:?}", writes.len());
+    for pair in writes.windows(2) {
+        assert!(pair[1].started - pair[0].done >= 0.25 - 1e-9, "{pair:?}");
+    }
+    // The camera's Kelvin is the whole change at the feed-forward's `α` (one camera step is 1 K here).
+    let alpha = 0.006f64.max(0.0105);
+    let want = 1e6 / (mired(k0) + (meter::warmth_target(warmth) - meter::warmth_target(0.0)) / alpha);
+    assert!((f64::from(sim.device_k()) - want).abs() <= 1.0, "{} K, want {want:.1} K", sim.device_k());
+}
+
+#[test]
+fn a_warmth_change_on_a_held_picture_is_the_resume_point() {
+    // A closed camera must reopen at the Kelvin the user's warmth change made, though the loop (holding on a picture
+    // of one colour) stores nothing of its own.
+    let (mut sim, mut ctrl) = kit("red_wall", 4600, kelvin(5500.0));
+    sim.run(&mut ctrl, 10.0);
+    assert_eq!(wb_state(&ctrl), WhiteBalanceState::NoSignal);
+    assert_eq!(ctrl.status().resume, None);
+    let t0 = sim.t;
+    set_warmth(&mut ctrl, 0.5);
+    sim.run(&mut ctrl, t0 + 0.4);
+    // Not at once: the drag may still be going.
+    assert_eq!(ctrl.status().resume, None);
+    sim.run(&mut ctrl, t0 + 3.0);
+    let first = sim.device_k();
+    assert_ne!(first, 4600);
+    assert_eq!(wb_state(&ctrl), WhiteBalanceState::NoSignal);
+    assert_eq!(ctrl.status().resume.and_then(|r| r.white_balance), Some(first));
+    // A second change soon after is written at once but stored only when `RESUME_EVERY` allows.
+    set_warmth(&mut ctrl, -0.5);
+    sim.run(&mut ctrl, t0 + 6.0);
+    let second = sim.device_k();
+    assert_ne!(second, first);
+    assert_eq!(ctrl.status().resume.and_then(|r| r.white_balance), Some(first));
+    sim.run(&mut ctrl, t0 + 16.0);
+    assert_eq!(ctrl.status().resume.and_then(|r| r.white_balance), Some(second));
 }
 
 // --- the watchdog ---
