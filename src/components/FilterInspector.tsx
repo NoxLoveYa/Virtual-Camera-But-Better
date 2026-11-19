@@ -9,6 +9,7 @@ import { ParamField } from "./ParamField";
 import { Popover } from "./Popover";
 import { focusSelectedRow } from "../ui/navFocus";
 import { toolBlock, toolOf } from "../ui/previewTool";
+import { NOT_HELD, holdStep, isHeld, type Hold, type HoldEvent } from "../ui/previewFrame";
 import { moveWithFocus, type ChainHandlers, type DragView } from "../ui/useChainDrag";
 
 /**
@@ -37,27 +38,12 @@ const pointsAt = (id: string) => {
  * output again, unless another gesture took the picture meanwhile. Any loss of the pointer, the focus or the window lets go.
  */
 function BeforeButton({ id, blocked }: { id: string; blocked: string | null }) {
-  const [hold, setHold] = useState({ pointer: false, key: false });
-  const held = hold.pointer || hold.key;
+  const [hold, setHold] = useState<Hold>(NOT_HELD);
+  const held = isHeld(hold);
   const shown = useRef(false);
   const off = blocked !== null;
 
-  const step = useCallback((event: "pointerdown" | "pointerup" | "keydown" | "keyup" | "blur") => {
-    setHold((h) => {
-      switch (event) {
-        case "pointerdown":
-          return h.pointer ? h : { ...h, pointer: true };
-        case "pointerup":
-          return h.pointer ? { ...h, pointer: false } : h;
-        case "keydown":
-          return h.key ? h : { ...h, key: true };
-        case "keyup":
-          return h.key ? { ...h, key: false } : h;
-        case "blur":
-          return h.pointer || h.key ? { pointer: false, key: false } : h;
-      }
-    });
-  }, []);
+  const step = useCallback((event: HoldEvent) => setHold((h) => holdStep(h, event)), []);
 
   useEffect(() => {
     if (held && !off) {

@@ -48,19 +48,15 @@ const steps = [
   { id: "b", label: "Crop/Pad" },
 ];
 eq(samePoint(null, null), true, "null is null");
-eq(samePoint("input", "input"), true, "input is input");
-eq(samePoint("input", null), false, "input is not null");
+eq(samePoint("compare", null), false, "compare is not null");
 eq(samePoint({ filter: "a" }, { filter: "a" }), true, "same filter");
 eq(samePoint({ filter: "a" }, { filter: "b" }), false, "other filter");
-eq(samePoint({ filter: "a" }, "input"), false, "filter is not input");
+eq(samePoint({ filter: "a" }, "compare"), false, "filter is not compare");
 eq(pointFilter({ filter: "b" }), "b", "the filter of a filter point");
-eq(pointFilter("input"), null, "input names no filter");
 eq(pointFilter(null), null, "the output names no filter");
 eq(pointLabel(null, steps), null, "no caption for the output");
-eq(pointLabel("input", steps), "Before", "the compare caption");
 eq(pointLabel("compare", steps), null, "the split-wipe Compare labels its sides itself, no caption");
 eq(samePoint("compare", "compare"), true, "compare is compare");
-eq(samePoint("compare", "input"), false, "compare is not input");
 eq(pointFilter("compare"), null, "compare names no filter");
 eq(pointLabel({ filter: "b" }, steps), "Crop/Pad · step 2 · showing the picture before this filter", "a filter caption");
 eq(pointLabel({ filter: "gone" }, steps), null, "a filter that left the chain has no caption");

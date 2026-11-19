@@ -710,7 +710,7 @@ button.link:hover:not(:disabled) { box-shadow: none; text-decoration: underline;
 /* Hold to compare: a chip like the others in the bar; held, it takes the accent. No text selection or touch scroll while held. */
 button.preview-compare { height: 24px; padding: 0 10px; background: rgba(9, 11, 14, 0.72); user-select: none; touch-action: none; }
 button.preview-compare[aria-pressed="true"] { color: var(--accent); border-color: rgba(46, 230, 214, 0.55); background: var(--accent-soft); box-shadow: var(--glow-soft); }
-/* What the picture is while a point other than the output is set ("Before", or the step a gesture edits). */
+/* What the picture is while a point other than the output is set (the step a gesture edits). */
 .preview-caption { position: absolute; left: 8px; bottom: 8px; max-width: calc(100% - 16px); padding: 2px 8px; color: var(--text); font-size: 11px; background: rgba(9, 11, 14, 0.72); border: 1px solid rgba(46, 230, 214, 0.55); border-radius: var(--r); pointer-events: none; }
 /* Preview tools (L2 eyedropper, L3 crop frame): a layer over the picture, under the bar and the caption. The filter that owns the tool takes the accent (its header in the inspector, its row in the navigator). */
 /* The bar's chips sit over the picture's top corners, where a handle or a pick may be: while a tool runs the bar steps aside (Esc or Done first). */

@@ -29,6 +29,9 @@ import {
   presetNotes,
   presetSignature,
   presetStateOf,
+  restoreRecord,
+  UNKNOWN_CAMERA,
+  withDeviceName,
   withPresetCamera,
   type PresetCamera,
   type PresetState,
@@ -419,4 +422,49 @@ same(
 same(planNotes({ a: [], b: [], c: [], skipped: [{ key: "roll", why: "x" }], downgraded: [] }), ["1 camera control is not on this camera."], "plan note, one control");
 same(planNotes({ a: [], b: [], c: [], skipped: [], downgraded: [] }), [], "no plan notes");
 
+// --- a camera that is not in the list is not a change (S3) ----------------------------------------------------------------
+{
+  const saved = { ...DEFAULT_SOURCE, video_device_id: BRIO };
+  const chain = [makeFilter("color_filter")];
+  const live = presetStateOf(chain, saved, DEFAULT_OUTPUT, {}, [cam(BRIO, "Logitech BRIO")]);
+  const sig0 = presetSignature(live);
+  same(presetStateOf(chain, saved, DEFAULT_OUTPUT, {}, []).camera.device, { id: BRIO, name: "" }, "unplugged, no record: no name to show");
+  same(presetSignature(presetStateOf(chain, saved, DEFAULT_OUTPUT, {}, [])), sig0, "an unplugged camera with no record is not modified");
+  same(presetSignature(presetStateOf(chain, saved, DEFAULT_OUTPUT, {}, null)), sig0, "the camera list not read yet is not modified");
+  same(presetSignature(presetStateOf(chain, saved, DEFAULT_OUTPUT, {}, [cam(BRIO_OTHER_PORT, "Logitech BRIO")])), sig0, "the same camera on another port is not modified");
+  same(presetSignature(presetStateOf(chain, saved, DEFAULT_OUTPUT, {}, [cam(OTHER, "Other")])), sig0, "the saved camera unplugged while another one is connected is not modified");
+  differs(presetSignature(presetStateOf(chain, { ...saved, video_device_id: OTHER }, DEFAULT_OUTPUT, {}, null)), sig0, "another camera is a change");
+
+  // The file never holds a name of "": the last one the camera had, else a placeholder. The signature does not see the name.
+  const unnamed = presetStateOf(chain, saved, DEFAULT_OUTPUT, {}, []);
+  same(withDeviceName(unnamed, "Logitech BRIO").camera.device, { id: BRIO, name: "Logitech BRIO" }, "the last known name is written");
+  same(withDeviceName(unnamed).camera.device, { id: BRIO, name: UNKNOWN_CAMERA }, "no name known: the placeholder, not \"\"");
+  same(withDeviceName(live, "Other name").camera.device, { id: BRIO, name: "Logitech BRIO" }, "a name that is known is kept");
+  same(withDeviceName(defaultState(null)).camera.device, null, "no camera, no name to fill");
+  same(presetSignature(withDeviceName(unnamed)), sig0, "the placeholder does not make the state modified");
+  const file = presetFileOf(withDeviceName(unnamed));
+  if (file.camera.device?.name === "") throw new Error("a saved file has no empty device name");
+}
+
+// --- Undo of a load that switched camera gives the other camera its record back (S4) ----------------------------------
+{
+  const A = { id: BRIO, name: "Logitech BRIO" };
+  const B = { id: OTHER, name: "Other" };
+  const before: StoredControls = { [BRIO]: { name: A.name, values: { focus: { value: 10, auto: false } } }, [OTHER]: { name: B.name, values: { zoom: { value: 3, auto: false } } } };
+  // The load changed the record of B (it was the camera that stayed), then switched to A.
+  const loaded = withPresetCamera(before, B, { zoom: { value: 9, auto: false } }, DEFAULT_AUTO, true);
+  same(loaded[OTHER].values.zoom, { value: 9, auto: false }, "the load changed B's record");
+  same(restoreRecord(loaded, before, B)[OTHER], before[OTHER], "Undo gives B its record back");
+  same(restoreRecord(loaded, before, B)[BRIO], loaded[BRIO], "and leaves A's alone");
+  // A camera without a record before the load has none after the Undo.
+  const none = restoreRecord(withPresetCamera({}, B, { zoom: { value: 9, auto: false } }, DEFAULT_AUTO, true), {}, B);
+  same(Object.keys(none), [], "a record the load made is removed");
+  // The same camera on another port is the same record.
+  const moved = restoreRecord({ [BRIO_OTHER_PORT]: { name: A.name, values: { focus: { value: 99, auto: false } } } }, before, { id: BRIO_OTHER_PORT, name: A.name });
+  same(Object.keys(moved), [BRIO], "a re-keyed record comes back under its old key");
+  same(moved[BRIO].values.focus, { value: 10, auto: false }, "with its old values");
+  same(restoreRecord(before, before, B), before, "nothing to restore: the same map");
+}
+
 console.log("ok");
+

@@ -167,3 +167,14 @@ export function selectionAfter(prev: readonly { id: string }[], next: readonly {
   if (next.length === 0) return "output";
   return filterSelection(next[Math.min(i, next.length - 1)].id);
 }
+
+/**
+ * The selection after a whole chain was swapped in (a preset load, a reset, an Undo): every filter has a new id there, so "the
+ * filter at the old place" (`selectionAfter`) is chance. A section stays; a filter that is still there stays; else the first
+ * filter of the new chain, else Output.
+ */
+export function selectionAfterLoad(next: readonly { id: string }[], selected: string): string {
+  const id = selectedFilterId(selected);
+  if (id === null || next.some((f) => f.id === id)) return selected;
+  return next.length > 0 ? filterSelection(next[0].id) : "output";
+}

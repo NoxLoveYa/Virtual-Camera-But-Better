@@ -16,6 +16,7 @@ import {
   normalizeUi,
   selectedFilterId,
   selectionAfter,
+  selectionAfterLoad,
   widthAfterKey,
   widthFromDrag,
   widthRange,
@@ -159,5 +160,12 @@ eq(selectionAfter(abc, [], "filter:b"), "output", "an emptied chain selects Outp
 eq(selectionAfter(abc, chain("x"), "controls"), "controls", "a section is never changed");
 eq(selectionAfter(abc, [], "camera"), "camera", "a section stays when the chain empties");
 eq(selectionAfter(abc, chain("x"), "filter:zzz"), "camera", "a selection that named no filter is camera");
+
+// ---- the selection after a whole chain was swapped in (a preset load) ----
+eq(selectionAfterLoad(chain("x", "y", "z"), "filter:b"), "filter:x", "a load selects the first filter, not the one at the old place");
+eq(selectionAfterLoad(chain("a", "y"), "filter:a"), "filter:a", "a filter that is still there stays (Undo brings the old ids back)");
+eq(selectionAfterLoad([], "filter:b"), "output", "a load with no filters selects Output");
+eq(selectionAfterLoad(chain("x"), "camera"), "camera", "a section stays through a load");
+eq(selectionAfterLoad([], "controls"), "controls", "a section stays through a load that empties the chain");
 
 console.log("ok");

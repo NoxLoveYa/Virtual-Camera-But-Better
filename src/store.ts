@@ -15,14 +15,18 @@ import {
   presetNotes,
   presetSignature,
   presetStateOf,
+  restoreRecord,
+  withDeviceName,
   withPresetCamera,
   type ControlStep,
   type ParsedPreset,
   type PresetCamera,
   type PresetState,
 } from "./presets/preset";
+import { createQueue } from "./presets/queue";
+import { settled as settleEngine } from "./presets/settle";
 import { presetNameFor, stemOf } from "./ui/fileDrop";
-import { DEFAULT_UI, filterSelection, normalizeUi, selectedFilterId, selectionAfter, type UiState } from "./ui/layout";
+import { DEFAULT_UI, filterSelection, normalizeUi, selectedFilterId, selectionAfter, selectionAfterLoad, type UiState } from "./ui/layout";
 import { pointFilter, samePoint, type PreviewPoint } from "./ui/previewFrame";
 import { toolBlock, toolOf, type PreviewTool } from "./ui/previewTool";
 import { keyColorOf } from "./ui/eyedropper";
@@ -47,6 +51,8 @@ import {
   findStored,
   forgetControls,
   isHandBackState,
+  linkKey,
+  vidPid,
   withAutoCfg,
   withLearned,
   withResume,
@@ -116,6 +122,8 @@ export interface Snapshot {
   activePreset: string | null;
   presetBaseline: string | null;
   full?: PresetState;
+  /** With `full`: every camera's record at that time (`full` has the selected camera's only), so Undo gives the camera the load changed its record back. */
+  controls?: StoredControls;
 }
 
 /** What the virtual camera is being asked to do (the button that was pressed). */
@@ -299,7 +307,7 @@ interface State extends Saved {
   setCloseToTray: (on: boolean) => void;
   setPreviewOn: (on: boolean) => void;
   /**
-   * Which picture the preview shows (L1): `null` the output (what apps get), `"input"` the camera before the chain, or the picture
+   * Which picture the preview shows (L1): `null` the output (what apps get), `"compare"` the camera before the chain beside the output, or the picture
    * entering a filter. For the length of a gesture only (hold to compare, the eyedropper, the crop handles): whoever sets it puts it
    * back to `null`. It also goes back by itself when the filter leaves the chain, the preview is turned off, the engine stops or
    * the window is hidden. The output to apps never changes. Not saved.
@@ -519,6 +527,7 @@ export const useStore = create<State>((set, get) => {
   let relist = false;
   const loadCameras = async () => {
     const cameras = await api.listCameras();
+    for (const c of cameras) camNames.set(vidPid(c.id) ?? linkKey(c.id), c.name);
     set({ cameras });
     const prev = get().source;
     const next = repairSource(prev, cameras);
@@ -721,25 +730,15 @@ export const useStore = create<State>((set, get) => {
     return presetStateOf(s.chain, s.source, s.output, s.controls, s.cameras);
   };
   const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-  /** How long a load waits for the camera to be open before it leaves the controls for the next `live`. */
-  const SETTLE_MS = 10_000;
+  /** The names the cameras had when the list was read, by link: the name of a camera that is unplugged by the time a preset is saved (never written as ""). */
+  const camNames = new Map<string, string>();
 
   /**
-   * Waits until the engine is `live` (the camera is open) or `stopped` (closed for good), at most SETTLE_MS; false on a timeout. `reopens`:
-   * a capture change was just sent, so a `live` from before it does not count until the engine has left it (or 1.5 s passed).
+   * Waits until the engine is `live` (the camera is open) or `stopped` (closed for good); false when it will not open soon (idle:
+   * no app uses it; reconnecting) or after SETTLE_MS (see `settleStep`). `reopens`: a capture change was just sent, so a `live`
+   * from before it does not count until the engine has left it (or 1.5 s passed).
    */
-  const settled = async (reopens: boolean): Promise<boolean> => {
-    const t0 = performance.now();
-    let left = false;
-    while (performance.now() - t0 < SETTLE_MS) {
-      const st = get().engine.state;
-      if (st === "stopped") return true;
-      if (st !== "live") left = true;
-      else if (!reopens || left || performance.now() - t0 > 1500) return true;
-      await sleep(100);
-    }
-    return false;
-  };
+  const settled = (reopens: boolean) => settleEngine({ engine: () => get().engine, now: () => performance.now(), sleep }, reopens);
 
   /** One step of a plan, written to the camera; the store follows what the camera answers. A key with a slider write waiting is the user's now and is left alone. */
   const runStep = async (cam: { id: string; name: string }, step: ControlStep, errors: string[]) => {
@@ -761,8 +760,16 @@ export const useStore = create<State>((set, get) => {
 
   /** Steps 6 to 9 of 3.3: read the camera, send Better Cam auto's settings, then write the controls (leave Better Cam auto, plain controls, engage Better Cam auto). */
   const applyDevice = async (cam: { id: string; name: string }, camera: PresetCamera, notes: string[]) => {
-    await get().refreshControls();
-    const infos = get().controlsFor === cam.id && !get().controlsError ? get().controlInfos : null;
+    // Read straight from the camera: the panel's own read may be replaced by a newer one (an error of that one is not this load's).
+    // This read is the newest now, so the panel shows it.
+    const seq = ++controlsSeq;
+    let infos: ControlInfo[] | null = null;
+    try {
+      infos = await api.getCameraControls(cam.id);
+      if (seq === controlsSeq && selectedCam()?.id === cam.id) set({ controlInfos: sortControls(infos), controlsFor: cam.id, controlsError: null });
+    } catch {
+      void get().refreshControls();
+    }
     if (!infos) {
       notes.push("The camera's controls could not be read, so they were not applied.");
       return;
@@ -778,7 +785,7 @@ export const useStore = create<State>((set, get) => {
   };
 
   /** Steps 4 and 5 (and 6 to 9 when the preset's camera is connected): the camera, its capture settings, its controls and Better Cam auto. */
-  const applyCamera = async (camera: PresetCamera, notes: string[]) => {
+  const applyCamera = async (camera: PresetCamera, notes: string[]): Promise<SourceCfg> => {
     const cams = get().cameras ?? [];
     const hit = presetCamera(cams, camera.device);
     const cur = selectedCam();
@@ -809,7 +816,7 @@ export const useStore = create<State>((set, get) => {
     await api.setSource(runningSource(), record()).catch(fail);
     if (!hit) {
       if (cur) pushAutoConfig();
-      return;
+      return fixed;
     }
     if (!(await settled(reopens))) {
       // In use by another app, reconnecting or slow to open: the rest waits for its next `live`. The record says what the preset says
@@ -818,15 +825,19 @@ export const useStore = create<State>((set, get) => {
       persist();
       await api.setSource(runningSource(), record()).catch(fail);
       notes.push("Camera controls apply when the camera opens.");
-      return;
+      return fixed;
     }
     await applyDevice(hit, camera, notes);
+    return fixed;
   };
 
   interface Finish {
     activePreset: string | null;
-    /** `"now"`: the signature of the state when the apply is done (after the repairs), so a repaired value is not "unsaved". */
-    baseline: string | null | "now";
+    /**
+     * `"target"`: the signature of what the apply was asked to set, after the repairs (the camera's own answers and the capture
+     * the repair made count, an edit made while it ran does not), so a repaired value is not "unsaved" but an edit is.
+     */
+    baseline: string | null | "target";
   }
 
   /**
@@ -835,52 +846,42 @@ export const useStore = create<State>((set, get) => {
    * section the target does not have (an old file) is left as it is. Returns the Undo snapshot taken before anything changed.
    */
   const applyState = async (
-    t: { chain: FilterCfg[]; camera: PresetCamera | null; output: OutputCfg | null },
+    t: { chain: FilterCfg[]; camera: PresetCamera | null; output: OutputCfg | null; /** Undo: every camera's record as it was (`Snapshot.controls`). */ restore?: StoredControls },
     fin: Finish,
   ): Promise<{ prev: Snapshot; notes: string[] }> => {
-    const prev: Snapshot = { ...snapshot(), full: stateNow() };
+    const start = stateNow();
+    const prev: Snapshot = { ...snapshot(), full: start, controls: get().controls };
     const notes: string[] = [];
     set({ pendingControls: null });
+    const selected = get().ui.selected;
     setChain(t.chain);
+    // The chain has new ids: `setChain` selected whatever filter sits at the old one's place; the first one is the better pick.
+    const pick = selectionAfterLoad(t.chain, selected);
+    if (pick !== get().ui.selected) set({ ui: { ...get().ui, selected: pick } });
     if (t.output) {
       set({ output: { ...t.output } });
       persistNow();
       pushOutput();
     }
-    if (t.camera) await applyCamera(t.camera, notes);
-    set({ activePreset: fin.activePreset, presetBaseline: fin.baseline === "now" ? presetSignature(stateNow()) : fin.baseline });
+    let capture = start.camera.capture;
+    if (t.camera) {
+      // Undo of a load that switched camera: the camera the load changed gets its record back before the camera is switched.
+      const cam = selectedCam();
+      if (t.restore && cam) set({ controls: restoreRecord(get().controls, t.restore, cam) });
+      const { video_device_id: _, ...fixed } = await applyCamera(t.camera, notes);
+      capture = fixed;
+    }
+    // What the apply was asked to set, as the repairs and the camera made it: an edit made while it ran stays "unsaved".
+    const after = stateNow();
+    const target: PresetState = { chain: t.chain, output: t.output ?? start.output, camera: t.camera ? { ...after.camera, capture } : start.camera };
+    set({ activePreset: fin.activePreset, presetBaseline: fin.baseline === "target" ? presetSignature(target) : fin.baseline });
     persistNow();
     return { prev, notes };
   };
 
-  // One apply at a time; a load that arrives meanwhile waits, and only the latest waiting one runs (the others end at once).
-  let applying = false;
-  let waiting: { label: string | null; job: () => Promise<void>; done: () => void } | null = null;
-  const serial = (label: string | null, job: () => Promise<void>) =>
-    new Promise<void>((done) => {
-      if (applying) {
-        waiting?.done();
-        waiting = { label, job, done };
-        return;
-      }
-      void (async () => {
-        applying = true;
-        let cur: typeof waiting = { label, job, done };
-        while (cur) {
-          if (cur.label) set({ presetLoading: cur.label });
-          try {
-            await cur.job();
-          } catch (e) {
-            fail(e);
-          }
-          cur.done();
-          cur = waiting;
-          waiting = null;
-        }
-        applying = false;
-        set({ presetLoading: null });
-      })();
-    });
+  // One apply at a time (see `createQueue`): a load that arrives meanwhile waits, and only the latest waiting one runs.
+  const queue = createQueue({ label: (presetLoading) => set({ presetLoading }), fail });
+  const { serial, exclusive } = queue;
 
   /** The camera opened (`live`) while a load's controls were waiting for it. */
   const runPending = async () => {
@@ -1048,6 +1049,8 @@ export const useStore = create<State>((set, get) => {
     },
 
     init: async () => {
+      // A page that reloaded (the engine and its window outlive it) starts at the output: nothing here is looking at another picture.
+      api.setPreviewPoint(null).catch(() => {});
       await api.onEngineState((e) => {
         set((s) => ({
           engine: {
@@ -1467,14 +1470,19 @@ export const useStore = create<State>((set, get) => {
       if (!u) return;
       const full = u.full;
       if (!full) {
-        replaceChain(u.chain, u.activePreset, u.presetBaseline);
-        say("Undone");
+        const back = () => {
+          replaceChain(u.chain, u.activePreset, u.presetBaseline);
+          say("Undone");
+        };
+        // While a load runs, the chain is its to change: this waits for the end of it (and is never dropped).
+        if (queue.busy()) void exclusive(async () => back());
+        else back();
         return;
       }
       // A preset load, a reset or an import: the camera, its controls, Better Cam auto and the output go back too.
       set({ undo: null });
       void serial(u.activePreset ?? "Undo", async () => {
-        const { notes } = await applyState(full, { activePreset: u.activePreset, baseline: u.presetBaseline });
+        const { notes } = await applyState({ ...full, restore: u.controls }, { activePreset: u.activePreset, baseline: u.presetBaseline });
         say(["Undone.", ...notes].join(" "));
       });
     },
@@ -1548,16 +1556,23 @@ export const useStore = create<State>((set, get) => {
 
     refreshPresets: async () => set({ presets: await api.listPresets() }),
     savePreset: async (name) => {
-      const state = stateNow();
-      try {
-        await api.savePresetFile(name, presetFileOf(state));
-        set({ activePreset: name, presetBaseline: presetSignature(state) });
-        persistNow();
-        await get().refreshPresets();
-        say(`Saved “${name}”`);
-      } catch (e) {
-        fail(e);
-      }
+      // A load in progress has the state half way: saving it would overwrite the preset with it (the buttons are off then too).
+      if (get().presetLoading !== null) return;
+      await exclusive(async () => {
+        const state = stateNow();
+        // A camera that is unplugged and has no record has no name here: the last one it had, never "".
+        const d = state.camera.device;
+        const file = withDeviceName(state, d ? camNames.get(vidPid(d.id) ?? linkKey(d.id)) : undefined);
+        try {
+          await api.savePresetFile(name, presetFileOf(file));
+          set({ activePreset: name, presetBaseline: presetSignature(state) });
+          persistNow();
+          await get().refreshPresets();
+          say(`Saved “${name}”`);
+        } catch (e) {
+          fail(e);
+        }
+      });
     },
     saveActivePreset: async () => {
       const name = get().activePreset;
@@ -1572,7 +1587,7 @@ export const useStore = create<State>((set, get) => {
         return;
       }
       await serial(name, async () => {
-        const { prev, notes } = await applyState(parsed, { activePreset: name, baseline: "now" });
+        const { prev, notes } = await applyState(parsed, { activePreset: name, baseline: "target" });
         // A load that changed nothing has nothing to undo.
         const same = presetSignature(prev.full!) === presetSignature(stateNow());
         say([`Loaded “${name}”.`, ...presetNotes(parsed, name), ...notes].join(" "), same ? null : prev);
@@ -1587,7 +1602,7 @@ export const useStore = create<State>((set, get) => {
         await api.savePresetFile(name, presetFileOfParsed(parsed));
         await get().refreshPresets();
         await serial(name, async () => {
-          const { prev, notes } = await applyState(parsed, { activePreset: name, baseline: "now" });
+          const { prev, notes } = await applyState(parsed, { activePreset: name, baseline: "target" });
           say([`Imported “${name}”.`, ...presetNotes(parsed, name), ...notes].join(" "), prev);
         });
       } catch (e) {
@@ -1595,6 +1610,7 @@ export const useStore = create<State>((set, get) => {
       }
     },
     renamePreset: async (from, to) => {
+      if (get().presetLoading === from) return say(`“${from}” is loading. Rename it when it is done.`);
       try {
         await api.renamePreset(from, to);
         if (get().activePreset === from) {
@@ -1608,6 +1624,7 @@ export const useStore = create<State>((set, get) => {
       }
     },
     deletePreset: async (name) => {
+      if (get().presetLoading === name) return say(`“${name}” is loading. Delete it when it is done.`);
       try {
         await api.deletePreset(name);
         if (get().activePreset === name) {

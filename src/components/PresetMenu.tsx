@@ -51,15 +51,17 @@ export function PresetMenu() {
   const label = loading ?? activePreset ?? (isDefault ? "Default" : "Unsaved");
   const modified = loading === null && activePreset !== null && dirty;
 
-  // Save overwrites the active preset; with none active it asks for a name instead.
+  // Save overwrites the active preset; with none active it asks for a name instead. While a load runs the state is half way: no save.
+  const busy = loading !== null;
   const save = useCallback(() => {
+    if (busy) return;
     if (!activePreset) {
       setOpen(true);
       setSaving(true);
     } else if (dirty) {
       void saveActivePreset();
     }
-  }, [activePreset, dirty, saveActivePreset]);
+  }, [busy, activePreset, dirty, saveActivePreset]);
 
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
@@ -83,7 +85,7 @@ export function PresetMenu() {
 
   const submit = (e: FormEvent) => {
     e.preventDefault();
-    if (!trimmed || invalid) return;
+    if (!trimmed || invalid || busy) return;
     void savePreset(existing ?? trimmed).then(close);
   };
 
@@ -182,7 +184,8 @@ export function PresetMenu() {
                 <button
                   className="ghost icon"
                   aria-label={`Rename ${p}`}
-                  title="Rename"
+                  title={p === loading ? "Loading" : "Rename"}
+                  disabled={p === loading}
                   onClick={() => {
                     setRenaming(p);
                     setNewName(p);
@@ -191,7 +194,7 @@ export function PresetMenu() {
                 >
                   <Pencil />
                 </button>
-                <button className="ghost icon" aria-label={`Delete ${p}`} title="Delete" onClick={() => setConfirmDelete(p)}>
+                <button className="ghost icon" aria-label={`Delete ${p}`} title={p === loading ? "Loading" : "Delete"} disabled={p === loading} onClick={() => setConfirmDelete(p)}>
                   <Icon name="trash" />
                 </button>
               </div>
@@ -210,7 +213,7 @@ export function PresetMenu() {
               onChange={(e) => setName(e.target.value)}
               aria-label="Preset name"
             />
-            <button className="primary" type="submit" disabled={!trimmed || invalid}>
+            <button className="primary" type="submit" disabled={!trimmed || invalid || busy}>
               {existing ? "Replace" : "Save"}
             </button>
             {hint && <small className={invalid ? "bad" : ""}>{hint}</small>}
@@ -232,9 +235,9 @@ export function PresetMenu() {
       </Popover>
       <button
         className={dirty ? "toggled" : ""}
-        disabled={!!activePreset && !dirty}
+        disabled={busy || (!!activePreset && !dirty)}
         onClick={save}
-        title={activePreset ? `Save changes to “${activePreset}” (Ctrl+S)` : "Save as a preset (Ctrl+S)"}
+        title={busy ? "Wait until the preset has loaded" : activePreset ? `Save changes to “${activePreset}” (Ctrl+S)` : "Save as a preset (Ctrl+S)"}
       >
         {activePreset ? "Save" : "Save as…"}
       </button>

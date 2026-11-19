@@ -121,8 +121,12 @@ export function parsePreset(raw: unknown, extensions: readonly ExtensionInfo[]):
   };
 }
 
-/** The camera as a signature part: the same camera on another USB port (another link, same vid/pid and name) is the same. */
-const deviceKey = (d: PresetCamera["device"]) => (d ? [vidPid(d.id) ?? linkKey(d.id), d.name.toLowerCase()] : null);
+/**
+ * The camera as a signature part: the same camera on another USB port (another link, same vid/pid) is the same. The name is
+ * not part of it: it is "" while the camera is unplugged and has no record, or the list is not read yet, and a preset must not
+ * look modified for that.
+ */
+const deviceKey = (d: PresetCamera["device"]) => (d ? (vidPid(d.id) ?? linkKey(d.id)) : null);
 
 /**
  * Fingerprint for "unsaved changes" (3.6). Ids are ignored; the value of a Better Cam auto control is ignored (it is the
@@ -164,6 +168,26 @@ export function presetStateOf(chain: FilterCfg[], source: SourceCfg, output: Out
   const device = id ? { id, name: cam?.name ?? record?.device.name ?? "" } : null;
   return { chain, camera: { device, capture: withoutDevice(source), controls: record?.device.values ?? {}, auto: autoCfgOf(stored, device) }, output };
 }
+
+/** Shown as the name of a camera nothing knows the name of (it is not signed: see `deviceKey`). */
+export const UNKNOWN_CAMERA = "Unknown camera";
+
+/** `state` with a name for its camera, so a file never holds `device.name` "": `known` (the last name the camera had), else `UNKNOWN_CAMERA`. */
+export const withDeviceName = (state: PresetState, known?: string): PresetState => {
+  const d = state.camera.device;
+  return !d || d.name !== "" ? state : { ...state, camera: { ...state.camera, device: { id: d.id, name: known || UNKNOWN_CAMERA } } };
+};
+
+/** `current` with the record of `cam` as `saved` has it (or none): what Undo of a load does to the camera the load changed. */
+export const restoreRecord = (current: StoredControls, saved: StoredControls, cam: { id: string; name: string }): StoredControls => {
+  const now = findStored(current, cam);
+  const was = findStored(saved, cam);
+  if (!now && !was) return current;
+  const next = { ...current };
+  if (now) delete next[now.id];
+  if (was) next[was.id] = was.device;
+  return next;
+};
 
 /** A parsed file as it is written back: a v1 file stays v1 (filters only), a v2 file keeps the sections it has. */
 export interface PresetFileAny {

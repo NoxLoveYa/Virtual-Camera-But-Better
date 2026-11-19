@@ -16,6 +16,7 @@ import { PickOverlay } from "./PickOverlay";
 /** The Install button's tooltip while the data folder is encrypted: the banner sits above the preview, not below it. */
 const PREVIEW_BLOCKED_REASON = "An administrator must turn off encryption first (see the banner above).";
 
+const COMPARE_OFF_HINT = "Turn Compare off. Esc does it when focus is in the preview or the navigator; elsewhere Esc closes what is in front first";
 const COMPARE_HINT = "Compare the camera picture before the filters with the result: drag the bar over the picture";
 
 /** Whether a key press is typing into a field (the orientation key must not take it). */
@@ -426,6 +427,7 @@ export function Preview() {
   // off) ends it with it.
   const compareOn = point === "compare";
   const { setPreviewPoint } = useStore.getState();
+  const compareButton = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     const apply = () => {
       const c = useCompare.getState();
@@ -447,7 +449,10 @@ export function Preview() {
       if (e.defaultPrevented) return;
       if (e.key === "Escape") {
         e.preventDefault();
+        // With the bar itself focused it goes away under the focus, which would fall to <body>: the Compare button takes it.
+        const inBar = e.target instanceof Element && e.target.closest(".compare-layer") !== null;
         setPreviewPoint(null);
+        if (inBar) compareButton.current?.focus();
       } else if (isOrientKey(e, isTyping(e.target))) {
         e.preventDefault();
         useCompare.getState().swapOrientation();
@@ -507,11 +512,12 @@ export function Preview() {
           <div className="preview-tools">
             {showing && compareOn && <CompareOrient />}
             <button
+              ref={compareButton}
               type="button"
               className="preview-compare"
               aria-pressed={compareOn}
               disabled={!showing || tool !== null}
-              title={tool !== null ? "Finish the pick or the crop first" : !showing ? "Nothing to compare: the camera picture is not showing" : compareOn ? "Turn Compare off (Esc)" : COMPARE_HINT}
+              title={tool !== null ? "Finish the pick or the crop first" : !showing ? "Nothing to compare: the camera picture is not showing" : compareOn ? COMPARE_OFF_HINT : COMPARE_HINT}
               onClick={() => setPreviewPoint(compareOn ? null : "compare")}
             >
               Compare

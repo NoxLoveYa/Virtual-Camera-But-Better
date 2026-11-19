@@ -63,17 +63,18 @@ export function readHeader(buf: ArrayBuffer): FrameHeader | null {
 }
 
 /**
- * What `set_preview_point` takes: `null` the output (what apps get), `"input"` the camera before the chain, `"compare"` both of
- * those in one frame (the split-wipe Compare), or the picture entering a filter.
+ * What `set_preview_point` takes: `null` the output (what apps get), `"compare"` the camera picture before the chain and the
+ * output in one frame (the split-wipe Compare), or the picture entering a filter. (The engine also knows `"input"`, the camera
+ * picture alone; nothing in the window asks for it since Compare shows both.)
  */
-export type PreviewPoint = null | "input" | "compare" | { filter: string };
+export type PreviewPoint = null | "compare" | { filter: string };
 
 export function samePoint(a: PreviewPoint, b: PreviewPoint): boolean {
   if (a === null || b === null || typeof a === "string" || typeof b === "string") return a === b;
   return a.filter === b.filter;
 }
 
-/** The filter card a point names, or `null` (the output and the input name none). */
+/** The filter card a point names, or `null` (the output and Compare name none). */
 export function pointFilter(point: PreviewPoint): string | null {
   return point !== null && typeof point === "object" ? point.filter : null;
 }
@@ -84,7 +85,6 @@ export function pointFilter(point: PreviewPoint): string | null {
  */
 export function pointLabel(point: PreviewPoint, steps: readonly { id: string; label: string }[]): string | null {
   if (point === null || point === "compare") return null; // Compare labels its two sides itself
-  if (point === "input") return "Before";
   const at = steps.findIndex((s) => s.id === point.filter);
   if (at < 0) return null;
   return `${steps[at].label} · step ${at + 1} · showing the picture before this filter`;
