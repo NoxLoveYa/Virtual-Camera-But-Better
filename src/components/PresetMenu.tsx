@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { useStore } from "../store";
-import { PRESET_NAME } from "../filters/chain";
+import { presetNameError } from "../filters/chain";
 import { isDefaultPreset, presetSignature, presetStateOf } from "../presets/preset";
 import { Icon } from "./Icon";
 import { Popover } from "./Popover";
@@ -76,9 +76,10 @@ export function PresetMenu() {
 
   const trimmed = name.trim();
   const existing = presets.find((p) => p.toLowerCase() === trimmed.toLowerCase());
-  const invalid = trimmed !== "" && !PRESET_NAME.test(trimmed);
-  const hint = invalid
-    ? "Use letters, numbers, spaces, - and _ only."
+  const nameError = presetNameError(trimmed);
+  const invalid = nameError !== null;
+  const hint = nameError
+    ? nameError
     : existing
       ? `“${existing}” already exists. Saving replaces it.`
       : "";
@@ -92,8 +93,9 @@ export function PresetMenu() {
   // Rename: another preset with the name is refused; a change of letter case only (the same preset) is fine.
   const renamed = newName.trim();
   const taken = renaming === null ? undefined : presets.find((p) => p.toLowerCase() === renamed.toLowerCase() && p.toLowerCase() !== renaming.toLowerCase());
-  const renameInvalid = renamed !== "" && !PRESET_NAME.test(renamed);
-  const renameHint = renameInvalid ? "Use letters, numbers, spaces, - and _ only." : taken ? `“${taken}” already exists.` : "";
+  const renameError = presetNameError(renamed);
+  const renameInvalid = renameError !== null;
+  const renameHint = renameError ?? (taken ? `“${taken}” already exists.` : "");
 
   const submitRename = (e: FormEvent) => {
     e.preventDefault();

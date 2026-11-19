@@ -2,6 +2,7 @@
  * Checks of the pure logic behind dropping files from Explorer (W2). `npm run test:ui` bundles and runs it together with
  * the reorder checks. It throws at the first failure and prints `ok` otherwise.
  */
+import { presetNameError } from "../filters/chain";
 import { ONE_AT_A_TIME, dropKind, extensionOf, fitsField, hintFor, presetNameFor, routeDrop, stemOf, unsupportedMessage, type DropRoute } from "./fileDrop";
 
 function eq<T>(actual: T, expected: T, what: string) {
@@ -89,5 +90,34 @@ eq(presetNameFor("!!!", []), "Imported", "nothing left");
 eq(presetNameFor("", ["Imported"]), "Imported 2", "nothing left and a clash");
 eq(presetNameFor("  padded  ", []), "padded", "trimmed");
 eq(presetNameFor("x".repeat(60), []).length, 40, "capped at 40 characters");
+eq(presetNameFor("a".repeat(39) + " " + "b".repeat(10), []), "a".repeat(39), "a cut that ends on a space is trimmed");
+eq(presetNameFor("😀".repeat(60), []), "Imported", "emoji are not allowed characters");
+eq(presetNameFor("é".repeat(60), []), "é".repeat(40), "cut by characters, not code units");
+eq(presetNameFor("name...", []), "name", "trailing dots go with the other dropped characters");
+eq(presetNameFor("CON", []), "CON preset", "a reserved name gets a suffix");
+eq(presetNameFor("nul", []), "nul preset", "reserved without regard to case");
+eq(presetNameFor("com1", ["COM1 preset"]), "com1 preset 2", "reserved and a clash");
+eq(presetNameFor("LPT9.", []), "LPT9 preset", "reserved once the dot is gone");
+eq(presetNameFor("console", []), "console", "a name that only starts with a reserved one is fine");
+eq(presetNameFor("COM0", []), "COM0", "COM0 is not reserved");
+for (const stem of ["CON", "aux", "x".repeat(200), "a. . .", "  ", "💥", "Prn", "LPT1"]) {
+  eq(presetNameError(presetNameFor(stem, [])), null, `an imported name always passes the rule: ${stem}`);
+}
+
+// The name rule the menu enforces up front (the backend's `check_preset_name`).
+eq(presetNameError(""), null, "empty is nothing to save, not an error");
+eq(presetNameError("Studio light"), null, "plain name");
+eq(presetNameError("Über_Ünï-1"), null, "allowed characters");
+eq(presetNameError("a".repeat(64)), null, "64 characters pass");
+eq(presetNameError("é".repeat(64)), null, "64 characters pass, counted as characters");
+eq(presetNameError("a".repeat(65)) !== null, true, "65 characters fail");
+eq(presetNameError("😀".repeat(2)) !== null, true, "emoji fail");
+eq(presetNameError("a.b") !== null, true, "a dot fails");
+eq(presetNameError("trailing.") !== null, true, "a trailing dot fails");
+eq(presetNameError("trailing ") !== null, true, "a trailing space fails");
+eq(presetNameError(" leading"), null, "a leading space is allowed by the backend");
+eq(presetNameError("a/b") !== null, true, "a slash fails");
+for (const n of ["CON", "con", "Prn", "AUX", "nUl", "COM1", "com9", "LPT1", "lpt9"]) eq(presetNameError(n) !== null, true, `${n} is reserved`);
+for (const n of ["COM0", "LPT0", "COM10", "CONSOLE", "CON 1", "my CON"]) eq(presetNameError(n), null, `${n} is not reserved`);
 
 console.log("ok");

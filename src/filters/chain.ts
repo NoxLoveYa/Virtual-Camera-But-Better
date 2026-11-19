@@ -120,5 +120,28 @@ export const refreshExtParams = (chain: FilterCfg[], extensions: readonly Extens
   return changed ? next : chain;
 };
 
-/** Same rule the backend enforces for preset file names. */
+/** The characters a preset name may hold (the backend's rule for preset file names). */
 export const PRESET_NAME = /^[\p{L}\p{N} _-]+$/u;
+
+/** The longest preset name, in characters. Same number as `PRESET_NAME_MAX_CHARS` in the backend. */
+export const PRESET_NAME_MAX_CHARS = 64;
+
+/** Device names Windows keeps for itself: a file called `CON.json` is the console, not a file. */
+const RESERVED_NAME = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
+
+/** Whether `name` is a Windows device name (compared without regard to case). */
+export const isReservedPresetName = (name: string): boolean => RESERVED_NAME.test(name);
+
+/**
+ * Why the backend would refuse `name` as a preset name, as a short hint, or null when it takes it. Same rule as the
+ * backend's `check_preset_name`: allowed characters only, at most {@link PRESET_NAME_MAX_CHARS} characters, no
+ * trailing space, not a Windows device name. An empty name is not an error here (the field just has nothing to save).
+ */
+export function presetNameError(name: string): string | null {
+  if (name === "") return null;
+  if (!PRESET_NAME.test(name)) return "Use letters, numbers, spaces, - and _ only.";
+  if (Array.from(name).length > PRESET_NAME_MAX_CHARS) return `Use at most ${PRESET_NAME_MAX_CHARS} characters.`;
+  if (name.endsWith(" ")) return "A name can't end with a space.";
+  if (isReservedPresetName(name)) return `“${name}” is a name Windows keeps for itself. Pick another.`;
+  return null;
+}

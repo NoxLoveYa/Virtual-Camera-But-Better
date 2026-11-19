@@ -6,7 +6,7 @@
  * Kinds by extension, case-insensitive. LUT: `.cube`, `.png`. Image: `.png .jpg .jpeg .bmp .gif` (the lists of the file
  * dialog, `file_dialog.rs`). Preset: `.json`. Anything else, folders included, is unsupported.
  */
-import { PRESET_NAME } from "../filters/chain";
+import { PRESET_NAME, isReservedPresetName } from "../filters/chain";
 
 /** What a path field wants, as `PathField`'s `kind`. */
 export type PathKind = "image" | "lut";
@@ -129,17 +129,18 @@ export function hintFor(path: string, overField: boolean): string {
 }
 
 /**
- * The name an imported preset gets: the file name's characters that preset names allow, "Imported" when none are left,
+ * The name an imported preset gets: the file name's characters that preset names allow (so no dots), cut to 40
+ * characters and trimmed, "Imported" when none are left, " preset" added to a name Windows keeps for itself ("CON"),
  * and "Name 2", "Name 3"… while a preset of that name exists (compared without regard to case).
  */
 export function presetNameFor(stem: string, existing: readonly string[]): string {
   const clean = Array.from(stem)
     .filter((ch) => PRESET_NAME.test(ch))
-    .join("")
-    .trim()
     .slice(0, 40)
+    .join("")
     .trim();
-  const base = clean || "Imported";
+  const named = clean || "Imported";
+  const base = isReservedPresetName(named) ? `${named} preset` : named;
   const taken = new Set(existing.map((n) => n.toLowerCase()));
   if (!taken.has(base.toLowerCase())) return base;
   for (let n = 2; ; n++) {
