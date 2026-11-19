@@ -1,10 +1,11 @@
 # Release readiness: Better Cam 0.1.0
 
-Latest build: 2026-11-19 from commit `f68c15a` (`fix(fx): Auto Adjust white balance stops flipping on a face`), on the
-development PC (Windows 11 Pro 10.0.26200). The working tree was clean. Nothing was uploaded, tagged or published.
+Latest build: 2026-11-19 from commit `42fef49` (`fix(presets): undo and save cannot cross a preset load`), on the
+development PC (Windows 11 Pro 10.0.26200). The working tree was clean. This build is published as the GitHub pre-release
+`v0.1.0` (tag `v0.1.0`, on the release-notes commit that follows `42fef49`).
 
-An earlier build the same day came from commit `ac02150`; its install test is the one recorded below. Its hashes are
-superseded by the ones in the table.
+Earlier builds: `f68c15a` (same day; its hashes are superseded and no longer listed), and `ac02150` (its install test is
+the one recorded below).
 
 ## Build
 
@@ -13,25 +14,32 @@ publisher NoxLoveYa, per-machine NSIS installer.
 
 | File | Size (bytes) | SHA-256 |
 |---|---|---|
-| `target\release\bundle\nsis\Better Cam_0.1.0_x64-setup.exe` | 3,734,351 (3.56 MiB) | `8F544B30C5D8B71E990F37CD9C889FA3CA14D41EBB9CA06DD608AB289A2E31F5` |
-| `target\release\bundle\portable\Better-Cam-0.1.0-portable.zip` | 5,088,954 | `1B81142C609F919C96FB860A24B1A9AF545820F88B4092071EC0DAC284C6AEED` |
-| `better-cam.exe` (in the zip; the installer packs the same file) | 14,449,152 | `D93785926493CBDAE517CD4262EC54FD57B02CA9E0A9485C9469ED308BA68770` |
-| `better_cam_vcam.dll` (in the zip; the installer packs the same file; build id `282bb805`) | 809,472 | `516CB5AFB8DF42B19A81D40EC9195370F693A2FBF65C879E73ADF16D3DE1E074` |
+| `target\release\bundle\nsis\Better Cam_0.1.0_x64-setup.exe` | 3,759,049 (3.58 MiB) | `C4EDD40C55AFFCE171B4A31955659F8E4DAD9386F9F7AF37EB869735E2178639` |
+| `target\release\bundle\portable\Better-Cam-0.1.0-portable.zip` | 5,115,136 | `00F3A17AFCF09A9A2AA023ED0EC822A6F8E5562F9857D796FDF512241E159481` |
+| `target\release\better-cam.exe` (in the zip; the installer packs the same file) | 14,492,160 | `66FE89A339C850EAB7B027C16B785EB3609AE2B7918CA1EDBBF5A4813540CFB3` |
+| `target\release\better_cam_vcam.dll` (in the zip; the installer packs the same file; build id `282bb805`) | 809,472 | `516CB5AFB8DF42B19A81D40EC9195370F693A2FBF65C879E73ADF16D3DE1E074` |
 
-The zip holds `better-cam.exe`, `vcam/better_cam_vcam.dll`, `LICENSE` and `README.txt` (checked by unzipping it into a
-temp folder, since deleted); the exe and the DLL in it match `target\release\better-cam.exe` and
-`target\release\better_cam_vcam.dll`. The virtual camera DLL is byte for byte the same as in the earlier build (same hash,
+The zip holds `better-cam.exe`, `vcam/better_cam_vcam.dll`, `LICENSE` and `README.txt` (checked by reading the zip
+entries in memory, nothing extracted); the exe and the DLL in it match `target\release\better-cam.exe` and
+`target\release\better_cam_vcam.dll`. The virtual camera DLL is byte for byte the same as in the earlier builds (same hash,
 same build id). The installer's inner copy of the exe was not extracted and compared. The zip's exe has no `--version`
 switch, so it was not started (it would take the camera).
 
-### Changes since the previous build (`ac02150`)
+### What this release adds (since `f68c15a`)
 
-Only app code changed; the virtual camera and the installer did not.
+Only app code and docs changed; the virtual camera and the installer did not (see the install-test note below).
 
-- `3fa0ba2` docs: README for the new features, and the first version of these release notes.
-- `eed7ca5` The app now explains a slow camera for any format choice, not only some.
-- `0ee222d` Automatic white balance no longer hunts back and forth on a face in a dim room.
-- `f68c15a` The Auto Adjust white balance effect no longer flips back and forth on a face.
+- Inspector layout: a navigator on the left (Camera, Camera controls, Output, then the filter chain with status dots),
+  the preview in the middle, and a settings panel on the right for the selected item. Below 1100 px the navigator becomes
+  an icon rail. Keyboard navigation: arrows select, Space bypasses a filter, Delete removes it, Enter or F6 goes to the
+  settings, Escape comes back.
+- Presets save and reapply everything: the filter chain, camera and capture settings, camera controls with their modes,
+  Better Cam auto settings, and output. Loading is one step you can undo. The title bar marks unsaved changes. Rename and
+  Reset to defaults are in the Preset menu. Presets from older versions (filters only) still load.
+- Compare: a split-wipe toggle over the preview. A bar shows the camera picture on one side and the result on the other;
+  drag it, or the picture, to wipe. It can be vertical or horizontal.
+- Warmth fix `1a8a686`: warmth always applies; a face is followed slowly, not held.
+- Preset file safety: names Windows cannot store are refused up front; undo and save cannot cross a preset load.
 
 Build warnings (none affects the result):
 
@@ -43,10 +51,10 @@ Build warnings (none affects the result):
 ## Tests on this PC
 
 These install and uninstall tests were run on the earlier build from commit `ac02150` (`Better Cam_0.1.0_x64-setup.exe`
-with SHA-256 `73F978F9...3545A5`), and were **not repeated** for the latest build from `f68c15a`. The installer code
+with SHA-256 `73F978F9...3545A5`), and were **not repeated** for this build from `42fef49`. The installer code
 (`src-tauri/windows`, the `bundle` part of `src-tauri/tauri.conf.json`, `crates/vcam-install`, `scripts`) is unchanged
-between `3fa0ba2` and `f68c15a` (`git diff 3fa0ba2 HEAD --stat` on those paths is empty), and the virtual camera DLL has
-the same hash, so the results below still describe the installer. The installed app code is newer, and it has not been
+between `3fa0ba2` and `42fef49` (`git diff f68c15a HEAD --stat` on those paths is empty, and `tauri.conf.json` did not change
+in that range either), and the virtual camera DLL has the same hash, so the results below still describe the installer. The installed app code is newer, and it has not been
 started from an installer.
 
 Both the dev virtual camera and the installer use the same folder and the same DLL name
