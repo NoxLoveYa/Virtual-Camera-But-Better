@@ -153,11 +153,35 @@ pub struct ExposureFacts {
     pub target_fps: f64,
     /// The rate the camera dropped to when the learned cap was set.
     pub dropped_to: Option<f64>,
+    /// The backlight term is on (10.7): the median backlight term of the readings is at least `BACKLIT_ON`, with
+    /// hysteresis.
+    pub backlit: bool,
+    /// The front light term is on (11.8, 13.11): the loop's held reading is at least `FRONTLIT_ON` (0.5 stop) under
+    /// its plain one, with hysteresis (off again from 0.25 stop). The flag only says so; `hold_note` decides what the
+    /// text shows, and `backlit` goes first.
+    pub frontlit: bool,
     /// Why the loop stopped, and where the control went.
     pub fault: Option<Fault>,
     pub handed_back: Option<HandBackKind>,
     /// How long there has been no picture, in seconds.
     pub no_picture_for: f64,
+}
+
+/// 10.7: the end of a holding text while the backlight term is on: why the window is white.
+pub const BACKLIGHT_NOTE: &str = " · backlight: exposing for the middle";
+
+/// 11.8: the end of a holding text while the front light term is on: why the face is not white and the room is dark.
+pub const FRONTLIT_NOTE: &str = " · dark room: exposing for the lit middle";
+
+/// The suffix of a holding text: at most one, 10's first.
+fn hold_note(f: &ExposureFacts) -> &'static str {
+    if f.backlit {
+        BACKLIGHT_NOTE
+    } else if f.frontlit {
+        FRONTLIT_NOTE
+    } else {
+        ""
+    }
 }
 
 /// The text of 4.2 for the state, `None` when the state has none of its own.
@@ -172,9 +196,15 @@ pub fn exposure_message(f: &ExposureFacts) -> Option<String> {
         ExposureState::Starting | ExposureState::Adjusting => Some("Adjusting…".to_string()),
         ExposureState::Holding if f.lowered => {
             let fps = f.fps.round();
+            let note = hold_note(f);
             Some(match (f.gain, f.max_gain) {
-                (Some(g), Some(m)) => format!("Lowered frame rate for light: holding {fps:.0} fps · gain {g} of {m}"),
-                _ => format!("Lowered frame rate for light: holding {fps:.0} fps · {}", exposure_time(f.exposure)),
+                (Some(g), Some(m)) => {
+                    format!("Lowered frame rate for light: holding {fps:.0} fps · gain {g} of {m}{note}")
+                }
+                _ => format!(
+                    "Lowered frame rate for light: holding {fps:.0} fps · {}{note}",
+                    exposure_time(f.exposure)
+                ),
             })
         }
         ExposureState::Holding => {
@@ -187,10 +217,11 @@ pub fn exposure_message(f: &ExposureFacts) -> Option<String> {
                 ));
             }
             let fps = f.fps.round();
+            let note = hold_note(f);
             Some(match (f.gain, f.max_gain) {
-                (Some(g), Some(m)) => format!("Holding {fps:.0} fps · gain {g} of {m}"),
-                _ if f.gain_off => format!("Holding {fps:.0} fps · {} · gain off", exposure_time(f.exposure)),
-                _ => format!("Holding {fps:.0} fps · {}", exposure_time(f.exposure)),
+                (Some(g), Some(m)) => format!("Holding {fps:.0} fps · gain {g} of {m}{note}"),
+                _ if f.gain_off => format!("Holding {fps:.0} fps · {} · gain off{note}", exposure_time(f.exposure)),
+                _ => format!("Holding {fps:.0} fps · {}{note}", exposure_time(f.exposure)),
             })
         }
         ExposureState::LimitGain if f.lowered => Some(format!(
@@ -268,10 +299,75 @@ mod tests {
             fps: 30.0,
             target_fps: 30.0,
             dropped_to: None,
+            backlit: false,
+            frontlit: false,
             fault: None,
             handed_back: None,
             no_picture_for: 0.0,
         }
+    }
+
+    #[test]
+    fn a_backlit_hold_says_why_the_window_is_white() {
+        let say = |f: &dyn Fn(&mut ExposureFacts)| {
+            let mut x = facts(ExposureState::Holding);
+            x.backlit = true;
+            f(&mut x);
+            exposure_message(&x).unwrap()
+        };
+        let note = " · backlight: exposing for the middle";
+        assert_eq!(BACKLIGHT_NOTE, note);
+        assert_eq!(say(&|_| {}), format!("Holding 30 fps · gain 48 of 75{note}"));
+        assert_eq!(
+            say(&|x| {
+                x.gain = None;
+                x.max_gain = None;
+            }),
+            format!("Holding 30 fps · 1/32 s{note}")
+        );
+        assert_eq!(
+            say(&|x| x.lowered = true),
+            format!("Lowered frame rate for light: holding 30 fps · gain 48 of 75{note}")
+        );
+        // Not backlit: no suffix; and no suffix on a text that is not a hold.
+        assert_eq!(exposure_message(&facts(ExposureState::Holding)).unwrap(), "Holding 30 fps · gain 48 of 75");
+        let mut x = facts(ExposureState::LimitGain);
+        x.backlit = true;
+        assert!(!exposure_message(&x).unwrap().contains("backlight"));
+    }
+
+    #[test]
+    fn a_front_lit_hold_says_the_room_is_dark() {
+        let note = " · dark room: exposing for the lit middle";
+        assert_eq!(FRONTLIT_NOTE, note);
+        let say = |f: &dyn Fn(&mut ExposureFacts)| {
+            let mut x = facts(ExposureState::Holding);
+            x.frontlit = true;
+            f(&mut x);
+            exposure_message(&x).unwrap()
+        };
+        assert_eq!(say(&|_| {}), format!("Holding 30 fps · gain 48 of 75{note}"));
+        assert_eq!(
+            say(&|x| {
+                x.gain = None;
+                x.max_gain = None;
+            }),
+            format!("Holding 30 fps · 1/32 s{note}")
+        );
+        assert_eq!(
+            say(&|x| x.lowered = true),
+            format!("Lowered frame rate for light: holding 30 fps · gain 48 of 75{note}")
+        );
+        // At most one suffix, and 10's wins.
+        assert_eq!(
+            say(&|x| x.backlit = true),
+            format!("Holding 30 fps · gain 48 of 75{BACKLIGHT_NOTE}")
+        );
+        // None on a text that is not a hold, none when the flag is off.
+        let mut x = facts(ExposureState::LimitGain);
+        x.frontlit = true;
+        assert!(!exposure_message(&x).unwrap().contains("dark room"));
+        assert_eq!(exposure_message(&facts(ExposureState::Holding)).unwrap(), "Holding 30 fps · gain 48 of 75");
     }
 
     #[test]

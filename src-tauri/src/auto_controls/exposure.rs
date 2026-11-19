@@ -89,6 +89,172 @@ const JUDGE_PATIENCE: f64 = 3.0;
 const METER_EDGE: f64 = SEARCH_STOPS - 0.1;
 /// The white balance loop waits while the exposure loop is adjusting with more error than this (2.6).
 const UNSETTLED_STOPS: f64 = 1.0;
+/// 10.7: the card says "backlight: exposing for the middle" from this many stops of the backlight term, until it is
+/// down to the second value.
+const BACKLIT_ON: f64 = 0.5;
+const BACKLIT_OFF: f64 = 0.25;
+/// 11.4: while the front light term is on (a lit face), the loop never wants more light than the lit readings of this
+/// many seconds said: it darkens at once when a lit face appears and waits this long before it brightens when the
+/// face turns away.
+const FRONT_HOLD: f64 = 2.0;
+/// 13.11, 13.13: the hold while lit samples keep arriving, and after the last one once a lit face has come back (a face
+/// that comes and goes every few seconds): a release and a new darkening, over and over, are the reversals W4 counts.
+/// Longer than the face stays away (2-3.5 s in the sim) and than a face that stays lit swings (a lean, a wave of up to
+/// 12 s whose lit half is 6 s); shorter than a lamp stays off.
+const FRONT_HOLD_LONG: f64 = 6.0;
+/// 13.13 A: a gap between two lit samples longer than this is the face away from the light (a lit face moves 0.2-0.5
+/// stop from frame to frame, and a sample or two near the edge of the term's gate drop out): its coming back is the
+/// come-back that lengthens the hold, also when it is back before the hold ran out (a wave of 8 s is away for 2 s).
+const FRONT_GAP: f64 = 1.0;
+/// 13.11: how long after the hold ran out the lit face may come back and still lengthen the hold; after a longer
+/// absence the hold is `FRONT_HOLD` again.
+const FRONT_BACK_WITHIN: f64 = 6.0;
+/// 13.13 E: lit samples without a gap longer than `FRONT_GAP` for this long end the long hold after the last lit
+/// sample (`FRONT_HOLD` again): a lamp that goes off then is a lamp, not a face that comes back. Twice
+/// `FRONT_HOLD_LONG`, so that the lit half of a slow wave (12 s period: 6 s lit) is not taken for it.
+const FRONT_STAYED: f64 = 2.0 * FRONT_HOLD_LONG;
+/// 11.8: the card says "dark room: exposing for the lit middle" from this many stops of the held front light term
+/// (negative), until it is up to the second value.
+const FRONTLIT_ON: f64 = -0.5;
+const FRONTLIT_OFF: f64 = -0.25;
+
+/// The "backlit" flag after a reading whose median backlight term is `backlight` stops: on from `BACKLIT_ON`, off at
+/// `BACKLIT_OFF` or less, unchanged between (hysteresis, so the polite live region of the card does not chatter).
+pub fn backlit_after(was: bool, backlight: f64) -> bool {
+    if backlight >= BACKLIT_ON {
+        true
+    } else if backlight <= BACKLIT_OFF {
+        false
+    } else {
+        was
+    }
+}
+
+/// The "front lit" flag after a held front light term of `front` stops (`<= 0`): on from `FRONTLIT_ON`, off at
+/// `FRONTLIT_OFF` or more, unchanged between (11.8).
+pub fn frontlit_after(was: bool, front: f64) -> bool {
+    if front <= FRONTLIT_ON {
+        true
+    } else if front >= FRONTLIT_OFF {
+        false
+    } else {
+        was
+    }
+}
+
+/// The lit hold (11.4, 13.11, 13.13): the readings of the samples that have the front light term on (a lit face). The
+/// loop never wants more light than the lowest of them says (attack at once, release later). A reading and not only its
+/// front term is held: with the term on, the reading follows the face (a face two stops darker is a reading a stop
+/// higher), so holding the term alone leaves the loop following a face that comes and goes.
+///
+/// While lit samples keep arriving (the last one at most `FRONT_HOLD` ago) the held reading is the lowest of the last
+/// `FRONT_HOLD_LONG` seconds: a face that stays lit and changes by half a stop to two (a lean, a smooth wave) swings
+/// through that window, and the loop follows its brightest moment and not each swing. Once they stop (the lamp is off,
+/// the face left the light: the term is back to 0) the hold lasts `len` after the last one: `FRONT_HOLD` until a lit
+/// sample comes back after more than `FRONT_GAP` away, within `len` or `FRONT_BACK_WITHIN` after the hold ran out (a
+/// face that comes and goes), then `FRONT_HOLD_LONG` until `FRONT_STAYED` seconds of lit samples pass without such a
+/// gap (it stayed: a lamp that goes off then is a lamp); a longer absence, a pause or a close puts it back. A hold that
+/// ran out is released for good: the readings it held do not come back with the next lit sample.
+#[derive(Clone, Debug)]
+struct LitHold {
+    /// `(capture time, reading)` of the lit samples of the last `FRONT_HOLD_LONG` seconds.
+    ring: VecDeque<(f64, f64)>,
+    /// `(time the picture shows it, stops)` of the writes of the last `FRONT_HOLD_LONG` seconds: a reading captured
+    /// before one is that many stops too bright to compare with a reading captured after it.
+    moves: VecDeque<(f64, f64)>,
+    /// The hold after the last lit sample, when lit samples have stopped.
+    len: f64,
+    /// Capture time of the last lit sample.
+    last: Option<f64>,
+    /// Capture time of the first sample of the run of lit samples that has no gap longer than `FRONT_GAP`.
+    run_from: f64,
+}
+
+impl LitHold {
+    fn new() -> LitHold {
+        LitHold {
+            ring: VecDeque::new(),
+            moves: VecDeque::new(),
+            len: FRONT_HOLD,
+            last: None,
+            run_from: f64::NEG_INFINITY,
+        }
+    }
+
+    /// A write batch that changed the light by `dx` stops (more light is positive) shows in the pictures captured from
+    /// `shown`; its first write started at `from`. A lit reading captured in between shows the batch partly (the
+    /// camera applies a write somewhere in there) and is dropped; the older ones are `dx` stops too bright now.
+    fn moved(&mut self, shown: f64, dx: f64, from: f64) {
+        self.ring.retain(|&(t, _)| !(from <= t && t < shown));
+        self.moves.push_back((shown, dx));
+        while self.moves.front().is_some_and(|&(s, _)| s < shown - FRONT_HOLD_LONG - 1.0) {
+            self.moves.pop_front();
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = LitHold::new();
+    }
+
+    /// A confident sample captured at `t`, read `e` stops, with the front light term on.
+    fn push(&mut self, t: f64, e: f64) {
+        match self.last.map(|l| t - l) {
+            None => self.run_from = t,
+            Some(gap) if gap > FRONT_GAP => {
+                self.run_from = t;
+                if gap > self.len {
+                    // The hold had run out: what it held is released for good (the new lit samples must not bring it
+                    // back). A lit face that is back soon after is one that comes and goes.
+                    self.ring.clear();
+                    self.len = if gap - self.len <= FRONT_BACK_WITHIN {
+                        FRONT_HOLD_LONG
+                    } else {
+                        FRONT_HOLD
+                    };
+                } else {
+                    // Away for a while and back before the hold ran out: one that comes and goes as well.
+                    self.len = FRONT_HOLD_LONG;
+                }
+            }
+            Some(_) => {
+                if self.len > FRONT_HOLD && t - self.run_from >= FRONT_STAYED {
+                    // It stayed lit for twice as long as the long hold lasts, with no come-back: a lamp that goes
+                    // off now is a lamp.
+                    self.len = FRONT_HOLD;
+                }
+            }
+        }
+        self.last = Some(t);
+        self.ring.push_back((t, e));
+        while self.ring.front().is_some_and(|&(s, _)| s < t - FRONT_HOLD_LONG) {
+            self.ring.pop_front();
+        }
+        while self.moves.front().is_some_and(|&(s, _)| s < t - FRONT_HOLD_LONG) {
+            self.moves.pop_front();
+        }
+    }
+
+    /// The lowest median of three consecutive lit readings among those in the hold at `now`, each as the picture now
+    /// would read it (less the writes since); `None` with fewer than three lit readings.
+    fn held(&self, now: f64) -> Option<f64> {
+        let lit_now = self.last.is_some_and(|l| now - l <= FRONT_HOLD);
+        let len = if lit_now { FRONT_HOLD_LONG } else { self.len };
+        let v: Vec<f64> = self
+            .ring
+            .iter()
+            .filter(|&&(t, _)| t >= now - len)
+            .map(|&(t, e)| e - self.moves.iter().filter(|&&(shown, _)| shown > t).map(|&(_, dx)| dx).sum::<f64>())
+            .collect();
+        v.windows(MEDIAN_SAMPLES)
+            .map(|w| {
+                let mut w = [w[0], w[1], w[2]];
+                w.sort_by(f64::total_cmp);
+                w[1]
+            })
+            .min_by(f64::total_cmp)
+    }
+}
+
 /// 2.3 "gain range under 0.5 stop": the whole gain range (3 stops until learned) must have steps no coarser than half
 /// a stop, i.e. at least this many.
 const GAIN_MIN_STEPS: i32 = 6;
@@ -239,6 +405,14 @@ struct Sample {
     e: f64,
     conf: f64,
     clip: f64,
+    /// The stops of `e` that are the backlight term (10.4), and the share of light sources that opened it.
+    backlight: f64,
+    sources: f64,
+    /// The stops of `e` that are the front light term (11.4, `<= 0`), and the gap to the room that opened it.
+    front: f64,
+    room_gap: f64,
+    /// The horizontal spread of the bright tenth (13.4), for the log line.
+    spread: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -251,6 +425,16 @@ struct Pending {
     seed: bool,
     /// An exposure write above the frame-rate limit (2.5.12): a camera may refuse it.
     past_rate: bool,
+}
+
+/// A decision's write batch in flight: what the lit hold needs to know when it lands (13.13 C).
+#[derive(Clone, Copy, Debug)]
+struct Moving {
+    /// The model's light `E + gs(G)` (stops) when the batch was decided, and the `S` it was computed with.
+    x_before: f64,
+    s: f64,
+    /// When the first write of the batch started (the earliest start reported so far).
+    started: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -304,10 +488,20 @@ enum Guard {
 /// What the loop makes of the samples it may use now.
 #[derive(Clone, Copy, Debug)]
 struct Reading {
+    /// What the loop decides on (11.4): the median of the last samples, never above the lit hold's reading.
     e: f64,
+    /// The median of the readings without their front light term (section 10's reading): what the camera's answer to a
+    /// write is measured on (W3, gain learning). The front term follows the face, not the exposure (13.11).
+    e_plain: f64,
     sigma: f64,
     conf: f64,
     clip: f64,
+    backlight: f64,
+    sources: f64,
+    /// The front light term the decision has now: `e - e_plain` (11.8).
+    front_held: f64,
+    room_gap: f64,
+    spread: f64,
 }
 
 pub struct ExposureLoop {
@@ -376,6 +570,21 @@ pub struct ExposureLoop {
     last_e: f64,
     /// Confidence and clipped share of the last decision's reading, for the log line (`diag`).
     last_conf_clip: (f64, f64),
+    /// The median backlight term (stops) and light-source share of the last decision's reading (10.7, `diag`).
+    last_backlight: (f64, f64),
+    /// The backlight term is on: at least `BACKLIT_ON` stops, until it falls to `BACKLIT_OFF` (the card says so while
+    /// holding).
+    backlit: bool,
+    /// The readings of the samples with the front light term on (11.4, 13.11), kept comparable across writes; cleared
+    /// on pause, close, engagement and a new target.
+    lit_hold: LitHold,
+    /// The batch in flight, for the lit hold when it lands (13.13 C).
+    moving: Option<Moving>,
+    /// The held front light term (stops), the median gap to the room and the median spread of the bright tenth of the
+    /// last decision's reading (11.8, 13.4, `diag`).
+    last_front: (f64, f64, f64),
+    /// The held front light term is on: at most `FRONTLIT_ON` stops, until it is back up to `FRONTLIT_OFF`.
+    frontlit: bool,
     /// Seconds without a sample, when it is long enough to matter (W5).
     no_picture: Option<f64>,
     /// Values another program changed: written again (W6).
@@ -432,6 +641,12 @@ impl ExposureLoop {
             limit_stored: false,
             last_e: f64::INFINITY,
             last_conf_clip: (0.0, 0.0),
+            last_backlight: (0.0, 0.0),
+            backlit: false,
+            lit_hold: LitHold::new(),
+            moving: None,
+            last_front: (0.0, 0.0, 0.0),
+            frontlit: false,
             no_picture: None,
             retakes: Vec::new(),
             watchdog: Watchdog::new(Unit::Stops),
@@ -447,6 +662,7 @@ impl ExposureLoop {
         if (cfg.target - self.cfg.target).abs() > f64::EPSILON {
             // The error of the samples was measured against the old target.
             self.samples.clear();
+            self.lit_hold.clear();
             self.batch = None;
         }
         if cfg.longest != self.cfg.longest || cfg.max_gain != self.cfg.max_gain {
@@ -464,6 +680,13 @@ impl ExposureLoop {
         if self.over && !self.over_above && self.e <= lim.e_rate && e2 <= lim.e_rate {
             self.end_lowered();
         }
+    }
+
+    /// The card's "backlit" and "front lit" notes say what the last decision saw: after a pause or a close there is no
+    /// such decision, and the first "Holding" text after the resume must not show them (13.11).
+    fn clear_notes(&mut self) {
+        self.backlit = false;
+        self.frontlit = false;
     }
 
     /// The frame rate is no longer lowered for light (2.5.12).
@@ -507,6 +730,7 @@ impl ExposureLoop {
     pub fn reset_session(&mut self) {
         self.started = false;
         self.samples.clear();
+        self.lit_hold.clear();
         self.pending.clear();
         self.retakes.clear();
         self.fault = None;
@@ -530,6 +754,10 @@ impl ExposureLoop {
         self.last_arrival = f64::NEG_INFINITY;
         self.last_e = f64::INFINITY;
         self.last_conf_clip = (0.0, 0.0);
+        self.last_backlight = (0.0, 0.0);
+        self.backlit = false;
+        self.last_front = (0.0, 0.0, 0.0);
+        self.frontlit = false;
         self.no_picture = None;
         self.watchdog.reset();
     }
@@ -692,15 +920,28 @@ impl ExposureLoop {
             error,
             confidence,
             clip,
+            backlight,
+            sources,
+            front,
+            room_gap,
+            spread,
         } = measure_exposure(stats, self.cfg.target);
         self.samples.push_back(Sample {
             t: capture_time,
             e: error,
             conf: confidence,
             clip,
+            backlight,
+            sources,
+            front,
+            room_gap,
+            spread,
         });
         while self.samples.len() > MAX_SAMPLES {
             self.samples.pop_front();
+        }
+        if confidence >= NO_SIGNAL_CONFIDENCE && front <= FRONTLIT_ON {
+            self.lit_hold.push(capture_time, error);
         }
     }
 
@@ -746,6 +987,19 @@ impl ExposureLoop {
             }
         }
         self.t_done = self.t_done.max(w.done);
+        if let Some(m) = self.moving.as_mut() {
+            m.started = m.started.min(w.started);
+        }
+        if self.pending.is_empty() {
+            // The batch has landed: pictures captured from `valid_from` on show it. What it changed is the model's
+            // light now (the read-backs, a refused or failed write left out) less the light it started from.
+            if let Some(m) = self.moving.take() {
+                let dx = self.x(m.s) - m.x_before;
+                if dx.abs() > 1e-9 {
+                    self.lit_hold.moved(self.valid_from(), dx, m.started);
+                }
+            }
+        }
     }
 
     /// W6: the 1 Hz read-back of a driven control.
@@ -864,10 +1118,14 @@ impl ExposureLoop {
         if self.closed {
             self.started = false;
             self.no_picture = None;
+            self.lit_hold.clear();
+            self.clear_notes();
             return Vec::new();
         }
         if facts.paused {
             self.paused = true;
+            self.lit_hold.clear();
+            self.clear_notes();
             self.no_signal_since = None;
             self.limit_since = None;
             self.dark_since = None;
@@ -1000,6 +1258,7 @@ impl ExposureLoop {
 
     /// Record the writes as pending and believe them; the runner reports each result.
     fn issue(&mut self, writes: Vec<(ControlKey, i32)>, seed: bool) -> Vec<Action> {
+        self.moving = None;
         let mut out = Vec::with_capacity(writes.len());
         for (key, value) in writes {
             let prev = match key {
@@ -1064,18 +1323,36 @@ impl ExposureLoop {
             });
         self.state = ExposureState::Adjusting;
         self.band = Band::Adjusting;
-        Some(self.issue(plan.into_iter().map(|(k, v, _)| (k, v)).collect(), false))
+        let x_before = self.x(lim.s);
+        let actions = self.issue(plan.into_iter().map(|(k, v, _)| (k, v)).collect(), false);
+        self.moving = Some(Moving {
+            x_before,
+            s: lim.s,
+            started: f64::INFINITY,
+        });
+        Some(actions)
     }
 
     /// The valid samples: captured after the last write landed (`D_apply`, longer for a slow camera) and after a
     /// resume (2.5.4).
     fn valid(&self) -> Vec<Sample> {
-        let threshold =
-            (self.t_done + D_APPLY_BASE + 1.0 / self.f + self.watchdog.slow()).max(self.resumed_at);
+        let threshold = self.valid_from();
         self.samples.iter().filter(|s| s.t >= threshold).copied().collect()
     }
 
-    fn reading(valid: &[Sample]) -> Option<Reading> {
+    fn valid_from(&self) -> f64 {
+        (self.t_done + D_APPLY_BASE + 1.0 / self.f + self.watchdog.slow()).max(self.resumed_at)
+    }
+
+    /// The lit hold's reading (11.4, 13.11) for these valid samples: the lowest recent reading of a lit face, as the
+    /// picture now would read it.
+    fn lit_held(&self, valid: &[Sample]) -> Option<f64> {
+        self.lit_hold.held(valid.last()?.t)
+    }
+
+    /// `hold` is the lit hold's reading (`lit_held`): the decision's `e` is the median of the last samples, never
+    /// above it (11.4).
+    fn reading(valid: &[Sample], hold: Option<f64>) -> Option<Reading> {
         if valid.len() < 2 {
             return None;
         }
@@ -1089,19 +1366,29 @@ impl ExposureLoop {
                 v[v.len() / 2]
             }
         };
-        let tail: Vec<f64> = valid.iter().rev().take(SIGMA_SAMPLES).map(|s| s.e).collect();
+        // The spread of what the decision is about: the reading without the front light term, which the hold deals
+        // with (a moving face changes it by 0.2-0.5 stop from frame to frame).
+        let tail: Vec<f64> = valid.iter().rev().take(SIGMA_SAMPLES).map(|s| s.e - s.front).collect();
         let mean = tail.iter().sum::<f64>() / tail.len() as f64;
         let sigma = (tail.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / tail.len() as f64).sqrt();
+        let e_plain = median(|s| s.e - s.front);
+        let e = hold.map_or(median(|s| s.e), |h| median(|s| s.e).min(h));
         Some(Reading {
-            e: median(|s| s.e),
+            e,
+            e_plain,
             sigma,
             conf: median(|s| s.conf),
             clip: median(|s| s.clip),
+            backlight: median(|s| s.backlight),
+            sources: median(|s| s.sources),
+            front_held: e - e_plain,
+            room_gap: median(|s| s.room_gap),
+            spread: median(|s| s.spread),
         })
     }
 
-    /// The error now as the white balance loop may look at it: the median of the last valid samples, or the last
-    /// decision's reading when there are none yet.
+    /// The error now as the white balance loop may look at it: the median of the last valid samples, never above the
+    /// lit hold's reading, or the last decision's reading when there are none yet.
     fn peek_error(&self) -> f64 {
         let valid = self.valid();
         if valid.is_empty() {
@@ -1109,7 +1396,8 @@ impl ExposureLoop {
         }
         let mut v: Vec<f64> = valid.iter().rev().take(MEDIAN_SAMPLES).map(|s| s.e).collect();
         v.sort_by(f64::total_cmp);
-        v[v.len() / 2]
+        let e = v[v.len() / 2];
+        self.lit_held(&valid).map_or(e, |h| e.min(h))
     }
 
     /// What the white balance loop looks at (2.6).
@@ -1141,11 +1429,15 @@ impl ExposureLoop {
             return self.move_to(e2, g2, lim, None, None).unwrap_or_default();
         }
         let valid = self.valid();
-        let Some(r) = Self::reading(&valid) else {
+        let Some(r) = Self::reading(&valid, self.lit_held(&valid)) else {
             return Vec::new();
         };
         self.last_e = r.e;
         self.last_conf_clip = (r.conf, r.clip);
+        self.last_backlight = (r.backlight, r.sources);
+        self.backlit = backlit_after(self.backlit, r.backlight);
+        self.last_front = (r.front_held, r.room_gap, r.spread);
+        self.frontlit = frontlit_after(self.frontlit, r.front_held);
         self.learn(&r, learned);
         // W3: did the picture answer the last batch?
         match self.assess(now, &valid, &r) {
@@ -1184,8 +1476,8 @@ impl ExposureLoop {
         }
         let lim = &lim;
         let before = Before {
-            e: r.e,
-            judgeable: r.conf >= JUDGE_CONFIDENCE && r.clip < JUDGE_CLIP && r.e.abs() < METER_EDGE,
+            e: r.e_plain,
+            judgeable: r.conf >= JUDGE_CONFIDENCE && r.clip < JUDGE_CLIP && r.e_plain.abs() < METER_EDGE,
         };
         // W4: while damped the bands are wider.
         let bands = self.watchdog.band_scale(now);
@@ -1267,7 +1559,7 @@ impl ExposureLoop {
             (e2, self.g)
         };
         let probe = (r.conf >= LEARN_MIN_CONFIDENCE && r.clip < LEARN_MAX_CLIP).then(|| Probe {
-            e_before: r.e,
+            e_before: r.e_plain,
             dgs: self.gs_with(g2, s) - self.gs_with(self.g, s),
         });
         match self.move_to(e2, g2, lim, probe, Some(before)) {
@@ -1290,18 +1582,20 @@ impl ExposureLoop {
         let Some(b) = self.batch else {
             return Assess::Go;
         };
-        if r.conf < JUDGE_CONFIDENCE || r.clip >= JUDGE_CLIP || r.e.abs() >= METER_EDGE {
+        // W3 judges the camera's answer to a write, so it reads the picture without the front light term: the term
+        // follows the face, which a write does not move (13.11).
+        if r.conf < JUDGE_CONFIDENCE || r.clip >= JUDGE_CLIP || r.e_plain.abs() >= METER_EDGE {
             self.batch = None;
             return Assess::Go;
         }
-        if (b.e_before - r.e) / b.predicted >= NO_EFFECT_RATIO {
+        if (b.e_before - r.e_plain) / b.predicted >= NO_EFFECT_RATIO {
             self.watchdog.responded();
             self.batch = None;
             return Assess::Go;
         }
         let good: Vec<&Sample> = valid
             .iter()
-            .filter(|s| s.conf >= JUDGE_CONFIDENCE && s.clip < JUDGE_CLIP && s.e.abs() < METER_EDGE)
+            .filter(|s| s.conf >= JUDGE_CONFIDENCE && s.clip < JUDGE_CLIP && (s.e - s.front).abs() < METER_EDGE)
             .collect();
         let span = match (good.first(), good.last()) {
             (Some(a), Some(z)) => z.t - a.t,
@@ -1314,7 +1608,7 @@ impl ExposureLoop {
             }
             return Assess::Wait;
         }
-        let mut tail: Vec<f64> = good.iter().rev().take(MEDIAN_SAMPLES).map(|s| s.e).collect();
+        let mut tail: Vec<f64> = good.iter().rev().take(MEDIAN_SAMPLES).map(|s| s.e - s.front).collect();
         tail.sort_by(f64::total_cmp);
         let observed = tail[tail.len() / 2];
         self.batch = None;
@@ -1446,7 +1740,7 @@ impl ExposureLoop {
         if r.conf < LEARN_MIN_CONFIDENCE || r.clip >= LEARN_MAX_CLIP {
             return;
         }
-        let rho = (p.e_before - r.e) / p.dgs;
+        let rho = (p.e_before - r.e_plain) / p.dgs;
         if (LEARN_RHO.0..=LEARN_RHO.1).contains(&rho) {
             let s = learned.gain_stops.unwrap_or(S_INITIAL);
             let next = s * rho.clamp(LEARN_CLAMP.0, LEARN_CLAMP.1).powf(LEARN_EXPONENT);
@@ -1544,7 +1838,7 @@ impl ExposureLoop {
         let g = self.caps.gain.map_or("-".to_string(), |_| self.g.to_string());
         let max_g = lim.gain_usable.then_some(lim.g_cap).map_or("-".to_string(), |m| m.to_string());
         Some(format!(
-            "exposure {:?} E={} G={g} cap={} ({:?}) ceil={} over={} maxG={max_g} S={:.2} err={err} conf={:.2} clip={:.2} fps={:.1}/{:.0}",
+            "exposure {:?} E={} G={g} cap={} ({:?}) ceil={} over={} maxG={max_g} S={:.2} err={err} conf={:.2} clip={:.2} bl={:+.2} src={:.2} fl={:+.2} gap={:+.2} sd={:.2} fps={:.1}/{:.0}",
             self.state,
             self.e,
             lim.e_rate,
@@ -1554,6 +1848,11 @@ impl ExposureLoop {
             lim.s,
             self.last_conf_clip.0,
             self.last_conf_clip.1,
+            self.last_backlight.0,
+            self.last_backlight.1,
+            self.last_front.0,
+            self.last_front.1,
+            self.last_front.2,
             self.capture_fps,
             self.f,
         ))
@@ -1595,6 +1894,8 @@ impl ExposureLoop {
             fps: self.capture_fps,
             target_fps: self.f,
             dropped_to: self.dropped_to,
+            backlit: self.backlit,
+            frontlit: self.frontlit,
             fault: halted.map(|h| h.fault),
             handed_back,
             no_picture_for: self.no_picture.unwrap_or(0.0),
@@ -1625,5 +1926,186 @@ fn fault_state(f: Fault) -> ExposureState {
         Fault::NoResponse => ExposureState::NoResponse,
         Fault::Hunting => ExposureState::Hunting,
         Fault::Conflict => ExposureState::Conflict,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auto_controls::ExposureCfg;
+
+    /// Lit samples every 0.1 s from `from` to `to`, all reading `e`.
+    fn lit(h: &mut LitHold, from: f64, to: f64, e: f64) {
+        for i in 0..=((to - from) * 10.0).round() as i32 {
+            h.push(from + f64::from(i) * 0.1, e);
+        }
+    }
+
+    /// 13.13 A: a face that stays lit and gets darker (a higher reading) is not followed for `FRONT_HOLD_LONG` s, and
+    /// the hold lasts `FRONT_HOLD` after the last lit sample (a lamp that goes off).
+    #[test]
+    fn a_lit_face_that_stays_lit_is_held_over_the_long_window_and_a_lamp_off_releases_after_two_seconds() {
+        let mut h = LitHold::new();
+        lit(&mut h, 0.0, 2.0, 0.0);
+        lit(&mut h, 2.1, 5.0, 1.0);
+        assert_eq!(h.held(5.0), Some(0.0), "the brightest moment of the last 6 s");
+        assert_eq!(h.held(6.5), Some(0.0));
+        assert_eq!(h.held(5.0 + FRONT_HOLD - 0.05), Some(0.0), "still lit: the long window");
+        assert_eq!(h.held(5.0 + FRONT_HOLD + 0.05), None, "no lit sample for FRONT_HOLD: released");
+        // A lit face that stays 6 s at the darker level is followed.
+        lit(&mut h, 5.1, 9.0, 1.0);
+        assert_eq!(h.held(9.0), Some(1.0));
+    }
+
+    /// 13.13 F: the hold acts on three lit readings, not on one or two.
+    #[test]
+    fn the_hold_needs_three_lit_samples() {
+        let mut h = LitHold::new();
+        assert_eq!(h.held(0.0), None);
+        h.push(0.0, -1.0);
+        h.push(0.1, -1.0);
+        assert_eq!(h.held(0.1), None);
+        h.push(0.2, -1.0);
+        assert_eq!(h.held(0.2), Some(-1.0));
+    }
+
+    /// 13.13 A, E: the hold is lengthened by a lit face that comes back after more than `FRONT_GAP`, before the hold ran
+    /// out or after, within `FRONT_BACK_WITHIN`; a longer absence does not lengthen it; a run of lit samples of
+    /// `FRONT_STAYED` s ends the long hold.
+    #[test]
+    fn a_face_that_comes_back_lengthens_the_hold_and_a_long_stay_ends_it() {
+        let mut h = LitHold::new();
+        lit(&mut h, 0.0, 1.0, 0.0);
+        assert_eq!(h.len, FRONT_HOLD);
+        // Back after 1.5 s, before the hold ran out.
+        lit(&mut h, 2.5, 3.0, 0.0);
+        assert_eq!(h.len, FRONT_HOLD_LONG);
+        // A long stay (lit samples with no gap longer than FRONT_GAP) ends it.
+        lit(&mut h, 3.1, 3.0 + FRONT_STAYED + 0.5, 0.0);
+        assert_eq!(h.len, FRONT_HOLD);
+        // Back after the hold ran out, within FRONT_BACK_WITHIN: long again; after longer: not.
+        let end = 3.0 + FRONT_STAYED + 0.5;
+        lit(&mut h, end + 3.0, end + 3.2, 0.0);
+        assert_eq!(h.len, FRONT_HOLD_LONG);
+        let end = end + 3.2;
+        lit(&mut h, end + FRONT_HOLD_LONG + FRONT_BACK_WITHIN + 1.0, end + FRONT_HOLD_LONG + FRONT_BACK_WITHIN + 1.2, 0.0);
+        assert_eq!(h.len, FRONT_HOLD);
+    }
+
+    /// A hold that ran out is released for good: the readings it held do not come back with the next lit sample.
+    #[test]
+    fn a_released_hold_does_not_come_back() {
+        let mut h = LitHold::new();
+        lit(&mut h, 0.0, 1.0, 0.0);
+        lit(&mut h, 4.0, 4.5, 5.0);
+        assert_eq!(h.held(4.5), Some(5.0));
+    }
+
+    /// 13.13 B: `moves` stays small without lit samples (it was pruned in `push` only).
+    #[test]
+    fn the_write_log_is_bounded_without_lit_samples() {
+        let mut h = LitHold::new();
+        for i in 0..10_000 {
+            h.moved(f64::from(i) * 0.1, 0.2, f64::from(i) * 0.1 - 0.3);
+        }
+        assert!(h.moves.len() as f64 <= (FRONT_HOLD_LONG + 1.0) / 0.1 + 2.0, "{} entries", h.moves.len());
+    }
+
+    /// 13.13 C: older readings are shifted by the batch, those captured while it landed are dropped.
+    #[test]
+    fn a_landed_batch_shifts_older_readings_and_drops_those_in_between() {
+        let mut h = LitHold::new();
+        lit(&mut h, 0.0, 1.9, 0.0);
+        lit(&mut h, 2.0, 2.9, 0.5);
+        h.moved(3.0, 1.0, 2.0);
+        assert_eq!(h.ring.len(), 20, "the ten readings of 2.0-2.9 s are gone");
+        lit(&mut h, 3.0, 4.0, -1.0);
+        // Before the batch the face read 0.0; it would read 1 stop lower now.
+        assert_eq!(h.held(4.0), Some(-1.0));
+        assert_eq!(h.held(1.9 + 1.0 / 20.0), Some(-1.0), "a reading from before the batch, shifted");
+    }
+
+    fn loop_with_lit_samples() -> ExposureLoop {
+        let caps = ExposureCaps {
+            e_min: -11,
+            e_max: -2,
+            e_default: -5,
+            e_auto: true,
+            gain: Some(GainCaps {
+                min: 0,
+                max: 100,
+                step: 1,
+                default: 0,
+                can_auto: true,
+            }),
+        };
+        let mut l = ExposureLoop::new(caps, ExposureCfg::default());
+        l.f = 30.0;
+        l.e = -5;
+        l.g = 100;
+        l.e_rate = -5;
+        l.now = 10.0;
+        lit(&mut l.lit_hold, 0.0, 1.9, 0.0);
+        lit(&mut l.lit_hold, 10.0, 10.3, 0.0);
+        l
+    }
+
+    fn done(key: ControlKey, requested: i32, readback: Option<i32>, ok: bool) -> WriteDone {
+        WriteDone {
+            key,
+            requested,
+            readback,
+            ok,
+            started: 10.0,
+            done: 10.1,
+        }
+    }
+
+    /// Writes as `move_to` records them: the model's light before, then `issue`.
+    fn decided(l: &mut ExposureLoop, writes: Vec<(ControlKey, i32)>) {
+        let x_before = l.x(S_INITIAL);
+        l.issue(writes, false);
+        l.moving = Some(Moving {
+            x_before,
+            s: S_INITIAL,
+            started: f64::INFINITY,
+        });
+    }
+
+    /// 13.13 C: an exposure write past the frame-rate limit that the camera refuses (it reads back the old value)
+    /// changes no light: the lit readings are not shifted, and none is dropped.
+    #[test]
+    fn a_refused_exposure_write_shifts_nothing() {
+        let mut l = loop_with_lit_samples();
+        let before = l.lit_hold.ring.len();
+        decided(&mut l, vec![(ControlKey::Exposure, -4)]);
+        l.on_write_done(done(ControlKey::Exposure, -4, Some(-5), true));
+        assert!(l.lit_hold.moves.is_empty(), "{:?}", l.lit_hold.moves);
+        assert_eq!(l.lit_hold.ring.len(), before);
+    }
+
+    /// The same write taken: one stop, from the first picture after it landed.
+    #[test]
+    fn a_taken_exposure_write_shifts_by_the_stops_it_made() {
+        let mut l = loop_with_lit_samples();
+        decided(&mut l, vec![(ControlKey::Exposure, -4)]);
+        l.on_write_done(done(ControlKey::Exposure, -4, Some(-4), true));
+        let shown = l.valid_from();
+        assert_eq!(l.lit_hold.moves.iter().copied().collect::<Vec<_>>(), vec![(shown, 1.0)]);
+        // The samples at 10.0-10.3 s were captured while the write landed (started 10.0, shown from about 10.28).
+        assert!(l.lit_hold.ring.iter().all(|&(t, _)| t < 10.0 || t >= shown), "{:?}", l.lit_hold.ring);
+    }
+
+    /// A two-write batch whose last write failed: the first one still counts (only the last write's `ok` did).
+    #[test]
+    fn the_first_write_of_a_batch_counts_when_the_last_one_failed() {
+        let mut l = loop_with_lit_samples();
+        decided(&mut l, vec![(ControlKey::Exposure, -4), (ControlKey::Gain, 50)]);
+        l.on_write_done(done(ControlKey::Exposure, -4, Some(-4), true));
+        assert!(l.lit_hold.moves.is_empty(), "the batch has not landed");
+        l.on_write_done(done(ControlKey::Gain, 50, None, false));
+        let shown = l.valid_from();
+        assert_eq!(l.lit_hold.moves.iter().copied().collect::<Vec<_>>(), vec![(shown, 1.0)]);
+        assert_eq!(l.g, 100, "a failed write is not believed");
     }
 }

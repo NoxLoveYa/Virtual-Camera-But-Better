@@ -66,6 +66,139 @@ impl Rng {
     }
 }
 
+/// Where the window is (docs/AUTO-CONTROLS.md 10.8 step 3): the cells of the 16 x 16 picture a bright window takes
+/// from the wall. Cells of the person (skin, hair, shirt) are never window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowShape {
+    /// Rows 0-5.
+    Top,
+    /// Rows 0-5, and columns 0-2 and 13-15 down to row 11.
+    TopAndSides,
+    /// Rows 0-9.
+    Big,
+    /// Rows 0-12.
+    Wall,
+    /// Rows 0-5, the columns 0-4 down to row 12 and the columns 13-15 down to row 11 (13.8 step 1): the bright patch
+    /// beside the head that the subject zone weighs on the left, where the zone's weight is.
+    OneSide,
+    /// Rows 0-5, columns 0-6: the corner window of the owner's desk (11.9 step 3).
+    Corner,
+}
+
+impl WindowShape {
+    fn covers(self, i: usize) -> bool {
+        let (x, y) = (i % GRID, i / GRID);
+        match self {
+            WindowShape::Top => y <= 5,
+            WindowShape::TopAndSides => y <= 5 || ((x <= 2 || x >= 13) && y <= 11),
+            WindowShape::Big => y <= 9,
+            WindowShape::Wall => y <= 12,
+            WindowShape::OneSide => y <= 5 || (x <= 4 && y <= 12) || (x >= 13 && y <= 11),
+            WindowShape::Corner => y <= 5 && x <= 6,
+        }
+    }
+}
+
+/// How bright the window (or the lit face, `LampLit::face`) is, in stops over the light-skin face under the same light.
+#[derive(Clone, Copy, Debug)]
+pub enum WindowLevel {
+    Const(f64),
+    /// Linear from `from` at 0 s to `to` at `secs` s, then `to`.
+    Ramp { from: f64, to: f64, secs: f64 },
+    Wave { mid: f64, amp: f64, period: f64 },
+    /// `a` for `every` s, then `b` for `every` s, and so on (a lamp switched, a user leaning in and out).
+    Toggle { a: f64, b: f64, every: f64 },
+}
+
+impl WindowLevel {
+    pub fn stops(self, t: f64) -> f64 {
+        match self {
+            WindowLevel::Const(s) => s,
+            WindowLevel::Ramp { from, to, secs } => from + (to - from) * (t / secs).clamp(0.0, 1.0),
+            WindowLevel::Wave { mid, amp, period } => mid + amp * (std::f64::consts::TAU * t / period).sin(),
+            WindowLevel::Toggle { a, b, every } => {
+                if (t / every).floor() as i64 % 2 == 0 {
+                    a
+                } else {
+                    b
+                }
+            }
+        }
+    }
+}
+
+/// A dark room whose person is lit by a lamp (docs/AUTO-CONTROLS.md 11.9 step 3): `room` stops (`< 0`) for every cell
+/// that is not skin, hair or shirt (the two highlight cells included; the shirt gets half), the skin and hair at
+/// `face` stops. The scene is calibrated before the room is darkened, so `need` keeps its meaning (the evenly lit room
+/// on target). Window cells are not darkened: a window is its own light.
+#[derive(Clone, Copy, Debug)]
+pub struct LampLit {
+    pub room: f64,
+    pub face: WindowLevel,
+}
+
+impl LampLit {
+    pub fn new(room: f64) -> LampLit {
+        LampLit {
+            room,
+            face: WindowLevel::Const(0.0),
+        }
+    }
+}
+
+/// A window in a kit scene (`SimCfg::scene`): its cells have a neutral colour and the luma of the light-skin face
+/// times `2^stops(t)`. The scene is calibrated without it, so `need` keeps its meaning (the windowless room on target).
+#[derive(Clone, Copy, Debug)]
+pub struct Window {
+    pub shape: WindowShape,
+    pub level: WindowLevel,
+    /// A second shape that replaces the first in every other `secs` seconds (someone walking in front of the window).
+    pub alternate: Option<(WindowShape, f64)>,
+}
+
+impl Window {
+    pub fn new(shape: WindowShape, level: WindowLevel) -> Window {
+        Window {
+            shape,
+            level,
+            alternate: None,
+        }
+    }
+
+    fn shape_at(&self, t: f64) -> WindowShape {
+        match self.alternate {
+            Some((other, secs)) if (t / secs).floor() as i64 % 2 == 1 => other,
+            _ => self.shape,
+        }
+    }
+}
+
+/// The window as the picture has it at one moment.
+struct WindowNow {
+    /// The cells that are window now.
+    mask: Vec<bool>,
+    /// Their reflectance (luma): the light-skin face's times `2^stops`.
+    refl: f64,
+}
+
+/// The lamp-lit room as the picture has it at one moment: linear factors on the cells' reflectance.
+#[derive(Clone, Copy)]
+struct LampNow {
+    /// Skin and hair.
+    face: f64,
+    /// The shirt (half the room's stops).
+    shirt: f64,
+    /// Every other cell.
+    room: f64,
+}
+
+/// What a kit scene gets on top of its reflectances at one moment.
+#[derive(Default)]
+struct Overlay {
+    window: Option<WindowNow>,
+    lamp: Option<LampNow>,
+}
+
 /// The camera has a manual white balance.
 #[derive(Clone, Copy, Debug)]
 pub struct WbSim {
@@ -117,7 +250,15 @@ pub struct SimCfg {
     pub exposure_auto: bool,
     /// A coloured scene of the kit `fx::awb::scenes` (`None`: the grey wall).
     pub scene: Option<&'static str>,
-    /// Frames recorded from a real camera replace the scene (white balance only: the exposure meter is not fed).
+    /// A bright window behind the person (kit scenes only).
+    pub window: Option<Window>,
+    /// A dark room with a lamp-lit person (kit scenes only; 11.9 step 3).
+    pub lamp_lit: Option<LampLit>,
+    /// The kit surface (`skin_light`, `skin_mid`, `skin_dark`) of every cell the scene names skin (kit scenes only;
+    /// 13.8 step 1). The scene is calibrated with it, so `need` is that skin's evenly lit rest.
+    pub skin: Option<&'static str>,
+    /// Frames recorded from a real camera replace the scene (white balance, and exposure when the replay has the
+    /// exposure it was recorded at: [`Replay::with_exposure`]).
     pub replay: Option<Replay>,
 }
 
@@ -125,26 +266,47 @@ pub struct SimCfg {
 #[derive(Clone)]
 pub struct Replay {
     frames: std::sync::Arc<Vec<real::Frame>>,
+    /// The total light `E + gs(G)` in stops the frames were recorded at: the exposure meter sees them times
+    /// `2^(x - x_rec)` (at most 1). `None`: as recorded, whatever the camera's exposure (white balance tests).
+    x_rec: Option<f64>,
 }
 
 impl Replay {
     pub fn new(frames: Vec<real::Frame>) -> Replay {
         assert!(frames.len() > 1, "a replay needs frames");
-        Replay { frames: std::sync::Arc::new(frames) }
+        Replay {
+            frames: std::sync::Arc::new(frames),
+            x_rec: None,
+        }
     }
 
-    /// The picture at sim time `t` that a camera at `k` would have made (`alpha_true` colour signal per mired): the
-    /// recorded frame, its cells moved along the blue-red axis by the difference between `k` and the Kelvin the
-    /// camera had when it was recorded, each cell keeping its luma.
-    fn shot(&self, t: f64, k: i32, alpha_true: f64) -> Stats {
+    /// A replay that follows the camera's exposure: the frames were recorded at `E + gs(G) = x_rec` stops.
+    pub fn with_exposure(frames: Vec<real::Frame>, x_rec: f64) -> Replay {
+        Replay {
+            x_rec: Some(x_rec),
+            ..Replay::new(frames)
+        }
+    }
+
+    /// The recorded frame at sim time `t`: forward through the frames, then back, so the loop has no cut.
+    fn frame_at(&self, t: f64) -> &real::Frame {
         let (t0, t1) = (self.frames[0].t, self.frames[self.frames.len() - 1].t);
         let span = t1 - t0;
         let phase = t.rem_euclid(2.0 * span);
         let pos = t0 + if phase < span { phase } else { 2.0 * span - phase };
         let at = self.frames.partition_point(|f| f.t <= pos).saturating_sub(1);
-        let f = &self.frames[at];
+        &self.frames[at]
+    }
+
+    /// The picture at sim time `t` that a camera at `k` would have made (`alpha_true` colour signal per mired): the
+    /// recorded frame, its cells moved along the blue-red axis by the difference between `k` and the Kelvin the
+    /// camera had when it was recorded, each cell keeping its luma, and with `x` stops of light where the replay
+    /// follows the exposure.
+    fn shot(&self, t: f64, k: i32, alpha_true: f64, x: f64) -> Stats {
+        let f = self.frame_at(t);
         let dc = alpha_true * (1e6 / f64::from(k) - 1e6 / f64::from(f.k));
         let m = [(-0.5 * dc).exp(), (LOCUS_SLOPE * dc).exp(), (0.5 * dc).exp()];
+        let light = self.x_rec.map_or(1.0, |x_rec| (x - x_rec).exp2());
         let cells = f
             .stats
             .cells
@@ -154,11 +316,34 @@ impl Replay {
                 let moved = [0, 1, 2].map(|i| rgb[i] * m[i]);
                 let n = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2])
                     / (0.2126 * moved[0] + 0.7152 * moved[1] + 0.0722 * moved[2]).max(1e-9);
-                let v = [0, 1, 2].map(|i| (moved[i] * n).min(1.0) as f32);
+                let v = [0, 1, 2].map(|i| (moved[i] * n * light).min(1.0) as f32);
                 [v[0], v[1], v[2], c[3]]
             })
             .collect();
         Stats { cells }
+    }
+
+    /// The face and the room of the recorded desk as `shot` shows them with `x` stops of light, coded (0-255): the
+    /// face is the mean of the cells from row 6 down that the recorded frame has at 90/255 or more, the room the
+    /// median of the other cells from row 5 down. `None` when the frame has no face cell.
+    fn face_room(&self, t: f64, x: f64) -> Option<(f64, f64)> {
+        let f = self.frame_at(t);
+        let shot = self.shot(t, f.k, 0.0, x);
+        let coded = |c: &[f32; 4]| srgb_encode(meter::luma([c[0], c[1], c[2]])) * 255.0;
+        let (mut face, mut room) = (Vec::new(), Vec::new());
+        for i in 5 * GRID..GRID * GRID {
+            let recorded = srgb_encode(meter::luma([f.stats.cells[i][0], f.stats.cells[i][1], f.stats.cells[i][2]]));
+            if i / GRID >= 6 && recorded * 255.0 >= 90.0 {
+                face.push(coded(&shot.cells[i]));
+            } else {
+                room.push(coded(&shot.cells[i]));
+            }
+        }
+        if face.is_empty() || room.is_empty() {
+            return None;
+        }
+        room.sort_by(f64::total_cmp);
+        Some((face.iter().sum::<f64>() / face.len() as f64, room[room.len() / 2]))
     }
 }
 
@@ -182,6 +367,9 @@ impl Default for SimCfg {
             wb: None,
             exposure_auto: true,
             scene: None,
+            window: None,
+            lamp_lit: None,
+            skin: None,
             replay: None,
         }
     }
@@ -245,16 +433,31 @@ struct Scene {
     scale: f64,
     s_true: f64,
     bent: bool,
+    /// The cells of the person (skin, hair, shirt) in a kit scene: a window never covers them.
+    person: Vec<bool>,
+    /// The cells of skin and hair, and of the shirt, in a kit scene: a lamp lights the first, the shirt gets half the
+    /// room's stops.
+    face: Vec<bool>,
+    shirt: Vec<bool>,
 }
 
 impl Scene {
-    fn new(s_true: f64, bent: bool, kit: Option<&str>) -> Scene {
+    fn new(s_true: f64, bent: bool, kit: Option<&str>, skin: Option<&str>) -> Scene {
         let mut refl = vec![1.0; GRID * GRID];
         let mut rho = vec![[1.0; 3]; GRID * GRID];
+        let mut person = vec![false; GRID * GRID];
+        let mut face = vec![false; GRID * GRID];
+        let mut shirt = vec![false; GRID * GRID];
         if let Some(name) = kit {
             for (i, c) in scenes::scene(name).iter().enumerate() {
-                rho[i] = c.rho;
-                refl[i] = scenes::luma(c.rho);
+                rho[i] = match skin {
+                    Some(s) if c.name.starts_with("skin") => scenes::surface(s),
+                    _ => c.rho,
+                };
+                refl[i] = scenes::luma(rho[i]);
+                person[i] = ["skin", "hair", "shirt"].iter().any(|p| c.name.starts_with(p));
+                face[i] = c.name.starts_with("skin") || c.name.starts_with("hair");
+                shirt[i] = c.name.starts_with("shirt");
             }
             for i in scenes::HIGHLIGHTS {
                 rho[i] = [1.0; 3]; // a lamp or a specular spot: white, clipped
@@ -290,13 +493,17 @@ impl Scene {
             scale: 1.0,
             s_true,
             bent,
+            person,
+            face,
+            shirt,
         };
-        // Calibrate: `E + gs(G) = 0` and `L = 1` is on target (0.45).
+        // Calibrate: `E + gs(G) = 0` and `L = 1` is on target (0.45). Without a window or a lamp: the scene is
+        // calibrated before they are added, so `need` keeps its meaning.
         let (mut lo, mut hi) = (-16.0f64, 16.0f64);
         for _ in 0..40 {
             let mid = 0.5 * (lo + hi);
             scene.scale = mid.exp2();
-            let e = measure_exposure(&scene.render(0, 0, 1.0, None, None), 0.45).error;
+            let e = measure_exposure(&scene.render(0, 0, 1.0, None, &Overlay::default(), None), 0.45).error;
             if e > 0.0 {
                 lo = mid;
             } else {
@@ -323,12 +530,36 @@ impl Scene {
     }
 
     /// The statistics image of a frame exposed with `2^e` s, gain setting `g`, at light factor `l`, under the colour
-    /// cast `cast` (per channel; `None` is neutral). Each cell keeps its own luma.
-    fn render(&self, e: i32, g: i32, l: f64, cast: Option<[f64; 3]>, mut rng: Option<&mut Rng>) -> Stats {
+    /// cast `cast` (per channel; `None` is neutral). Each cell keeps its own luma. The cells of the overlay's window
+    /// are window: neutral, with the window's reflectance (a lamp cell keeps its own when that is brighter); the
+    /// overlay's lamp lights the person and darkens the rest.
+    fn render(
+        &self,
+        e: i32,
+        g: i32,
+        l: f64,
+        cast: Option<[f64; 3]>,
+        overlay: &Overlay,
+        mut rng: Option<&mut Rng>,
+    ) -> Stats {
         let gain = self.gs(g).exp2();
         let base = self.scale * l * f64::from(e).exp2() * gain;
         let mut cells = Vec::with_capacity(GRID * GRID);
-        for (r, rho) in self.refl.iter().zip(&self.rho) {
+        for (i, (r, rho)) in self.refl.iter().zip(&self.rho).enumerate() {
+            let r = match overlay.lamp {
+                Some(lamp) if self.face[i] => r * lamp.face,
+                Some(lamp) if self.shirt[i] => r * lamp.shirt,
+                Some(lamp) => r * lamp.room,
+                None => *r,
+            };
+            // (a window's own cells replace `r` below: a window is its own light)
+            let (r, rho) = match &overlay.window {
+                Some(w) if w.mask[i] => {
+                    let highlight = scenes::HIGHLIGHTS.contains(&i);
+                    (if highlight { w.refl.max(r) } else { w.refl }, [1.0; 3])
+                }
+                _ => (r, *rho),
+            };
             let mut sum = 0.0;
             for t in &self.tex {
                 let lin = base * r * t;
@@ -413,6 +644,12 @@ pub struct Snap {
     pub g: i32,
     /// True white balance error `e_wb` of the landed state (noiseless); 0 without white balance.
     pub wb_err: f64,
+    /// [`Sim::stops_over_need`] of the landed state.
+    pub over_need: f64,
+    /// [`Sim::face_over_need`] of the landed state (`over_need` without a lamp-lit room).
+    pub face_over_need: f64,
+    /// [`Sim::replay_face_room`] of the landed state: the replayed desk's face and room, coded 0-255.
+    pub face_room: Option<(f64, f64)>,
 }
 
 pub struct Sim {
@@ -464,7 +701,7 @@ pub struct Sim {
 
 impl Sim {
     pub fn new(cfg: SimCfg, light: Light) -> Sim {
-        let scene = Scene::new(cfg.s_true, cfg.bent, cfg.scene);
+        let scene = Scene::new(cfg.s_true, cfg.bent, cfg.scene, cfg.skin);
         let k0 = cfg.wb.map_or(4600, |w| w.start_k);
         Sim {
             rng: Rng::new(cfg.seed),
@@ -585,11 +822,65 @@ impl Sim {
         }
     }
 
+    /// The window and the lamp-lit room at time `t` (nothing in the grey wall scene).
+    fn overlay_now(&self, t: f64) -> Overlay {
+        let window = self.cfg.window.map(|w| {
+            assert!(self.cfg.scene.is_some(), "a window needs a kit scene");
+            let shape = w.shape_at(t);
+            WindowNow {
+                mask: (0..GRID * GRID).map(|i| shape.covers(i) && !self.scene.person[i]).collect(),
+                refl: scenes::luma(scenes::surface("skin_light")) * w.level.stops(t).exp2(),
+            }
+        });
+        let lamp = self.cfg.lamp_lit.map(|l| {
+            assert!(self.cfg.scene.is_some(), "a lamp-lit room needs a kit scene");
+            LampNow {
+                face: l.face.stops(t).exp2(),
+                shirt: (0.5 * l.room).exp2(),
+                room: l.room.exp2(),
+            }
+        });
+        Overlay { window, lamp }
+    }
+
+    /// The face's offset in stops from where the windowless, evenly lit room is on target (the oracle of 10.8 step
+    /// 3): positive = brighter than the rest. `E + gs(G) + log2 L(t)` of the landed state.
+    pub fn stops_over_need(&self) -> f64 {
+        f64::from(self.eff_e) + self.scene.gs(self.eff_g) + (self.light)(self.t).log2()
+    }
+
+    /// [`Sim::stops_over_need`] plus the level of the lamp on the face now (11.9 step 3): where the face is.
+    pub fn face_over_need(&self) -> f64 {
+        self.stops_over_need() + self.cfg.lamp_lit.map_or(0.0, |l| l.face.stops(self.t))
+    }
+
+    /// A replay's frame at `t` for a camera at `k` kelvin with `x` stops of light.
+    fn replay_shot(&self, r: &Replay, t: f64, k: i32, x: f64) -> Stats {
+        r.shot(t, k, self.cfg.wb.map_or(0.0, |w| w.alpha_true), x)
+    }
+
+    /// The light the replay's frames get now: `E + gs(G)` of the landed state.
+    fn replay_x(&self) -> f64 {
+        f64::from(self.eff_e) + self.scene.gs(self.eff_g)
+    }
+
+    /// The face and the room of the replayed desk as the landed state shows them (coded 0-255, see
+    /// `Replay::face_room`); `None` without a replay.
+    pub fn replay_face_room(&self) -> Option<(f64, f64)> {
+        self.cfg.replay.as_ref()?.face_room(self.t, self.replay_x())
+    }
+
+    /// The scene's calibrated scale (the same with and without a window).
+    pub fn calibration(&self) -> f64 {
+        self.scene.scale
+    }
+
     fn oracle(&self, target: f64, warmth: f64) -> (meter::ExposureReading, f64) {
         let cast = self.cast(self.eff_k, (self.temp)(self.t));
+        let overlay = self.overlay_now(self.t);
         let stats = self
             .scene
-            .render(self.eff_e, self.eff_g, (self.light)(self.t), cast, None);
+            .render(self.eff_e, self.eff_g, (self.light)(self.t), cast, &overlay, None);
         let wb = cast.map_or(0.0, |c| {
             // Not `measure_white_balance`: the true `e_wb` is the blue-red signal of the cast minus the aim.
             (c[2] / c[0]).ln() - warmth_target(warmth)
@@ -599,12 +890,13 @@ impl Sim {
 
     /// The noiseless statistics image of the landed state now: what Auto Adjust would measure after this loop.
     pub fn picture(&self) -> Stats {
-        if let (Some(r), Some(w)) = (&self.cfg.replay, self.cfg.wb) {
-            return r.shot(self.t, self.eff_k, w.alpha_true);
+        if let Some(r) = &self.cfg.replay {
+            return self.replay_shot(r, self.t, self.eff_k, self.replay_x());
         }
         let cast = self.cast(self.eff_k, (self.temp)(self.t));
+        let overlay = self.overlay_now(self.t);
         self.scene
-            .render(self.eff_e, self.eff_g, (self.light)(self.t), cast, None)
+            .render(self.eff_e, self.eff_g, (self.light)(self.t), cast, &overlay, None)
     }
 
     /// The colour a neutral surface has in the landed state now (the cast, linear RGB; white without white balance).
@@ -841,9 +1133,12 @@ impl Sim {
             if self.paused || self.no_samples {
                 continue;
             }
-            let stats = match (&self.cfg.replay, self.cfg.wb) {
-                (Some(r), Some(w)) => r.shot(c.t, c.k, w.alpha_true),
-                _ => self.scene.render(c.e, c.g, c.light, c.cast, Some(&mut self.rng)),
+            let stats = match &self.cfg.replay {
+                Some(r) => self.replay_shot(r, c.t, c.k, f64::from(c.e) + self.scene.gs(c.g)),
+                None => {
+                    let overlay = self.overlay_now(c.t);
+                    self.scene.render(c.e, c.g, c.light, c.cast, &overlay, Some(&mut self.rng))
+                }
             };
             ctrl.on_sample(
                 &MeterSample {
@@ -888,6 +1183,9 @@ impl Sim {
             e: self.eff_e,
             g: self.eff_g,
             wb_err,
+            over_need: self.stops_over_need(),
+            face_over_need: self.face_over_need(),
+            face_room: self.replay_face_room(),
         });
     }
 }
