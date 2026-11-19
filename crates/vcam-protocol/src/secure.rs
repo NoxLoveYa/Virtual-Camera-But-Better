@@ -48,15 +48,14 @@ use windows::Win32::Security::SECURITY_DESCRIPTOR;
 use windows::Win32::Storage::FileSystem::{
     FileDispositionInfo, FileDispositionInfoEx, FileFullDirectoryInfo,
     FileFullDirectoryRestartInfo, FileIdInfo, FileRenameInfo, FileStandardInfo, FileStreamInfo,
-    FlushFileBuffers, FILE_STANDARD_INFO,
-    GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    FlushFileBuffers, GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
     GetFinalPathNameByHandleW, GetFullPathNameW, SetFileInformationByHandle,
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, FILE_ACCESS_RIGHTS, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_CREATION_DISPOSITION,
     FILE_FLAGS_AND_ATTRIBUTES, FILE_FULL_DIR_INFO, FILE_ID_INFO, FILE_NAME_NORMALIZED,
     FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_STREAM_INFO, GETFINALPATHNAMEBYHANDLE_FLAGS, OPEN_ALWAYS, OPEN_EXISTING, SYNCHRONIZE,
-    VOLUME_NAME_DOS,
+    FILE_STANDARD_INFO, FILE_STREAM_INFO, GETFINALPATHNAMEBYHANDLE_FLAGS, OPEN_ALWAYS,
+    OPEN_EXISTING, SYNCHRONIZE, VOLUME_NAME_DOS,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Ioctl::{
@@ -1279,7 +1278,14 @@ pub fn file_identity(h: HANDLE) -> io::Result<FileIdentity> {
 /// so the open does not wake a virus scanner that scans on open, and it needs the least a file can give. A link is
 /// opened as the link.
 pub fn open_to_inspect(path: &Path) -> io::Result<OwnedHandle> {
-    open_with(path, ACCESS_READ_ATTRIBUTES, SHARE_ALL, OPEN_EXISTING, false, 0)
+    open_with(
+        path,
+        ACCESS_READ_ATTRIBUTES,
+        SHARE_ALL,
+        OPEN_EXISTING,
+        false,
+        0,
+    )
 }
 
 /// Whether the file behind `h` is marked for deletion (its name is gone or goes when the last handle closes; no new

@@ -22,6 +22,7 @@ use crate::header::{
 };
 use crate::secure;
 use crate::seqlock::{PublishError, Shared, SlotFormat};
+use crate::signal::FrameSignal;
 
 /// `%ProgramData%\BetterCam`, with `%ProgramData%` from `SHGetKnownFolderPath` (not the environment).
 pub fn data_dir() -> PathBuf {
@@ -324,6 +325,14 @@ fn advertised_from(read: io::Result<(Vec<u8>, u64)>) -> Vec<Format> {
 /// once it has returned, no write of the lease reaches the file (a write that is running is waited for), however
 /// long the thread lives on. The gate is a lock, not a flag that is looked at before a write, so there is no gap
 /// between the look and the write.
+///
+/// # The frame event
+///
+/// A writer also makes the pair of frame events of [`crate::signal`] and signals them after every publish and every
+/// change of state, so that the virtual camera's pump can sleep until there is something to look at. The events are a
+/// hint on top of the file: when they cannot be made (or are switched off, [`WriterOptions`]) the writer works exactly
+/// as it did without them, and the reason is in [`Writer::frame_event_status`]. A lease shares its owner's events, and
+/// the gate above covers the signal too: a retired writer does not signal.
 pub struct Writer {
     map: Arc<MappedFile>,
     /// The path the file was opened by: the virtual camera opens the file by this path, so it is what must still lead
@@ -332,6 +341,34 @@ pub struct Writer {
     /// The write gate: `true` once the writer is retired. Every write to the file holds it for reading, so a writer
     /// that retires waits for the writes under way, and no later one starts.
     retired: RwLock<bool>,
+    /// The frame events, shared with the leases; `None` when there are none (see `event_status`).
+    signal: Option<Arc<FrameSignal>>,
+    event_status: FrameEventStatus,
+}
+
+/// How a [`Writer`] is opened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriterOptions {
+    /// Make and signal the frame events (default). Off for a writer that stands in for an old app (`vcam-tool feed
+    /// --no-signal`, tests of a reader against a writer without events).
+    pub signal: bool,
+}
+
+impl Default for WriterOptions {
+    fn default() -> Self {
+        WriterOptions { signal: true }
+    }
+}
+
+/// Whether a [`Writer`] has frame events, and if not, why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrameEventStatus {
+    /// The events exist and are signalled.
+    On,
+    /// Switched off by [`WriterOptions::signal`].
+    Disabled,
+    /// They could not be made (the text says why); the writer works without them.
+    Failed(String),
 }
 
 /// Whether the path of a [`Writer`]'s file still leads to the file it has mapped ([`Writer::backing_file`]).
@@ -361,19 +398,33 @@ impl Writer {
     /// An existing file is never truncated: a running DLL may have it mapped, and Windows refuses to shrink a mapped
     /// file. A larger existing file is used as is.
     pub fn create(path: &Path) -> io::Result<Writer> {
+        Self::create_with(path, &WriterOptions::default())
+    }
+
+    /// [`Writer::create`] with options.
+    pub fn create_with(path: &Path, opts: &WriterOptions) -> io::Result<Writer> {
         if is_default_path(path) {
-            return Self::open_precreated(path, Some(&secure::program_data_dir()));
+            return Self::open_precreated_with(path, Some(&secure::program_data_dir()), opts);
         }
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        Self::open_file(path, secure::DISP_OPEN_ALWAYS, None)
+        Self::open_file(path, secure::DISP_OPEN_ALWAYS, None, opts)
     }
 
     /// Open the file the installer made at `path` (it must exist), as [`Writer::create`] does for the default path.
     /// With `pin = Some(root)` the file must really be `path` below the canonical folder `root`.
     pub fn open_precreated(path: &Path, pin: Option<&Path>) -> io::Result<Writer> {
-        Self::open_file(path, secure::DISP_OPEN_EXISTING, pin).map_err(|e| {
+        Self::open_precreated_with(path, pin, &WriterOptions::default())
+    }
+
+    /// [`Writer::open_precreated`] with options.
+    pub fn open_precreated_with(
+        path: &Path,
+        pin: Option<&Path>,
+        opts: &WriterOptions,
+    ) -> io::Result<Writer> {
+        Self::open_file(path, secure::DISP_OPEN_EXISTING, pin, opts).map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
                 io::Error::new(
                     io::ErrorKind::NotFound,
@@ -392,6 +443,7 @@ impl Writer {
         path: &Path,
         disposition: windows::Win32::Storage::FileSystem::FILE_CREATION_DISPOSITION,
         pin: Option<&Path>,
+        opts: &WriterOptions,
     ) -> io::Result<Writer> {
         let expect = match pin {
             Some(root) => Some(secure::expected_path(root, path)?),
@@ -428,20 +480,56 @@ impl Writer {
         map.shared()
             .init_writer(std::process::id(), qpc_frequency(), qpc_now())
             .map_err(|e| io::Error::other(format!("{e:?}")))?;
+        // The events come after `init_writer` (which zeroes the advert) and never stop the writer from opening: any
+        // failure leaves a writer without events, and a reader that finds no advert polls.
+        let (signal, event_status) = if opts.signal {
+            match FrameSignal::create() {
+                Ok(s) => {
+                    s.advertise(map.shared());
+                    (Some(Arc::new(s)), FrameEventStatus::On)
+                }
+                Err(e) => (None, FrameEventStatus::Failed(e.to_string())),
+            }
+        } else {
+            (None, FrameEventStatus::Disabled)
+        };
         Ok(Writer {
             map: Arc::new(map),
             path: path.to_path_buf(),
             retired: RwLock::new(false),
+            signal,
+            event_status,
         })
     }
 
-    /// A writer on the same mapped file with a write gate of its own (see the type's notes). It shares the mapping, so
-    /// the file stays mapped until the last lease is gone; nothing is written or reset by making it.
+    /// A writer on the same mapped file with a write gate of its own (see the type's notes). It shares the mapping and
+    /// the frame events, so the file stays mapped (and the events open) until the last lease is gone; nothing is
+    /// written or reset by making it.
     pub fn lease(&self) -> Writer {
         Writer {
             map: self.map.clone(),
             path: self.path.clone(),
             retired: RwLock::new(false),
+            signal: self.signal.clone(),
+            event_status: self.event_status.clone(),
+        }
+    }
+
+    /// Whether this writer has frame events: [`FrameEventStatus::On`], switched off, or failed (with the reason). A
+    /// failure is not an error of the writer; it just has no events.
+    pub fn frame_event_status(&self) -> &FrameEventStatus {
+        &self.event_status
+    }
+
+    /// The nonce the frame events are named by, when there are events.
+    pub fn frame_event_nonce(&self) -> Option<u128> {
+        self.signal.as_ref().map(|s| s.nonce())
+    }
+
+    /// One signal for a reader that waits, if there are events. Called with the write gate held.
+    fn notify(&self) {
+        if let Some(s) = &self.signal {
+            s.notify(self.shared());
         }
     }
 
@@ -502,15 +590,18 @@ impl Writer {
         }
     }
 
-    /// Set `writer_state` and refresh the heartbeat.
+    /// Set `writer_state` and refresh the heartbeat, then signal the frame event: a reader that waits sees the change
+    /// at once.
     pub fn set_state(&self, state: WriterState) {
         if let Some(_gate) = self.open_gate() {
             self.shared().set_writer_state(state);
             self.shared().set_writer_heartbeat(qpc_now());
+            self.notify();
         }
     }
 
-    /// Refresh `writer_heartbeat`. Call it every frame and at least every 200 ms when idle.
+    /// Refresh `writer_heartbeat`. Call it every frame and at least every 200 ms when idle. It does not signal: a
+    /// reader that waits needs no wake-up while nothing changes.
     pub fn heartbeat(&self) {
         if let Some(_gate) = self.open_gate() {
             self.shared().set_writer_heartbeat(qpc_now());
@@ -534,19 +625,21 @@ impl Writer {
         Some(f)
     }
 
-    /// Publish a frame (see [`Shared::publish`]). `capture_qpc` is when the frame was captured (QPC ticks); the
-    /// heartbeat is refreshed too.
+    /// Publish a frame (see [`Shared::publish`]) and signal the frame event once it is in place. `capture_qpc` is when
+    /// the frame was captured (QPC ticks); the heartbeat is refreshed too. A publish that fails signals nothing.
     pub fn publish(
         &self,
         f: SlotFormat,
         capture_qpc: u64,
         fill: impl FnOnce(&mut [u8]),
     ) -> Result<u64, PublishError> {
-        // The gate stays open for the whole publish, the copy of the frame included.
+        // The gate stays open for the whole publish, the copy of the frame included, and for the signal after it.
         let Some(_gate) = self.open_gate() else {
             return Err(PublishError::Retired);
         };
-        self.shared().publish(f, capture_qpc, qpc_now(), fill)
+        let seq = self.shared().publish(f, capture_qpc, qpc_now(), fill)?;
+        self.notify();
+        Ok(seq)
     }
 
     /// Whether the path the file was opened by still leads to the file this writer has mapped: the file ids (volume
@@ -581,7 +674,8 @@ impl Writer {
     }
 
     /// Forget the newest frame (see [`Shared::clear_latest`]): a reader that attaches gets no old picture, only the
-    /// next one published. The state and the heartbeat are not touched.
+    /// next one published. The state and the heartbeat are not touched, and nothing is signalled: it removes a frame
+    /// and needs no wake-up.
     pub fn clear_latest(&self) {
         if let Some(_gate) = self.open_gate() {
             self.shared().clear_latest();
@@ -590,8 +684,19 @@ impl Writer {
 
     /// Mark the file closed (the DLL shows "not running" immediately). Nothing else does that: dropping a writer
     /// leaves the file as it is.
+    ///
+    /// The advert of the frame events is withdrawn first (`features = 0`), then the state goes `Closed`, then the
+    /// frame event is signalled so that a reader that waits sees the close at once. The withdrawal is final for this
+    /// writer: a state set after a close is signalled, but readers poll for the rest of its life.
     pub fn close(&self) {
-        self.set_state(WriterState::Closed);
+        if let Some(_gate) = self.open_gate() {
+            if let Some(s) = &self.signal {
+                s.withdraw(self.shared());
+            }
+            self.shared().set_writer_state(WriterState::Closed);
+            self.shared().set_writer_heartbeat(qpc_now());
+            self.notify();
+        }
     }
 }
 
@@ -937,8 +1042,15 @@ mod tests {
         lease.clear_latest();
         let h = owner.shared().header();
         assert_eq!(h.writer_state, WriterState::Live as u32);
-        assert_eq!(h.writer_frames, 1, "a retired writer's frame reached the file");
-        assert_ne!(h.latest_slot, crate::NO_SLOT, "a retired writer cleared the newest frame");
+        assert_eq!(
+            h.writer_frames, 1,
+            "a retired writer's frame reached the file"
+        );
+        assert_ne!(
+            h.latest_slot,
+            crate::NO_SLOT,
+            "a retired writer cleared the newest frame"
+        );
         let beat = h.writer_heartbeat;
         lease.heartbeat();
         assert_eq!(owner.shared().header().writer_heartbeat, beat);
@@ -947,7 +1059,10 @@ mod tests {
         owner.publish(fmt, 333, |d| d.fill(3)).unwrap();
         assert_eq!(owner.shared().header().writer_frames, 2);
         owner.close();
-        assert_eq!(owner.shared().header().writer_state, WriterState::Closed as u32);
+        assert_eq!(
+            owner.shared().header().writer_state,
+            WriterState::Closed as u32
+        );
     }
 
     /// The gate is a lock: a publish that is running finishes before `retire` returns, and none starts after it.
@@ -1003,7 +1118,10 @@ mod tests {
         assert_eq!(open_failure_verdict(&denied), BackingFile::Unknown);
         assert_eq!(open_failure_verdict(&sharing), BackingFile::Unknown);
         assert_eq!(open_failure_verdict(&other), BackingFile::Unknown);
-        assert_eq!(open_failure_verdict(&secure::refused("held back")), BackingFile::Unknown);
+        assert_eq!(
+            open_failure_verdict(&secure::refused("held back")),
+            BackingFile::Unknown
+        );
         assert_eq!(
             open_failure_verdict(&io::Error::from_raw_os_error(2)),
             BackingFile::Replaced
@@ -1049,7 +1167,10 @@ mod tests {
         // no data access: a read through that handle is refused
         let mut f = std::fs::File::from(h);
         let mut b = [0u8; 4];
-        assert!(std::io::Read::read(&mut f, &mut b).is_err(), "the inspect handle can read data");
+        assert!(
+            std::io::Read::read(&mut f, &mut b).is_err(),
+            "the inspect handle can read data"
+        );
         assert_eq!(w.backing_file(), BackingFile::Same);
     }
 
@@ -1246,5 +1367,341 @@ mod tests {
         let q = qpc_now();
         let back = hns_to_qpc(qpc_to_hns(q));
         assert!(q.abs_diff(back) <= qpc_frequency() / 1_000_000 + 1);
+    }
+
+    // ---- the frame event ------------------------------------------------------------------------------------
+
+    use crate::header::{wake_mode, FEATURE_FRAME_EVENT};
+    use crate::signal::tests::{is_set, not_found, open_for, squat, with_nonces, What};
+    use crate::signal::{open_frame_events, Step};
+
+    const MODIFY_OR_WAIT: u32 = 0x0010_0000;
+
+    fn fmt16() -> SlotFormat {
+        SlotFormat {
+            width: 16,
+            height: 16,
+            stride: 16,
+            subtype: SUBTYPE_NV12,
+        }
+    }
+
+    fn trace(w: &Writer) -> Vec<crate::signal::tests::Seen> {
+        w.signal.as_ref().unwrap().trace.lock().unwrap().clone()
+    }
+
+    fn handles(w: &Writer) -> [windows::Win32::Foundation::HANDLE; 2] {
+        let s = w.signal.as_ref().unwrap();
+        [s.handle(0), s.handle(1)]
+    }
+
+    #[test]
+    fn a_new_writer_advertises_its_events() {
+        let path = temp_file("ev-advert.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        assert_eq!(w.frame_event_status(), &FrameEventStatus::On);
+        let h = w.header();
+        let nonce = w.frame_event_nonce().unwrap();
+        assert_eq!(h.features, FEATURE_FRAME_EVENT);
+        assert_eq!(
+            ((h.event_nonce_hi as u128) << 64) | h.event_nonce_lo as u128,
+            nonce
+        );
+        assert_eq!(h.signal_seq, 0, "nothing is signalled by opening");
+        // a reader validates it as an advert
+        let m = MappedFile::open(&path, Access::ReadOnly).unwrap();
+        let v = validate_header(&m.shared().header(), m.len() as u64, None, None).unwrap();
+        assert_eq!(v.wake.map(|w| (w.nonce, w.signal_seq)), Some((nonce, 0)));
+        let ev = open_frame_events(nonce).unwrap();
+        drop(ev);
+        // the DLL's diagnostics start at zero
+        assert_eq!((h.wake_mode, h.wake_events), (wake_mode::POLLING, 0));
+    }
+
+    #[test]
+    fn the_writer_signals_after_publishes_and_state_changes_and_after_nothing_else() {
+        let path = temp_file("ev-order.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        let seq = |w: &Writer| w.header().signal_seq;
+        assert_eq!(seq(&w), 0);
+
+        w.set_state(WriterState::Live);
+        assert_eq!(seq(&w), 1, "a state change signals");
+        w.publish(fmt16(), 5, |d| d.fill(1)).unwrap();
+        assert_eq!(seq(&w), 2, "a publish signals");
+        w.publish(fmt16(), 6, |d| d.fill(1)).unwrap();
+        assert_eq!(seq(&w), 3);
+
+        // no signal: the heartbeat, clearing the newest frame, a rejected frame, setting the advertised types
+        w.heartbeat();
+        w.clear_latest();
+        let odd = SlotFormat {
+            width: 15,
+            ..fmt16()
+        };
+        assert!(w.publish(odd, 7, |_| panic!("no fill")).is_err());
+        w.set_advertised(&crate::advertised_for_output(1280, 720, 30));
+        assert_eq!(seq(&w), 3);
+
+        w.set_state(WriterState::Paused);
+        w.set_state(WriterState::Live);
+        assert_eq!(seq(&w), 5);
+
+        // the order of every signal: reset next, store, set; the publish was in place before the first step
+        let t = trace(&w);
+        assert_eq!(t.len(), 5 * 3);
+        for (i, chunk) in t.chunks(3).enumerate() {
+            let n = i as u64 + 1;
+            let steps: Vec<What> = chunk.iter().map(|s| s.what).collect();
+            assert_eq!(
+                steps,
+                vec![
+                    What::Step(Step::Reset(((n + 1) & 1) as usize)),
+                    What::Step(Step::Store(n)),
+                    What::Step(Step::Set((n & 1) as usize)),
+                ],
+                "signal {n}"
+            );
+        }
+        // signal 2 and 3 are the publishes: the frame (latest slot, count) was in the file before the reset
+        assert_eq!(t[3].frames, 1);
+        assert_ne!(t[3].latest, crate::NO_SLOT);
+        assert_eq!(t[6].frames, 2);
+        // signals 1, 4 and 5 are state changes: the state was already stored
+        assert_eq!(t[0].state, WriterState::Live as u32);
+        assert_eq!(t[9].state, WriterState::Paused as u32);
+        assert_eq!(t[12].state, WriterState::Live as u32);
+        // the last signal's event is the one that is set
+        let e = handles(&w);
+        assert!(is_set(e[1]) && !is_set(e[0]));
+    }
+
+    #[test]
+    fn close_withdraws_the_advert_before_the_state_goes_closed_and_then_signals() {
+        let path = temp_file("ev-close.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        w.publish(fmt16(), 1, |d| d.fill(1)).unwrap();
+        assert_eq!(w.header().signal_seq, 2);
+        w.close();
+        let h = w.header();
+        assert_eq!(h.features, 0);
+        assert_eq!(h.writer_state, WriterState::Closed as u32);
+        assert_eq!(h.signal_seq, 3, "the close is signalled");
+        let t = trace(&w);
+        let close_part = &t[6..];
+        assert_eq!(close_part.len(), 4, "{close_part:?}");
+        // the withdrawal came first, while the state was still Live and the advert still there
+        assert_eq!(close_part[0].what, What::Withdraw);
+        assert_eq!(close_part[0].features, FEATURE_FRAME_EVENT);
+        assert_eq!(close_part[0].state, WriterState::Live as u32);
+        // then the three steps of the signal, with the advert gone and the state stored
+        for s in &close_part[1..] {
+            assert_eq!(s.features, 0);
+            assert_eq!(s.state, WriterState::Closed as u32);
+        }
+        assert_eq!(close_part[1].what, What::Step(Step::Reset(0)));
+        assert_eq!(close_part[2].what, What::Step(Step::Store(3)));
+        assert_eq!(close_part[3].what, What::Step(Step::Set(1)));
+        // a reader no longer finds an advert
+        let m = MappedFile::open(&path, Access::ReadOnly).unwrap();
+        let v = validate_header(&m.shared().header(), m.len() as u64, None, None).unwrap();
+        assert_eq!(v.wake, None);
+        assert_eq!(v.state, WriterState::Closed);
+    }
+
+    #[test]
+    fn setting_the_state_closed_keeps_the_advert_and_signals() {
+        // the engine goes Closed and Live again on one writer; only `close` is final
+        let path = temp_file("ev-state-closed.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        w.set_state(WriterState::Closed);
+        assert_eq!(w.header().features, FEATURE_FRAME_EVENT);
+        assert_eq!(w.header().signal_seq, 2);
+        w.set_state(WriterState::Live);
+        assert_eq!(w.header().signal_seq, 3);
+    }
+
+    #[test]
+    fn a_retired_lease_signals_nothing_and_the_owner_still_does() {
+        let path = temp_file("ev-retire.bin");
+        let _ = std::fs::remove_file(&path);
+        let owner = Writer::create(&path).unwrap();
+        let lease = owner.lease();
+        lease.set_state(WriterState::Live);
+        lease.publish(fmt16(), 1, |d| d.fill(1)).unwrap();
+        assert_eq!(
+            owner.header().signal_seq,
+            2,
+            "a lease signals through the shared events"
+        );
+        let e = handles(&owner);
+        let (e0, e1) = (is_set(e[0]), is_set(e[1]));
+
+        lease.retire();
+        let before = trace(&owner).len();
+        assert!(lease.publish(fmt16(), 2, |_| panic!("no fill")).is_err());
+        lease.set_state(WriterState::Paused);
+        lease.close();
+        lease.heartbeat();
+        lease.clear_latest();
+        let h = owner.header();
+        assert_eq!(h.signal_seq, 2, "a retired lease signalled");
+        assert_eq!(
+            trace(&owner).len(),
+            before,
+            "a retired lease touched the events"
+        );
+        assert_eq!((is_set(e[0]), is_set(e[1])), (e0, e1));
+        assert_eq!(
+            h.features, FEATURE_FRAME_EVENT,
+            "a retired close withdrew the advert"
+        );
+        assert_eq!(h.writer_state, WriterState::Live as u32);
+
+        // the owner is not affected
+        owner.publish(fmt16(), 3, |d| d.fill(3)).unwrap();
+        assert_eq!(owner.header().signal_seq, 3);
+        owner.set_state(WriterState::Paused);
+        assert_eq!(owner.header().signal_seq, 4);
+        // the counter is shared: the lease and the owner never reuse a number
+        let lease2 = owner.lease();
+        lease2.set_state(WriterState::Live);
+        assert_eq!(owner.header().signal_seq, 5);
+    }
+
+    #[test]
+    fn a_writer_whose_events_cannot_be_made_works_as_before() {
+        let path = temp_file("ev-fail.bin");
+        let _ = std::fs::remove_file(&path);
+        // every nonce the generator offers has a taken name
+        let nonces: Vec<u128> = (1..=3).map(|i| 0xDEAD_0000 + i).collect();
+        let _squatters: Vec<_> = nonces.iter().map(|&n| squat(n, 0, None)).collect();
+        let w = with_nonces(nonces.iter().map(|&n| Ok(n)).collect(), || {
+            Writer::create(&path).unwrap()
+        });
+        match w.frame_event_status() {
+            FrameEventStatus::Failed(why) => assert!(why.contains("taken"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(w.frame_event_nonce(), None);
+        let h = w.header();
+        assert_eq!(h.features, 0, "the feature bit is set without events");
+        assert_eq!(
+            (h.event_nonce_lo, h.event_nonce_hi, h.signal_seq),
+            (0, 0, 0)
+        );
+        // nothing was left open under the names the writer tried
+        for &n in &nonces {
+            assert!(not_found(&open_for(n, 1, MODIFY_OR_WAIT)));
+        }
+        // and it publishes, changes state, leases and closes exactly as before, advertising nothing
+        w.set_advertised(&crate::advertised_for_output(1280, 720, 30));
+        w.set_state(WriterState::Live);
+        w.publish(fmt16(), 9, |d| d.fill(7)).unwrap();
+        let lease = w.lease();
+        assert_eq!(lease.frame_event_status(), w.frame_event_status());
+        lease.publish(fmt16(), 10, |d| d.fill(8)).unwrap();
+        let m = MappedFile::open(&path, Access::ReadOnly).unwrap();
+        let v = validate_header(&m.shared().header(), m.len() as u64, None, None).unwrap();
+        assert_eq!(
+            (v.state, v.writer_frames, v.wake),
+            (WriterState::Live, 2, None)
+        );
+        assert_eq!(m.shared().header().signal_seq, 0);
+        w.close();
+        assert_eq!(m.shared().header().writer_state, WriterState::Closed as u32);
+        assert_eq!(m.shared().header().features, 0);
+    }
+
+    #[test]
+    fn a_writer_without_signals_is_the_old_writer() {
+        let path = temp_file("ev-disabled.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create_with(&path, &WriterOptions { signal: false }).unwrap();
+        assert_eq!(w.frame_event_status(), &FrameEventStatus::Disabled);
+        w.set_state(WriterState::Live);
+        w.publish(fmt16(), 1, |d| d.fill(1)).unwrap();
+        w.close();
+        let h = w.header();
+        assert_eq!(
+            (h.features, h.signal_seq, h.event_nonce_lo, h.event_nonce_hi),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(h.writer_frames, 1);
+        assert_eq!(WriterOptions::default(), WriterOptions { signal: true });
+    }
+
+    #[test]
+    fn a_writer_that_starts_over_clears_the_advert_of_the_one_before() {
+        let path = temp_file("ev-restart.bin");
+        let _ = std::fs::remove_file(&path);
+        let first = Writer::create(&path).unwrap();
+        first.set_state(WriterState::Live);
+        first.publish(fmt16(), 1, |d| d.fill(1)).unwrap();
+        let n1 = first.frame_event_nonce().unwrap();
+        assert_eq!(first.header().signal_seq, 2);
+        // an old app (no events) starts over the same file: its init zeroes the advert and the count
+        let old = Writer::create_with(&path, &WriterOptions { signal: false }).unwrap();
+        let h = old.header();
+        assert_eq!(
+            (h.features, h.event_nonce_lo, h.event_nonce_hi, h.signal_seq),
+            (0, 0, 0, 0)
+        );
+        // a new app starts over it: a new nonce, the count from 0
+        let second = Writer::create(&path).unwrap();
+        let n2 = second.frame_event_nonce().unwrap();
+        assert_ne!(n1, n2);
+        let h = second.header();
+        assert_eq!(h.features, FEATURE_FRAME_EVENT);
+        assert_eq!(
+            ((h.event_nonce_hi as u128) << 64) | h.event_nonce_lo as u128,
+            n2
+        );
+        assert_eq!(h.signal_seq, 0);
+        // both pairs exist, each named by its own nonce
+        assert!(open_frame_events(n1).is_ok() && open_frame_events(n2).is_ok());
+    }
+
+    #[test]
+    fn dropping_the_writer_and_its_leases_closes_the_event_handles() {
+        let path = temp_file("ev-drop.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        let n = w.frame_event_nonce().unwrap();
+        let lease = w.lease();
+        // a reader's handles keep the events alive; the writer's do not
+        let reader = open_frame_events(n).unwrap();
+        drop(w);
+        assert!(
+            open_frame_events(n).is_ok(),
+            "the lease still holds the events"
+        );
+        drop(lease);
+        assert!(
+            open_frame_events(n).is_ok(),
+            "the reader still holds the events"
+        );
+        drop(reader);
+        assert!(
+            not_found(&open_for(n, 0, MODIFY_OR_WAIT))
+                && not_found(&open_for(n, 1, MODIFY_OR_WAIT)),
+            "an event handle of the writer leaked"
+        );
+        // 50 writers on one file, each dropped: no event of any of them is left
+        let mut nonces = Vec::new();
+        for _ in 0..50 {
+            let w = Writer::create(&path).unwrap();
+            nonces.push(w.frame_event_nonce().unwrap());
+            w.set_state(WriterState::Live);
+        }
+        for n in nonces {
+            assert!(not_found(&open_for(n, 0, MODIFY_OR_WAIT)));
+        }
     }
 }

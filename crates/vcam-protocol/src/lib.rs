@@ -3,6 +3,7 @@
 //! * Names, paths and sizes (this file).
 //! * The frame transport of plan 2.5: [`header`] (layout), [`seqlock`] (atomic access and the seqlock),
 //!   [`validate`] (every field is checked before use), and on Windows [`map`] (file mapping, QPC, [`Writer`]).
+//! * [`signal`] (Windows): the frame event that wakes the camera service's pump when the writer has something new.
 //! * [`pattern`] (checkerboard + stripe test pattern) and [`slate`] (RLE slates), used by `vcam-tool` and the tests.
 
 pub mod header;
@@ -12,22 +13,26 @@ pub mod pattern;
 #[cfg(windows)]
 pub mod secure;
 pub mod seqlock;
+#[cfg(windows)]
+pub mod signal;
 pub mod slate;
 pub mod validate;
 
 pub use header::{
-    advertised_for_output, default_advertised, off, round_fps, slot_off, Format, RawHeader,
-    SlotMeta, WriterState, ADVERTISED_MAX, FILE_SIZE, HEADER_SIZE, MAGIC, MAX_HEIGHT, MAX_WIDTH,
-    NO_SLOT, SLOT_CAPACITY, SLOT_COUNT, SUBTYPE_NV12, SUBTYPE_RGB32,
+    advertised_for_output, default_advertised, off, round_fps, slot_off, wake_mode, Format,
+    RawHeader, SlotMeta, WriterState, ADVERTISED_MAX, FEATURE_FRAME_EVENT, FILE_SIZE, HEADER_SIZE,
+    MAGIC, MAX_HEIGHT, MAX_WIDTH, NO_SLOT, SLOT_CAPACITY, SLOT_COUNT, SUBTYPE_NV12, SUBTYPE_RGB32,
 };
 #[cfg(windows)]
 pub use map::{
     data_dir as frames_dir, frames_path, hns_to_qpc, qpc_frequency, qpc_now, qpc_to_hns,
-    read_advertised, read_advertised_pinned, Access, BackingFile, MappedFile, Writer,
+    read_advertised, read_advertised_pinned, Access, BackingFile, FrameEventStatus, MappedFile,
+    Writer, WriterOptions,
 };
 pub use seqlock::{Disposition, PublishError, Read, ReadError, Shared, SlotData, SlotFormat};
 pub use validate::{
-    is_stale, validate_format, validate_header, validate_slot, HeaderError, SlotError, ValidHeader,
+    is_stale, validate_format, validate_header, validate_slot, validate_wake, HeaderError,
+    SlotError, ValidHeader, WakeAdvert,
 };
 
 /// CLSID of the Better Cam media source, in registry form.

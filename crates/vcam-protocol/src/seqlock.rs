@@ -12,8 +12,8 @@ use std::marker::PhantomData;
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 
 use crate::header::{
-    off, slot_off, Format, RawHeader, SlotMeta, WriterState, ADVERTISED_MAX, FILE_SIZE,
-    HEADER_SIZE, NO_SLOT, SLOT_CAPACITY, SLOT_COUNT,
+    off, slot_off, Format, RawHeader, SlotMeta, WriterState, ADVERTISED_MAX, FEATURE_FRAME_EVENT,
+    FILE_SIZE, HEADER_SIZE, NO_SLOT, SLOT_CAPACITY, SLOT_COUNT,
 };
 use crate::validate::{
     frame_bytes, min_stride, validate_format, validate_slot, FormatError, SlotError, ValidHeader,
@@ -177,6 +177,11 @@ impl Shared {
 
     /// Reset the whole header and publish it: magic last, so a reader never sees a half-built header.
     /// Fails when the mapping is smaller than [`FILE_SIZE`] or read-only.
+    ///
+    /// The whole header is zeroed, the frame event fields (`features`, the nonce, `signal_seq` and the DLL's `wake_*`
+    /// diagnostics, bytes 448..512) included, in this version and in every older one alike: an older app that starts
+    /// over the file of a newer one clears the advert, so a reader falls back to polling. A newer app advertises its
+    /// events afterwards ([`Shared::advertise_frame_event`]).
     pub fn init_writer(
         &self,
         pid: u32,
@@ -236,6 +241,40 @@ impl Shared {
     pub fn clear_latest(&self) {
         if self.writable {
             self.a32(off::LATEST_SLOT).store(NO_SLOT, Ordering::Release);
+        }
+    }
+
+    /// Tell readers that the frame events named by `nonce` exist ([`crate::signal`]): the nonce first, `features` last
+    /// with release ordering, so a reader that sees the bit finds the nonce. `signal_seq` is not touched: it starts at 0
+    /// with [`init_writer`](Self::init_writer). Ignored on a read-only view. A zero nonce is not an advert and clears
+    /// the bit instead.
+    pub fn advertise_frame_event(&self, nonce: u128) {
+        if !self.writable {
+            return;
+        }
+        if nonce == 0 {
+            self.clear_features();
+            return;
+        }
+        self.a64(off::EVENT_NONCE_LO)
+            .store(nonce as u64, Ordering::Release);
+        self.a64(off::EVENT_NONCE_HI)
+            .store((nonce >> 64) as u64, Ordering::Release);
+        self.a32(off::FEATURES)
+            .store(FEATURE_FRAME_EVENT, Ordering::Release);
+    }
+
+    /// Withdraw the advert: `features` becomes 0 (the nonce stays; readers need the bit).
+    pub fn clear_features(&self) {
+        if self.writable {
+            self.a32(off::FEATURES).store(0, Ordering::Release);
+        }
+    }
+
+    /// Store the count of signals ([`crate::signal`] calls this between the reset and the set of an event).
+    pub fn set_signal_seq(&self, n: u64) {
+        if self.writable {
+            self.a64(off::SIGNAL_SEQ).store(n, Ordering::Release);
         }
     }
 
@@ -358,6 +397,18 @@ impl Shared {
                 .store(p95_us, Ordering::Relaxed);
             self.a64(off::DELIVERED).store(delivered, Ordering::Relaxed);
             self.a64(off::REPEATED).store(repeated, Ordering::Relaxed);
+        }
+    }
+
+    /// The DLL's diagnostics of how the pump waits (`wake_mode` of [`crate::header::wake_mode`] and three counters).
+    /// Ignored on a read-only view. The caller writes them only while the header is valid, like the statistics.
+    pub fn set_wake_stats(&self, mode: u32, events: u64, missed: u64, spurious: u64) {
+        if self.writable {
+            self.a32(off::WAKE_MODE).store(mode, Ordering::Relaxed);
+            self.a64(off::WAKE_EVENTS).store(events, Ordering::Relaxed);
+            self.a64(off::WAKE_MISSED).store(missed, Ordering::Relaxed);
+            self.a64(off::WAKE_SPURIOUS)
+                .store(spurious, Ordering::Relaxed);
         }
     }
 
@@ -538,6 +589,66 @@ mod tests {
         assert_eq!(v.state, WriterState::Live);
         let r = s.read_latest(&v, |_, _| panic!("no frame yet"));
         assert_eq!(r, Ok(Read::NoFrame));
+    }
+
+    #[test]
+    fn init_zeroes_the_frame_event_bytes_and_the_advert_round_trips() {
+        let mut heap = Heap::new();
+        let s = heap.shared(true);
+        // an earlier writer left an advert and the DLL left diagnostics
+        s.init_writer(1, 1_000_000, 1).unwrap();
+        s.advertise_frame_event(0xAAAA_BBBB_CCCC_DDDD_1111_2222_3333_4444);
+        s.set_signal_seq(9);
+        s.set_wake_stats(1, 2, 3, 4);
+        let h = s.header();
+        assert_eq!(h.features, FEATURE_FRAME_EVENT);
+        assert_eq!(
+            (h.event_nonce_lo, h.event_nonce_hi),
+            (0x1111_2222_3333_4444, 0xAAAA_BBBB_CCCC_DDDD)
+        );
+        assert_eq!(
+            (h.event_nonce_lo_again, h.event_nonce_hi_again),
+            (h.event_nonce_lo, h.event_nonce_hi)
+        );
+        assert_eq!((h.signal_seq, h.wake_mode), (9, 1));
+        assert_eq!((h.wake_events, h.wake_missed, h.wake_spurious), (2, 3, 4));
+        // a new init (this version's, and the old one's was the same `write_bytes`) clears 448..512
+        for o in (off::FEATURES..512).step_by(8) {
+            s.poke64(o, u64::MAX);
+        }
+        s.init_writer(2, 1_000_000, 2).unwrap();
+        let h = s.header();
+        assert_eq!((h.features, h.signal_seq, h.wake_mode), (0, 0, 0));
+        assert_eq!((h.event_nonce_lo, h.event_nonce_hi), (0, 0));
+        assert_eq!((h.wake_events, h.wake_missed, h.wake_spurious), (0, 0, 0));
+        assert_eq!(valid(&s).wake, None);
+        // the advert is valid again after an advertise; clearing keeps the nonce but drops the bit
+        s.advertise_frame_event(5);
+        assert_eq!(valid(&s).wake.map(|w| w.nonce), Some(5));
+        s.clear_features();
+        assert_eq!(valid(&s).wake, None);
+        assert_eq!(s.header().event_nonce_lo, 5);
+        // a zero nonce is no advert
+        s.advertise_frame_event(7);
+        s.advertise_frame_event(0);
+        assert_eq!(valid(&s).wake, None);
+    }
+
+    #[test]
+    fn a_read_only_view_cannot_touch_the_frame_event_bytes() {
+        let mut heap = Heap::new();
+        let w = heap.shared(true);
+        w.init_writer(1, 1_000_000, 1).unwrap();
+        w.advertise_frame_event(3);
+        w.set_signal_seq(4);
+        let ro = heap.shared(false);
+        ro.advertise_frame_event(99);
+        ro.clear_features();
+        ro.set_signal_seq(100);
+        ro.set_wake_stats(1, 1, 1, 1);
+        let h = ro.header();
+        assert_eq!((h.features, h.event_nonce_lo, h.signal_seq), (1, 3, 4));
+        assert_eq!((h.wake_mode, h.wake_events), (0, 0));
     }
 
     #[test]

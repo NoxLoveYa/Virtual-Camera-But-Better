@@ -35,6 +35,24 @@ pub const MAX_FILE_SIZE: u64 = 256 * 1024 * 1024;
 /// Heartbeat older than this means "writer gone".
 pub const HEARTBEAT_TIMEOUT_MS: u64 = 1000;
 
+/// `features` bit 0: the writer made the pair of frame events and signals them ([`crate::signal`]). The other bits are
+/// reserved: writers store 0 in them and readers ignore them.
+pub const FEATURE_FRAME_EVENT: u32 = 1;
+
+/// `wake_mode` values (written by the DLL for diagnostics; `vcam-tool stats` prints them).
+pub mod wake_mode {
+    /// No advert, or the writer is not live: the pump polls.
+    pub const POLLING: u32 = 0;
+    /// The pump waits on the frame event.
+    pub const EVENT: u32 = 1;
+    /// Polling after too many spurious wake-ups.
+    pub const POLLING_SPURIOUS: u32 = 2;
+    /// Polling after missed wake-ups.
+    pub const POLLING_MISSED: u32 = 3;
+    /// Polling because the events could not be opened.
+    pub const POLLING_OPEN_FAILED: u32 = 4;
+}
+
 /// `subtype`: NV12, BT.709 limited range. Y plane then interleaved UV, both with the slot's stride.
 pub const SUBTYPE_NV12: u32 = u32::from_le_bytes(*b"NV12");
 /// `subtype`: BGRX (`MFVideoFormat_RGB32`), top-down.
@@ -67,6 +85,25 @@ pub mod off {
     // -- slots --
     pub const LATEST_SLOT: usize = 296;
     pub const SLOTS: usize = 304;
+    // -- frame event (see `crate::signal`); the header ends at 448 without it --
+    /// u32, app: feature bits ([`FEATURE_FRAME_EVENT`](super::FEATURE_FRAME_EVENT)). Stored last, after the nonce.
+    pub const FEATURES: usize = 448;
+    /// u64, app: low 64 bits of the event nonce.
+    pub const EVENT_NONCE_LO: usize = 456;
+    /// u64, app: high 64 bits of the event nonce.
+    pub const EVENT_NONCE_HI: usize = 464;
+    /// u64, app: signals since `init_writer`.
+    pub const SIGNAL_SEQ: usize = 472;
+    // -- written by the DLL (diagnostics) --
+    /// u32: how the pump waits (0 polling, 1 event, 2 polling after spurious wake-ups, 3 polling after missed
+    /// wake-ups, 4 polling because the events could not be opened).
+    pub const WAKE_MODE: usize = 480;
+    /// u64: event wake-ups of the stream.
+    pub const WAKE_EVENTS: usize = 488;
+    /// u64: missed wake-ups counted.
+    pub const WAKE_MISSED: usize = 496;
+    /// u64: spurious wake-ups counted.
+    pub const WAKE_SPURIOUS: usize = 504;
 
     /// Offsets inside one [`Format`](super::Format).
     pub const FMT_WIDTH: usize = 0;
@@ -142,6 +179,16 @@ struct HeaderLayout {
     latest_slot: u32,
     reserved2: u32,
     slots: [SlotLayout; SLOT_COUNT],
+    features: u32,
+    reserved3: u32,
+    event_nonce_lo: u64,
+    event_nonce_hi: u64,
+    signal_seq: u64,
+    wake_mode: u32,
+    reserved4: u32,
+    wake_events: u64,
+    wake_missed: u64,
+    wake_spurious: u64,
 }
 
 // The offsets above are the contract; the compiler checks them against the struct.
@@ -170,6 +217,19 @@ const _: () = {
     assert!(offset_of!(HeaderLayout, repeated) == off::REPEATED);
     assert!(offset_of!(HeaderLayout, latest_slot) == off::LATEST_SLOT);
     assert!(offset_of!(HeaderLayout, slots) == off::SLOTS);
+    assert!(offset_of!(HeaderLayout, features) == off::FEATURES);
+    assert!(offset_of!(HeaderLayout, reserved3) == off::FEATURES + 4);
+    assert!(offset_of!(HeaderLayout, event_nonce_lo) == off::EVENT_NONCE_LO);
+    assert!(offset_of!(HeaderLayout, event_nonce_hi) == off::EVENT_NONCE_HI);
+    assert!(offset_of!(HeaderLayout, signal_seq) == off::SIGNAL_SEQ);
+    assert!(offset_of!(HeaderLayout, wake_mode) == off::WAKE_MODE);
+    assert!(offset_of!(HeaderLayout, reserved4) == off::WAKE_MODE + 4);
+    assert!(offset_of!(HeaderLayout, wake_events) == off::WAKE_EVENTS);
+    assert!(offset_of!(HeaderLayout, wake_missed) == off::WAKE_MISSED);
+    assert!(offset_of!(HeaderLayout, wake_spurious) == off::WAKE_SPURIOUS);
+    // the new fields start where the slots end and use the old header's unused bytes only
+    assert!(off::FEATURES == off::SLOTS + SLOT_COUNT * off::SLOT_SIZE);
+    assert!(off::WAKE_SPURIOUS + 8 == 512);
     assert!(size_of::<FormatLayout>() == off::FMT_SIZE);
     assert!(offset_of!(FormatLayout, height) == off::FMT_HEIGHT);
     assert!(offset_of!(FormatLayout, fps_num) == off::FMT_FPS_NUM);
@@ -192,6 +252,11 @@ const _: () = {
     );
     assert!(off::DELIVERED % 8 == 0 && off::REPEATED % 8 == 0 && off::SLOTS % 8 == 0);
     assert!(off::SLOT_CAPTURE_QPC % 8 == 0 && off::SLOT_SIZE % 8 == 0);
+    assert!(off::FEATURES % 4 == 0 && off::WAKE_MODE % 4 == 0);
+    assert!(
+        off::EVENT_NONCE_LO % 8 == 0 && off::EVENT_NONCE_HI % 8 == 0 && off::SIGNAL_SEQ % 8 == 0
+    );
+    assert!(off::WAKE_EVENTS % 8 == 0 && off::WAKE_MISSED % 8 == 0 && off::WAKE_SPURIOUS % 8 == 0);
 };
 
 /// Video format: used for the advertised list, `negotiated`, and slot descriptors.
@@ -301,6 +366,21 @@ pub struct RawHeader {
     pub delivered: u64,
     pub repeated: u64,
     pub latest_slot: u32,
+    /// Feature bits ([`FEATURE_FRAME_EVENT`]); unknown bits are not an error.
+    pub features: u32,
+    /// The event nonce, read before `features`.
+    pub event_nonce_lo: u64,
+    pub event_nonce_hi: u64,
+    /// The event nonce read again after `features`: [`crate::validate_header`] accepts an advert only when both reads
+    /// agree (a writer that starts over in the middle of the read gives a different nonce, or none).
+    pub event_nonce_lo_again: u64,
+    pub event_nonce_hi_again: u64,
+    pub signal_seq: u64,
+    /// Written by the DLL (diagnostics): see [`wake_mode`].
+    pub wake_mode: u32,
+    pub wake_events: u64,
+    pub wake_missed: u64,
+    pub wake_spurious: u64,
 }
 
 impl RawHeader {
@@ -313,10 +393,22 @@ impl RawHeader {
             fps_den: get32(o + off::FMT_FPS_DEN),
             subtype: get32(o + off::FMT_SUBTYPE),
         };
+        // `signal_seq` is loaded first, before `writer_frames` (and before the poll that follows): a publish bumps the
+        // frame count before the signal count, so a count of signals that is older than the count of frames can only
+        // make the reader wait for a signal that is already on its way, never count a frame as missed that the
+        // signal count already covers.
+        let signal_seq = get64(off::SIGNAL_SEQ);
         let mut advertised = [Format::default(); ADVERTISED_MAX];
         for (i, a) in advertised.iter_mut().enumerate() {
             *a = fmt(off::ADVERTISED + i * off::FMT_SIZE);
         }
+        // The writer stores `features` last (Release) after the nonce, so a reader that sees the bit and then reads
+        // the nonce again gets the final value. The order of these loads is the point: nonce, features, nonce.
+        let event_nonce_lo = get64(off::EVENT_NONCE_LO);
+        let event_nonce_hi = get64(off::EVENT_NONCE_HI);
+        let features = get32(off::FEATURES);
+        let event_nonce_lo_again = get64(off::EVENT_NONCE_LO);
+        let event_nonce_hi_again = get64(off::EVENT_NONCE_HI);
         RawHeader {
             magic: get32(off::MAGIC),
             protocol: get32(off::PROTOCOL),
@@ -340,6 +432,16 @@ impl RawHeader {
             delivered: get64(off::DELIVERED),
             repeated: get64(off::REPEATED),
             latest_slot: get32(off::LATEST_SLOT),
+            features,
+            event_nonce_lo,
+            event_nonce_hi,
+            event_nonce_lo_again,
+            event_nonce_hi_again,
+            signal_seq,
+            wake_mode: get32(off::WAKE_MODE),
+            wake_events: get64(off::WAKE_EVENTS),
+            wake_missed: get64(off::WAKE_MISSED),
+            wake_spurious: get64(off::WAKE_SPURIOUS),
         }
     }
 

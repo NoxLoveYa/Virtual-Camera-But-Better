@@ -2,9 +2,9 @@
 //! hostile file must give the slate, never a crash or an out-of-bounds read.
 
 use crate::header::{
-    Format, RawHeader, SlotMeta, WriterState, ADVERTISED_MAX, HEADER_SIZE, HEARTBEAT_TIMEOUT_MS,
-    MAX_HEIGHT, MAX_WIDTH, RGB32_MAX_HEIGHT, RGB32_MAX_WIDTH, SLOT_CAPACITY, SLOT_COUNT,
-    SUBTYPE_NV12, SUBTYPE_RGB32,
+    Format, RawHeader, SlotMeta, WriterState, ADVERTISED_MAX, FEATURE_FRAME_EVENT, HEADER_SIZE,
+    HEARTBEAT_TIMEOUT_MS, MAX_HEIGHT, MAX_WIDTH, RGB32_MAX_HEIGHT, RGB32_MAX_WIDTH, SLOT_CAPACITY,
+    SLOT_COUNT, SUBTYPE_NV12, SUBTYPE_RGB32,
 };
 use crate::MAGIC;
 
@@ -54,6 +54,18 @@ impl From<FormatError> for SlotError {
     }
 }
 
+/// What the writer says about its frame events ([`crate::signal`]): present only when `features` has
+/// [`FEATURE_FRAME_EVENT`] and the nonce is non-zero and was read the same twice.
+///
+/// The header never names the events, it only holds 128 bits: the reader formats the name itself
+/// ([`crate::signal::event_name`]), so a hostile file can only point it at objects under our own prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WakeAdvert {
+    pub nonce: u128,
+    /// `signal_seq` as loaded with the header.
+    pub signal_seq: u64,
+}
+
 /// A header that passed [`validate_header`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidHeader {
@@ -64,8 +76,29 @@ pub struct ValidHeader {
     pub file_size: u64,
     pub slot_capacity: u64,
     pub latest_slot: u32,
+    /// Frames the writer has published (for the miss check of an event wait; any value is accepted).
+    pub writer_frames: u64,
+    /// The frame event advert; `None` when there is none or it is malformed. A broken advert never makes the header
+    /// invalid: it must not turn into a slate.
+    pub wake: Option<WakeAdvert>,
     /// Advertised entries that passed [`validate_advertised`] (invalid ones are dropped); empty means "use defaults".
     pub advertised: Vec<Format>,
+}
+
+/// The frame event advert of `h`, or `None`: the bit is set, the nonce is not zero, and the two reads of the nonce
+/// (one before and one after `features`) agree. Unknown feature bits are ignored.
+pub fn validate_wake(h: &RawHeader) -> Option<WakeAdvert> {
+    if h.features & FEATURE_FRAME_EVENT == 0 {
+        return None;
+    }
+    if h.event_nonce_lo != h.event_nonce_lo_again || h.event_nonce_hi != h.event_nonce_hi_again {
+        return None;
+    }
+    let nonce = (h.event_nonce_hi as u128) << 64 | h.event_nonce_lo as u128;
+    (nonce != 0).then_some(WakeAdvert {
+        nonce,
+        signal_seq: h.signal_seq,
+    })
 }
 
 /// Check a header read from a mapping (or a plain read) of `mapped_len` bytes.
@@ -126,6 +159,8 @@ pub fn validate_header(
         file_size: h.file_size,
         slot_capacity: h.slot_capacity,
         latest_slot: h.latest_slot,
+        writer_frames: h.writer_frames,
+        wake: validate_wake(h),
         advertised: validate_advertised(h),
     })
 }
@@ -506,6 +541,126 @@ mod tests {
         m.stride = 1920 * 4;
         m.data_size = 1920 * 1080 * 4;
         assert!(validate_slot(&m, &v).is_ok());
+    }
+
+    fn with_advert(f: impl FnOnce(&mut RawHeader)) -> RawHeader {
+        let mut h = good_header();
+        h.features = FEATURE_FRAME_EVENT;
+        h.event_nonce_lo = 0x1122_3344_5566_7788;
+        h.event_nonce_hi = 0x99aa_bbcc_ddee_ff00;
+        h.event_nonce_lo_again = h.event_nonce_lo;
+        h.event_nonce_hi_again = h.event_nonce_hi;
+        h.signal_seq = 41;
+        f(&mut h);
+        h
+    }
+
+    #[test]
+    fn no_advert_means_no_wake() {
+        // a header that has never heard of the frame event (an old app, or after `init_writer`)
+        let v = validate_header(&good_header(), FILE_SIZE, None, None).unwrap();
+        assert_eq!(v.wake, None);
+        // the bit without a nonce, and a nonce without the bit
+        let h = with_advert(|h| {
+            h.event_nonce_lo = 0;
+            h.event_nonce_hi = 0;
+            h.event_nonce_lo_again = 0;
+            h.event_nonce_hi_again = 0;
+        });
+        assert_eq!(validate_wake(&h), None);
+        let h = with_advert(|h| h.features = 0);
+        assert_eq!(validate_wake(&h), None);
+    }
+
+    #[test]
+    fn a_good_advert_gives_the_nonce_and_the_signal_count() {
+        let v = validate_header(&with_advert(|_| {}), FILE_SIZE, None, None).unwrap();
+        let w = v.wake.expect("advert");
+        assert_eq!(w.nonce, 0x99aa_bbcc_ddee_ff00_1122_3344_5566_7788);
+        assert_eq!(w.signal_seq, 41);
+        // either half alone is a valid nonce
+        let h = with_advert(|h| {
+            h.event_nonce_hi = 0;
+            h.event_nonce_hi_again = 0;
+        });
+        assert_eq!(validate_wake(&h).unwrap().nonce, 0x1122_3344_5566_7788);
+        let h = with_advert(|h| {
+            h.event_nonce_lo = 0;
+            h.event_nonce_lo_again = 0;
+        });
+        assert_eq!(
+            validate_wake(&h).unwrap().nonce,
+            0x99aa_bbcc_ddee_ff00_0000_0000_0000_0000
+        );
+    }
+
+    #[test]
+    fn unknown_feature_bits_are_ignored() {
+        let h = with_advert(|h| h.features |= 0xffff_fffe);
+        assert!(validate_wake(&h).is_some());
+        // a reserved bit alone is not the frame event
+        let h = with_advert(|h| h.features = 0x8000_0000);
+        assert_eq!(validate_wake(&h), None);
+        let h = with_advert(|h| h.features = 2);
+        assert_eq!(validate_wake(&h), None);
+    }
+
+    #[test]
+    fn a_nonce_that_changed_between_the_two_reads_gives_no_advert() {
+        for flip in 0..2 {
+            let h = with_advert(|h| {
+                if flip == 0 {
+                    h.event_nonce_lo_again ^= 1;
+                } else {
+                    h.event_nonce_hi_again ^= 1 << 63;
+                }
+            });
+            assert_eq!(validate_wake(&h), None, "flip {flip}");
+        }
+        // a re-init in progress: the nonce was still the old one, then zero
+        let h = with_advert(|h| {
+            h.event_nonce_lo_again = 0;
+            h.event_nonce_hi_again = 0;
+        });
+        assert_eq!(validate_wake(&h), None);
+    }
+
+    #[test]
+    fn a_broken_advert_never_invalidates_the_header() {
+        // whatever the advert fields hold, the header is as valid as without them: never a slate because of them
+        let plain =
+            validate_header(&good_header(), FILE_SIZE, Some(10_000_000), Some(5_000_000)).unwrap();
+        for (features, lo, hi, lo2, hi2, seq) in [
+            (u32::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX),
+            (1, 0, 0, 0, 0, 0),
+            (1, 5, 6, 7, 8, 9),
+            (0xdead_beef, 1, 2, 1, 2, 3),
+        ] {
+            let mut h = good_header();
+            h.features = features;
+            h.event_nonce_lo = lo;
+            h.event_nonce_hi = hi;
+            h.event_nonce_lo_again = lo2;
+            h.event_nonce_hi_again = hi2;
+            h.signal_seq = seq;
+            h.wake_mode = u32::MAX;
+            h.wake_events = u64::MAX;
+            let v = validate_header(&h, FILE_SIZE, Some(10_000_000), Some(5_000_000)).unwrap();
+            assert_eq!(
+                (v.state, v.latest_slot, v.writer_frames, &v.advertised),
+                (
+                    plain.state,
+                    plain.latest_slot,
+                    plain.writer_frames,
+                    &plain.advertised
+                )
+            );
+        }
+        // the frame count is carried for the reader's miss check
+        let mut h = good_header();
+        h.writer_frames = 77;
+        let v = validate_header(&h, FILE_SIZE, None, None).unwrap();
+        assert_eq!(v.writer_frames, 77);
     }
 
     #[test]

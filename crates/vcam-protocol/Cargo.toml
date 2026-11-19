@@ -19,6 +19,10 @@ features = [
     "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Security",
+    # the frame event's security descriptor (SDDL) and the user's SID as text; the DLL links these but never calls them
+    "Win32_Security_Authorization",
+    # the frame event's random name (`BCryptGenRandom`), writer side only
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_IO",
