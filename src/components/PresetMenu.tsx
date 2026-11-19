@@ -54,7 +54,7 @@ export function PresetMenu() {
   // Save overwrites the active preset; with none active it asks for a name instead. While a load runs the state is half way: no save.
   const busy = loading !== null;
   const save = useCallback(() => {
-    if (busy) return;
+    if (busy) return useStore.getState().notify("Wait until the preset has loaded");
     if (!activePreset) {
       setOpen(true);
       setSaving(true);

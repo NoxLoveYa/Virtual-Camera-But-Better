@@ -9,7 +9,10 @@
  * - `exclusive` (a save, an Undo of the chain alone): never dropped, never replaces another; runs in order.
  */
 export interface QueueHooks {
-  /** The label of the job that starts (`null`: it has none), and `null` when the queue is empty. The title bar shows it. */
+  /**
+   * The label of the job that runs or, when that one has none, of the latest load that waits; `null` when there is none.
+   * Called when it changes. The title bar shows it, and a save, a rename or a delete checks it.
+   */
   label: (label: string | null) => void;
   /** A job threw. */
   fail: (error: unknown) => void;
@@ -20,6 +23,8 @@ export interface Queue {
   exclusive: (job: () => Promise<void>) => Promise<void>;
   /** A job runs or waits. */
   busy: () => boolean;
+  /** The labels of the jobs that run or wait (a load that waits is not yet the one the title bar shows). */
+  loads: () => string[];
 }
 
 interface Entry {
@@ -31,14 +36,25 @@ interface Entry {
 
 export function createQueue(hooks: QueueHooks): Queue {
   let running = false;
+  let current: Entry | null = null;
+  let shown: string | null = null;
   const waiting: Entry[] = [];
+
+  // An unlabelled job clears the label (the spinner never shows the name of a job that is over), but a load that waits behind
+  // it shows at once: from the click on, a save over the preset it replaces, a rename or a delete of it is refused.
+  const emit = () => {
+    const next = current?.label ?? [...waiting].reverse().find((w) => w.label !== null)?.label ?? null;
+    if (next === shown) return;
+    shown = next;
+    hooks.label(next);
+  };
 
   const drain = async () => {
     running = true;
     let cur: Entry | undefined;
     while ((cur = waiting.shift())) {
-      // Every job sets the label, an unlabelled one clears it: the spinner never shows the name of a job that is over.
-      hooks.label(cur.label);
+      current = cur;
+      emit();
       try {
         await cur.job();
       } catch (e) {
@@ -46,8 +62,9 @@ export function createQueue(hooks: QueueHooks): Queue {
       }
       cur.done();
     }
+    current = null;
     running = false;
-    hooks.label(null);
+    emit();
   };
 
   const add = (label: string | null, replaceable: boolean, job: () => Promise<void>) =>
@@ -64,6 +81,7 @@ export function createQueue(hooks: QueueHooks): Queue {
         }
       }
       waiting.push({ label, replaceable, job, done });
+      emit();
       if (!running) void drain();
     });
 
@@ -71,5 +89,6 @@ export function createQueue(hooks: QueueHooks): Queue {
     serial: (label, job) => add(label, true, job),
     exclusive: (job) => add(null, false, job),
     busy: () => running || waiting.length > 0,
+    loads: () => [current, ...waiting].flatMap((e) => (e?.label != null ? [e.label] : [])),
   };
 }

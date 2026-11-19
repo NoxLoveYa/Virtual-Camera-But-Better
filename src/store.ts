@@ -1471,6 +1471,8 @@ export const useStore = create<State>((set, get) => {
       const full = u.full;
       if (!full) {
         const back = () => {
+          // A load (or any toast) that ran while this waited replaced the Undo slot: its state is newer, this chain is stale.
+          if (get().undo !== u) return;
           replaceChain(u.chain, u.activePreset, u.presetBaseline);
           say("Undone");
         };
@@ -1557,8 +1559,11 @@ export const useStore = create<State>((set, get) => {
     refreshPresets: async () => set({ presets: await api.listPresets() }),
     savePreset: async (name) => {
       // A load in progress has the state half way: saving it would overwrite the preset with it (the buttons are off then too).
-      if (get().presetLoading !== null) return;
+      if (get().presetLoading !== null) return say("Wait until the preset has loaded");
+      const active = get().activePreset;
       await exclusive(async () => {
+        // A load that ran first changed the state (and the active preset): this save would write that state under this name.
+        if (get().activePreset !== active) return get().addNotice("Not saved: another preset loaded first.");
         const state = stateNow();
         // A camera that is unplugged and has no record has no name here: the last one it had, never "".
         const d = state.camera.device;
@@ -1610,7 +1615,7 @@ export const useStore = create<State>((set, get) => {
       }
     },
     renamePreset: async (from, to) => {
-      if (get().presetLoading === from) return say(`“${from}” is loading. Rename it when it is done.`);
+      if (queue.loads().includes(from)) return say(`“${from}” is loading. Rename it when it is done.`);
       try {
         await api.renamePreset(from, to);
         if (get().activePreset === from) {
@@ -1624,7 +1629,7 @@ export const useStore = create<State>((set, get) => {
       }
     },
     deletePreset: async (name) => {
-      if (get().presetLoading === name) return say(`“${name}” is loading. Delete it when it is done.`);
+      if (queue.loads().includes(name)) return say(`“${name}” is loading. Delete it when it is done.`);
       try {
         await api.deletePreset(name);
         if (get().activePreset === name) {

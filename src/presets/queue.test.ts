@@ -105,7 +105,36 @@ const tick = async () => {
   await r.finish("A");
   same(r.labels, ["A", null], "the unlabelled job sets no label");
   await r.finish("pending");
-  same(r.labels, ["A", null, null], "and the end clears it");
+  same(r.labels, ["A", null], "and the end has nothing to clear (the label only changes when it differs)");
+}
+
+// A load that waits behind an unlabelled job shows its label at once (so a save or a rename of it is refused), and it is cleared after.
+{
+  const r = rig();
+  void r.queue.serial(null, r.job("pending"));
+  same([r.labels, r.queue.loads()], [[], []], "an unlabelled job shows no label");
+  const load = ended(r.queue.serial("B", r.job("B")));
+  await tick();
+  same(r.labels, ["B"], "the waiting load's label is visible while the unlabelled job still runs");
+  same(r.queue.loads(), ["B"], "and it is listed as a load that waits");
+  await r.finish("pending");
+  same(r.labels, ["B"], "it stays when the load starts (no flicker)");
+  same(r.queue.loads(), ["B"], "and as the load that runs");
+  await r.finish("B");
+  same([load.done, r.labels, r.queue.loads()], [true, ["B", null], []], "cleared at the end");
+}
+
+// A load that is replaced while waiting takes its label with it; the running load's label stays until it ends.
+{
+  const r = rig();
+  void r.queue.serial("A", r.job("A"));
+  void r.queue.serial("B", r.job("B"));
+  void r.queue.serial("C", r.job("C"));
+  await tick();
+  same([r.labels, r.queue.loads()], [["A"], ["A", "C"]], "the label is the running load's; the replaced one is gone from the list");
+  await r.finish("A");
+  await r.finish("C");
+  same([r.labels, r.queue.loads()], [["A", "C", null], []], "empty after the end");
 }
 
 // An exclusive job (a save) is never dropped and never replaces one, and runs in order.
