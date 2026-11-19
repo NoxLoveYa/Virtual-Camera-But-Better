@@ -8,10 +8,13 @@ import type { ExtensionInfo, FilterCfg } from "../filters/schema";
 import { normalizeChain, signature } from "../filters/chain";
 import {
   CONTROL_KEYS,
+  CONTROL_LABELS,
   DEFAULT_AUTO,
   DEFAULT_OUTPUT,
   DEFAULT_SOURCE,
+  autoCfgOf,
   findCamera,
+  findStored,
   largestWide,
   linkKey,
   modeOf,
@@ -20,6 +23,8 @@ import {
   normalizeOutput,
   normalizeSource,
   vidPid,
+  withAutoCfg,
+  withControlValues,
   type AutoCfg,
   type CameraInfo,
   type ControlInfo,
@@ -28,6 +33,7 @@ import {
   type OutputCfg,
   type SourceCfg,
   type StoredControl,
+  type StoredControls,
 } from "../camera/schema";
 
 /** A chain entry as the file holds it: no id. */
@@ -150,6 +156,54 @@ export function presetSignature(state: PresetState): string {
   return `v2:${JSON.stringify([signature(state.chain), deviceKey(state.camera.device), capture, controls, auto, output])}`;
 }
 
+/** What the store holds now, as a preset state: the selected camera's record (changed controls, Better Cam auto settings), the capture fields, the output. */
+export function presetStateOf(chain: FilterCfg[], source: SourceCfg, output: OutputCfg, stored: StoredControls, cams: CameraInfo[] | null): PresetState {
+  const cam = cams && source.video_device_id ? findCamera(cams, source.video_device_id) : null;
+  const id = cam?.id ?? source.video_device_id;
+  const record = id ? findStored(stored, { id, name: cam?.name ?? "" }) : null;
+  const device = id ? { id, name: cam?.name ?? record?.device.name ?? "" } : null;
+  return { chain, camera: { device, capture: withoutDevice(source), controls: record?.device.values ?? {}, auto: autoCfgOf(stored, device) }, output };
+}
+
+/** A parsed file as it is written back: a v1 file stays v1 (filters only), a v2 file keeps the sections it has. */
+export interface PresetFileAny {
+  app: "better-cam";
+  version: 1 | 2;
+  chain: PresetEntry[];
+  camera?: PresetCamera;
+  output?: OutputCfg;
+}
+
+export const presetFileOfParsed = (p: ParsedPreset): PresetFileAny => {
+  const file = presetFileOf({ chain: p.chain, camera: p.camera ?? defaultState(null).camera, output: p.output ?? DEFAULT_OUTPUT });
+  const { camera, output, ...rest } = file;
+  return p.camera || p.output ? { ...rest, ...(p.camera && { camera }), ...(p.output && { output }) } : { ...rest, version: 1 };
+};
+
+/** The controls with each Better Cam auto entry turned into Manual at the same value (the resume point becomes the seed of the later `mode app` write). */
+export const appAsManual = (controls: PresetCamera["controls"]): PresetCamera["controls"] =>
+  Object.fromEntries(Object.entries(controls).map(([k, c]) => [k, c.mode === "app" ? { value: c.value, auto: false } : c]));
+
+/** `stored` with a preset's controls and Better Cam auto settings as the record of `cam`; `seed`: Better Cam auto entries as Manual (see `appAsManual`). Learned values stay. */
+export const withPresetCamera = (stored: StoredControls, cam: { id: string; name: string }, controls: PresetCamera["controls"], auto: AutoCfg, seed: boolean): StoredControls =>
+  withAutoCfg(withControlValues(stored, cam, seed ? appAsManual(controls) : controls), cam, auto);
+
+/** A baseline saved by the filters-only build is a chain fingerprint: it becomes a full one when it still describes the chain, else it is dropped. */
+export const migrateBaseline = (baseline: string | null, state: PresetState): string | null =>
+  baseline === null || baseline.startsWith("v2:") ? baseline : baseline === signature(state.chain) ? presetSignature(state) : null;
+
+/** Whether a saved preset's file (a v1 file: filters only) describes `now`. */
+export const presetMatches = (p: ParsedPreset, now: PresetState): boolean =>
+  p.camera === null && p.output === null
+    ? signature(p.chain) === signature(now.chain)
+    : presetSignature({ chain: p.chain, camera: p.camera ?? now.camera, output: p.output ?? now.output }) === presetSignature(now);
+
+/** The notes a load adds to its toast for what the file lacks or the version it has. */
+export const presetNotes = (p: ParsedPreset, name: string): string[] => [
+  ...(p.camera === null && p.output === null ? [`“${name}” has filters only (saved by an older Better Cam).`] : []),
+  ...(p.version > 2 ? ["This preset was saved by a newer Better Cam; some settings may be missing."] : []),
+];
+
 /** The defaults for a camera: empty chain, DEFAULT_SOURCE (largest 16:9 size), no controls, DEFAULT_AUTO, DEFAULT_OUTPUT. */
 export function defaultState(cam: CameraInfo | null): PresetState {
   return {
@@ -163,6 +217,12 @@ export function defaultState(cam: CameraInfo | null): PresetState {
     output: { ...DEFAULT_OUTPUT },
   };
 }
+
+const DEFAULT_PRESET_SIGNATURE = presetSignature(defaultState(null));
+
+/** Whether `state` is the defaults, whatever camera it has ("Default" in the title bar). */
+export const isDefaultPreset = (state: PresetState): boolean =>
+  presetSignature({ ...state, camera: { ...state.camera, device: null } }) === DEFAULT_PRESET_SIGNATURE;
 
 /**
  * The camera a preset names, among the connected ones: `findCamera` (the same link, else the only one with that
@@ -266,4 +326,13 @@ export function planControls(infos: ControlInfo[], target: PresetCamera["control
     if (info && want.get(key)?.mode === "app" && modeOf(info) !== "app") plan.c.push({ key, op: "mode", mode: "app" });
   }
   return plan;
+}
+
+/** The toast lines about a plan: controls the camera does not have or cannot set by hand, and Better Cam auto asked for where it is not offered. */
+export function planNotes(plan: ControlPlan): string[] {
+  const n = plan.skipped.length;
+  return [
+    ...(n > 0 ? [n === 1 ? "1 camera control is not on this camera." : `${n} camera controls are not on this camera.`] : []),
+    ...plan.downgraded.map((k) => `Better Cam auto is not available for ${CONTROL_LABELS[k]} on this camera.`),
+  ];
 }

@@ -748,6 +748,10 @@ export const autoCfgOf = (stored: StoredControls, cam: { id: string; name: strin
 export const withAutoCfg = (stored: StoredControls, cam: { id: string; name: string }, cfg: AutoCfg): StoredControls =>
   editDevice(stored, cam, (d) => ({ ...d, auto: JSON.stringify(cfg) === JSON.stringify(DEFAULT_AUTO) ? undefined : cfg }));
 
+/** `stored` with the changed controls of `cam` replaced by `values` (a preset load). Its Better Cam auto settings and learned values stay. */
+export const withControlValues = (stored: StoredControls, cam: { id: string; name: string }, values: StoredDevice["values"]): StoredControls =>
+  editDevice(stored, cam, (d) => ({ ...d, values: { ...values } }));
+
 /** `stored` with what the controller learned about `cam` (an empty `learned` removes it). */
 export const withLearned = (stored: StoredControls, cam: { id: string; name: string }, learned: unknown): StoredControls => {
   const l = normalizeLearned(learned);

@@ -11,15 +11,25 @@ import {
   type CameraInfo,
   type ControlInfo,
   type ControlKey,
+  type StoredControls,
 } from "../camera/schema";
 import { makeFilter } from "../filters/schema";
+import { signature } from "../filters/chain";
 import {
   defaultState,
+  isDefaultPreset,
+  migrateBaseline,
   parsePreset,
   planControls,
+  planNotes,
   presetCamera,
   presetFileOf,
+  presetFileOfParsed,
+  presetMatches,
+  presetNotes,
   presetSignature,
+  presetStateOf,
+  withPresetCamera,
   type PresetCamera,
   type PresetState,
 } from "./preset";
@@ -340,5 +350,73 @@ same(defaultState(null).camera.capture, DEFAULT_CAPTURE, "default capture withou
 // Two calls do not share objects.
 defaultState(null).camera.auto.exposure.target = 0.8;
 same(defaultState(null).camera.auto, DEFAULT_AUTO, "defaults are fresh");
+
+// --- what the store holds as a preset state (P2) -----------------------------------------------------------------------
+
+const stored: StoredControls = {
+  [BRIO]: {
+    name: "Logitech BRIO",
+    values: { brightness: { value: 140, auto: false }, exposure: { value: -6, auto: false, mode: "app" } },
+    auto: { ...DEFAULT_AUTO, exposure: { ...DEFAULT_AUTO.exposure, target: 0.6 } },
+    learned: { gain_stops: 3 },
+  },
+};
+const src = { ...DEFAULT_SOURCE, video_device_id: BRIO_OTHER_PORT, flip_vertically: true };
+const now = presetStateOf([], src, DEFAULT_OUTPUT, stored, [cam(BRIO_OTHER_PORT, "Logitech BRIO")]);
+same(now.camera.device, { id: BRIO_OTHER_PORT, name: "Logitech BRIO" }, "state: the connected camera, on its new port");
+same([now.camera.controls, now.camera.auto.exposure.target, now.camera.capture.flip_vertically], [stored[BRIO].values, 0.6, true], "state: the record of the moved camera");
+const gone = presetStateOf([], { ...DEFAULT_SOURCE, video_device_id: BRIO }, DEFAULT_OUTPUT, stored, []);
+same(gone.camera.device, { id: BRIO, name: "Logitech BRIO" }, "state: a saved camera that is not connected keeps its name from the record");
+same(presetStateOf([], DEFAULT_SOURCE, DEFAULT_OUTPUT, {}, null).camera, defaultState(null).camera, "state: no camera, nothing stored");
+
+// Default, whatever the camera.
+if (!isDefaultPreset(defaultState(wide(BRIO)))) throw new Error("the defaults for a camera are the defaults");
+if (!isDefaultPreset(presetStateOf([], DEFAULT_SOURCE, DEFAULT_OUTPUT, {}, [wide(BRIO)]))) throw new Error("a fresh install is the defaults");
+if (isDefaultPreset(presetStateOf([makeFilter("color_filter")], DEFAULT_SOURCE, DEFAULT_OUTPUT, {}, null))) throw new Error("a filter is not the defaults");
+if (isDefaultPreset(presetStateOf([], DEFAULT_SOURCE, { ...DEFAULT_OUTPUT, resolution: "1280x720" }, {}, null))) throw new Error("an output change is not the defaults");
+if (isDefaultPreset(now)) throw new Error("changed controls are not the defaults");
+
+// The record a load makes: values replaced, Better Cam auto settings replaced, learned values kept; app entries as Manual when they are to be engaged later.
+const seeded = withPresetCamera(stored, { id: BRIO, name: "Logitech BRIO" }, { focus: { value: 30, auto: false }, exposure: { value: -4, auto: false, mode: "app" } }, DEFAULT_AUTO, true);
+same(seeded[BRIO].values, { focus: { value: 30, auto: false }, exposure: { value: -4, auto: false } }, "record: values replaced, app seeded as Manual");
+same([seeded[BRIO].auto, seeded[BRIO].learned], [undefined, { gain_stops: 3 }], "record: default Better Cam auto is not kept, learned stays");
+same(withPresetCamera({}, { id: BRIO, name: "x" }, { exposure: { value: -4, auto: false, mode: "app" } }, DEFAULT_AUTO, false)[BRIO].values.exposure, { value: -4, auto: false, mode: "app" }, "record: app kept when not seeded");
+same(withPresetCamera(stored, { id: BRIO, name: "Logitech BRIO" }, {}, DEFAULT_AUTO, true)[BRIO], { name: "Logitech BRIO", values: {}, learned: { gain_stops: 3 } }, "record: reset keeps only what was learned");
+same(Object.keys(withPresetCamera({ [BRIO]: { name: "x", values: { focus: { value: 1, auto: false } } } }, { id: BRIO, name: "x" }, {}, DEFAULT_AUTO, true)), [], "record: an empty record is dropped");
+
+// Baselines: a chain fingerprint from the filters-only build.
+const chainOnly = [makeFilter("color_filter")];
+const stateWith = { ...defaultState(null), chain: chainOnly };
+same(migrateBaseline(signature(chainOnly), stateWith), presetSignature(stateWith), "old baseline that fits the chain becomes a full one");
+same(migrateBaseline(signature([]), stateWith), null, "old baseline that does not fit is dropped");
+same(migrateBaseline("v2:[]", stateWith), "v2:[]", "a v2 baseline stays");
+same(migrateBaseline(null, stateWith), null, "no baseline");
+
+// A saved preset matches the state it describes: a v2 file on everything, a v1 file on the filters.
+const asFile = (s: PresetState) => parsePreset(JSON.parse(JSON.stringify(presetFileOf(s))), []);
+if (!presetMatches(asFile(state), state)) throw new Error("a v2 file matches its own state");
+if (presetMatches(asFile(state), manual)) throw new Error("a v2 file does not match a changed control");
+const v1file = parsePreset([entry], []);
+if (!presetMatches(v1file, { ...state, chain: v1file.chain })) throw new Error("a v1 file matches on its filters");
+if (presetMatches(v1file, state)) throw new Error("a v1 file does not match other filters");
+
+// A parsed file is written back as it was.
+same(presetFileOfParsed(v1file).version, 1, "v1 stays v1");
+same(Object.keys(presetFileOfParsed(v1file)).sort(), ["app", "chain", "version"], "v1 file has no camera or output");
+const onlyOutput = parsePreset({ chain: [], output: { fps: 30 } }, []);
+same([presetFileOfParsed(onlyOutput).version, "camera" in presetFileOfParsed(onlyOutput), presetFileOfParsed(onlyOutput).output?.fps], [2, false, 30], "a file with an output only keeps just that");
+same(presetFileOfParsed(v2), presetFileOf({ chain: v2.chain, camera: v2.camera!, output: v2.output! }), "v2 is written whole");
+
+// Toast notes.
+same(presetNotes(v1file, "Old"), ["“Old” has filters only (saved by an older Better Cam)."], "note for an old file");
+same(presetNotes(v2, "New"), [], "no note for a full file");
+same(presetNotes(v3, "Newer"), ["This preset was saved by a newer Better Cam; some settings may be missing."], "note for a newer file");
+same(
+  planNotes({ a: [], b: [], c: [], skipped: [{ key: "roll", why: "not on this camera" }, { key: "pan", why: "no manual mode" }], downgraded: ["exposure"] }),
+  ["2 camera controls are not on this camera.", "Better Cam auto is not available for Exposure on this camera."],
+  "plan notes",
+);
+same(planNotes({ a: [], b: [], c: [], skipped: [{ key: "roll", why: "x" }], downgraded: [] }), ["1 camera control is not on this camera."], "plan note, one control");
+same(planNotes({ a: [], b: [], c: [], skipped: [], downgraded: [] }), [], "no plan notes");
 
 console.log("ok");

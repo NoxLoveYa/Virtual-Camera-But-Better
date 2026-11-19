@@ -23,7 +23,7 @@ React, and runs on Windows 11 only.
 - Extension filters: WGSL or HLSL shaders, each in its own folder with an `extension.json`, in
   `%APPDATA%\dev.bettercam.app\extensions`. Settings → Extensions lists them. Scripts, overlays and widgets are not
   built yet.
-- Presets: save and load a filter chain by name. A preset holds the filters only, not the device controls.
+- Presets: save and load the whole look of the camera by name: the filter chain, the camera and its capture settings, the camera controls with their Manual / Camera auto / Better Cam auto modes, Better Cam auto's settings, and the output. Loading is one step you can undo; the title bar marks unsaved changes (`Name*`). Save, Save as, rename, delete and Reset to defaults are in the Preset menu. Presets from older versions (filters only) still load and change only the filters. App settings (autostart, tray, extensions, window layout) are not part of a preset.
 - Live preview and a line of stats (capture and output size and frame rate, latency, dropped and repeated frames).
   The preview stays in view while the settings scroll, and a splitter sets the width of the two columns.
 - Preview tools: show the picture as it enters a chosen filter, and hold Compare to see the camera picture. An

@@ -1,8 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import type { ExtensionInfo, FilterCfg } from "./filters/schema";
-import { presetChain, presetFile } from "./filters/chain";
-import type { PresetFileV2 } from "./presets/preset";
+import type { PresetFileAny } from "./presets/preset";
 import { answerFlushRequest } from "./ui/saver";
 import type { PreviewPoint } from "./ui/previewFrame";
 import type { AutoCfg, AutoStatus, CameraInfo, ControlInfo, ControlKey, ControlMode, Learned, OutputCfg, SourceCfg, StoredControl } from "./camera/schema";
@@ -181,16 +180,8 @@ export const api = {
   /** The whole chain, cheap enough for every slider step; applies before the next frame, also while the engine is stopped. */
   setChain: (chain: FilterCfg[]) => invoke<void>("set_chain", { chain }),
   listPresets: () => invoke<string[]>("list_presets"),
-  /** Writes the preset file of plan 5.4 (no ids). */
-  savePreset: (name: string, chain: FilterCfg[]) => invoke<void>("save_preset", { name, preset: presetFile(chain) }),
-  /**
-   * The chain of the preset file (the object, or the old bare array), normalized, with fresh ids. `extensions` coerces
-   * the `ext:` entries of installed extensions; other `ext:` entries stay as they are.
-   */
-  loadPreset: (name: string, extensions: readonly ExtensionInfo[] = []) =>
-    invoke<unknown>("load_preset", { name }).then((raw) => presetChain(raw, extensions)),
-  /** Writes a version 2 preset file (see `presetFileOf`) under `name`; ids are dropped, the file is replaced atomically. */
-  savePresetFile: (name: string, file: PresetFileV2) => invoke<void>("save_preset", { name, preset: file }),
+  /** Writes a preset file (see `presetFileOf`; a file read from disk goes back as it was) under `name`; ids are dropped, the file is replaced atomically. */
+  savePresetFile: (name: string, file: PresetFileAny) => invoke<void>("save_preset", { name, preset: file }),
   /** The preset file as the backend returns it (`chain`, and `camera` and `output` when the file has them), still raw: run it through `parsePreset`. */
   loadPresetRaw: (name: string) => invoke<unknown>("load_preset", { name }),
   /** Renames a preset file. Rejects when `from` is missing or `to` is another preset; a change of letter case only is allowed. */
@@ -198,7 +189,7 @@ export const api = {
   deletePreset: (name: string) => invoke<void>("delete_preset", { name }),
   /**
    * The preset file at `path` (a file dropped on the window; the object format, or the old bare array wrapped in it),
-   * still raw: run it through `presetChain`. Only reads; rejects with a sentence (over 1 MiB, not JSON, not a preset).
+   * still raw: run it through `parsePreset`. Only reads; rejects with a sentence (over 1 MiB, not JSON, not a preset).
    */
   readPresetFile: (path: string) => invoke<unknown>("read_preset_file", { path }),
   onEngineState: (cb: (s: EngineState) => void) => listen<EngineState>("engine-state", (e) => cb(e.payload)),

@@ -2,7 +2,8 @@
  * Checks of how extension cards (`ext:<id>`) live in chains and presets (E3). `npm run test:ext` bundles and runs it.
  * It throws at the first failure and prints `ok` otherwise.
  */
-import { PresetFile, normalizeChain, presetChain, presetFile, refreshExtParams, signature } from "./chain";
+import { normalizeChain, refreshExtParams, signature } from "./chain";
+import { defaultState, parsePreset, presetFileOf } from "../presets/preset";
 import { defOf, defaultParams, extOf, isFilterKind, labelOf, makeFilter, type ExtensionInfo, type FilterCfg } from "./schema";
 
 function eq<T>(actual: T, expected: T, what: string) {
@@ -102,14 +103,10 @@ eq(signature(color, overlay) !== signature(color, overlay2), true, "an overlay's
 eq(signature(color, overlay), signature(color, normalizeChain([entry("ext:clock", { size: 40 })], [])), "same overlay, same signature (ids are ignored)");
 eq(signature(color, overlay) !== signature(overlay, color), true, "chain and overlays are not interchangeable");
 
-// Presets: an ext entry survives a save and load, with or without the extension; `overlays` is written only when there are some.
-const saved = presetFile(chain);
-eq("overlays" in saved, false, "no overlays key without overlays");
-eq(presetFile(chain, overlay).overlays?.[0].kind, "ext:clock", "overlays written when present");
-const file = JSON.parse(JSON.stringify(presetFile(chain, overlay))) as PresetFile;
-const back = presetChain(file, []);
-same(back.map((f) => f.kind), ["ext:vignette", "color_filter", "ext:other"], "preset load keeps ext entries, ignores overlays");
+// Presets: an ext entry survives a save and load, with or without the extension.
+const file = JSON.parse(JSON.stringify(presetFileOf({ chain, camera: defaultState(null).camera, output: defaultState(null).output })));
+const back = parsePreset(file, []).chain;
+same(back.map((f) => f.kind), ["ext:vignette", "color_filter", "ext:other"], "preset load keeps ext entries");
 same(back[0].params, chain[0].params, "preset load without the extension keeps the params");
-same(presetChain(file, [edited])[0].params, refreshed[0].params, "preset load with the extension coerces");
-
+same(parsePreset(file, [edited]).chain[0].params, refreshed[0].params, "preset load with the extension coerces");
 console.log("ok");
