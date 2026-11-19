@@ -8,8 +8,10 @@ import {
 } from "../camera/schema";
 import { ColorField } from "./ColorField";
 import { Field } from "./Field";
+import { InspectorHeader } from "./InspectorHeader";
 import { Select } from "./Select";
 import { ToggleRow } from "./ToggleRow";
+import { useSummary } from "../ui/useSummary";
 
 /** The list plus the saved value when it is not in it (a size typed into the saved settings), so the Select can show it. */
 const withCurrent = (options: Option[], value: string): Option[] =>
@@ -18,14 +20,13 @@ const withCurrent = (options: Option[], value: string): Option[] =>
 export function OutputPanel() {
   const output = useStore((s) => s.output);
   const { patchOutput, setBackground } = useStore.getState();
+  const summary = useSummary("output");
 
   return (
-    <section className="panel output" aria-label="Output">
-      <h3 className="card-title panel-title">
-        <span className="label">Output</span>
-      </h3>
-      <div className="panel-body">
-        <div className="fields">
+    <section className="insp-panel" aria-label="Output">
+      <InspectorHeader title="Output" sub={summary} />
+      <div className="insp-scroll">
+        <div className="props">
           <Field label="Resolution">
             <Select
               value={output.resolution}
@@ -47,8 +48,6 @@ export function OutputPanel() {
             {/* No alpha: the background stays opaque, ColorField keeps the alpha byte (0xFF) as it is. */}
             <ColorField value={output.background_color} onChange={setBackground} label="Background color" />
           </Field>
-        </div>
-        <div className="toggles">
           <ToggleRow label="Also offer 720p and 360p to apps" on={output.extra_sizes} onChange={(on) => patchOutput({ extra_sizes: on })} />
         </div>
       </div>

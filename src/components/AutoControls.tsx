@@ -1,4 +1,4 @@
-import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useId, useState, type CSSProperties } from "react";
 import { useStats, useStore } from "../store";
 import {
   DEFAULT_AUTO,
@@ -27,6 +27,7 @@ import {
   type Speed,
   type WhiteBalanceStatus,
 } from "../camera/schema";
+import { Field } from "./Field";
 import { Select } from "./Select";
 
 /** What the Better Cam auto blocks of the card read besides the row's own control. */
@@ -78,19 +79,12 @@ export function LoopStatus({ loop, label, status, live }: { loop: AutoLoop; labe
 
 const pct = (v: number, min: number, max: number) => (max > min ? ((v - min) / (max - min)) * 100 : 0);
 
-function Field({ label, value, children }: { label: string; value?: string; children: ReactNode }) {
-  return (
-    <label className="auto-field">
-      <span className="auto-label">{label}</span>
-      <span className="auto-input">{children}</span>
-      {value !== undefined && <b>{value}</b>}
-    </label>
-  );
-}
-
-/** A slider of a sub-block: the app's own range input, reset by a double click. */
-function Range({
-  label, min, max, step, value, def, onChange, ends,
+/**
+ * A slider row of a sub-block: label, the app's own range input (reset by a double click), the value. `ends` names what the
+ * two ends of the range mean; they are the slider's tooltip.
+ */
+function SliderRow({
+  label, min, max, step, value, def, text, onChange, ends,
 }: {
   label: string;
   min: number;
@@ -98,16 +92,23 @@ function Range({
   step: number;
   value: number;
   def: number;
+  /** The value as the row shows it. */
+  text: string;
   onChange: (v: number) => void;
   ends?: [string, string];
 }) {
+  const id = useId();
   return (
-    <>
-      {ends && <span className="auto-end">{ends[0]}</span>}
+    <div className="prop slider">
+      <label className="pf-label" htmlFor={id}>
+        {label}
+      </label>
       <input
+        id={id}
+        className="pf-range"
         type="range"
         aria-label={label}
-        title="Double-click to reset"
+        title={ends ? `${ends[0]} to ${ends[1]}. Double-click to reset` : "Double-click to reset"}
         style={{ "--p": `${pct(value, min, max)}%` } as CSSProperties}
         min={min}
         max={max}
@@ -116,8 +117,8 @@ function Range({
         onChange={(e) => onChange(Number(e.target.value))}
         onDoubleClick={() => onChange(def)}
       />
-      {ends && <span className="auto-end">{ends[1]}</span>}
-    </>
+      <b className="pf-val">{text}</b>
+    </div>
   );
 }
 
@@ -153,32 +154,30 @@ export function ExposureAuto({ info, ctx }: { info: ControlInfo; ctx: AutoCtx })
 
   return (
     <div className="ctl-sub" data-for="exposure">
-      <Field label="Target brightness" value={cfg.target.toFixed(2)}>
-        <Range
-          label="Target brightness"
-          min={TARGET_MIN}
-          max={TARGET_MAX}
-          step={0.01}
-          value={cfg.target}
-          def={DEFAULT_AUTO.exposure.target}
-          onChange={(target) => setAutoConfig({ exposure: { target } })}
-        />
-      </Field>
+      <SliderRow
+        label="Target brightness"
+        min={TARGET_MIN}
+        max={TARGET_MAX}
+        step={0.01}
+        value={cfg.target}
+        def={DEFAULT_AUTO.exposure.target}
+        text={cfg.target.toFixed(2)}
+        onChange={(target) => setAutoConfig({ exposure: { target } })}
+      />
       <Field label="Longest exposure">
         <Select value={longest} options={options} onChange={(v) => setAutoConfig({ exposure: { longest: parseLongest(v) } })} />
       </Field>
       {gain && mostGain !== null && (
-        <Field label="Most gain" value={mostGain <= gain.min ? "Off" : String(mostGain)}>
-          <Range
-            label="Most gain"
-            min={gain.min}
-            max={gain.max}
-            step={Math.max(1, gain.step)}
-            value={mostGain}
-            def={maxGainValue(null, gain)}
-            onChange={(max_gain) => setAutoConfig({ exposure: { max_gain } })}
-          />
-        </Field>
+        <SliderRow
+          label="Most gain"
+          min={gain.min}
+          max={gain.max}
+          step={Math.max(1, gain.step)}
+          value={mostGain}
+          def={maxGainValue(null, gain)}
+          text={mostGain <= gain.min ? "Off" : String(mostGain)}
+          onChange={(max_gain) => setAutoConfig({ exposure: { max_gain } })}
+        />
       )}
       <ResponseField value={cfg.speed} onChange={(speed) => setAutoConfig({ exposure: { speed } })} />
       <LoopStatus loop="exposure" label="Exposure" status={ctx.exposure} live={ctx.live} />
@@ -258,18 +257,17 @@ export function WhiteBalanceAuto({ ctx }: { ctx: AutoCtx }) {
 
   return (
     <div className="ctl-sub" data-for="white_balance">
-      <Field label="Warmth" value={signed(cfg.warmth)}>
-        <Range
-          label="Warmth"
-          min={-1}
-          max={1}
-          step={0.01}
-          value={cfg.warmth}
-          def={0}
-          ends={["cooler", "warmer"]}
-          onChange={(warmth) => setAutoConfig({ white_balance: { warmth } })}
-        />
-      </Field>
+      <SliderRow
+        label="Warmth"
+        min={-1}
+        max={1}
+        step={0.01}
+        value={cfg.warmth}
+        def={0}
+        text={signed(cfg.warmth)}
+        ends={["cooler", "warmer"]}
+        onChange={(warmth) => setAutoConfig({ white_balance: { warmth } })}
+      />
       <ResponseField value={cfg.speed} onChange={(speed) => setAutoConfig({ white_balance: { speed } })} />
       <LoopStatus loop="white_balance" label="White balance" status={ctx.whiteBalance} live={ctx.live} />
       {ctx.whiteBalance?.state === "at_limit" &&

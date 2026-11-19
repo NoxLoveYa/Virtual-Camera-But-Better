@@ -1,4 +1,4 @@
-import { useEffect, type CSSProperties, type KeyboardEvent } from "react";
+import { Fragment, useEffect, type CSSProperties, type KeyboardEvent } from "react";
 import { useStore } from "../store";
 import {
   CONTROL_LABELS,
@@ -18,11 +18,14 @@ import {
   type ControlInfo,
   type ControlMode,
 } from "../camera/schema";
+import { groupControls } from "../ui/controlGroups";
+import { useSummary } from "../ui/useSummary";
 import { CameraAutoHint, ExposureAuto, LimitMark, LoopStatus, WhiteBalanceAuto, type AutoCtx } from "./AutoControls";
 import { Icon } from "./Icon";
+import { InspectorHeader } from "./InspectorHeader";
 import { Select, type SelectOption } from "./Select";
 
-/** The device controls of the selected camera (plan 6.2): the device's own ranges, Auto switches, double-click to reset. */
+/** The device controls of the selected camera (plan 6.2): the device's own ranges, Auto toggles, double-click to reset. */
 export function ControlsCard() {
   const cameras = useStore((s) => s.cameras);
   const deviceId = useStore((s) => s.source.video_device_id);
@@ -33,6 +36,7 @@ export function ControlsCard() {
   const state = useStore((s) => s.engine.state);
   const stored = useStore((s) => s.controls);
   const autoStatus = useStore((s) => s.autoStatus);
+  const summary = useSummary("controls");
   const { refreshControls, resetAllControls } = useStore.getState();
 
   const cam = cameras ? findCamera(cameras, deviceId) : null;
@@ -67,32 +71,38 @@ export function ControlsCard() {
       live: state === "live",
     };
     body = (
-      <div className="ctl-rows">
-        {shown.map((i) => (
-          <ControlRow key={i.key} info={i} ctx={ctx} />
+      <div className="props ctl-props">
+        {groupControls(shown).map((g) => (
+          <Fragment key={g.title}>
+            <h3 className="prop-group">{g.title}</h3>
+            {g.items.map((i) => (
+              <ControlRow key={i.key} info={i} ctx={ctx} />
+            ))}
+          </Fragment>
         ))}
       </div>
     );
   }
 
   return (
-    <section className="card controls" aria-label="Camera controls">
-      <div className="card-head">
-        <h3 className="card-title">
-          <span className="label">Camera controls</span>
-        </h3>
-        <span className="fill" />
-        <button
-          className="ghost"
-          disabled={!shown || shown.length === 0 || resetting}
-          title="Back to the camera’s own defaults, Auto on where the camera has it"
-          onClick={() => void resetAllControls()}
-        >
-          <Icon name="reset" />
-          Reset all
-        </button>
-      </div>
-      {body}
+    <section className="insp-panel" aria-label="Camera controls">
+      <InspectorHeader
+        title="Camera controls"
+        sub={summary}
+        end={
+          <button
+            type="button"
+            className="ghost insp-refresh"
+            disabled={!shown || shown.length === 0 || resetting}
+            title="Back to the camera’s own defaults, Auto on where the camera has it"
+            onClick={() => void resetAllControls()}
+          >
+            <Icon name="reset" />
+            Reset all
+          </button>
+        }
+      />
+      <div className="insp-scroll">{body}</div>
     </section>
   );
 }
@@ -134,69 +144,96 @@ function ControlRow({ info, ctx }: { info: ControlInfo; ctx: AutoCtx }) {
     if (f != null) limit = { fraction: f, title: `Most gain: ${most}` };
   }
 
-  return (
-    <div className={`ctl${locked || info.auto ? " auto" : ""}${modal ? " multi" : ""}`} data-key={info.key} data-mode={mode}>
-      <div className="ctl-head">
-        <span className="ctl-name" title={label}>
+  // "A": the camera sets this control itself (a control with a mode list has its own list instead).
+  const autoToggle =
+    !modal && info.can_auto ? (
+      <button
+        type="button"
+        className="ctl-a"
+        aria-pressed={info.auto}
+        aria-label={`${label} auto`}
+        title={info.auto ? "The camera sets this" : "Let the camera set this"}
+        onClick={() => setControl(info.key, { auto: !info.auto })}
+      >
+        A
+      </button>
+    ) : null;
+  const resetButton =
+    kind === "slider" && !app && changed ? (
+      <button
+        type="button"
+        className="reset-btn"
+        aria-label={`Reset ${label}`}
+        title={`Reset to ${info.can_auto ? "Auto" : controlValueText({ ...info, value: info.def })}`}
+        onClick={(e) => {
+          reset();
+          // The button leaves with the change: keep the keyboard on the slider.
+          (e.currentTarget.closest(".ctl")?.querySelector("input[type=range]") as HTMLElement | null)?.focus();
+        }}
+      >
+        <Icon name="reset" size={16} />
+      </button>
+    ) : null;
+  // The slots keep their width whether or not a button is in them, so the sliders do not resize when a value changes.
+  const actions = (
+    <span className="pf-act">
+      <span className="pf-slot">{autoToggle}</span>
+      <span className="pf-slot">{resetButton}</span>
+    </span>
+  );
+
+  let row;
+  if (kind === "slider") {
+    row = (
+      <div className={`prop slider${modal ? " has-mode" : ""}`}>
+        <span className="pf-label" title={label}>
           {label}
         </span>
-        {kind !== "select" && <b>{controlValueText(info)}</b>}
-        {kind === "slider" && !app && changed && (
-          <button
-            type="button"
-            className="reset-btn"
-            aria-label={`Reset ${label}`}
-            title={`Reset to ${info.can_auto ? "Auto" : controlValueText({ ...info, value: info.def })}`}
-            onClick={(e) => {
-              reset();
-              // The button leaves with the change: keep the keyboard on the slider.
-              (e.currentTarget.closest(".ctl")?.querySelector("input[type=range]") as HTMLElement | null)?.focus();
-            }}
-          >
-            <Icon name="reset" size={16} />
-          </button>
-        )}
         {modal && (
           <label className="ctl-mode">
             <span className="sr-only">{label} mode</span>
             <Select value={mode} options={modeOptions(info)} onChange={(m) => void setControlMode(info.key, m as ControlMode)} />
           </label>
         )}
-        {!modal && info.can_auto && (
-          <label className="ctl-auto" title={info.auto ? "The camera sets this" : "Let the camera set this"}>
-            <span>Auto</span>
-            <button
-              type="button"
-              role="switch"
-              aria-checked={info.auto}
-              aria-label={`${label} auto`}
-              className="switch"
-              onClick={() => setControl(info.key, { auto: !info.auto })}
-            />
-          </label>
-        )}
-        {kind === "switch" && (
-          <button
-            type="button"
-            role="switch"
-            aria-checked={info.value !== 0}
-            aria-label={label}
-            className="switch"
-            disabled={locked}
-            onClick={() => setControl(info.key, { value: info.value !== 0 ? 0 : 1 })}
-          />
-        )}
+        <Slider info={info} label={label} locked={locked} onReset={reset} limit={limit} />
+        <b className="pf-val">{controlValueText(info)}</b>
+        {actions}
+        {info.driven_by && <small className="pf-hint">Set by Better Cam auto exposure</small>}
       </div>
-      {kind === "slider" && <Slider info={info} label={label} locked={locked} onReset={reset} limit={limit} />}
-      {info.driven_by && <span className="ctl-hint">Set by Better Cam auto exposure</span>}
-      {kind === "select" && (
-        <Select
-          value={String(info.value)}
-          options={powerlineOptions(info)}
+    );
+  } else if (kind === "switch") {
+    row = (
+      <div className="prop bool">
+        <span className="pf-label" title={label}>
+          {label}
+        </span>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={info.value !== 0}
+          aria-label={label}
+          className="switch"
           disabled={locked}
-          onChange={(v) => setControl(info.key, { value: Number(v) })}
+          onClick={() => setControl(info.key, { value: info.value !== 0 ? 0 : 1 })}
         />
-      )}
+        {autoToggle && <span className="pf-act pf-act-only">{autoToggle}</span>}
+      </div>
+    );
+  } else {
+    row = (
+      <div className={`prop${autoToggle ? " has-a" : ""}`}>
+        <span className="pf-label" title={label}>
+          {label}
+        </span>
+        <Select value={String(info.value)} options={powerlineOptions(info)} disabled={locked} onChange={(v) => setControl(info.key, { value: Number(v) })} />
+        {autoToggle && <span className="pf-act pf-act-only">{autoToggle}</span>}
+      </div>
+    );
+  }
+
+  return (
+    <div className={`ctl${locked || info.auto ? " auto" : ""}${modal ? " multi" : ""}`} data-key={info.key} data-mode={mode}>
+      {row}
       {loop === "exposure" && mode === "camera" && ctx.live && <CameraAutoHint info={info} />}
       {loop === "exposure" && app && <ExposureAuto info={info} ctx={ctx} />}
       {loop === "white_balance" && app && <WhiteBalanceAuto ctx={ctx} />}
@@ -228,6 +265,7 @@ function Slider({
   const range = (
     <input
       type="range"
+      className="pf-range"
       aria-label={label}
       title={locked ? undefined : info.auto ? "Moving this turns Auto off" : "Double-click or press Delete to reset"}
       style={{ "--p": `${fill}%` } as CSSProperties}
@@ -242,7 +280,7 @@ function Slider({
     />
   );
   return limit ? (
-    <div className="ctl-range">
+    <div className="ctl-range pf-range">
       {range}
       <LimitMark fraction={limit.fraction} title={limit.title} />
     </div>

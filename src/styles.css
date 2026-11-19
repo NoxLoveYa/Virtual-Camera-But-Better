@@ -143,7 +143,6 @@ body {
 .pm-save small.bad { color: var(--danger); }
 
 .icon { flex: none; width: 28px; height: 28px; padding: 0; display: inline-grid; place-items: center; }
-.card-head .icon { height: 28px; }
 
 .wc { display: flex; align-self: stretch; margin-left: 4px; }
 .wc button {
@@ -217,9 +216,6 @@ button.ghost:hover:not(:disabled) { color: var(--text); box-shadow: none; border
 .panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 16px; }
 .label { color: var(--faint); font-size: 11px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; }
 
-.devices { display: flex; gap: 16px; align-items: flex-end; }
-.devices label { display: flex; flex-direction: column; gap: 8px; flex: 1; min-width: 0; }
-.devices > button { display: inline-flex; align-items: center; gap: 6px; flex: none; }
 
 /* ---------- workspace: navigator | preview | inspector ---------- */
 /* Three docked regions under the title bar. --nav and --insp are the widths of the outer two (App.tsx works them out from the
@@ -246,36 +242,13 @@ body.col-resizing, body.col-resizing * { cursor: col-resize !important; user-sel
 /* Banners span the window under the title bar. */
 .banners { flex: none; display: flex; flex-direction: column; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
 
-/* ---------- camera and output panels ---------- */
-.source, .output { display: flex; flex-direction: column; gap: 14px; }
-.field { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
-.fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 16px; }
-.fields.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.fields.three.rates { grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr) minmax(0, 1fr); }
-.fields .wide { grid-column: 1 / -1; }
-.source .devices { align-items: flex-end; }
-.source .card-title.fold { margin: 0 0 -4px -4px; }
-/* The name of a section at the top of its panel, in the small uppercase style. */
-.panel-title { margin: 0; }
-.card-title .label { transition: color 0.15s; }
-.card-title button:hover:not(:disabled) .label { color: var(--accent); }
-.panel-body { display: flex; flex-direction: column; gap: 14px; }
-/* P15 review: the format that runs when the camera cannot deliver the saved one, with the saved one named. */
-.format-in-use { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 8px 12px; border: 1px solid var(--line); border-left: 2px solid var(--warn); border-radius: var(--r); }
-.format-in-use-text { display: flex; flex-direction: column; min-width: 0; }
-.format-in-use-text b { font-weight: 600; color: var(--text); }
-.format-in-use-text small { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.format-in-use button { flex: none; }
-.toggles { display: flex; flex-direction: column; gap: 2px; }
-.toggle { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 30px; color: var(--dim); cursor: pointer; }
-.toggle:hover { color: var(--text); }
 
 /* Colour field (components/ColorField.tsx): the swatch button looks like a field; the panel is the shared floating menu. */
 .swatch { display: flex; align-items: center; gap: 10px; width: 100%; padding: 0 10px; font-weight: 400; text-align: left; }
 .swatch[aria-expanded="true"] { border-color: rgba(46, 230, 214, 0.55); box-shadow: var(--glow-soft); }
 .swatch .chip, .swatch .chip::after { border-radius: 2px; }
 /* The chip shows the colour (--c) over a checkerboard, so an alpha below 100% reads as see-through. */
-.swatch .chip { position: relative; flex: none; box-sizing: border-box; width: 18px; height: 18px; border: 1px solid rgba(255, 255, 255, 0.2); background: conic-gradient(#4a4f57 25%, #7b818b 0 50%, #4a4f57 0 75%, #7b818b 0) 0 0 / 8px 8px; }
+.swatch .chip { position: relative; flex: none; box-sizing: border-box; width: 18px; height: 18px; outline: 1px solid rgba(255, 255, 255, 0.2); outline-offset: -1px; background: conic-gradient(#4a4f57 25%, #7b818b 0 50%, #4a4f57 0 75%, #7b818b 0) 0 0 / 8px 8px; }
 .swatch .chip::after { content: ""; position: absolute; inset: 0; background: var(--c); }
 .swatch .hex { color: var(--dim); font-variant-numeric: tabular-nums; }
 .color-pop { width: 248px; min-width: 0; padding: 10px; }
@@ -392,22 +365,117 @@ button.nav-add:hover:not(:disabled) { color: var(--text); }
 .empty-add button { height: 28px; justify-content: flex-start; text-align: left; }
 
 /* ---------- inspector ---------- */
-/* The settings of the one selected item. The body scrolls inside itself, which only an item taller than the column needs;
-   it is a size container for the parts that change with its width. Padding: 12 top, 16 sides, 20 bottom (the scrollbar's gutter comes on top). */
+/* The settings of the one selected item: a header (components/InspectorHeader.tsx) that stays where it is and a body (.insp-scroll)
+   that scrolls inside itself, which only an item taller than the column needs. Nothing is boxed in here: hierarchy comes from group
+   headings, indentation and hairlines. The body is a size container for the parts that change with its width (docs/LAYOUT-INSPECTOR.md
+   2.1). Padding: 12 top, 16 sides, 20 bottom (the scrollbar's gutter comes on top). */
+.inspector { overflow: hidden; }
+.insp-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .insp-scroll { flex: 1; min-height: 0; overflow-y: auto; scrollbar-gutter: stable; padding: 12px 16px 20px; container-type: inline-size; }
-.inspector .card-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.inspector .fields, .inspector .fields.three, .inspector .fields.three.rates { grid-template-columns: minmax(0, 1fr); }
 
-.card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 12px 16px; transition: border-color 0.2s, box-shadow 0.2s; }
-.card:hover { border-color: var(--line-strong); }
-.card-head { display: flex; align-items: center; gap: 4px; min-height: 32px; }
-.card-title { margin: 0 8px 0 0; font-size: 13px; font-weight: 600; letter-spacing: -0.005em; }
-.card-title button { display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 8px 0 4px; font-weight: 600; background: none; border: 0; }
-.card-title button:hover:not(:disabled) { box-shadow: none; color: var(--accent); }
-.card-title svg { color: var(--dim); transition: transform 0.15s; }
-.card-title.folded svg { transform: rotate(-90deg); }
-.card-head .fill { flex: 1; }
-.card-head .switch { margin: 0 4px; }
+/* Header: grip, name and tags, step or summary, the end (On and ⋯, or a section's action); under it the buttons, then status lines. */
+.insp-head { flex: none; padding: 10px 28px 10px 16px; border-bottom: 1px solid var(--line); }
+.insp-top { display: flex; align-items: flex-start; gap: 4px; }
+.insp-top .grip { margin-left: -8px; height: 28px; }
+.insp-id { flex: 1; min-width: 0; padding-left: 4px; }
+.insp-line { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.insp-title { margin: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; font-weight: 600; letter-spacing: -0.01em; line-height: 28px; }
+.insp-line .ext-badge, .insp-line .tag { flex: none; margin: 0; white-space: nowrap; }
+.insp-line .ext-badge { font-weight: 500; letter-spacing: 0.06em; }
+.insp-sub { margin-top: -3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); font-size: 11px; }
+.insp-end { flex: none; display: flex; align-items: center; gap: 4px; height: 28px; margin-left: 8px; }
+.insp-end .switch { margin: 0 4px 0 0; }
+.insp-on { display: inline-flex; align-items: center; gap: 8px; color: var(--dim); cursor: pointer; }
+.insp-on:hover { color: var(--text); }
+button.insp-refresh { display: inline-flex; align-items: center; gap: 6px; height: 28px; }
+.insp-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; }
+.insp-actions-start { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.insp-actions button { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; }
+.insp-actions button svg { flex: none; color: var(--dim); }
+.insp-actions button[aria-pressed="true"] { color: var(--accent); border-color: rgba(46, 230, 214, 0.55); background: var(--accent-soft); box-shadow: var(--glow-soft); }
+.insp-actions button[aria-pressed="true"] svg { color: var(--accent); }
+/* Held to look at the picture before the filter: no text selection or touch scroll while it is down. */
+button.insp-before { user-select: none; touch-action: none; }
+button.insp-reset { border-color: transparent; color: var(--dim); }
+button.insp-reset:hover:not(:disabled) { color: var(--text); box-shadow: none; border-color: var(--line-strong); }
+.insp-hint { margin: 8px 0 0; color: var(--dim); font-size: 11px; }
+.insp-head .filter-error, .insp-head .filter-status { margin: 8px 0 0; }
+/* A bypassed filter shows its settings dimmed; the one a preview tool runs on takes the accent along the header's edge. */
+.insp-panel.off .props { opacity: 0.4; transition: opacity 0.2s; }
+.insp-panel.tooling .insp-head { box-shadow: inset 2px 0 0 var(--accent); }
+.row-menu kbd { margin-left: auto; color: var(--faint); font: inherit; font-size: 11px; }
+.ctl-note { margin: 0; color: var(--dim); }
+.ctl-note.bad { color: var(--danger); }
+
+/* Controls in the inspector are 28 px high (32 elsewhere). */
+.inspector .select, .inspector .swatch, .inspector .pf-text, .inspector .pf-browse, .inspector .pf-clear, .inspector .num-step,
+.inspector input:not([type="range"]) { height: 28px; }
+.inspector .pf-clear, .inspector .num-step { width: 28px; }
+.inspector .select, .inspector .swatch { font-size: 12px; }
+
+/* Property rows. Every row of a group uses the same four columns, so labels, controls, values and buttons line up from row to row:
+   label, control (takes what is left), value, actions. A row's control may reach to the end; the value and actions columns are as
+   wide as the widest row needs and are empty (0 px) in a group with no slider. At 400 px of body width or more a slider is one
+   line; below that it is two (label, value and buttons, then the slider across the full width). */
+.props { --lbl: 40%; display: grid; grid-template-columns: [lbl] var(--lbl) [ctl] minmax(0, 1fr) [val] auto [act] auto; row-gap: 4px; }
+@container (min-width: 400px) {
+  .props { --lbl: clamp(96px, 34%, 160px); }
+}
+.prop { grid-column: 1 / -1; display: grid; grid-template-columns: subgrid; align-items: center; row-gap: 4px; min-height: 28px; }
+.prop > * { grid-column: 2 / -1; min-width: 0; }
+.prop > .pf-label { grid-column: 1; padding-right: 8px; color: var(--dim); font-size: 12px; line-height: 1.25; overflow-wrap: anywhere; }
+.pf-hint { margin: 0; color: var(--faint); font-size: 11px; line-height: 1.35; }
+.pf-failure { color: var(--danger); overflow-wrap: anywhere; }
+
+/* Slider row: one line, label · slider · value · actions. */
+.prop.slider > .pf-range { grid-column: 2; }
+.prop.slider > .pf-val { grid-column: 3; }
+.prop.slider > .pf-act { grid-column: 4; }
+.pf-val { box-sizing: content-box; min-width: 44px; padding-left: 8px; text-align: right; color: var(--text); font-size: 12px; font-weight: 500; font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* The actions column holds up to two 24 px buttons in slots of their own, so a button that comes and goes (reset, "A") does not move the sliders. */
+.pf-act { display: inline-flex; align-items: center; justify-content: flex-end; gap: 4px; min-width: 24px; margin-left: 4px; }
+.pf-slot { flex: none; width: 24px; height: 24px; }
+.ctl-props .pf-act { min-width: 52px; }
+.ctl-props .pf-act.pf-act-only { justify-self: start; }
+@container (width < 400px) {
+  .prop.slider:not(.has-mode) { grid-template-rows: 24px 16px; min-height: 44px; align-content: center; }
+  .prop.slider:not(.has-mode) > .pf-label { grid-column: 1 / 3; grid-row: 1; }
+  .prop.slider:not(.has-mode) > .pf-val, .prop.slider:not(.has-mode) > .pf-act { grid-row: 1; }
+  .prop.slider:not(.has-mode) > .pf-range { grid-column: 1 / -1; grid-row: 2; }
+}
+/* A slider with a mode list (exposure, white balance): the list on the first line, the slider indented under it. */
+.prop.has-mode > .pf-label, .prop.has-mode > .ctl-mode { grid-row: 1; }
+.prop.has-mode > .pf-range, .prop.has-mode > .pf-val, .prop.has-mode > .pf-act { grid-row: 2; }
+.ctl-mode { display: block; }
+
+/* A switch row: the label takes the room and wraps beside the switch, which sits at the end of the control column. */
+.prop.bool { cursor: pointer; }
+.prop.bool > .pf-label { grid-column: 1 / -1; grid-row: 1; padding-right: 44px; }
+.prop.bool > .switch { grid-column: 2 / -1; grid-row: 1; justify-self: end; }
+.ctl-props .prop.bool > .pf-label { grid-column: 1 / 4; }
+.ctl-props .prop.bool > .switch { grid-column: 2 / 4; }
+.prop.bool > .pf-act { grid-row: 1; }
+.prop.bool > .pf-hint { grid-row: 2; }
+.prop.bool:has(.switch:disabled) { cursor: default; }
+/* A file: the label on its own line, then the path across the whole row. */
+.prop.path > .pf-label, .prop.path > .pathfield, .prop.path > .pf-hint { grid-column: 1 / -1; }
+.prop.has-a > .pop { grid-column: 2 / 4; }
+.prop.has-a > .pf-act { grid-column: 4; }
+
+/* Group heading: the small uppercase label, 14 px above and 4 below. */
+.prop-group { grid-column: 1 / -1; margin: 14px 0 0; color: var(--faint); font-size: 11px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; }
+.props > .prop-group:first-child { margin-top: 0; }
+.prop-group button { display: flex; align-items: center; gap: 6px; height: 24px; margin-left: -2px; padding: 0 6px 0 2px; color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit; background: none; border: 0; }
+.prop-group button:hover:not(:disabled) { box-shadow: none; color: var(--accent); }
+.prop-group svg { transition: transform 0.15s; }
+.prop-group.folded svg { transform: rotate(-90deg); }
+/* P15 review: the format that runs when the camera cannot deliver the saved one, with the saved one named. */
+.format-in-use { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 4px 0 4px 10px; border-left: 2px solid var(--warn); }
+.format-in-use-text { display: flex; flex-direction: column; min-width: 0; }
+.format-in-use-text b { font-weight: 600; color: var(--text); }
+.format-in-use-text small { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.format-in-use button { flex: none; height: 28px; }
+
 .tag { color: var(--faint); font-size: 10px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; }
 .grip { cursor: grab; color: var(--faint); user-select: none; display: grid; place-items: center; width: 20px; height: 28px; }
 .grip:hover { color: var(--dim); }
@@ -420,25 +488,13 @@ button.nav-add:hover:not(:disabled) { color: var(--text); }
 /* The look stays 30x16; the hit area is 30x24. */
 .switch::before { content: ""; position: absolute; inset: -4px 0; }
 
-.params { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px 28px; margin-top: 12px; transition: opacity 0.2s; }
-.filter-card.off .params { opacity: 0.4; }
-.params label, .params .pf { display: flex; flex-direction: column; gap: 6px; min-width: 0; color: var(--dim); font-size: 12px; }
-.params label > span, .params .pf > span { display: flex; justify-content: space-between; }
-.params label b { color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; }
-.params small { color: var(--faint); }
-/* A switch row: the caption takes the room and wraps beside the switch at the right end, an optional hint on its own line. */
-.params label.pf-row { flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; min-height: 28px; cursor: pointer; }
-.params label.pf-row > span { flex: 1 1 0; min-width: 0; }
-.params label.pf-row > .pf-hint { flex-basis: 100%; }
-/* A slider's value with its reset button (components/ParamField.tsx, ControlsCard.tsx): 24x24 hit area, 16px icon, no extra row height. */
-.pf-val { display: inline-flex; align-items: center; gap: 2px; }
-button.reset-btn { flex: none; width: 24px; height: 24px; margin: -4px -4px -4px 0; padding: 0; display: inline-grid; place-items: center; color: var(--dim); background: none; border-color: transparent; }
+/* A slider's reset button (components/ParamField.tsx, ControlsCard.tsx): 24x24 hit area, 16px icon. */
+button.reset-btn { flex: none; width: 24px; height: 24px; padding: 0; display: inline-grid; place-items: center; color: var(--dim); background: none; border-color: transparent; }
 button.reset-btn:hover:not(:disabled) { color: var(--text); box-shadow: none; border-color: var(--line-strong); }
 /* A file param (components/PathField.tsx): the path as read-only text in the look of `.select`, Browse…, clear. The
    folder shortens first (its end becomes "…"), then the file name's stem; the extension never shrinks. The shrink
    weights are 1000 : 1 : 0, so the folder gives way before the stem does (a flex-shrink sum below 1 would not
    absorb the whole overflow). The full path is the tooltip. */
-.params .pf-wide { grid-column: 1 / -1; }
 .pathfield { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .pf-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .pf-text { flex: 1; min-width: 0; display: flex; align-items: center; height: 32px; padding: 0 12px; color: var(--text); font-weight: 400; white-space: nowrap; border: 1px solid var(--line-strong); border-radius: var(--r); cursor: default; }
@@ -448,13 +504,11 @@ button.reset-btn:hover:not(:disabled) { color: var(--text); box-shadow: none; bo
 .pf-ext { flex: none; }
 .pf-browse { flex: none; padding: 0 10px; }
 .pf-clear { flex: none; width: 32px; height: 32px; }
-.params .pf-failure { color: var(--danger); overflow-wrap: anywhere; }
-/* Card layout hook: `.params.layout-<name>` (FilterDef.layout); every field carries data-key="<param key>". */
-/* Crop layout: the four edges around a small frame (top above, left and right at the sides, bottom below). With
-   Relative off, Width takes the place of Right and Height the place of Bottom. Plain rows while the inspector is narrow;
-   the frame grid from 400 px of body width (the inspector body is a size container). */
-@container (min-width: 400px) {
-  .params.layout-crop {
+/* Crop layout hook: `.props.layout-crop` (FilterDef.layout); every row carries data-key="<param key>". The four edges go round a small
+   frame (top above, left and right at the sides, bottom below), each as a label over its box. With Relative off, Width takes the
+   place of Right and Height the place of Bottom. Plain rows while the inspector is narrow; the frame grid from 400 px of body width. */
+@container (width >= 400px) {
+  .props.layout-crop {
     grid-template-columns: minmax(124px, 1fr) minmax(112px, 160px) minmax(124px, 1fr);
     grid-template-areas:
       "rel rel rel"
@@ -464,6 +518,11 @@ button.reset-btn:hover:not(:disabled) { color: var(--text); box-shadow: none; bo
     align-items: center;
     gap: 12px 20px;
   }
+  .layout-crop > .prop { grid-column: auto; display: flex; flex-direction: column; align-items: stretch; gap: 4px; min-height: 0; }
+  .layout-crop > .prop > .pf-label { padding-right: 0; }
+  .layout-crop > .prop.bool { flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: space-between; }
+  .layout-crop > .prop.bool > .pf-label { flex: 1; padding-right: 12px; }
+  .layout-crop > .prop.bool > .pf-hint { flex-basis: 100%; }
   .layout-crop > [data-key="relative"] { grid-area: rel; }
   .layout-crop > [data-key="top"] { grid-area: top; }
   .layout-crop > [data-key="left"] { grid-area: left; }
@@ -481,7 +540,7 @@ button.reset-btn:hover:not(:disabled) { color: var(--text); box-shadow: none; bo
 /* Select with a "Custom…" text box (components/ComboField.tsx) */
 .combo { display: flex; flex-direction: column; gap: 8px; }
 .combo input { width: 100%; min-width: 0; }
-/* A filter that failed, inside its card */
+/* A filter that failed, in the inspector's header */
 .filter-error { margin: 10px 0 0; padding: 8px 12px; color: var(--text); font-size: 12px; border-left: 2px solid var(--danger); background: rgba(255, 92, 108, 0.08); overflow-wrap: anywhere; }
 /* NVIDIA filters (P13b): a line that is not an error ("Loading model…"), the install link on an error line, the menu badge */
 .filter-status { display: flex; align-items: center; gap: 8px; margin: 10px 0 0; padding: 8px 12px; color: var(--dim); font-size: 12px; border-left: 2px solid var(--accent); background: var(--accent-soft); }
@@ -491,7 +550,6 @@ button.reset-btn:hover:not(:disabled) { color: var(--text); box-shadow: none; bo
 .rtx-badge { margin-left: 8px; color: var(--warn); font-size: 10px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; }
 /* Extensions (E3): menu group and badge, the card line of an extension that does not run, Settings → Extensions */
 .ext-badge { margin-left: 8px; color: var(--accent); font-size: 10px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; white-space: nowrap; }
-.card-head .ext-badge { margin: 0 8px 0 0; font-weight: 500; letter-spacing: 0.06em; }
 .pm-group { margin: 6px 0 2px; padding: 8px 10px 4px; color: var(--faint); font-size: 10px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; border-top: 1px solid var(--line); }
 .filter-status.ext-note { border-left-color: var(--warn); background: rgba(255, 255, 255, 0.04); }
 .ext-modal { width: min(560px, calc(100vw - 48px)); max-height: calc(100vh - var(--titlebar) - 48px); display: flex; flex-direction: column; }
@@ -573,7 +631,6 @@ button.link:hover:not(:disabled) { box-shadow: none; text-decoration: underline;
 /* ---------- small windows (the window can't go below 900x600) ---------- */
 @media (max-height: 640px) {
   .panel { padding: 12px; }
-  .devices label { gap: 6px; }
   .footer .meters { gap: 4px; }
   .meter.scale { display: none; }
   .track { height: 10px; }
@@ -602,11 +659,7 @@ button.preview-compare { height: 24px; padding: 0 10px; background: rgba(9, 11, 
 button.preview-compare[aria-pressed="true"] { color: var(--accent); border-color: rgba(46, 230, 214, 0.55); background: var(--accent-soft); box-shadow: var(--glow-soft); }
 /* What the picture is while a point other than the output is set ("Before", or the step a gesture edits). */
 .preview-caption { position: absolute; left: 8px; bottom: 8px; max-width: calc(100% - 16px); padding: 2px 8px; color: var(--text); font-size: 11px; background: rgba(9, 11, 14, 0.72); border: 1px solid rgba(46, 230, 214, 0.55); border-radius: var(--r); pointer-events: none; }
-/* Preview tools (L2 eyedropper, L3 crop frame): a layer over the picture, under the bar and the caption. The filter that owns the tool takes the accent (its card in the inspector, its row in the navigator). */
-.card.tooling { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent), var(--glow-soft); }
-.card-tool { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 12px; margin: 8px 0 2px; }
-.card-tool .pf-hint { color: var(--dim); }
-.card-tool button[aria-pressed="true"] { color: var(--accent); border-color: rgba(46, 230, 214, 0.55); background: var(--accent-soft); }
+/* Preview tools (L2 eyedropper, L3 crop frame): a layer over the picture, under the bar and the caption. The filter that owns the tool takes the accent (its header in the inspector, its row in the navigator). */
 /* The bar's chips sit over the picture's top corners, where a handle or a pick may be: while a tool runs the bar steps aside (Esc or Done first). */
 .preview-box.has-tool .preview-bar { visibility: hidden; }
 .pick-overlay, .crop-overlay { position: absolute; inset: 0; overflow: hidden; touch-action: none; user-select: none; }
@@ -628,44 +681,27 @@ button.preview-compare[aria-pressed="true"] { color: var(--accent); border-color
 .crop-window.pad-b { border-bottom-style: dashed; }
 .crop-handle { position: absolute; width: 10px; height: 10px; margin: -5px 0 0 -5px; box-sizing: border-box; background: var(--accent); border: 1px solid #05070a; border-radius: 2px; pointer-events: none; }
 .crop-handle.padded { background: transparent; border: 2px solid var(--accent); }
-/* Camera controls */
-.card.controls { grid-column: auto; }
-.card.controls .card-head .ghost { display: inline-flex; align-items: center; gap: 6px; }
-.ctl-note { margin: 12px 0 4px; color: var(--dim); }
-.ctl-note.bad { color: var(--danger); }
-.ctl-rows { display: grid; grid-template-columns: repeat(auto-fill, minmax(206px, 1fr)); gap: 12px 20px; margin-top: 12px; align-items: start; }
-.ctl { display: flex; flex-direction: column; gap: 6px; min-width: 0; color: var(--dim); font-size: 12px; }
-.ctl-head { display: flex; align-items: center; gap: 8px; min-height: 22px; }
-.ctl-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ctl-head b { color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.ctl.auto .ctl-head b { color: var(--dim); }
-.ctl-auto { display: inline-flex; align-items: center; gap: 6px; flex: none; cursor: pointer; color: var(--faint); font-size: 10px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; }
-.ctl-auto:hover { color: var(--dim); }
+/* Camera controls (components/ControlsCard.tsx): `.ctl` is one control: its row, then the Better Cam auto block and the lines under it. */
+.ctl { grid-column: 1 / -1; display: grid; grid-template-columns: subgrid; row-gap: 4px; }
+.ctl > * { grid-column: 1 / -1; }
+.ctl.auto .pf-val { color: var(--dim); }
 .ctl input[type="range"]:disabled { cursor: default; opacity: 0.5; }
 .ctl input[type="range"]:disabled::-webkit-slider-thumb { background: var(--dim); box-shadow: none; }
-.ctl .select-value, .ctl .select { font-size: 12px; }
 .sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
-/* A control with three modes (components/AutoControls.tsx): the mode list takes the Auto switch's place, the row spans the card */
-.ctl.multi { grid-column: 1 / -1; }
-.ctl-mode { flex: none; width: 150px; display: block; }
+/* "A": the camera sets this control itself. */
+button.ctl-a { width: 24px; height: 24px; padding: 0; display: inline-grid; place-items: center; color: var(--faint); font-size: 11px; font-weight: 700; border-color: var(--line); }
+button.ctl-a[aria-pressed="true"] { color: var(--accent); border-color: rgba(46, 230, 214, 0.55); background: var(--accent-soft); }
 /* Limit ticks on a slider Better Cam auto moves: a tick at the limit, the range beyond it shaded. The thumb is 10px wide, so the track runs 5px inside. */
 .ctl-range { position: relative; }
 .ctl-shade, .ctl-limit { position: absolute; left: calc(5px + (100% - 10px) * var(--m)); }
 .ctl-shade { top: 6px; right: 5px; height: 4px; background: repeating-linear-gradient(135deg, rgba(255, 184, 77, 0.35) 0 2px, rgba(255, 184, 77, 0.08) 2px 4px); pointer-events: none; }
 .ctl-limit { top: 1px; width: 9px; height: 14px; margin-left: -4px; cursor: help; }
 .ctl-limit::before { content: ""; position: absolute; top: 0; bottom: 0; left: 4px; width: 1px; background: var(--warn); }
-/* The settings of Better Cam auto, indented under the row, only while that mode is selected */
-.ctl-sub { display: flex; flex-direction: column; gap: 8px; margin: 4px 0 2px 14px; padding: 2px 0 2px 14px; border-left: 1px solid var(--line-strong); }
-.auto-field { display: grid; grid-template-columns: 118px minmax(0, 1fr) 44px; align-items: center; gap: 8px; min-height: 24px; }
-.auto-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.auto-input { grid-column: 2; display: flex; align-items: center; gap: 8px; min-width: 0; }
-.auto-input > .select, .auto-input > :not(input):not(.auto-end) { min-width: 0; }
-.auto-input .select { max-width: 100%; }
-.auto-field b { grid-column: 3; text-align: right; color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.auto-field:not(:has(b)) .auto-input { grid-column: 2 / -1; }
-.auto-end { flex: none; color: var(--faint); font-size: 11px; }
-.ctl-sub input[type="range"] { flex: 1; min-width: 0; }
-.ctl-status { display: flex; align-items: flex-start; gap: 8px; min-height: 0; color: var(--dim); }
+/* The settings of Better Cam auto: an indented block of rows under the control, only while that mode is selected. Its one line is the
+   indent guide at the left. */
+.ctl-sub { display: grid; grid-template-columns: subgrid; row-gap: 4px; margin: 2px 0 6px 6px; padding-left: 12px; border-left: 1px solid var(--line-strong); }
+.ctl-sub > * { grid-column: 1 / -1; }
+.ctl-status { display: flex; align-items: flex-start; gap: 8px; min-height: 0; color: var(--dim); font-size: 12px; }
 .ctl-status:empty { display: none; }
 .ctl-status-text { flex: 0 1 auto; min-width: 0; overflow-wrap: anywhere; }
 .ctl-status button.link { flex: none; display: inline; margin: 0; font-size: 12px; }
@@ -673,10 +709,9 @@ button.preview-compare[aria-pressed="true"] { color: var(--accent); border-color
 .ctl-status[data-idle="true"] .ctl-dot { background: var(--faint); box-shadow: none; }
 .ctl-status[data-tone="warn"] .ctl-dot { background: var(--warn); box-shadow: 0 0 6px rgba(255, 184, 77, 0.55); }
 .ctl-status[data-tone="error"] .ctl-dot { background: var(--danger); box-shadow: 0 0 6px rgba(255, 92, 108, 0.55); }
-.ctl > .ctl-status { margin-left: 2px; }
 .ctl-hint { margin: 0; color: var(--faint); font-size: 11px; }
 .ctl-hint button.link { display: inline; margin: 0 0 0 8px; font-size: 11px; }
-.ctl > p.ctl-hint { margin: 2px 0 0 2px; color: var(--dim); }
+.ctl > p.ctl-hint { color: var(--dim); }
 
 /* Reorder */
 .chain-block { position: relative; }
@@ -684,7 +719,6 @@ button.grip { flex: none; width: 28px; height: 32px; padding: 0; display: grid; 
 button.grip:hover:not(:disabled) { color: var(--dim); border-color: transparent; box-shadow: none; }
 button.grip[aria-pressed="true"] { color: var(--accent); background: var(--accent-soft); cursor: grabbing; }
 button.grip[aria-disabled="true"] { opacity: 0.4; cursor: default; }
-.card-head .fill { align-self: stretch; }
 body.reordering, body.reordering * { cursor: grabbing !important; user-select: none; }
 
 /* The row's place while it is dragged: it keeps its height, so nothing jumps (a lifted row is outlined, see the navigator). */

@@ -19,8 +19,10 @@ import {
 } from "../camera/schema";
 import { Field } from "./Field";
 import { Icon } from "./Icon";
+import { InspectorHeader } from "./InspectorHeader";
 import { Select } from "./Select";
 import { ToggleRow } from "./ToggleRow";
+import { useSummary } from "../ui/useSummary";
 
 const intervalLabel = (i: number) => (i === MATCH_OUTPUT_FPS ? "Match output FPS" : i === HIGHEST_FPS ? "Highest FPS" : fpsLabel(i));
 
@@ -35,6 +37,7 @@ export function SourcePanel() {
   const advanced = useStore((s) => s.ui.advanced);
   const { setUi } = useStore.getState();
   const [scanning, setScanning] = useState(false);
+  const summary = useSummary("camera");
 
   const cam = cameras ? findCamera(cameras, source.video_device_id) : null;
   const missing = !!cameras && !!source.video_device_id && !cam;
@@ -73,12 +76,19 @@ export function SourcePanel() {
   };
 
   return (
-    <section className="panel source" aria-label="Camera">
-      <h3 className="card-title panel-title">
-        <span className="label">Camera</span>
-      </h3>
-      <div className="panel-body">
-        <div className="devices">
+    <section className="insp-panel" aria-label="Camera">
+      <InspectorHeader
+        title="Camera"
+        sub={summary}
+        end={
+          <button type="button" className="ghost insp-refresh" onClick={rescan} disabled={scanning} title="Rescan cameras" aria-label="Refresh cameras">
+            <Icon name="reset" />
+            Refresh
+          </button>
+        }
+      />
+      <div className="insp-scroll">
+        <div className="props">
           <Field label="Device">
             <Select
               value={cam?.id ?? source.video_device_id ?? ""}
@@ -87,14 +97,7 @@ export function SourcePanel() {
               placeholder={cameras ? "No camera found" : "Loading…"}
             />
           </Field>
-          <button onClick={rescan} disabled={scanning} title="Rescan cameras" aria-label="Refresh cameras">
-            <Icon name="reset" />
-            <span className="btn-text">Refresh</span>
-          </button>
-        </div>
-
-        <div className="fields">
-          <Field label="Resolution/FPS type" className="wide">
+          <Field label="Resolution/FPS type">
             <Select
               value={source.res_type}
               options={RES_TYPE_OPTIONS}
@@ -102,8 +105,6 @@ export function SourcePanel() {
               onChange={(v) => patchSource({ res_type: v as SourceCfg["res_type"] })}
             />
           </Field>
-        </div>
-        <div className="fields three rates">
           <Field label="Resolution">
             <Select
               value={source.resolution}
@@ -128,28 +129,26 @@ export function SourcePanel() {
               onChange={(v) => patchSource({ video_format: v as SourceCfg["video_format"] })}
             />
           </Field>
-        </div>
-        {inUse && (
-          <div className="format-in-use" role="status">
-            <span className="format-in-use-text" title={`The camera does not deliver ${inUse.asked}. It stays your saved choice.`}>
-              <b>Using the device default</b>
-              <small>Saved: {inUse.asked}</small>
-            </span>
-            <button onClick={trySavedFormat} title="Open the camera with the saved format again">
-              Try saved format
-            </button>
-          </div>
-        )}
+          {inUse && (
+            <div className="format-in-use" role="status">
+              <span className="format-in-use-text" title={`The camera does not deliver ${inUse.asked}. It stays your saved choice.`}>
+                <b>Using the device default</b>
+                <small>Saved: {inUse.asked}</small>
+              </span>
+              <button onClick={trySavedFormat} title="Open the camera with the saved format again">
+                Try saved format
+              </button>
+            </div>
+          )}
 
-        <h3 className={`card-title fold${advanced ? "" : " folded"}`}>
-          <button aria-expanded={advanced} onClick={() => setUi({ advanced: !advanced })}>
-            <Icon name="chevron" />
-            Advanced
-          </button>
-        </h3>
-        {advanced && (
-          <>
-            <div className="fields three">
+          <h3 className={`prop-group fold${advanced ? "" : " folded"}`}>
+            <button type="button" aria-expanded={advanced} onClick={() => setUi({ advanced: !advanced })}>
+              <Icon name="chevron" />
+              Advanced
+            </button>
+          </h3>
+          {advanced && (
+            <>
               <Field label="Color space">
                 <Select
                   value={source.color_space}
@@ -171,8 +170,6 @@ export function SourcePanel() {
                   onChange={(v) => patchSource({ buffering: v as SourceCfg["buffering"] })}
                 />
               </Field>
-            </div>
-            <div className="toggles">
               <ToggleRow label="Flip vertically" on={source.flip_vertically} onChange={flag("flip_vertically")} />
               <ToggleRow label="Apply rotation data from camera" on={source.autorotation} onChange={flag("autorotation")} />
               <ToggleRow label="Use hardware decoding when available" on={source.hw_decode} onChange={flag("hw_decode")} />
@@ -181,9 +178,9 @@ export function SourcePanel() {
                 on={source.deactivate_when_not_showing}
                 onChange={flag("deactivate_when_not_showing")}
               />
-            </div>
-          </>
-        )}
+            </>
+          )}
+        </div>
       </div>
     </section>
   );

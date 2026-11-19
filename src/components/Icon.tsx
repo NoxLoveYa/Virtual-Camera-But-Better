@@ -16,6 +16,9 @@ const PATHS = {
   camera: "M2 5.5h2.5L5.7 4h4.6l1.2 1.5H14v7H2zM8 7.1a2.2 2.2 0 100 4.4 2.2 2.2 0 000-4.4z",
   sliders: "M2 4.5h3.5M9 4.5h5M2 8h6M11.5 8H14M2 11.5h2M7.5 11.5H14M7 3v3M10 6.5v3M5 10v3",
   output: "M2 3.5h12v8H2zM6 14h4M8 11.5V14",
+  compare: "M8 2.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM8 2.5v11M8 5.2a2.8 2.8 0 000 5.6",
+  eyedropper: "M10.8 2.4l2.8 2.8-1.6 1.6-2.8-2.8zM9.2 4.4l-5.7 5.7v2.4h2.4l5.7-5.7",
+  crop: "M4.5 2v9.5H14M2 4.5h9.5V14",
 } as const;
 
 export type IconName = keyof typeof PATHS;

@@ -1,8 +1,7 @@
 import { memo, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { useStore } from "../store";
-import { cameraSummary, controlsSummary, outputSummary } from "../ui/navSummary";
-import { effectiveSource, findCamera, findStored } from "../camera/schema";
+import { useSummary } from "../ui/useSummary";
 import { defOf, extOf, isExtKind, labelOf, type ParamDef } from "../filters/schema";
 import { finalIndex } from "../ui/chainDrag";
 import { registerField } from "../ui/fileDrop";
@@ -27,16 +26,6 @@ const SECTIONS: { id: "camera" | "controls" | "output"; icon: IconName; title: s
   { id: "controls", icon: "sliders", title: "Camera controls" },
   { id: "output", icon: "output", title: "Output" },
 ];
-
-/** The summaries, as text from the store only (never a read of the camera, which would light its LED). */
-function useSummary(id: (typeof SECTIONS)[number]["id"]): string {
-  return useStore((s) => {
-    if (id === "output") return outputSummary(s.output);
-    const cam = s.cameras ? findCamera(s.cameras, s.source.video_device_id) : null;
-    if (id === "camera") return cameraSummary(effectiveSource(s.source, s.inUse), s.cameras, cam);
-    return controlsSummary(cam, cam ? (findStored(s.controls, cam)?.device ?? null) : null);
-  });
-}
 
 function SectionRow({ id, icon, title }: (typeof SECTIONS)[number]) {
   const selected = useStore((s) => s.ui.selected === id);
