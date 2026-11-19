@@ -21,7 +21,10 @@
 //! [`FORMAT_NV12`]: BT.709 limited range (the matrix the engine encodes for the virtual camera, see
 //! `gpu::output::dispatch_packed_nv12`), 4:2:0 with each chroma sample the mean of its 2 x 2 pixels, top row first.
 //! The payload is the Y plane, `height` rows of `stride` bytes (`width` of them are pixels), then the UV plane,
-//! `height / 2` rows of `stride` bytes (`width / 2` interleaved `Cb Cr` pairs): `stride * height * 3 / 2` bytes. `width`
+//! `height / 2` rows of `stride` bytes (`width / 2` interleaved `Cb Cr` pairs): `stride * height * 3 / 2` bytes.
+//! While the preview point is Compare the `format` is [`FORMAT_NV12_PAIR`] and the payload is two such pictures of the
+//! header's size, one after the other: the camera picture before the chain (fitted to the output size, as the output
+//! stage does), then the output picture; the page draws both and splits them where the user put the bar. `width`
 //! is a multiple of 4 and `height` is even (the encoder's block). `stride` equals `width` today; it is the pitch of both
 //! planes, so the layout can change without a protocol change. The page uploads Y as an `R8` and UV as an `RG8`
 //! texture and converts in its fragment shader (`src/ui/yuv.ts` holds the one set of constants).
@@ -47,6 +50,9 @@ pub const MAX_SIZE: (u32, u32) = (960, 540);
 pub const HEADER_LEN: usize = 28;
 /// The `format` word of the header: NV12, BT.709 limited range.
 pub const FORMAT_NV12: u32 = 1;
+/// The `format` word of a Compare frame ([`crate::fx::PreviewPoint::Compare`]): two [`FORMAT_NV12`] pictures of the
+/// header's `width` x `height` one after the other, the camera picture before the chain first, then the output.
+pub const FORMAT_NV12_PAIR: u32 = 2;
 /// At most 30 frames per second.
 pub const FRAME_INTERVAL: Duration = Duration::from_micros(33_333);
 /// A frame this much before its slot still counts, so a camera at exactly 30 fps with timing jitter loses nothing.
@@ -114,9 +120,14 @@ impl Header {
         })
     }
 
-    /// Bytes of pixels after the header: the Y plane and the half height UV plane.
+    /// Bytes of pixels after the header: the Y plane and the half height UV plane, twice for [`FORMAT_NV12_PAIR`].
     pub fn payload_len(&self) -> usize {
-        self.stride as usize * self.height as usize * 3 / 2
+        let one = self.stride as usize * self.height as usize * 3 / 2;
+        if self.format == FORMAT_NV12_PAIR {
+            one * 2
+        } else {
+            one
+        }
     }
 }
 
@@ -162,6 +173,26 @@ fn pack(
         capture_qpc,
         bytes,
     }
+}
+
+/// The two halves of a Compare frame as one [`FORMAT_NV12_PAIR`] frame: the header of `after` with the pair format, the
+/// pixels of `before`, then those of `after`. `None` when they are not two pictures of one size (then the output alone is
+/// what is shown).
+fn pair(before: &Frame, after: &Frame) -> Option<Frame> {
+    let (hb, ha) = (Header::decode(&before.bytes)?, Header::decode(&after.bytes)?);
+    let same = (hb.width, hb.height, hb.stride, hb.format) == (ha.width, ha.height, ha.stride, ha.format);
+    if !same || ha.format != FORMAT_NV12 || before.bytes.len() != after.bytes.len() {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(HEADER_LEN + 2 * ha.payload_len());
+    bytes.extend_from_slice(&Header { format: FORMAT_NV12_PAIR, ..ha }.encode());
+    bytes.extend_from_slice(&before.bytes[HEADER_LEN..]);
+    bytes.extend_from_slice(&after.bytes[HEADER_LEN..]);
+    Some(Frame {
+        number: after.number,
+        capture_qpc: after.capture_qpc,
+        bytes,
+    })
 }
 
 /// The preview picture size for a `source` picture and the window's request: [`fit_within`], then the width down to a
@@ -515,10 +546,82 @@ struct PreviewTap {
     /// The staging ring, the picture size it was made for and the size of the source picture that is shrunk into it.
     /// A change of either starts a new ring: the pictures of the old one would say the wrong source size.
     ring: Option<Staging>,
+    /// Compare only: the staging ring of the camera picture (`ring` has the output). `None` in every other mode.
+    before: Option<Staging>,
+    /// Compare only: the pictures that were mapped and wait for the other half of their frame (matched by number).
+    held: Held,
     /// The constants of the NV12 dispatch, made on first use.
     cs_constants: Option<ConstantBuffer>,
     pacer: Pacer,
     complained: bool,
+}
+
+/// The mapped halves of a Compare frame that wait for each other.
+#[derive(Default)]
+struct Held {
+    before: Option<Frame>,
+    after: Option<Frame>,
+}
+
+/// Downscale `frame` into a small texture, write it as NV12 into `slot`'s targets (made, or made again when the size
+/// of the picture or of its source changed) and queue the copy of the planes to the CPU. Never waits for the GPU.
+#[allow(clippy::too_many_arguments)]
+fn shrink_into(
+    slot: &mut Option<Staging>,
+    down: &mut Downscaler,
+    cs_constants: &ConstantBuffer,
+    r: &Renderer,
+    frame: &RgbaTexture,
+    bound: (u32, u32),
+    tag: Tag,
+) -> GpuResult<()> {
+    let size = fit_preview((frame.width, frame.height), bound);
+    let source = (frame.width, frame.height);
+    if slot
+        .as_ref()
+        .is_none_or(|s| s.size != size || s.source != source)
+    {
+        let targets = packed_nv12_targets(&r.gpu, size.0, size.1)?;
+        *slot = Some(Staging {
+            ring: ReadbackRing::new(r.gpu.clone(), &targets.plane_descs())?,
+            targets,
+            size,
+            source,
+        });
+    }
+    // `frame.srv` (UNORM): the codes as they are stored, which is how the output stage reads them too, so the
+    // colours of a picture tapped inside the chain match the ones of the output.
+    let small = down.run(r, frame, size.0, size.1)?;
+    let staging = slot.as_mut().expect("made above");
+    dispatch_packed_nv12(r, cs_constants, &small, &staging.targets)?;
+    // The tap makes no frame while one is on the GPU, so the ring never overwrites here.
+    staging.ring.submit(&staging.targets.textures(), tag)?;
+    // `small` goes back to the pool; the dispatch above was queued first, so the GPU reads it before any reuse.
+    Ok(())
+}
+
+/// The newest picture of `slot`'s ring that the GPU has finished (all of them with `wait`), packed. More than one is
+/// pending only after a stall; the older ones would be overwritten anyway.
+fn newest_of(slot: &mut Option<Staging>, wait: bool) -> Result<Option<Frame>, String> {
+    let Some(Staging {
+        ring,
+        size: (w, h),
+        source,
+        ..
+    }) = slot.as_mut()
+    else {
+        return Ok(None);
+    };
+    let (w, h, source) = (*w, *h, *source);
+    let mut newest = None;
+    for _ in 0..ReadbackRing::<Tag>::SLOTS {
+        match ring.poll(wait, |planes, (number, qpc)| pack(planes, w, h, source, number, qpc)) {
+            Ok(Some(f)) => newest = Some(f),
+            Ok(None) => break,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(newest)
 }
 
 impl PreviewTap {
@@ -530,6 +633,8 @@ impl PreviewTap {
             request,
             down: Downscaler::new(),
             ring: None,
+            before: None,
+            held: Held::default(),
             cs_constants: None,
             pacer: Pacer::default(),
             complained: false,
@@ -541,83 +646,117 @@ impl PreviewTap {
     fn busy(&self) -> bool {
         lock(&self.shared.gate).has_pending()
             || self.ring.as_ref().is_some_and(|s| s.ring.pending() > 0)
+            || self.before.as_ref().is_some_and(|s| s.ring.pending() > 0)
+    }
+
+    /// What the window asked for, limited to [`MAX_SIZE`]: the bound of one picture.
+    fn bound(&self) -> (u32, u32) {
+        (
+            self.request.0.clamp(1, MAX_SIZE.0),
+            self.request.1.clamp(1, MAX_SIZE.1),
+        )
     }
 
     /// Downscale `frame` into a small texture, write it as NV12 and queue the copy of the planes to the CPU. Never
     /// waits for the GPU. `capture_qpc` is the capture time of the engine frame.
     fn capture(&mut self, r: &Renderer, frame: &RgbaTexture, capture_qpc: u64) -> GpuResult<()> {
-        let bound = (
-            self.request.0.clamp(1, MAX_SIZE.0),
-            self.request.1.clamp(1, MAX_SIZE.1),
-        );
-        let size = fit_preview((frame.width, frame.height), bound);
-        let source = (frame.width, frame.height);
-        if self
-            .ring
-            .as_ref()
-            .is_none_or(|s| s.size != size || s.source != source)
-        {
-            let targets = packed_nv12_targets(&r.gpu, size.0, size.1)?;
-            self.ring = Some(Staging {
-                ring: ReadbackRing::new(r.gpu.clone(), &targets.plane_descs())?,
-                targets,
-                size,
-                source,
-            });
-        }
+        // One picture: whatever the Compare mode had is of no use now.
+        self.before = None;
+        self.held = Held::default();
         if self.cs_constants.is_none() {
             self.cs_constants = Some(nv12_cs_constants(r)?);
         }
-        // `frame.srv` (UNORM): the codes as they are stored, which is how the output stage reads them too, so the
-        // colours of a picture tapped inside the chain match the ones of the output.
-        let small = self.down.run(r, frame, size.0, size.1)?;
-        let staging = self.ring.as_mut().expect("made above");
-        dispatch_packed_nv12(
-            r,
-            self.cs_constants.as_ref().expect("made above"),
-            &small,
-            &staging.targets,
-        )?;
         let number = self.numbers.fetch_add(1, Ordering::Relaxed);
-        // The tap makes no frame while one is on the GPU, so the ring never overwrites here.
-        staging
-            .ring
-            .submit(&staging.targets.textures(), (number, capture_qpc))?;
-        // `small` goes back to the pool; the dispatch above was queued first, so the GPU reads it before any reuse.
-        Ok(())
+        let bound = self.bound();
+        shrink_into(
+            &mut self.ring,
+            &mut self.down,
+            self.cs_constants.as_ref().expect("made above"),
+            r,
+            frame,
+            bound,
+            (number, capture_qpc),
+        )
+    }
+
+    /// [`PreviewTap::capture`] for Compare: both pictures, with one frame number, each in its own ring; `collect` joins
+    /// them into one [`FORMAT_NV12_PAIR`] frame.
+    fn capture_pair(&mut self, r: &Renderer, before: &RgbaTexture, after: &RgbaTexture, capture_qpc: u64) -> GpuResult<()> {
+        if self.cs_constants.is_none() {
+            self.cs_constants = Some(nv12_cs_constants(r)?);
+        }
+        let number = self.numbers.fetch_add(1, Ordering::Relaxed);
+        let bound = self.bound();
+        let cs = self.cs_constants.as_ref().expect("made above");
+        shrink_into(&mut self.before, &mut self.down, cs, r, before, bound, (number, capture_qpc))?;
+        shrink_into(&mut self.ring, &mut self.down, cs, r, after, bound, (number, capture_qpc))
     }
 
     /// Map the frames on the GPU and offer the newest. With `wait` the call blocks until the GPU has them (right
     /// after the engine's own readback, which waited for the same work, that is no wait at all); without it a frame
     /// the GPU has not finished stays for the next call.
     fn collect(&mut self, wait: bool) {
-        let Some(Staging {
-            ring,
-            size: (w, h),
-            source,
-            ..
-        }) = self.ring.as_mut()
-        else {
+        let after = newest_of(&mut self.ring, wait);
+        if self.before.is_none() {
+            match after {
+                Ok(Some(f)) => self.shared.offer(f),
+                Ok(None) => {}
+                Err(e) => self.complain(&e),
+            }
             return;
-        };
-        let (w, h, source) = (*w, *h, *source);
-        let mut newest = None;
-        // More than one is pending only after a stall; the older ones would be overwritten anyway.
-        for _ in 0..ReadbackRing::<Tag>::SLOTS {
-            match ring.poll(wait, |planes, (number, qpc)| {
-                pack(planes, w, h, source, number, qpc)
-            }) {
-                Ok(Some(f)) => newest = Some(f),
-                Ok(None) => break,
-                Err(e) => {
-                    self.complain(&e.to_string());
-                    break;
+        }
+        // Compare: a picture waits for its other half; they are the same frame when their numbers are.
+        let before = newest_of(&mut self.before, wait);
+        for half in [(before, true), (after, false)] {
+            match half {
+                (Ok(Some(f)), is_before) => {
+                    if is_before {
+                        self.held.before = Some(f);
+                    } else {
+                        self.held.after = Some(f);
+                    }
                 }
+                (Ok(None), _) => {}
+                (Err(e), _) => self.complain(&e),
             }
         }
-        if let Some(f) = newest {
-            self.shared.offer(f);
+        let numbers = (self.held.before.as_ref().map(|f| f.number), self.held.after.as_ref().map(|f| f.number));
+        match numbers {
+            (Some(b), Some(a)) if b == a => {
+                let (before, after) = (self.held.before.take().expect("seen"), self.held.after.take().expect("seen"));
+                // Two pictures that do not fit together (cannot happen: both are the output's size): the output alone.
+                self.shared.offer(pair(&before, &after).unwrap_or(after));
+            }
+            // One half is from an older frame (a stall, or the frame before the mode changed): it never gets its partner.
+            (Some(b), Some(a)) if b < a => self.held.before = None,
+            (Some(_), Some(_)) => self.held.after = None,
+            _ => {}
         }
+    }
+
+    /// Whether this frame makes no picture: nobody sees it, the 30 fps slot has not come, or the last one is not out yet.
+    /// Takes the slot when it does not skip.
+    fn skip_frame(&mut self) -> bool {
+        if self.hidden.load(Ordering::Relaxed) || self.shared.is_closed() {
+            // Nobody sees the picture: no GPU work, and the frames in the ring would be stale on return.
+            for s in [self.ring.as_mut(), self.before.as_mut()].into_iter().flatten() {
+                s.ring.clear();
+            }
+            self.held = Held::default();
+            self.pacer.reset();
+            return true;
+        }
+        let now = Instant::now();
+        if !self.pacer.due(now) {
+            return true;
+        }
+        if self.busy() {
+            // Not a frame the 30 fps limit would have dropped: counted, and the slot stays free for the next one.
+            self.shared.skipped.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        self.pacer.accept(now);
+        false
     }
 
     fn complain(&mut self, what: &str) {
@@ -632,31 +771,27 @@ impl FrameTap for PreviewTap {
     /// The engine rebuilt its GPU device: the staging ring and the downscale constants belong to the old one.
     fn device_changed(&mut self) {
         self.ring = None;
+        self.before = None;
+        self.held = Held::default();
         self.cs_constants = None;
         self.down = Downscaler::new();
         self.pacer.reset();
     }
 
     fn on_frame(&mut self, renderer: &Renderer, frame: &RgbaTexture, capture_qpc: u64) {
-        if self.hidden.load(Ordering::Relaxed) || self.shared.is_closed() {
-            // Nobody sees the picture: no GPU work, and the frames in the ring would be stale on return.
-            if let Some(s) = self.ring.as_mut() {
-                s.ring.clear();
-            }
-            self.pacer.reset();
+        if self.skip_frame() {
             return;
         }
-        let now = Instant::now();
-        if !self.pacer.due(now) {
-            return;
-        }
-        if self.busy() {
-            // Not a frame the 30 fps limit would have dropped: counted, and the slot stays free for the next one.
-            self.shared.skipped.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        self.pacer.accept(now);
         if let Err(e) = self.capture(renderer, frame, capture_qpc) {
+            self.complain(&e.to_string());
+        }
+    }
+
+    fn on_compare(&mut self, renderer: &Renderer, before: &RgbaTexture, after: &RgbaTexture, capture_qpc: u64) {
+        if self.skip_frame() {
+            return;
+        }
+        if let Err(e) = self.capture_pair(renderer, before, after, capture_qpc) {
             self.complain(&e.to_string());
         }
     }
@@ -1307,6 +1442,93 @@ mod tests {
                 assert!((v - 127).abs() <= 3, "{request:?} column {x}: {v}");
             }
         }
+    }
+
+    // --- Compare: two pictures in one frame ----------------------------------------------------------------
+
+    /// A one picture NV12 frame of `w` x `h` whose payload bytes are all `fill`.
+    fn flat(number: u32, w: u32, h: u32, fill: u8) -> Frame {
+        let header = Header { width: w, height: h, stride: w, frame: number, source_width: 640, source_height: 360, format: FORMAT_NV12 };
+        let mut bytes = header.encode().to_vec();
+        bytes.resize(HEADER_LEN + header.payload_len(), fill);
+        Frame { number, capture_qpc: 5, bytes }
+    }
+
+    #[test]
+    fn a_pair_frame_says_so_in_its_header_and_holds_the_camera_picture_then_the_output() {
+        let h = Header { width: 8, height: 4, stride: 8, frame: 9, source_width: 1920, source_height: 1080, format: FORMAT_NV12_PAIR };
+        assert_eq!(&h.encode()[24..28], &[2, 0, 0, 0], "the format word: 2 is two NV12 pictures");
+        assert_eq!(Header::decode(&h.encode()), Some(h));
+        assert_eq!(h.payload_len(), 2 * 8 * 4 * 3 / 2, "two pictures");
+        assert_eq!(Header { format: FORMAT_NV12, ..h }.payload_len(), 8 * 4 * 3 / 2);
+
+        let (before, after) = (flat(9, 8, 4, 0x11), flat(9, 8, 4, 0x22));
+        let p = pair(&before, &after).expect("two pictures of one size pair up");
+        let ph = Header::decode(&p.bytes).unwrap();
+        assert_eq!((ph.width, ph.height, ph.stride, ph.frame, ph.format), (8, 4, 8, 9, FORMAT_NV12_PAIR));
+        assert_eq!((ph.source_width, ph.source_height), (640, 360));
+        assert_eq!((p.number, p.capture_qpc), (9, 5));
+        assert_eq!(p.bytes.len(), HEADER_LEN + ph.payload_len());
+        let one = 8 * 4 * 3 / 2;
+        assert!(p.bytes[HEADER_LEN..HEADER_LEN + one].iter().all(|&b| b == 0x11), "the camera picture first");
+        assert!(p.bytes[HEADER_LEN + one..].iter().all(|&b| b == 0x22), "the output second");
+
+        // pictures of two sizes, or one that is already a pair, are not paired
+        assert!(pair(&flat(9, 8, 4, 0), &flat(9, 4, 2, 0)).is_none());
+        assert!(pair(&p, &p).is_none());
+    }
+
+    /// The pixel (`x`, `y`) of picture `which` (0 the camera picture, 1 the output) of a pair frame.
+    fn pair_pixel(f: &Frame, which: usize, x: u32, y: u32) -> [u8; 4] {
+        let h = Header::decode(&f.bytes).unwrap();
+        assert_eq!(h.format, FORMAT_NV12_PAIR);
+        let one = h.payload_len() / 2;
+        let mut bytes = Header { format: FORMAT_NV12, ..h }.encode().to_vec();
+        bytes.extend_from_slice(&f.bytes[HEADER_LEN + which * one..HEADER_LEN + (which + 1) * one]);
+        pixel(&Frame { number: f.number, capture_qpc: f.capture_qpc, bytes }, x, y)
+    }
+
+    /// Run `step` (a call of the tap) until the gate has a frame, and take it.
+    fn next_frame(tap: &mut PreviewTap, shared: &Arc<Shared>, mut step: impl FnMut(&mut PreviewTap)) -> Frame {
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            step(tap);
+            tap.frame_done(true);
+            if let Some(f) = lock(&shared.gate).take(Instant::now()) {
+                return f;
+            }
+            assert!(Instant::now() < end, "no frame came");
+            std::thread::sleep(FRAME_INTERVAL);
+        }
+    }
+
+    #[test]
+    fn the_tap_sends_both_pictures_in_one_frame_in_compare_and_one_again_after() {
+        let r = warp();
+        let (before, after) = (r.texture(640, 360).unwrap(), r.texture(640, 360).unwrap());
+        fill(&r, &before, |_, _| [220, 30, 30, 255]);
+        fill(&r, &after, |_, _| [90, 90, 90, 255]);
+        let shared = Shared::new(ACK_TIMEOUT);
+        let mut tap = PreviewTap::new(shared.clone(), Arc::new(AtomicU32::new(0)), Arc::new(AtomicBool::new(false)), (640, 360));
+
+        let f = next_frame(&mut tap, &shared, |t| t.on_compare(&r, &before, &after, 3));
+        let h = Header::decode(&f.bytes).unwrap();
+        assert_eq!((h.width, h.height, h.stride, h.format), (640, 360, 640, FORMAT_NV12_PAIR));
+        assert_eq!((h.source_width, h.source_height), (640, 360));
+        assert_eq!(f.bytes.len(), HEADER_LEN + 2 * 640 * 360 * 3 / 2);
+        assert_eq!(f.capture_qpc, 3);
+        near(pair_pixel(&f, 0, 100, 100), [220, 30, 30, 255], 3, "the camera picture is the first");
+        near(pair_pixel(&f, 1, 100, 100), [90, 90, 90, 255], 3, "the output is the second");
+        assert!(tap.before.is_some());
+        assert!(lock(&shared.gate).ack(f.number));
+
+        // Compare is over: plain frames of one picture, and the second ring is gone.
+        std::thread::sleep(FRAME_INTERVAL);
+        let f = next_frame(&mut tap, &shared, |t| t.on_frame(&r, &after, 4));
+        assert_eq!(Header::decode(&f.bytes).unwrap().format, FORMAT_NV12);
+        assert_eq!(f.bytes.len(), HEADER_LEN + 640 * 360 * 3 / 2);
+        near(pixel(&f, 100, 100), [90, 90, 90, 255], 3, "the output");
+        assert!(tap.before.is_none() && tap.held.before.is_none() && tap.held.after.is_none());
     }
 
     #[test]

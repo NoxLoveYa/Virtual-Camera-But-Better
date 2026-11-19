@@ -2,7 +2,7 @@
  * Checks of the preview helpers: the 28-byte frame header, the preview point and its caption, hold to compare, and the
  * mapping from the canvas to the tapped picture. `npm run test:ui` bundles and runs it. It throws at the first failure.
  */
-import { FORMAT_NV12, HEADER_BYTES, NOT_HELD, chromaOffset, holdStep, isHeld, letterbox, pointFilter, pointLabel, readHeader, samePoint, toSourcePixel, type Hold, type HoldEvent } from "./previewFrame";
+import { FORMAT_NV12, FORMAT_NV12_PAIR, HEADER_BYTES, NOT_HELD, chromaOffset, pictureOffset, holdStep, isHeld, letterbox, pointFilter, pointLabel, readHeader, samePoint, toSourcePixel, type Hold, type HoldEvent } from "./previewFrame";
 
 function eq<T>(actual: T, expected: T, what: string) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error(`${what}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
@@ -27,7 +27,12 @@ eq(readHeader(frame([4, 2, 4, 9, 1920, 1080], 8)), null, "a Y plane without its 
 eq(readHeader(frame([4, 2, 4, 9, 1920, 1080], 0).slice(0, 27)), null, "shorter than the header");
 eq(readHeader(new ArrayBuffer(24)), null, "an old 24-byte header is not a frame");
 eq(readHeader(frame([4, 2, 16, 9, 1920, 1080], 48, 0)), null, "an RGBA frame (no format word) is not read as NV12");
-eq(readHeader(frame([4, 2, 4, 9, 1920, 1080], 12, 2)), null, "an unknown format");
+eq(readHeader(frame([4, 2, 4, 9, 1920, 1080], 12, 3)), null, "an unknown format");
+eq(FORMAT_NV12_PAIR, 2, "the format word of a Compare frame");
+eq(readHeader(frame([4, 2, 4, 9, 1920, 1080], 24, FORMAT_NV12_PAIR)), { width: 4, height: 2, stride: 4, frame: 9, sourceWidth: 1920, sourceHeight: 1080, pair: true }, "a pair frame");
+eq(readHeader(frame([4, 2, 4, 9, 1920, 1080], 12, FORMAT_NV12_PAIR)), null, "a pair frame with only one picture of pixels");
+eq(pictureOffset({ width: 4, height: 2, stride: 6, frame: 0, sourceWidth: 1, sourceHeight: 1 }, 1), HEADER_BYTES + 18, "the second picture starts after the first");
+eq(chromaOffset({ width: 4, height: 2, stride: 6, frame: 0, sourceWidth: 1, sourceHeight: 1, pair: true }, 1), HEADER_BYTES + 18 + 12, "the UV plane of the second picture");
 eq(readHeader(frame([0, 2, 4, 9, 1920, 1080], 12)), null, "zero width");
 eq(readHeader(frame([3, 2, 4, 9, 1920, 1080], 12)), null, "an odd width has no whole chroma block");
 eq(readHeader(frame([4, 3, 4, 9, 1920, 1080], 18)), null, "an odd height has no whole chroma block");
@@ -53,6 +58,10 @@ eq(pointFilter("input"), null, "input names no filter");
 eq(pointFilter(null), null, "the output names no filter");
 eq(pointLabel(null, steps), null, "no caption for the output");
 eq(pointLabel("input", steps), "Before", "the compare caption");
+eq(pointLabel("compare", steps), null, "the split-wipe Compare labels its sides itself, no caption");
+eq(samePoint("compare", "compare"), true, "compare is compare");
+eq(samePoint("compare", "input"), false, "compare is not input");
+eq(pointFilter("compare"), null, "compare names no filter");
 eq(pointLabel({ filter: "b" }, steps), "Crop/Pad · step 2 · showing the picture before this filter", "a filter caption");
 eq(pointLabel({ filter: "gone" }, steps), null, "a filter that left the chain has no caption");
 

@@ -435,7 +435,7 @@ Stacked (900–1099 px)
 ## 4. Design notes for wave 2 (not first wave; recorded so the next brief starts from here)
 
 **L1, preview point.**
-- New command `set_preview_point(point: null | "input" | { filter: id })`. `null` is today's fitted output; `"input"` is the camera picture before the chain; `{ filter }` is the picture entering that filter, whether the filter is enabled or not.
+- New command `set_preview_point(point: null | "input" | "compare" | { filter: id })` (`"compare"` added with the split-wipe Compare, see L4 below). `null` is today's fitted output; `"input"` is the camera picture before the chain; `{ filter }` is the picture entering that filter, whether the filter is enabled or not.
 - In `Chain::run` (`fx/mod.rs:338-369`), call the tap with the intermediate texture just before the chosen slot, and do not call it after the output stage.
 - The frame header grows from 16 to 24 bytes, adding `source_width` and `source_height`: the full size of the tapped picture before the downscale. The `stride` field already allows layout change (`preview.rs:17-20`); bump the reader in `Preview.tsx:17-23` in the same change.
 - The output to apps is unchanged. The point resets to `null` when the gesture ends, when the window hides, and when the filter is removed.
@@ -469,6 +469,8 @@ Stacked (900–1099 px)
 - The eyedropper averages 5×5 preview pixels of the last frame and sets `key_color` (alpha byte kept) and `key_color_type: "custom"` in one change, one Undo.
 
 **L4, hold to compare.** A "Compare" button in the preview bar: while it is held (pointer, or Space with it focused), the preview point is `"input"` and the label reads "Before". Release goes back.
+
+**L4, as changed: split-wipe Compare.** Compare is now a toggle (click on, click off; Esc also turns it off). While it is on, `previewPoint` is `"compare"` (`set_preview_point("compare")`, engine `PreviewPoint::Compare`): the engine fits the camera picture before the chain with the output stage's own `OutputParams` (same size and Fit as the output), runs the chain as usual, and the tap (`FrameTap::on_compare`) gets both. The preview frame has `format` 2 (`FORMAT_NV12_PAIR`): the header's size and stride are those of one picture, and the payload is two NV12 pictures one after the other, the camera picture first, the output second. The page draws both textures with a split uniform (`Preview.tsx`), so a drag needs no round trip. The bar lies left-right (Before left of it) or up-down (Before above it); `O` switches, arrow keys move it 2 % (Shift 10 %), Home and End go to the edges, a double click centres it. The picture caps (960 x 540) apply to each of the two pictures. Geometry filters (Crop/Pad, Scaling, Transform) change the output's framing, so the two sides do not line up; accepted. What apps get is the same as without Compare.
 
 ---
 

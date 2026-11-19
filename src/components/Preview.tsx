@@ -3,17 +3,23 @@ import { api } from "../api";
 import { CAPTURE_KEYS, effectiveSource, problemText } from "../camera/schema";
 import { useStore } from "../store";
 import { labelOf } from "../filters/schema";
-import { HEADER_BYTES, NOT_HELD, chromaOffset, holdStep, isHeld, pointLabel, readHeader, type FrameHeader, type HoldEvent } from "../ui/previewFrame";
+import { chromaOffset, pictureOffset, pointLabel, readHeader, type FrameHeader } from "../ui/previewFrame";
 import { YUV_TO_RGB_GLSL } from "../ui/yuv";
 import { lastFrame } from "../ui/lastFrame";
 import { sourceChange, type SourceSize } from "../ui/previewTool";
+import { isOrientKey, type Split } from "../ui/compare";
+import { useCompare } from "../ui/compareState";
+import { CompareOrient, CompareSplit } from "./CompareBar";
 import { CropOverlay } from "./CropOverlay";
 import { PickOverlay } from "./PickOverlay";
 
 /** The Install button's tooltip while the data folder is encrypted: the banner sits above the preview, not below it. */
 const PREVIEW_BLOCKED_REASON = "An administrator must turn off encryption first (see the banner above).";
 
-const COMPARE_HINT = "Hold to see the camera picture before the filters (or hold Space)";
+const COMPARE_HINT = "Compare the camera picture before the filters with the result: drag the bar over the picture";
+
+/** Whether a key press is typing into a field (the orientation key must not take it). */
+const isTyping = (t: EventTarget | null) => t instanceof HTMLElement && (t.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName));
 
 const VERTEX = `#version 300 es
 out vec2 uv;
@@ -25,22 +31,40 @@ void main() {
 
 // The frame is NV12: Y is one R8 texture, UV one RG8 texture of half the size (linear filtering interpolates the chroma
 // between its texels). The matrix (BT.709 limited range, what the engine encodes) is `yuv.ts`'s, the one the eyedropper uses.
+// A Compare frame has two pictures: the first (the camera, "Before") is in `luma`/`chroma`, the second (the output, "After")
+// in `lumaB`/`chromaB`. `split` is (1 for two pictures, the bar's place 0..1, 1 for a bar that lies across); the pixels
+// before the bar (left of it, or above it) are the first picture, the rest the second. The bar moves with a uniform, not a frame.
 const FRAGMENT = `#version 300 es
 precision highp float;
 uniform sampler2D luma;
 uniform sampler2D chroma;
+uniform sampler2D lumaB;
+uniform sampler2D chromaB;
+uniform vec3 split;
 in vec2 uv;
 out vec4 color;
 ${YUV_TO_RGB_GLSL}
-void main() { color = vec4(yuvToRgb(texture(luma, uv).r, texture(chroma, uv).rg), 1.0); }`;
+void main() {
+  bool second = split.x > 0.5 && (split.z > 0.5 ? uv.y : uv.x) >= split.y;
+  if (second) color = vec4(yuvToRgb(texture(lumaB, uv).r, texture(chromaB, uv).rg), 1.0);
+  else color = vec4(yuvToRgb(texture(luma, uv).r, texture(chroma, uv).rg), 1.0);
+}`;
 
-/** The two WebGL textures the frames are uploaded to and drawn from. The planes are top row first: no swap or flip on the CPU. */
+/** The WebGL textures the frames are uploaded to and drawn from: the planes of up to two pictures. The planes are top row first: no swap or flip on the CPU. */
 class FrameView {
   private gl: WebGL2RenderingContext;
   private luma: WebGLTexture;
   private chroma: WebGLTexture;
+  private lumaB: WebGLTexture;
+  private chromaB: WebGLTexture;
+  private splitAt: WebGLUniformLocation | null;
   private w = 0;
   private h = 0;
+  private wB = 0;
+  private hB = 0;
+  /** The picture on the canvas came from a Compare frame (two pictures). */
+  private pair = false;
+  private drawn = false;
 
   constructor(private canvas: HTMLCanvasElement) {
     const gl = canvas.getContext("webgl2", { alpha: false, antialias: false, depth: false, stencil: false, powerPreference: "low-power" });
@@ -58,7 +82,7 @@ class FrameView {
     gl.linkProgram(program);
     if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program) ?? "link error");
     gl.useProgram(program);
-    // unit 0: Y, unit 1: UV
+    // unit 0: Y, unit 1: UV (first picture); unit 2: Y, unit 3: UV (second picture, Compare only)
     const plane = (unit: number, name: string) => {
       const texture = gl.createTexture()!;
       gl.activeTexture(gl.TEXTURE0 + unit);
@@ -72,12 +96,30 @@ class FrameView {
     };
     this.luma = plane(0, "luma");
     this.chroma = plane(1, "chroma");
+    this.lumaB = plane(2, "lumaB");
+    this.chromaB = plane(3, "chromaB");
+    this.splitAt = gl.getUniformLocation(program, "split");
+    // The second picture's planes exist before any Compare frame: a sampler bound to an incomplete texture warns on every draw.
+    gl.activeTexture(gl.TEXTURE0 + 2);
+    gl.bindTexture(gl.TEXTURE_2D, this.lumaB);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, 1, 1, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(1));
+    gl.activeTexture(gl.TEXTURE0 + 3);
+    gl.bindTexture(gl.TEXTURE_2D, this.chromaB);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG8, 1, 1, 0, gl.RG, gl.UNSIGNED_BYTE, new Uint8Array(2));
     // rows of the planes are `stride` bytes apart, which is `UNPACK_ROW_LENGTH` texels of 1 byte (Y) or `stride / 2` of 2 (UV)
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     this.gl = gl;
   }
 
-  draw(buf: ArrayBuffer, h: FrameHeader) {
+  /** Draw the textures as they are, with the bar where `split` puts it (it only matters for a Compare frame). */
+  private paint(split: Split) {
+    const { gl } = this;
+    gl.uniform3f(this.splitAt, this.pair ? 1 : 0, split.pos, split.orientation === "horizontal" ? 1 : 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    this.drawn = true;
+  }
+
+  draw(buf: ArrayBuffer, h: FrameHeader, split: Split) {
     const { gl, canvas } = this;
     // The canvas has the picture's own size; CSS (`object-fit: contain`) letterboxes it inside the 16:9 box.
     if (canvas.width !== h.width || canvas.height !== h.height) {
@@ -85,10 +127,7 @@ class FrameView {
       canvas.height = h.height;
     }
     gl.viewport(0, 0, h.width, h.height);
-    const y = new Uint8Array(buf, HEADER_BYTES, h.stride * h.height);
-    const uv = new Uint8Array(buf, chromaOffset(h), (h.stride * h.height) / 2);
-    const fresh = this.w !== h.width || this.h !== h.height;
-    const upload = (unit: number, texture: WebGLTexture, internal: number, format: number, w: number, hh: number, rowLength: number, data: Uint8Array) => {
+    const upload = (unit: number, texture: WebGLTexture, fresh: boolean, internal: number, format: number, w: number, hh: number, rowLength: number, data: Uint8Array) => {
       gl.activeTexture(gl.TEXTURE0 + unit);
       gl.bindTexture(gl.TEXTURE_2D, texture);
       // rows packed with no padding (the stride the engine sends today) take the browser's plain copy
@@ -96,11 +135,27 @@ class FrameView {
       if (fresh) gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, hh, 0, format, gl.UNSIGNED_BYTE, data);
       else gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, hh, format, gl.UNSIGNED_BYTE, data);
     };
-    upload(0, this.luma, gl.R8, gl.RED, h.width, h.height, h.stride, y);
-    upload(1, this.chroma, gl.RG8, gl.RG, h.width / 2, h.height / 2, h.stride / 2, uv);
+    const picture = (index: 0 | 1, luma: WebGLTexture, chroma: WebGLTexture, fresh: boolean, unit: number) => {
+      const y = new Uint8Array(buf, pictureOffset(h, index), h.stride * h.height);
+      const uv = new Uint8Array(buf, chromaOffset(h, index), (h.stride * h.height) / 2);
+      upload(unit, luma, fresh, gl.R8, gl.RED, h.width, h.height, h.stride, y);
+      upload(unit + 1, chroma, fresh, gl.RG8, gl.RG, h.width / 2, h.height / 2, h.stride / 2, uv);
+    };
+    picture(0, this.luma, this.chroma, this.w !== h.width || this.h !== h.height, 0);
     this.w = h.width;
     this.h = h.height;
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    if (h.pair) {
+      picture(1, this.lumaB, this.chromaB, this.wB !== h.width || this.hB !== h.height, 2);
+      this.wB = h.width;
+      this.hB = h.height;
+    }
+    this.pair = !!h.pair;
+    this.paint(split);
+  }
+
+  /** The bar moved (or Compare ended) with no new frame: draw the textures again. */
+  redraw(split: Split) {
+    if (this.drawn) this.paint(split);
   }
 }
 
@@ -147,6 +202,10 @@ export function Preview() {
   const [shown, setShown] = useState(false);
   const [fps, setFps] = useState(0);
   const drawn = useRef(0);
+  // The size of the picture on the canvas, for the Compare bar (it lies on the picture, not on the letterbox).
+  const [picture, setPicture] = useState<{ w: number; h: number } | null>(null);
+  // Where the Compare bar splits a pair frame; with Compare off a pair frame in flight shows the output only (the bar at 0).
+  const split = useRef<Split>({ pos: 0, orientation: "vertical" });
 
   // The canvas box in device pixels is what the backend sizes the picture for (it caps it at 960x540).
   useEffect(() => {
@@ -185,7 +244,8 @@ export function Preview() {
     if (mine !== gen.current) return;
     const header = readHeader(buf);
     if (!header) return;
-    lastFrame.set(buf, header);
+    // The tools read the last frame as one picture: a Compare frame (two) is never theirs (they end Compare when they start).
+    if (!header.pair) lastFrame.set(buf, header);
     const { previewTool, endPreviewTool } = useStore.getState();
     if (previewTool) {
       const seen = sourceChange(toolSource.current, { w: header.sourceWidth, h: header.sourceHeight }, previewTool.since, performance.now());
@@ -196,9 +256,10 @@ export function Preview() {
       const canvas = canvasRef.current;
       if (canvas) {
         view.current ??= new FrameView(canvas);
-        view.current.draw(buf, header);
+        view.current.draw(buf, header, split.current);
         drawn.current += 1;
         setShown(true);
+        setPicture((p) => (p && p.w === header.width && p.h === header.height ? p : { w: header.width, h: header.height }));
       }
     } catch (e) {
       console.error("preview: cannot draw the frame", e);
@@ -254,6 +315,8 @@ export function Preview() {
     if (seenEpoch.current === vcamEpoch) return;
     seenEpoch.current = vcamEpoch;
     applied.current = "";
+    // A new engine starts at the output: a Compare the page still shows as on would be a bar over one picture.
+    if (useStore.getState().previewPoint === "compare") useStore.getState().setPreviewPoint(null);
     void sync();
   }, [vcamEpoch, sync]);
 
@@ -353,45 +416,55 @@ export function Preview() {
   // A dimmed state shows the last frame at 35 %; any other placeholder hides the canvas.
   const canvasClass = showing ? "" : dim && shown ? " is-dim" : " is-off";
 
-  // Hold to compare (L4): the preview shows the camera before the filters while the button is held by the pointer or by Space.
-  const [hold, setHold] = useState(NOT_HELD);
-  const held = isHeld(hold);
-  const holding = useRef(NOT_HELD);
-  const press = useCallback((event: HoldEvent) => {
-    holding.current = holdStep(holding.current, event);
-    setHold(holding.current);
-  }, []);
-  const { setPreviewPoint } = useStore.getState();
-  const comparing = useRef(false);
-  useEffect(() => {
-    if (held && showing) {
-      comparing.current = true;
-      setPreviewPoint("input");
-    } else if (comparing.current) {
-      // Let go: back to the output, unless another gesture took the point meanwhile.
-      comparing.current = false;
-      if (useStore.getState().previewPoint === "input") setPreviewPoint(null);
-    }
-  }, [held, showing, setPreviewPoint]);
-  useEffect(
-    () => () => {
-      if (comparing.current && useStore.getState().previewPoint === "input") useStore.getState().setPreviewPoint(null);
-    },
-    [],
-  );
-  // A button that went away under the pointer (the picture stopped, the window was hidden) gets no pointerup.
-  useEffect(() => {
-    if (!showing || !visible) press("blur");
-  }, [showing, visible, press]);
-  useEffect(() => {
-    const letGo = () => press("blur");
-    window.addEventListener("blur", letGo);
-    return () => window.removeEventListener("blur", letGo);
-  }, [press]);
   const chain = useStore((s) => s.chain);
   const extensions = useStore((s) => s.extensions);
   const point = useStore((s) => s.previewPoint);
   const caption = showing ? pointLabel(point, chain.map((f) => ({ id: f.id, label: labelOf(f.kind, extensions) }))) : null;
+
+  // Compare (L4): a toggle. While it is on the preview point is "compare": the engine sends the camera picture and the output in one
+  // frame and the bar splits them here, so a drag needs no round trip. Whatever else takes the point (a tool, the preview going
+  // off) ends it with it.
+  const compareOn = point === "compare";
+  const { setPreviewPoint } = useStore.getState();
+  useEffect(() => {
+    const apply = () => {
+      const c = useCompare.getState();
+      const next: Split = { pos: useStore.getState().previewPoint === "compare" ? c.pos : 0, orientation: c.orientation };
+      if (next.pos === split.current.pos && next.orientation === split.current.orientation) return;
+      split.current = next;
+      view.current?.redraw(next);
+    };
+    apply();
+    const stops = [useCompare.subscribe(apply), useStore.subscribe(apply)];
+    return () => stops.forEach((stop) => stop());
+  }, []);
+  // Esc turns Compare off, the orientation key turns the bar.
+  useEffect(() => {
+    if (!compareOn) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setPreviewPoint(null);
+      } else if (isOrientKey(e, isTyping(e.target))) {
+        e.preventDefault();
+        useCompare.getState().swapOrientation();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [compareOn, setPreviewPoint]);
+  // The picture stopped showing or the window is hidden (the engine already took its point back then), or this view is going
+  // away: no one looks at the bar, so Compare is over.
+  useEffect(() => {
+    if ((!showing || !visible) && useStore.getState().previewPoint === "compare") setPreviewPoint(null);
+  }, [showing, visible, setPreviewPoint]);
+  useEffect(
+    () => () => {
+      if (useStore.getState().previewPoint === "compare") useStore.getState().setPreviewPoint(null);
+    },
+    [],
+  );
 
   // A tool (eyedropper, crop frame) works on a live picture: when it stops showing (paused, reopened, stopped), the tool is over.
   const tool = useStore((s) => s.previewTool);
@@ -420,6 +493,7 @@ export function Preview() {
         )}
         {showing && tool?.kind === "pick" && <PickOverlay key={tool.filter} boxRef={boxRef} filter={tool.filter} />}
         {showing && tool?.kind === "crop" && <CropOverlay key={tool.filter} boxRef={boxRef} filter={tool.filter} />}
+        {showing && compareOn && <CompareSplit boxRef={boxRef} picture={picture} />}
         <div className="preview-bar">
           {showing ? (
             <span className="preview-fps" title="Frames drawn per second">
@@ -429,33 +503,14 @@ export function Preview() {
             <span />
           )}
           <div className="preview-tools">
+            {showing && compareOn && <CompareOrient />}
             <button
               type="button"
               className="preview-compare"
-              aria-pressed={held}
+              aria-pressed={compareOn}
               disabled={!showing || tool !== null}
-              title={tool !== null ? "Finish the pick or the crop first" : showing ? COMPARE_HINT : "Nothing to compare: the camera picture is not showing"}
-              onPointerDown={(e) => {
-                if (e.button !== 0) return;
-                e.currentTarget.setPointerCapture(e.pointerId);
-                press("pointerdown");
-              }}
-              onPointerUp={() => press("pointerup")}
-              onPointerCancel={() => press("pointerup")}
-              onLostPointerCapture={() => press("pointerup")}
-              onKeyDown={(e) => {
-                if (e.key !== " ") return;
-                // The button's own Space click would fire on release: the hold is the whole gesture.
-                e.preventDefault();
-                if (!e.repeat) press("keydown");
-              }}
-              onKeyUp={(e) => {
-                if (e.key !== " ") return;
-                e.preventDefault();
-                press("keyup");
-              }}
-              onBlur={() => press("blur")}
-              onContextMenu={(e) => e.preventDefault()}
+              title={tool !== null ? "Finish the pick or the crop first" : !showing ? "Nothing to compare: the camera picture is not showing" : compareOn ? "Turn Compare off (Esc)" : COMPARE_HINT}
+              onClick={() => setPreviewPoint(compareOn ? null : "compare")}
             >
               Compare
             </button>

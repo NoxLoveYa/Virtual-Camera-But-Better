@@ -162,6 +162,7 @@ fn every_point_gives_the_same_output() {
     let (_, size, plain) = run(&r, &mut chain, &PreviewPoint::Output);
     for point in [
         PreviewPoint::Input,
+        PreviewPoint::Compare,
         PreviewPoint::Filter("gray".into()),
         PreviewPoint::Filter("half".into()),
         PreviewPoint::Filter("last".into()),
@@ -174,15 +175,17 @@ fn every_point_gives_the_same_output() {
 }
 
 #[test]
-fn the_point_argument_parses_null_input_and_a_filter_object() {
+fn the_point_argument_parses_null_input_compare_and_a_filter_object() {
     assert_eq!(PreviewPoint::parse(&json!(null)), Ok(PreviewPoint::Output));
     assert_eq!(PreviewPoint::parse(&json!("input")), Ok(PreviewPoint::Input));
+    assert_eq!(PreviewPoint::parse(&json!("compare")), Ok(PreviewPoint::Compare));
     assert_eq!(
         PreviewPoint::parse(&json!({ "filter": "abc" })),
         Ok(PreviewPoint::Filter("abc".into()))
     );
     for bad in [
         json!("output"),
+        json!("Compare"),
         json!(""),
         json!(3),
         json!([]),

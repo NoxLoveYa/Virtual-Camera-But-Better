@@ -31,9 +31,11 @@ React, and runs on Windows 11 only.
   is a 52 px icon rail (its » button opens the full list over the preview; the button at the top of the navigator also
   collapses it at any width). The navigator works from the keyboard: arrows select, Space bypasses a filter, Delete removes
   it, Enter or F6 goes to the inspector, Escape comes back.
-- Preview tools: show the picture as it enters a chosen filter, and hold Compare to see the camera picture. An
-  eyedropper picks key colours from the preview (Chroma Key, Color Key). Crop/Pad can be edited on the picture: drag to
-  pan, mouse wheel to zoom.
+- Preview tools: show the picture as it enters a chosen filter. Compare is a toggle: a bar appears over the preview
+  with the camera picture (before the filters) on one side and the result (what apps get) on the other; drag it, or
+  drag anywhere on the picture, to wipe between them. Arrow keys move the bar (Shift for big steps), `O` turns it
+  from left-right to up-down, Esc turns Compare off. An eyedropper picks key colours from the preview (Chroma Key,
+  Color Key). Crop/Pad can be edited on the picture: drag to pan, mouse wheel to zoom.
 - Drop files from Explorer: a LUT, a picture or a preset (`.json`) onto a field, the chain or the window.
 - Output: resolution, frame rate, aspect, background color, and an option to also offer 720p and 360p.
 - Errors in plain words (codes stay in tooltips), and accessibility basics: a clear focus ring, larger switch targets

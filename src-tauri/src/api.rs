@@ -582,7 +582,8 @@ impl Service {
     }
 
     /// `set_preview_point(point)`: which picture the preview shows while a gesture runs: `null` the output (what apps
-    /// get), `"input"` the camera picture before the chain, `{ filter: id }` the picture entering that filter, whether
+    /// get), `"input"` the camera picture before the chain, `"compare"` both that picture and the output in one frame
+    /// (the split-wipe Compare, `preview::FORMAT_NV12_PAIR`), `{ filter: id }` the picture entering that filter, whether
     /// the filter is switched on or not. The output to apps never changes. The engine puts it back to `null` when that
     /// filter leaves the chain, and when the window is hidden; the page puts it back when the gesture ends. A malformed
     /// point is an error and changes nothing. Ordered with [`Service::set_chain`]: a point that names a filter of the
@@ -750,7 +751,7 @@ mod tests {
     #[test]
     fn set_preview_point_takes_null_input_or_a_filter_and_rejects_the_rest() {
         let svc = Service::new();
-        for ok in [json!(null), json!("input"), json!({ "filter": "a1" })] {
+        for ok in [json!(null), json!("input"), json!("compare"), json!({ "filter": "a1" })] {
             assert!(svc.set_preview_point(&ok).is_ok(), "{ok}");
         }
         for bad in [json!("output"), json!({ "filter": 3 }), json!(7), json!({})] {
