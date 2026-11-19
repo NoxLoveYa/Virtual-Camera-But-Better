@@ -132,8 +132,8 @@ export const api = {
   setOutput: (output: OutputCfg) => invoke<void>("set_output", { output }),
   setPause: (on: boolean) => invoke<void>("set_pause", { on }),
   /**
-   * Starts, resizes (a new call replaces the stream) or stops the preview; `onFrame` gets each frame: a 24-byte header
-   * (see `ui/previewFrame.ts`) + RGBA pixels.
+   * Starts, resizes (a new call replaces the stream) or stops the preview; `onFrame` gets each frame: a 28-byte header
+   * (see `ui/previewFrame.ts`) + NV12 pixels.
    */
   setPreview: (on: boolean, width: number, height: number, onFrame: (frame: ArrayBuffer) => void = () => {}) => {
     const channel = new Channel<ArrayBuffer>();

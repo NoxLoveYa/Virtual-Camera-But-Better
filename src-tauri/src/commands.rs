@@ -165,8 +165,8 @@ pub async fn set_pause(state: State<'_, AppState>, on: bool) -> Result<(), Strin
 }
 
 /// Start or stop the live preview. Frames of at most `width` x `height` pixels (and 960x540) arrive on `channel` as
-/// raw bytes: a 24-byte header and RGBA pixels (see `better_cam::preview`). A new call replaces the old stream; the
-/// webview acknowledges each frame with `preview_ack`.
+/// raw bytes: a 28-byte header (seven little-endian u32) and NV12 pixels (see `better_cam::preview`). A new call
+/// replaces the old stream; the webview acknowledges each frame with `preview_ack`.
 #[tauri::command]
 pub async fn set_preview(
     state: State<'_, AppState>,

@@ -1,5 +1,5 @@
 /**
- * Checks of the preview helpers: the 24-byte frame header, the preview point and its caption, hold to compare, and the
+ * Checks of the preview helpers: the 28-byte frame header, the preview point and its caption, hold to compare, and the
  * mapping from the canvas to the tapped picture. `npm run test:ui` bundles and runs it. It throws at the first failure.
  */
 import { FORMAT_NV12, HEADER_BYTES, NOT_HELD, chromaOffset, holdStep, isHeld, letterbox, pointFilter, pointLabel, readHeader, samePoint, toSourcePixel, type Hold, type HoldEvent } from "./previewFrame";

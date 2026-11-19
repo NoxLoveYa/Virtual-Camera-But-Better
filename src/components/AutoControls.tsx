@@ -121,7 +121,7 @@ function Range({
   );
 }
 
-const signed = (v: number) => (v === 0 ? "0" : `${v > 0 ? "+" : ""}${v.toFixed(2)}`);
+const signed = (v: number) => (Math.abs(v) < 0.005 ? "+0.00" : `${v > 0 ? "+" : ""}${v.toFixed(2)}`);
 
 /** "Response": how fast the loop moves. */
 function ResponseField({ value, onChange }: { value: Speed; onChange: (v: Speed) => void }) {
