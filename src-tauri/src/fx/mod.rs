@@ -18,6 +18,7 @@
 
 pub mod assets;
 pub mod auto_adjust;
+pub mod awb;
 pub mod color;
 pub mod geometry;
 pub mod keys;
