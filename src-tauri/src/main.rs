@@ -183,6 +183,9 @@ fn main() {
             tray.build(app)?;
 
             // The engine reports to the webview; creating it (D3D11 device, shaders) happens off this thread.
+            // The engine's filter chains find `ext:` filters through the registry; it is installed before the engine can
+            // start a session (the folder is read further down).
+            better_cam::ext::install_registry(app.state::<commands::AppState>().extensions.clone());
             let service = app.state::<commands::AppState>().service.clone();
             service.set_sink(forward_events(app.handle()));
             std::thread::spawn(move || {

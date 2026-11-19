@@ -147,6 +147,17 @@ pub fn pc(p: &Params, k: &str, d: u32) -> [f32; 4] {
 // ---------------------------------------------------------------------------------------------------------------
 // Filters
 
+/// The session clock a frame is rendered with ([`GpuFilter::set_frame`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FrameInfo {
+    /// Seconds since the chain was made (the session start).
+    pub time: f64,
+    /// Seconds since the previous frame the chain ran; 0 for the first one.
+    pub delta: f64,
+    /// Frames the chain has run, counting from 0.
+    pub frame: u32,
+}
+
 /// One filter on the GPU. All methods run on the render thread.
 pub trait GpuFilter: Send {
     /// The chain calls this once, right after it made the filter, when the engine has an asset service (a chain
@@ -154,6 +165,14 @@ pub trait GpuFilter: Send {
     /// handle; ask for files with [`AssetHandle::request`] in `update` and read them with [`AssetHandle::get`] in
     /// `render`. The handle is the filter's alone: dropping the filter lets go of its file.
     fn attach_assets(&mut self, _assets: AssetHandle) {}
+
+    /// Called right after [`GpuFilter::attach_assets`], with the client itself and the card's id, for a filter that
+    /// reads several files (an extension with several picture params needs one handle for each).
+    fn attach_asset_client(&mut self, _client: &AssetClient, _card_id: &str) {}
+
+    /// The frame's clock, called on every enabled instance before each [`GpuFilter::render`], like
+    /// [`GpuFilter::set_canvas`] but every frame. A filter that does not animate leaves the default.
+    fn set_frame(&mut self, _frame: &FrameInfo) {}
 
     /// Take new settings. Cheap: repack constants, remember what changed. Called every time the chain is applied,
     /// on every instance (also when nothing changed), so compare before doing real work.
@@ -216,9 +235,14 @@ const REGISTRY: &[(&str, Maker)] = &[
     (nvidia::filter::BACKGROUND_BLUR_KIND, nvidia::filter::make_background_blur),
 ];
 
-/// A new filter of this kind, with default settings. `None` for a kind that is not registered.
+/// A new filter of this kind, with default settings. `None` for a kind that is not registered. Kinds that start with
+/// `ext:` belong to the extension registry ([`crate::ext::make_filter`]).
 pub fn make(kind: &str) -> Option<Box<dyn GpuFilter>> {
-    REGISTRY.iter().find(|(k, _)| *k == kind).map(|(_, m)| m())
+    match REGISTRY.iter().find(|(k, _)| *k == kind) {
+        Some((_, m)) => Some(m()),
+        None if kind.starts_with(crate::ext::KIND_PREFIX) => crate::ext::make_filter(kind),
+        None => None,
+    }
 }
 
 /// The registered kinds.
@@ -262,6 +286,10 @@ pub struct Chain {
     assets: Option<AssetClient>,
     /// The output resolution, once the engine has told ([`Chain::set_canvas`]).
     canvas: Option<(u32, u32)>,
+    /// When the chain was made, when it last ran a frame, and how many frames it ran ([`FrameInfo`]).
+    started: std::time::Instant,
+    last_run: Option<std::time::Instant>,
+    frames: u32,
 }
 
 impl Default for Chain {
@@ -285,6 +313,9 @@ impl Chain {
             statuses: Vec::new(),
             assets: None,
             canvas: None,
+            started: std::time::Instant::now(),
+            last_run: None,
+            frames: 0,
         }
     }
 
@@ -320,6 +351,7 @@ impl Chain {
                     Some(mut filter) => {
                         if let Some(a) = &self.assets {
                             filter.attach_assets(a.handle(&c.id));
+                            filter.attach_asset_client(a, &c.id);
                         }
                         if let Some(size) = self.canvas {
                             filter.set_canvas(size);
@@ -353,8 +385,16 @@ impl Chain {
     /// [`Chain::run`] with the frame's time given (tests drive the clock of [`GpuFilter::bypassed`] with it).
     pub fn run_at(&mut self, r: &Renderer, mut image: Pooled, now: std::time::Instant) -> GpuResult<Pooled> {
         let mut notes = Vec::new();
+        let info = FrameInfo {
+            time: now.saturating_duration_since(self.started).as_secs_f64(),
+            delta: self.last_run.map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f64()),
+            frame: self.frames,
+        };
+        self.last_run = Some(now);
+        self.frames = self.frames.wrapping_add(1);
         for slot in self.slots.iter_mut() {
             if slot.enabled {
+                slot.filter.set_frame(&info);
                 let (w, h) = slot.filter.output_size((image.width, image.height));
                 let out = r.texture(w, h)?;
                 match slot.filter.render(r, &image, &out) {

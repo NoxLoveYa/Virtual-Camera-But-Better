@@ -7,6 +7,7 @@
 //! Unknown fields are ignored on purpose: additive changes keep `apiVersion` (4.1), so a manifest written for a newer
 //! app that only adds a field still loads. A new `type` of param or a new `kind` is not additive and is refused.
 
+use super::wgsl::ParamDecl;
 use super::ExtError;
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -226,6 +227,48 @@ impl Manifest {
     /// Every file the manifest names, relative to the extension folder.
     pub fn files(&self) -> Vec<&Path> {
         self.shader.iter().chain(self.script.iter()).map(|p| p.as_path()).collect()
+    }
+
+    /// The members of the shader's `Params` struct, in manifest order: one per param that reaches the shader, then
+    /// one per manifest `uniforms` entry (`docs/EXTENSIONS.md` 4.3). Sliders are `f32`, ints `i32`, bools `u32`
+    /// (0 or 1), selects `f32` when every option value is a number and `u32` (the index of the option) otherwise,
+    /// colours `vec4<f32>` (straight RGBA, 0..1). `path`, `text` and `combo` params are not in `Params`: a `path` is a
+    /// texture ([`Manifest::image_keys`]), the others only a script reads.
+    pub fn param_decls(&self) -> Vec<ParamDecl> {
+        let mut out = Vec::new();
+        for p in &self.params {
+            let ty = match p {
+                ParamDef::Slider { .. } => "f32",
+                ParamDef::Int { .. } => "i32",
+                ParamDef::Bool { .. } => "u32",
+                ParamDef::Select { options, .. } => {
+                    if options.iter().all(|o| o.value.is_number()) {
+                        "f32"
+                    } else {
+                        "u32"
+                    }
+                }
+                ParamDef::Color { .. } => "vec4<f32>",
+                ParamDef::Path { .. } | ParamDef::Text { .. } | ParamDef::Combo { .. } => continue,
+            };
+            out.push(ParamDecl::new(p.key(), ty));
+        }
+        for u in &self.uniforms {
+            let ty = match u.ty {
+                UniformType::F32 => "f32",
+                UniformType::I32 => "i32",
+                UniformType::U32 => "u32",
+                UniformType::Vec2f => "vec2<f32>",
+                UniformType::Vec4f => "vec4<f32>",
+            };
+            out.push(ParamDecl::new(&u.key, ty));
+        }
+        out
+    }
+
+    /// The keys of the `path` params in manifest order: the images of the shader, at `@binding(4..)`.
+    pub fn image_keys(&self) -> Vec<&str> {
+        self.params.iter().filter(|p| matches!(p, ParamDef::Path { .. })).map(|p| p.key()).collect()
     }
 }
 

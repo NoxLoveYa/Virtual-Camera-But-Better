@@ -976,6 +976,17 @@ pub struct Pass<'a> {
     pub height: u32,
 }
 
+/// The most shader resources one pass binds (and unbinds again): the input, the history and four images of an
+/// extension filter, with room to spare. The built-in passes use at most four.
+pub const MAX_PASS_SRVS: usize = 8;
+
+/// What [`Renderer::draw_with`] takes besides a [`Pass`]; the default is a plain [`Renderer::draw`].
+#[derive(Default)]
+pub struct DrawExtras<'a> {
+    /// Bound to constant buffer slot 1 (`b1`).
+    pub constants_b1: Option<&'a ConstantBuffer>,
+}
+
 impl Renderer {
     pub fn new(gpu: Arc<GpuDevice>) -> GpuResult<Renderer> {
         let shaders = ShaderCache::new(gpu.device.clone());
@@ -1019,6 +1030,13 @@ impl Renderer {
     /// Draw one fullscreen triangle with `pass.ps` into `pass.target`. Inputs are unbound again afterwards so the
     /// next pass can render into a texture this one sampled.
     pub fn draw(&self, pass: &Pass<'_>) {
+        self.draw_with(pass, &DrawExtras::default());
+    }
+
+    /// [`Renderer::draw`] with what a pass may need besides a [`Pass`]: today a second constant buffer at slot 1 (the
+    /// extension filters bind `frame` at `b0` through `pass.constants` and `params` at `b1` here). Up to
+    /// [`MAX_PASS_SRVS`] shader resources are bound and unbound again.
+    pub fn draw_with(&self, pass: &Pass<'_>, extras: &DrawExtras<'_>) {
         let ctx = &self.gpu.context;
         let viewport = D3D11_VIEWPORT {
             TopLeftX: 0.0,
@@ -1028,7 +1046,7 @@ impl Renderer {
             MinDepth: 0.0,
             MaxDepth: 1.0,
         };
-        let none: [Option<ID3D11ShaderResourceView>; 4] = [None, None, None, None];
+        let none: [Option<ID3D11ShaderResourceView>; MAX_PASS_SRVS] = Default::default();
         // SAFETY: plain state-setting calls on the render thread's context; every slice and COM pointer outlives
         // the calls.
         unsafe {
@@ -1043,6 +1061,9 @@ impl Renderer {
             ctx.PSSetSamplers(0, Some(&[Some(self.linear.clone())]));
             if let Some(c) = pass.constants {
                 ctx.PSSetConstantBuffers(0, Some(&[Some(c.buffer.clone())]));
+            }
+            if let Some(c) = extras.constants_b1 {
+                ctx.PSSetConstantBuffers(1, Some(&[Some(c.buffer.clone())]));
             }
             ctx.RSSetViewports(Some(&[viewport]));
             ctx.Draw(3, 0);

@@ -1,13 +1,20 @@
-//! Extensions (spike E1): custom filters written in WGSL.
+//! Extensions (`docs/EXTENSIONS.md`): custom filters written in WGSL (or HLSL).
 //!
-//! This module only proves the shader path: [`wgsl::translate`] turns WGSL into HLSL and the reflected uniform
-//! layouts, [`compile::compile_ps`] compiles the HLSL with FXC (`ps_5_0`), and [`layout`] packs parameter values
-//! into the layout `naga` reflected. There is no manifest loader, registry or engine wiring yet; see
-//! `docs/SPIKE-EXT.md` for the verdict, the exact shader convention and the measurements.
+//! * Spike E1: [`wgsl::translate`] turns WGSL into HLSL and the reflected uniform layouts, [`compile::compile_ps`]
+//!   compiles the HLSL with FXC (`ps_5_0`), and [`layout`] packs parameter values into the layout `naga` reflected
+//!   (`docs/SPIKE-EXT.md`).
+//! * E3: [`manifest`] and the registry in this file (`ExtRegistry`), which finds the extension folders.
+//! * E4: [`loader`] builds shaders off the render thread (cache by source hash, bounded workers), [`hlsl`] is the
+//!   `.hlsl` path, [`params`] turns a card's settings into the `Params` bytes, and [`filter::ExtShaderFilter`] is the
+//!   chain entry `ext:<id>` that `fx::make` hands out through [`make_filter`].
 
 pub mod compile;
+pub mod filter;
+pub mod hlsl;
 pub mod layout;
+pub mod loader;
 pub mod manifest;
+pub mod params;
 pub mod wgsl;
 
 #[cfg(test)]
@@ -164,8 +171,42 @@ use manifest::{ActionDef, ExtKind, Manifest, ParamDef, RenderMode};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex};
+use std::sync::atomic::AtomicU64;
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::SystemTime;
+
+/// The kind of a chain entry that belongs to an extension: `ext:<id>`.
+pub const KIND_PREFIX: &str = "ext:";
+
+/// The registry the engine's filter chains ask for `ext:` kinds. `main` installs the app's; see [`registry`].
+static GLOBAL: OnceLock<ExtRegistry> = OnceLock::new();
+
+/// Make `registry` the one the filter chains use. The first call wins.
+pub fn install_registry(registry: ExtRegistry) {
+    let _ = GLOBAL.set(registry);
+}
+
+/// The registry the chains use: the installed one, else, in a process that installed none (`engine_script` and the other
+/// examples), one on the folder named by the environment variable `BETTER_CAM_EXTENSIONS_DIR` (started on first use), else
+/// none, and `ext:` cards are skipped as before.
+pub fn registry() -> Option<ExtRegistry> {
+    if let Some(r) = GLOBAL.get() {
+        return Some(r.clone());
+    }
+    let dir = PathBuf::from(std::env::var_os("BETTER_CAM_EXTENSIONS_DIR").filter(|d| !d.is_empty())?);
+    let reg = ExtRegistry::new();
+    reg.start(dir.clone(), dir.join(".extensions-state.json"), None);
+    install_registry(reg);
+    GLOBAL.get().cloned()
+}
+
+/// A new filter for the chain entry `kind` (`ext:<id>`), whether or not the extension is installed and switched on right
+/// now: the filter follows the registry, passes the picture through until its shader is built, and is a no-op while the
+/// extension is switched off or gone. `None` when there is no registry or `kind` is not an extension kind.
+pub fn make_filter(kind: &str) -> Option<Box<dyn crate::fx::GpuFilter>> {
+    let id = kind.strip_prefix(KIND_PREFIX).filter(|id| !id.is_empty())?;
+    Some(Box::new(filter::ExtShaderFilter::new(id, registry()?)))
+}
 
 /// How the page sees an extension (`docs/EXTENSIONS.md` 5.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -264,6 +305,9 @@ struct Shared {
     scanning: Mutex<()>,
     stop: Mutex<bool>,
     wake: Condvar,
+    /// Counts the scans that changed something an extension filter looks at (an extension reloaded, added, removed,
+    /// switched on or off). The render thread reads it with one atomic load per frame.
+    generation: AtomicU64,
 }
 
 /// Finds the extension folders under one root, validates their manifests and keeps the list.
@@ -287,6 +331,7 @@ impl Default for ExtRegistry {
                 scanning: Mutex::new(()),
                 stop: Mutex::new(false),
                 wake: Condvar::new(),
+                generation: AtomicU64::new(0),
             }),
         }
     }
@@ -354,6 +399,12 @@ impl ExtRegistry {
         lock(&self.shared.snapshot).clone()
     }
 
+    /// Changes whenever the snapshot got a different extension (see [`Shared::generation`]); equal values mean the
+    /// manifests an engine looked at are still the current ones. Cheap enough for every frame.
+    pub fn generation(&self) -> u64 {
+        self.shared.generation.load(Ordering::Acquire)
+    }
+
     pub fn list(&self) -> Vec<ExtensionInfo> {
         self.snapshot().extensions.clone()
     }
@@ -407,13 +458,19 @@ impl ExtRegistry {
 
         let (snapshot, previous, sink) = {
             let mut inner = lock(&self.shared.inner);
+            let before = inner.loaded.len();
             inner.loaded.retain(|id, _| names.contains(id));
+            let removed = inner.loaded.len() != before;
+            let reloaded = !fresh.is_empty();
             for (name, l) in fresh {
                 inner.loaded.insert(name, l);
             }
             let snap = Arc::new(build_snapshot(&inner));
             let mut current = lock(&self.shared.snapshot);
             let previous = std::mem::replace(&mut *current, snap.clone());
+            if removed || reloaded || previous.extensions != snap.extensions {
+                self.shared.generation.fetch_add(1, Ordering::AcqRel);
+            }
             (snap, previous, lock(&self.shared.config).sink.clone())
         };
         if previous.extensions != snapshot.extensions {

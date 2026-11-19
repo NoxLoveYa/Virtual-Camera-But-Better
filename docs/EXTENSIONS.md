@@ -1,6 +1,6 @@
 # Better Cam — Extension API design
 
-Status: design; phases E1, E2 and E3 done. Written 2026-11-18 against `main` at `b121ea7`. Spike E1 (commit `a627ce7`,
+Status: design; phases E1, E2, E3 and E4 done. Written 2026-11-18 against `main` at `b121ea7`. Spike E1 (commit `a627ce7`,
 `docs/SPIKE-EXT.md`, code in `src-tauri/src/ext/`) proved the WGSL filter path; the corrections of SPIKE-EXT.md
 section 8 are applied below (3.1, 3.4, 4.3, 4.7, 4.8, 5.1, 5.2, 5.4, 6.3, 6.4, 7). Spike E2 (commit `7e2bc83`,
 `docs/SPIKE-EXT.md` "Spike E2") settled the overlay raster: Direct2D on the engine device, on the render thread; its
@@ -320,7 +320,7 @@ fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> { ... }
 | Topic | Rule |
 |---|---|
 | Coordinates | Origin top-left, +y down. `pos.xy` is the pixel centre (x + 0.5), as in every built-in shader. `uv = pos.xy * frame.inv_size` |
-| Colour | Input and output are gamma-encoded sRGB in `RGBA8_UNORM` (the engine's working format). Convert with `to_linear` / `to_srgb` for maths that needs light |
+| Colour | Input and output are gamma-encoded sRGB in `RGBA8_UNORM` (the engine's working format). Convert with `to_linear` / `to_srgb` for maths that needs light. **E4 decision: the shader gets the pool's `UNORM` views (`Views::ENCODED`), not the `UNORM_SRGB` ones.** Reads return the stored codes and writes store what the shader returns, so the identity shader is bit-exact. The linear sampler therefore interpolates *codes* (a 2-texel picture of 0 and 255 samples as 128 half way, not the 188 that interpolating light gives), as OBS's shaders and the built-in gamma-space filters do; a filter that blurs or scales light converts first and samples with `texel()` or accepts the gamma blend. The `path` images are bound by their `UNORM` view as well (the PNG's codes, no decode). The pool also has `UNORM_SRGB` views (hardware decode on read, encode on write, interpolation in light); a manifest switch for them is **not part of API 1** and can be added without a version change (an optional `"colorSpace": "linear"` field, which older apps ignore) |
 | Alpha | Filters: straight alpha in and out; transparent pixels show the output background (as built-in keys do). Shader layers: return straight alpha; the compositor premultiplies |
 | Sampling | Use `tex()` (explicit LOD). `textureSample`, `dpdx`, `dpdy` and `fwidth` are valid WGSL only in uniform control flow, but **`naga` does not check this** (E1: `textureSample` after a branch on `pos.x` passes `naga` and FXC). Outside uniform control flow the result is undefined and may differ between GPUs, so authors should use `tex()`; in uniform control flow implicit sampling and derivatives work (E1: derivatives of `uv` are exactly one pixel) |
 | Register mapping (HLSL side) | `frame` b0, `params` b1, textures t0–t5, `smp` s0. `naga` `binding_map` sets this, `fake_missing_bindings` off (a missing mapping fails at translation), and `sampler_buffer_binding_map` must have an entry for group 0 or `naga` panics. `naga` 30 writes samplers as a D3D12 sampler heap (SM 5.1 syntax, rejected by `ps_5_0` with X3721); the app rewrites that output to one `SamplerState smp : register(s0)`, the sampler `Renderer::draw` binds, and refuses the result if any heap or `space` syntax is left (`fix_samplers`) |
@@ -328,11 +328,21 @@ fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> { ... }
 | Errors | `naga` parse and validation errors are reported as `vhs.wgsl:14:9: message`, lines and columns counted in the author's file (prelude excluded). A problem in the generated lines (a param type) is reported as `parameter #2 of the manifest: …`. FXC errors refer to the generated HLSL, so they have no author line: they are shown as `vhs.wgsl: <FXC message>` followed by `generated HLSL: <the offending line>` |
 | Uniform layout | The host packs `Frame` and `Params` at the member offsets `naga` computes for the WGSL structs (reflected from the validated module, `ext::layout`), rounded up to 16 bytes for the buffer; `naga` pads its HLSL so FXC lands each member at the same offset (verified in E1). These offsets are not HLSL's own packing: `vec2` after `f32` sits at 8 (HLSL: 4), `vec3` after `f32` at 16 (HLSL: 4); see `docs/SPIKE-EXT.md` 4. Packing rejects a missing, unknown or mistyped value instead of writing zero. The manifest only produces `f32`, `i32`, `u32`, `vec2<f32>` and `vec4<f32>` members today (4.2 `uniforms` types; `color` is `vec4<f32>`). If `vec3<f32>`, `mat*` or arrays are added as manifest `uniforms` types later, WGSL's own rules apply and the validator enforces them: a struct member of a uniform struct needs `@align(16)`, an array needs a 16-byte stride (`array<vec4<f32>, N>` or an array of structs; `array<f32, N>` is refused). `naga` renames identifiers that end in a digit (`m3` → `m3_`) or collide with HLSL names (`mul` → `mul_`); offsets, not names, are used, so this only shows in HLSL and FXC messages |
 
-Raw HLSL (`.hlsl` file): `float4 main(float4 pos : SV_Position) : SV_Target` with the same registers; the app prepends an HLSL
-prelude with `cbuffer Frame : register(b0)` and a generated `cbuffer Params : register(b1)` (packed with HLSL rules,
-which differ from the WGSL offsets above). E1 built only the WGSL layout; for `.hlsl` files E4 reads the offsets from
-the compiled bytecode with `D3DReflect` (as the E1 test helper `fxc_cbuffer` does) instead of re-implementing HLSL
-packing.
+Raw HLSL (`.hlsl` file, `ext::hlsl`, built in E4): the author writes `float4 main(float4 pos : SV_Position) : SV_Target`.
+The app prepends a generated prelude (`hlsl::prelude`) with the same names and registers as the WGSL one: `frame` (a
+`FrameData` struct in `cbuffer Frame : register(b0)`, the members of `FRAME_MEMBERS`), `params` (a `ParamsData` struct
+in `cbuffer Params : register(b1)`, only when the manifest has params; `f32`, `i32`, `u32`, `vec2f`, `vec4f` become
+`float`, `int`, `uint`, `float2`, `float4`), `image` and `history` at `t0` and `t1`, the `path` images by key at
+`t2..t5`, `SamplerState smp : register(s0)`, and the helpers `tex`, `texel`, `to_linear`, `to_srgb`, `luma`, `hash`.
+Colour handling, alpha, coordinates and the 3 ms guard are the same as for WGSL. What differs:
+
+| Topic | `.hlsl` |
+|---|---|
+| Packing | HLSL's own (`float` then `float2` puts the `float2` at offset 4, WGSL puts it at 8). The offsets are **read from the compiled bytecode** with `D3DReflect` (`hlsl::reflect_cbuffer`), not computed; a buffer the shader never reads is dropped by FXC and has no layout (nothing to bind) |
+| Errors | FXC's position is mapped to the author's file: `tint.hlsl:3:12: error X3004: undeclared identifier 'x'`. Errors inside the generated prelude read `in the generated prelude: …` (no author line) |
+| Guards | Source ≤ 256 KB, BOM stripped, brackets nested ≤ 256 deep (a crude scan: a bracket in a comment counts), FXC on a bounded worker with the 30 s timeout. **There is no `check_cost`**: nothing limits inlining before FXC, so an inlining bomb costs the full 30 s on the loader thread and leaves a counted stuck worker. Measured (debug profile, `opt-level 2`): 40 000 terms of `a+a+…` built in 4.0 s, 100 000 terms in 18.7 s (a valid shader both times) |
+| `#include` | Fails (`error X1505: No include handler specified`): FXC is given no include handler, so a shader cannot read any file. `#define` and `#pragma` work |
+| Not checked | Anything `naga` checks for WGSL (one entry point, no extra stages, textures of other types): an `.hlsl` file may declare further resources, which nothing binds |
 
 ### 4.4 TypeScript API (`better-cam.d.ts` sketch)
 
@@ -880,9 +890,12 @@ The loader thread never calls `naga` or FXC directly:
 - Before FXC, `check_cost` refuses shaders whose calls expand past **20 000 statements** once inlined (about 4 s of
   FXC); it guards against exponential inlining, not a cost model.
 - The source is refused before `naga` above 256 KB; a UTF-8 byte order mark is stripped.
-- Open option for a hard guarantee: compile in a helper process (`better-cam.exe --compile-shader`) with a kill
-  timer. Threads are enough for every input E1 tried; E4 decides (recommendation: threads in v1, revisit if E11's
-  fault tests find a case they do not cover).
+- Hard guarantee: compiling in a helper process (`better-cam.exe --compile-shader`) with a kill timer was the open
+  option. **E4 decided: threads in v1** (owner accepted the recommendation); revisit if E11's fault tests find a case
+  they do not cover. What the thread design costs, measured in E4: the loader thread (`ext loader`, one for all cards)
+  waits for each worker, so a shader that needs 30 s in FXC holds every other card's build for 30 s (the render thread
+  and the pictures are not affected: they pass through or keep the old shader); a source that timed out or failed is
+  cached as failed, so a poll that changed nothing does not start another stuck worker.
 - Translation cannot prevent a shader that hangs the GPU at run time (`loop {}` translates and compiles; `naga`'s
   loop bound is 2^64). That is the device-loss path of 6.4.
 
@@ -898,17 +911,20 @@ translucent filter results over the background in linear light (`output_fit.hlsl
 | `src-tauri/src/ext/mod.rs` | Exists since E1 (`ExtError`, `run_bounded`, `stuck_workers`). Add: `ExtRegistry`: scan, poll, snapshot, enable/disable, `make_filter(kind)`, `ExtensionInfo` for the UI |
 | `src-tauri/src/ext/manifest.rs` | New. Serde types, validation (named field in every error), `ParamDef` mirror incl. `text`, clamping readers reused from `fx` (`pf`, `pi`, `pb`, `ps`, `pc`), manifest param → `ParamDecl` mapping (`bool` → `u32`, `select` → `f32` or `u32`, `color` → `vec4<f32>`) |
 | `src-tauri/src/ext/wgsl.rs`, `layout.rs` | Exist since E1: prelude and `Params` generation, `naga` parse + validate, convention checks, cost check, reflected layouts and strict packing, HLSL write with `binding_map` and `sampler_buffer_binding_map`, sampler fix, error line mapping. E4 adds the HLSL prelude for `.hlsl` files and `D3DReflect` offsets for them |
-| `src-tauri/src/ext/compile.rs` | Exists since E1: `compile_ps` (bounded FXC through `gpu::compile_shader`, HLSL line in errors). E4 adds the loader thread jobs: transpile, translate, compile, `CreatePixelShader` (device is free-threaded), cache of `Translated` by source hash |
+| `src-tauri/src/ext/compile.rs` | Exists since E1: `compile_ps` (bounded FXC through `gpu::compile_shader`, HLSL line in errors). **E4:** FXC's log is tidied (the directory FXC prints before the name is dropped; the message carries no generated-HLSL position, only the HLSL line it pointed at) and `compile_hlsl` maps `.hlsl` errors to the author's line. The loader jobs (translate, compile, `CreatePixelShader`, cache by source hash) are in `ext/loader.rs` |
 | `src-tauri/src/ext/tests.rs`, `examples/*.wgsl` | Exist since E1: 30 tests (`cargo test -p better-cam --lib ext::`) and the corpus (identity, colour, uvdump, vignette, animated, builtins, derivatives, vhs, two inputs). Must keep passing; it is the `naga` upgrade gate |
-| `src-tauri/src/ext/filter.rs` | New. `ExtShaderFilter: GpuFilter`: two constant buffers, image params through `AssetHandle` (one handle per path param), `history` texture, per-pass GPU timer, uniforms from the script mailbox |
+| `src-tauri/src/ext/filter.rs` | **Built in E4.** `ExtShaderFilter: GpuFilter`: two constant buffers, image params through `AssetHandle` (one handle per path param), `history` texture, per-pass GPU timer and the 3 ms guard. Uniforms from the script mailbox come with E6 (`Active` has no uniforms yet; `params::values` writes zeros for manifest `uniforms`) |
+| `src-tauri/src/ext/loader.rs` | **Built in E4.** The loader thread (`ext loader`): a FIFO of `BuildSpec` jobs, tickets the filter polls with `try_lock`, cache of results by source hash (32 entries, failures included, a "restart Better Cam" refusal excluded), `CreatePixelShader` on the requesting filter's device |
+| `src-tauri/src/ext/params.rs` | **Built in E4.** A card's settings → `Params` member values with the manifest's ranges and defaults (`pf`, `pi`, `pb`, `pc` of `fx`), packed through the shader's `Layout` |
+| `src-tauri/src/ext/hlsl.rs` | **Built in E4.** The `.hlsl` path of 4.3: prelude, nesting guard, FXC, `D3DReflect` layouts |
 | `src-tauri/src/ext/script/{mod,host,api,transpile,limits}.rs` | New. One thread per card, `rquickjs` runtime (features `loader`; not `rust-alloc`), module resolver confined to the folder, `better-cam` module, timers, storage file, event queue, status/log rate limits |
 | `src-tauri/src/ext/scene.rs` | New. Scene types from JS values, validation and caps, structural hash for "unchanged" |
 | `src-tauri/src/gpu/layers.rs` | New. `LayerStack`: slots kept by id+kind like `Chain`; layer textures; `apply(cfg)`, `run(&fitted)` |
 | `src-tauri/src/gpu/d2d.rs` | New. D2D device/context on the engine's `IDXGIDevice` (multi-threaded factory), DirectWrite factory, raster of a `Scene` into a premultiplied BGRA texture with grayscale text antialiasing, text format, text layout and mask geometry caches. **No D3D11 state reset after `EndDraw`: spike E2 measured an empty diff (24 states) on the RTX 5080 and WARP.** E8 keeps the spike's probe-pass and state-snapshot diff (`Snap`, `PROBE_HLSL`, `max_diff`, `layer_check` in `examples/layer_spike.rs`) as a regression test on WARP and hardware; if a driver ever leaks, `Snap::restore` is the shape of the fix |
 | `src-tauri/src/gpu/shaders/layer_over.hlsl` | New. Samples a layer (premultiplied or straight flag) for blending |
-| `src-tauri/src/gpu/mod.rs` | Edit. `Renderer::draw_with(&Pass, DrawExtras { constants_b1, blend })`: leaves `Pass` and its ~20 call sites untouched. One premultiplied-over `ID3D11BlendState`. Still needed: `Renderer::draw` binds only constant slot 0; the E1 tests bound `b1` by hand with `PSSetConstantBuffers(1, …)` |
-| `src-tauri/src/fx/mod.rs` | Edit. `Chain` gets an optional registry handle: kinds starting with `ext:` are made by `ExtRegistry::make_filter`. New default trait method `GpuFilter::set_frame(&FrameInfo)`, called like `set_canvas` |
-| `src-tauri/src/engine.rs` | Edit. `Msg::SetOverlays`, `Msg::SetExtensions`, `Msg::ExtAction`; session clock (`FrameInfo`); `LayerStack::run` between `stage.run` and the tap; ext instances follow chain and overlays; GPU-loss suspects (6.4) |
+| `src-tauri/src/gpu/mod.rs` | Edit. **E4 built** `Renderer::draw_with(&Pass, &DrawExtras { constants_b1 })` (`draw` calls it with the default; `Pass` and its ~20 call sites are untouched) and `MAX_PASS_SRVS = 8` (the pass now unbinds up to 8 resources, was 4). **E7 adds** the blend field and the premultiplied-over `ID3D11BlendState` to `DrawExtras` |
+| `src-tauri/src/fx/mod.rs` | Edit. **E4 built:** `fx::make` hands kinds that start with `ext:` to `ext::make_filter` (no `Chain` field: the registry is process-wide, `ext::install_registry`; examples without one read `BETTER_CAM_EXTENSIONS_DIR`). New default trait methods `GpuFilter::set_frame(&FrameInfo)` (every enabled instance, every frame, before `render`; `FrameInfo { time, delta, frame }` is kept by the `Chain`: time since the chain was made) and `attach_asset_client(&AssetClient, card_id)` (one handle per `path` param) |
+| `src-tauri/src/engine.rs` | Edit. **E4 needed no change here** (the chain owns the session clock; the registry's generation counter makes a card follow reloads). Later phases: `Msg::SetOverlays`, `Msg::ExtAction`; `LayerStack::run` between `stage.run` and the tap; script lifecycle follows the chain; GPU-loss suspects (6.4) |
 | `src-tauri/src/api.rs`, `commands.rs`, `main.rs` | Edit. Commands below; registry start at launch |
 | `src-tauri/Cargo.toml` | Edit. `naga = { version = "=30.0.2", default-features = false, features = ["wgsl-in", "hlsl-out"] }` is already there (E1; exact pin on purpose, upgrade procedure in `docs/SPIKE-EXT.md` 2). Add: `rquickjs` (`loader`), `oxc` (`transformer`, `codegen`), `zip`; E8 also `windows-numerics = "0.3"` (`windows` 0.62 takes `Vector2` and `Matrix3x2` from it and does not re-export them; it is already in `Cargo.lock` at 0.3.1). The `windows` features `Win32_Graphics_Direct2D`, `Win32_Graphics_Direct2D_Common`, `Win32_Graphics_DirectWrite` are in since spike E2 |
 | `Cargo.toml` (workspace) | `workspace.package.rust-version` must be ≥ 1.87 (`naga` 30 declares 1.87; it was 1.82). Raised to `1.87` in `a627ce7`; keep it there or higher |
@@ -1017,7 +1033,7 @@ separate worktrees.
 
 ```
 Wave A:  E1 SPIKE wgsl→fxc (DONE)  E2 SPIKE d2d layer (DONE)  E3 registry + manifest + listing (DONE)
-Wave B:  E4 extension filters (E1, E3)                      E5 script host core (E3)
+Wave B:  E4 extension filters (DONE)                        E5 script host core (E3)
 Wave C:  E6 filter scripts + VHS (E4, E5)                   E7 layer stack + shader overlays (E4)
 Wave D:  E8 scene overlays (E2, E5, E7)
 Wave E:  E9 widgets (E8)
@@ -1197,8 +1213,82 @@ second to merge resolves the conflict.
      Add filter lists "Vignette" under Extension filters and Settings → Extensions shows it "ready". Delete the folder:
      the card shows "Extension “vignette” is not installed"; save and reload a preset: the entry is still there.
 
-### E4 — Extension filters (needs E1, E3)
+### E4 — Extension filters — **DONE** (2026-11-19)
 
+- Built: `ext/{filter,loader,params,hlsl}.rs` (new), `ext/compile.rs` (error tidying, `compile_hlsl`), `ext/manifest.rs`
+  (`param_decls`, `image_keys`), `ext/mod.rs` (`install_registry`, `registry`, `make_filter`, the registry's `generation`
+  counter), `fx/mod.rs` (`ext:` factory hook, `FrameInfo`, `set_frame`, `attach_asset_client`), `gpu/mod.rs`
+  (`draw_with`, `DrawExtras`), `main.rs` (installs the app's registry before the engine can start),
+  `sdk/examples/duotone/`, `src-tauri/examples/scripts/ext_filter_perf.json`, tests in `ext/filter_tests.rs`. No frontend
+  and no `engine.rs` change was needed.
+- Pipeline, card to pixels: the page sends `{kind: "ext:<id>", params}` in `set_chain` → `Chain::apply` → `fx::make` →
+  `ext::make_filter` → one `ExtShaderFilter` per card (it holds the registry handle; the id is the kind without `ext:`).
+  Each `update` (every chain apply) stores the card's settings and calls `service()`: one atomic load of
+  `ExtRegistry::generation()`; when it moved, the snapshot is read and, for a manifest that is not the one running or
+  pending, a `BuildSpec` goes to the loader thread (`loader::submit`, never blocks) and the filter keeps a `Ticket`.
+  The loader reads the shader file, hashes (kind of file, text, `Params` members, image names), and on a miss runs
+  `wgsl::translate` (10 s) and `compile_ps` (30 s) on bounded workers, or `hlsl::translate_hlsl` (FXC only), then
+  `CreatePixelShader` on the filter's device. Each frame the filter polls the ticket with `try_lock`. Until a shader
+  runs (and whenever the extension is switched off or gone) `render` copies input to output. A running shader: `b0` =
+  `frame` (`FrameValues`, from the chain's `FrameInfo`, the pass size, the canvas, a per-frame xorshift seed), `b1` =
+  `params` (`params::pack`, written only when the bytes changed), `t0` the picture, `t1` the card's `history` (its own
+  pooled texture, a copy of the last output, only when the manifest asks; else a 1×1 transparent texture), `t2..t5` the
+  `path` images (one `AssetHandle` each, 1×1 transparent until loaded), `s0` the pass's linear clamp sampler. The pass runs
+  through `Renderer::draw_with` with the `ENCODED` views and is timed with a `GpuTimer`; a one-second mean above 3 ms
+  switches the card to pass-through with "Too slow for live video (x.x ms per frame)" until the extension reloads.
+- Hot reload: the registry poll (1 s) bumps `generation` for a changed, added, removed or switched extension; a card
+  that sees a new manifest asks for a build and **keeps its old shader until the new one is ready**; a failed build keeps
+  the old shader and shows the error (`Note::Error`, cleared by the next good build); a broken manifest keeps what runs
+  and the page shows why; a missing or switched-off extension is a no-op card with no error. A new device (GPU reset
+  rebuild) restarts the card.
+- Decisions E4 took (not in the doc before): **threads for FXC** (5.1); `.hlsl` kept and complete (4.3 raw HLSL); the
+  shader gets gamma-encoded codes and the sampler interpolates codes (4.3 Colour row); loader cache keyed by source,
+  failures included, messages rendered per file name; `Params` values read with the manifest's own ranges and
+  defaults, never an error (`params.rs`); a `select` with string options is the option's index (`u32`), with numeric
+  options its number (`f32`); a colour without `"alpha": true` is opaque whatever the card holds; the guard window
+  restarts when the picture size changes; the registry reaches the chains through a process-wide handle.
+- Checks as run (debug build, WARP unless said, RTX 5080 for the rest):
+  1. `cargo test -p better-cam --lib ext::filter` 28 tests pass (vignette at strength 0 identical within 1/255; vignette
+     against a CPU reference 48×27 within 1.5/255; duotone black, white, grey and red map to their colours within 1;
+     a compile error reads `vignette.wgsl:3:1: …`; broken edit keeps the last good shader and a fix replaces it; off and
+     gone are no-ops; history, path image through the asset service, frame values and seed, gamma codes, the chain's
+     clock, a new device, async build, the guard on WARP, loader cache and cancelled jobs, hostile WGSL and HLSL files, raw
+     HLSL with D3DReflect offsets, params values). `cargo test -p better-cam --lib ext::` 80 pass (E1's 30 and E3's 19
+     unchanged).
+  2. `engine_script --script src-tauri/examples/scripts/ext_filter_perf.json` (release, synthetic 1080p60, Color,
+     Sharpen, LUT, Vignette, Duotone, Scaling; the extensions folder is `sdk/examples`, set with
+     `BETTER_CAM_EXTENSIONS_DIR`): fps capture/render/publish 60.00, dropped 0 (mailbox 0, output 0, errors 0), header latency
+     p95 2.64 ms (p50 2.15), engine latency p95 1.37 ms, `gpu_ms` mean 0.251 ms against 0.232 ms for the same file without
+     the two extension passes (`perf_synth1080_four.json` minus its `vcam-tool` step) on the same machine: **+0.019 ms for
+     two passes**. The picture was dumped from the virtual camera to confirm both passes ran. Alone at 1080p over an
+     empty chain (0.165 ms): Vignette +0.020 ms, VHS (shader of 4.8 with `glitch` as a plain param) +0.010 ms.
+  3. Live (debug app in test mode, camera 1280×720 at 16.6 fps): copy listed ready in 0.94 s; added card; strength 1
+     darkens the edges of the preview (edge/centre brightness 1.04 → 0.00, 0.3 s after the change); a broken shader shows
+     `vignette.wgsl:3:1: expected global item …` on the card 0.48 s after the edit while the picture keeps the vignette; the
+     fixed shader shows 0.30 s after the write; stats events during the break and the fix: dropped 0.
+  4. A busy shader (a loop of 30 000 `sin` per pixel: 15.6 ms a frame at 720p) was bypassed 1.38 s after the file was
+     written (poll, build and the one-second window included) with "Too slow for live video (16.0 ms per frame)"; the picture
+     went on; rewriting the file cleared it in 0.6 s. Also on WARP: the guard trips after 1.03 s.
+- Hostile input (`ext::filter::tests::hostile_*`, through the loader and, for the 30-line bomb, through a card): each ends in a
+  message that starts with the file name, never a hang: NUL byte, 30 000 nested parentheses ("internal WGSL front end
+  error"), 20 000 nested blocks, noise, empty file, 300 KB file ("limit is 256 KB"), invalid UTF-8, the inlining bomb
+  (refused in under 1 ms, 3 221 225 471 statements), the 125 000-term sum (1.7 s, FXC "memory exhausted"); HLSL: 5 000 nested
+  brackets (refused by the nesting scan), recursion (X3500), `#include` of an absolute or relative path (X1505, no file is
+  read), `#pragma`/`#define` (build), 3 000 functions (17 ms), NUL byte, empty file, a 40 000-term sum (4 s, builds), a BOM
+  (stripped). A stuck worker and the 2-worker refusal are E1's tests (`run_bounded`); the loader does not cache the
+  "restart Better Cam" refusal.
+- Known limits (E5 to E11 must know): (1) the first frames of a session pass the picture through until the loader answers,
+  even for a cached shader (the render thread never reads files); (2) the loader is one thread, so one slow FXC delays
+  every other card's build (5.1); (3) GPU-loss quarantine ("Disabled after a GPU reset", 6.4) is E11: today only the
+  new-device restart exists; (4) `Active` has no script uniforms: `params::values` writes zeros for manifest `uniforms`,
+  and E6 must add the mailbox read in `ExtShaderFilter::render` before `pack` (the `Params` layout already has the
+  members); (5) the guard measures the pass only (one `GpuTimer`, polled a frame late); (6) a card of a script-only
+  kind (overlay, widget) in the chain shows "not a filter extension"; (7) `.hlsl` has no `check_cost`.
+- E5 and E7 must know: `GpuFilter::set_frame` and `FrameInfo` exist; `Renderer::draw_with` takes `DrawExtras` (add the
+  blend there); `loader::{BuildSpec, build, submit}` and `compile_hlsl`/`translate_hlsl` are what a shader layer
+  uses (a layer's `Params` need `Manifest::param_decls`); `ExtRegistry::generation()` is the cheap "something changed"
+  signal, and the registry is `ext::registry()`; a test registry per test goes through `ExtShaderFilter::new(id, reg)`.
+- Original brief (kept for the record):
 - Goal: WGSL (and HLSL) filters run in the chain, with images, history, hot reload and the GPU-time guard.
 - Reuses E1 as is (`docs/SPIKE-EXT.md` 9): `ext::wgsl::translate`, `ext::layout`, `ext::compile::compile_ps`,
   `ext::run_bounded`, the corpus and test helpers. Builds what E1 left: manifest → `ParamDecl` mapping, the HLSL

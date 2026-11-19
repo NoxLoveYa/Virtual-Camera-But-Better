@@ -1,0 +1,16 @@
+{
+  "apiVersion": 1,
+  "id": "duotone",
+  "name": "Duotone",
+  "version": "1.0.0",
+  "author": "Better Cam examples",
+  "license": "MIT",
+  "kind": "filter",
+  "hint": "Map the picture's brightness between two colours",
+  "shader": "duotone.wgsl",
+  "params": [
+    { "type": "color", "key": "shadow", "label": "Shadows", "def": 4282912794 },
+    { "type": "color", "key": "highlight", "label": "Highlights", "def": 4285581567 },
+    { "type": "slider", "key": "amount", "label": "Amount", "min": 0, "max": 1, "step": 0.01, "def": 1 }
+  ]
+}
