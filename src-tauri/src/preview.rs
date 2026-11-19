@@ -14,8 +14,9 @@
 //! into channel messages through the [`Sink`] callback. The render thread only copies rows into a `Vec` and hands it
 //! over; it never waits for the webview.
 //!
-//! Wire format of one frame (little endian): `width`, `height`, `stride` (bytes per row), `frame` number as four
-//! `u32`, then `stride * height` bytes of pixels. Pixels are `R8G8B8A8`, top row first, alpha 255, which is exactly
+//! Wire format of one frame (little endian): `width`, `height`, `stride` (bytes per row), `frame` number,
+//! `source_width`, `source_height` (the size of the picture before the downscale: the output frame, or the picture at
+//! the preview point, see [`crate::fx::PreviewPoint`]) as six `u32`, then `stride * height` bytes of pixels. Pixels are `R8G8B8A8`, top row first, alpha 255, which is exactly
 //! what WebGL's `texImage2D(RGBA, UNSIGNED_BYTE)` reads: the GPU renders in that order, so neither side swaps bytes.
 //! `stride` equals `width * 4` today; the field is there so the layout can change without a protocol change.
 //!
@@ -36,7 +37,7 @@ use crate::gpu::{GpuResult, Renderer, RgbaTexture};
 /// Largest preview picture: 960x540 (plan 4.4).
 pub const MAX_SIZE: (u32, u32) = (960, 540);
 /// Bytes in front of the pixels.
-pub const HEADER_LEN: usize = 16;
+pub const HEADER_LEN: usize = 24;
 /// At most 30 frames per second.
 pub const FRAME_INTERVAL: Duration = Duration::from_micros(33_333);
 /// A frame this much before its slot still counts, so a camera at exactly 30 fps with timing jitter loses nothing.
@@ -54,7 +55,7 @@ pub type Sink = Arc<dyn Fn(Vec<u8>) -> bool + Send + Sync>;
 // ---------------------------------------------------------------------------------------------------------------
 // Wire format
 
-/// The 16 bytes in front of every frame.
+/// The 24 bytes in front of every frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
     pub width: u32,
@@ -63,12 +64,18 @@ pub struct Header {
     pub stride: u32,
     /// Counts up per frame made; gaps mean frames that were overwritten. What `preview_ack` carries.
     pub frame: u32,
+    /// The size of the tapped picture before the downscale: what a point on the preview maps back to.
+    pub source_width: u32,
+    pub source_height: u32,
 }
 
 impl Header {
     pub fn encode(&self) -> [u8; HEADER_LEN] {
         let mut out = [0u8; HEADER_LEN];
-        for (i, v) in [self.width, self.height, self.stride, self.frame].iter().enumerate() {
+        for (i, v) in [self.width, self.height, self.stride, self.frame, self.source_width, self.source_height]
+            .iter()
+            .enumerate()
+        {
             out[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
         out
@@ -82,6 +89,8 @@ impl Header {
             height: word(1)?,
             stride: word(2)?,
             frame: word(3)?,
+            source_width: word(4)?,
+            source_height: word(5)?,
         })
     }
 }
@@ -92,8 +101,9 @@ pub struct Frame {
     pub bytes: Vec<u8>,
 }
 
-/// Header plus the rows of a mapped `width` x `height` RGBA plane (padding between rows left out).
-fn pack(plane: &MappedPlane<'_>, width: u32, height: u32, number: u32) -> Frame {
+/// Header plus the rows of a mapped `width` x `height` RGBA plane (padding between rows left out). `source` is the
+/// size of the picture it was shrunk from.
+fn pack(plane: &MappedPlane<'_>, width: u32, height: u32, source: (u32, u32), number: u32) -> Frame {
     let stride = width * 4;
     let mut bytes = Vec::with_capacity(HEADER_LEN + stride as usize * height as usize);
     bytes.extend_from_slice(
@@ -102,6 +112,8 @@ fn pack(plane: &MappedPlane<'_>, width: u32, height: u32, number: u32) -> Frame 
             height,
             stride,
             frame: number,
+            source_width: source.0,
+            source_height: source.1,
         }
         .encode(),
     );
@@ -337,7 +349,16 @@ fn log_counters(shared: &Shared, gate: &Gate, sent: u64) {
 // ---------------------------------------------------------------------------------------------------------------
 // Tap
 
-/// The engine's frame tap: runs on the render thread with the finished output frame.
+/// The staging ring of the tap with the picture size it was made for and the size of the source picture that is shrunk
+/// into it.
+struct Staging {
+    ring: ReadbackRing<u32>,
+    size: (u32, u32),
+    source: (u32, u32),
+}
+
+/// The engine's frame tap: runs on the render thread with the picture the preview shows (the output frame, or the
+/// picture at the preview point).
 struct PreviewTap {
     shared: Arc<Shared>,
     numbers: Arc<AtomicU32>,
@@ -345,8 +366,9 @@ struct PreviewTap {
     /// What the window asked for, in pixels (already limited to [`MAX_SIZE`] when used).
     request: (u32, u32),
     down: Downscaler,
-    /// The staging ring and the picture size it was made for.
-    ring: Option<(ReadbackRing<u32>, (u32, u32))>,
+    /// The staging ring, the picture size it was made for and the size of the source picture that is shrunk into it.
+    /// A change of either starts a new ring: the pictures of the old one would say the wrong source size.
+    ring: Option<Staging>,
     pacer: Pacer,
     complained: bool,
 }
@@ -369,18 +391,25 @@ impl PreviewTap {
     fn capture(&mut self, r: &Renderer, frame: &RgbaTexture) -> GpuResult<()> {
         let bound = (self.request.0.clamp(1, MAX_SIZE.0), self.request.1.clamp(1, MAX_SIZE.1));
         let size = fit_within((frame.width, frame.height), bound);
-        if self.ring.as_ref().is_none_or(|(_, s)| *s != size) {
+        let source = (frame.width, frame.height);
+        if self.ring.as_ref().is_none_or(|s| s.size != size || s.source != source) {
             let plane = PlaneDesc {
                 format: DXGI_FORMAT_R8G8B8A8_UNORM,
                 width: size.0,
                 height: size.1,
                 bytes_per_texel: 4,
             };
-            self.ring = Some((ReadbackRing::new(r.gpu.clone(), &[plane])?, size));
+            self.ring = Some(Staging {
+                ring: ReadbackRing::new(r.gpu.clone(), &[plane])?,
+                size,
+                source,
+            });
         }
+        // `frame.srv` (UNORM): the codes as they are stored, which is how the output stage reads them too, so the
+        // colours of a picture tapped inside the chain match the ones of the output.
         let small = self.down.run(r, frame, size.0, size.1)?;
         let number = self.numbers.fetch_add(1, Ordering::Relaxed);
-        let (ring, _) = self.ring.as_mut().expect("made above");
+        let ring = &mut self.ring.as_mut().expect("made above").ring;
         // A full ring drops its oldest frame, which is what an overwrite means here.
         ring.submit(&[&small.texture], number)?;
         // `small` goes back to the pool; the copy above was queued first, so the GPU reads it before any reuse.
@@ -389,14 +418,14 @@ impl PreviewTap {
 
     /// Map the frames the GPU finished and offer the newest. Never waits.
     fn collect(&mut self) {
-        let Some((ring, (w, h))) = self.ring.as_mut() else {
+        let Some(Staging { ring, size: (w, h), source }) = self.ring.as_mut() else {
             return;
         };
-        let (w, h) = (*w, *h);
+        let (w, h, source) = (*w, *h, *source);
         let mut newest = None;
         // More than one is ready only after a stall; the older ones would be overwritten anyway.
         for _ in 0..ReadbackRing::<u32>::SLOTS {
-            match ring.poll(false, |planes, number| pack(&planes[0], w, h, number)) {
+            match ring.poll(false, |planes, number| pack(&planes[0], w, h, source, number)) {
                 Ok(Some(f)) => newest = Some(f),
                 Ok(None) => break,
                 Err(e) => {
@@ -429,8 +458,8 @@ impl FrameTap for PreviewTap {
     fn on_frame(&mut self, renderer: &Renderer, frame: &RgbaTexture, _capture_qpc: u64) {
         if self.hidden.load(Ordering::Relaxed) || self.shared.is_closed() {
             // Nobody sees the picture: no GPU work, and the frames in the ring would be stale on return.
-            if let Some((ring, _)) = self.ring.as_mut() {
-                ring.clear();
+            if let Some(s) = self.ring.as_mut() {
+                s.ring.clear();
             }
             self.pacer.reset();
             return;
@@ -544,21 +573,26 @@ mod tests {
     // --- wire format ---------------------------------------------------------------------------------------
 
     #[test]
-    fn the_header_is_four_little_endian_words() {
+    fn the_header_is_six_little_endian_words() {
         let h = Header {
             width: 960,
             height: 540,
             stride: 3840,
             frame: 0x0102_0304,
+            source_width: 1920,
+            source_height: 1080,
         };
         let b = h.encode();
-        assert_eq!(b.len(), 16);
+        assert_eq!(b.len(), 24);
+        assert_eq!(HEADER_LEN, 24);
         assert_eq!(&b[0..4], &[0xC0, 0x03, 0, 0]);
         assert_eq!(&b[4..8], &[0x1C, 0x02, 0, 0]);
         assert_eq!(&b[8..12], &[0x00, 0x0F, 0, 0]);
         assert_eq!(&b[12..16], &[4, 3, 2, 1]);
+        assert_eq!(&b[16..20], &[0x80, 0x07, 0, 0]);
+        assert_eq!(&b[20..24], &[0x38, 0x04, 0, 0]);
         assert_eq!(Header::decode(&b), Some(h));
-        assert_eq!(Header::decode(&b[..15]), None);
+        assert_eq!(Header::decode(&b[..23]), None);
         assert_eq!(Header::decode(&[]), None);
     }
 
@@ -573,7 +607,7 @@ mod tests {
             }
         }
         let plane = MappedPlane::new(&mem, pitch, 12, h as usize);
-        let f = pack(&plane, w, h, 7);
+        let f = pack(&plane, w, h, (30, 20), 7);
         assert_eq!(f.number, 7);
         assert_eq!(f.bytes.len(), HEADER_LEN + 24);
         assert_eq!(
@@ -582,7 +616,9 @@ mod tests {
                 width: 3,
                 height: 2,
                 stride: 12,
-                frame: 7
+                frame: 7,
+                source_width: 30,
+                source_height: 20,
             })
         );
         let pixels = &f.bytes[HEADER_LEN..];
@@ -710,6 +746,8 @@ mod tests {
                 height: 0,
                 stride: 4,
                 frame: n,
+                source_width: 1,
+                source_height: 0,
             }
             .encode()
             .to_vec(),
@@ -831,6 +869,7 @@ mod tests {
         let f = preview_of(&r, &src, (3000, 2000));
         let h = Header::decode(&f.bytes).unwrap();
         assert_eq!((h.width, h.height, h.stride, h.frame), (960, 540, 3840, 41));
+        assert_eq!((h.source_width, h.source_height), (1920, 1080), "the size before the downscale");
         assert_eq!(f.bytes.len(), HEADER_LEN + 3840 * 540);
         // R first, then G, B, A: no swap anywhere.
         assert_eq!(pixel(&f, 100, 300), [255, 0, 0, 255]);
@@ -1010,11 +1049,45 @@ mod tests {
         let shared = Shared::new(ACK_TIMEOUT);
         let mut tap = PreviewTap::new(shared.clone(), Arc::new(AtomicU32::new(0)), Arc::new(AtomicBool::new(false)), (960, 540));
         tap.capture(&r, &src).unwrap();
-        assert_eq!(tap.ring.as_ref().unwrap().1, (960, 540));
+        assert_eq!(tap.ring.as_ref().unwrap().size, (960, 540));
         tap.request = (480, 270);
         tap.capture(&r, &src).unwrap();
-        assert_eq!(tap.ring.as_ref().unwrap().1, (480, 270));
-        assert_eq!(tap.ring.as_ref().unwrap().0.pending(), 1, "the 960x540 picture is gone");
+        assert_eq!(tap.ring.as_ref().unwrap().size, (480, 270));
+        assert_eq!(tap.ring.as_ref().unwrap().ring.pending(), 1, "the 960x540 picture is gone");
+    }
+
+    /// L1: the header says how big the tapped picture was, also when it is not the output size, and a change of the
+    /// source size alone (the same shrunk size) never leaves a picture with the old one in the ring.
+    #[test]
+    fn the_header_carries_the_size_of_the_tapped_picture_and_a_source_change_starts_a_new_ring() {
+        let r = warp();
+        let big = r.texture(1280, 720).unwrap();
+        fill(&r, &big, |_, _| [10, 20, 30, 255]);
+        let f = preview_of(&r, &big, (320, 180));
+        let h = Header::decode(&f.bytes).unwrap();
+        assert_eq!((h.width, h.height, h.source_width, h.source_height), (320, 180, 1280, 720));
+        // 640x360 and 1280x720 both shrink to 320x180 here: the sizes of the preview are equal, the sources are not
+        let shared = Shared::new(ACK_TIMEOUT);
+        let mut tap = PreviewTap::new(shared.clone(), Arc::new(AtomicU32::new(0)), Arc::new(AtomicBool::new(false)), (320, 180));
+        tap.capture(&r, &big).unwrap();
+        let small = r.texture(640, 360).unwrap();
+        fill(&r, &small, |_, _| [30, 20, 10, 255]);
+        tap.capture(&r, &small).unwrap();
+        assert_eq!(tap.ring.as_ref().unwrap().size, (320, 180));
+        assert_eq!(tap.ring.as_ref().unwrap().source, (640, 360));
+        assert_eq!(tap.ring.as_ref().unwrap().ring.pending(), 1, "the picture of the other source is gone");
+        let end = Instant::now() + Duration::from_secs(5);
+        let f = loop {
+            tap.collect();
+            if let Some(f) = lock(&shared.gate).take(Instant::now()) {
+                break f;
+            }
+            assert!(Instant::now() < end, "the picture never arrived");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let h = Header::decode(&f.bytes).unwrap();
+        assert_eq!((h.source_width, h.source_height), (640, 360));
+        assert_eq!(pixel(&f, 5, 5), [30, 20, 10, 255]);
     }
 
     /// L9: the staging ring and the downscale constants belong to the GPU device; the engine tells the tap when it

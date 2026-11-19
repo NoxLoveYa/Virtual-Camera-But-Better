@@ -2,28 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { CAPTURE_KEYS, effectiveSource, problemText } from "../camera/schema";
 import { useStore } from "../store";
+import { labelOf } from "../filters/schema";
+import { HEADER_BYTES, NOT_HELD, holdStep, isHeld, pointLabel, readHeader, type FrameHeader, type HoldEvent } from "../ui/previewFrame";
 
 /** The Install button's tooltip while the data folder is encrypted: the banner sits above the preview, not below it. */
 const PREVIEW_BLOCKED_REASON = "An administrator must turn off encryption first (see the banner above).";
 
-/** The preview frame of `src-tauri/src/preview.rs`: 16 header bytes (four little-endian u32), then RGBA pixels. */
-const HEADER_BYTES = 16;
-
-interface FrameHeader {
-  width: number;
-  height: number;
-  /** Bytes per row. */
-  stride: number;
-  frame: number;
-}
-
-function readHeader(buf: ArrayBuffer): FrameHeader | null {
-  if (buf.byteLength < HEADER_BYTES) return null;
-  const v = new DataView(buf);
-  const [width, height, stride, frame] = [0, 4, 8, 12].map((at) => v.getUint32(at, true));
-  const complete = width > 0 && height > 0 && stride >= width * 4 && stride % 4 === 0 && buf.byteLength >= HEADER_BYTES + stride * height;
-  return complete ? { width, height, stride, frame } : null;
-}
+const COMPARE_HINT = "Hold to see the camera picture before the filters (or hold Space)";
 
 const VERTEX = `#version 300 es
 out vec2 uv;
@@ -328,6 +313,46 @@ export function Preview() {
   // A dimmed state shows the last frame at 35 %; any other placeholder hides the canvas.
   const canvasClass = showing ? "" : dim && shown ? " is-dim" : " is-off";
 
+  // Hold to compare (L4): the preview shows the camera before the filters while the button is held by the pointer or by Space.
+  const [hold, setHold] = useState(NOT_HELD);
+  const held = isHeld(hold);
+  const holding = useRef(NOT_HELD);
+  const press = useCallback((event: HoldEvent) => {
+    holding.current = holdStep(holding.current, event);
+    setHold(holding.current);
+  }, []);
+  const { setPreviewPoint } = useStore.getState();
+  const comparing = useRef(false);
+  useEffect(() => {
+    if (held && showing) {
+      comparing.current = true;
+      setPreviewPoint("input");
+    } else if (comparing.current) {
+      // Let go: back to the output, unless another gesture took the point meanwhile.
+      comparing.current = false;
+      if (useStore.getState().previewPoint === "input") setPreviewPoint(null);
+    }
+  }, [held, showing, setPreviewPoint]);
+  useEffect(
+    () => () => {
+      if (comparing.current && useStore.getState().previewPoint === "input") useStore.getState().setPreviewPoint(null);
+    },
+    [],
+  );
+  // A button that went away under the pointer (the picture stopped, the window was hidden) gets no pointerup.
+  useEffect(() => {
+    if (!showing || !visible) press("blur");
+  }, [showing, visible, press]);
+  useEffect(() => {
+    const letGo = () => press("blur");
+    window.addEventListener("blur", letGo);
+    return () => window.removeEventListener("blur", letGo);
+  }, [press]);
+  const chain = useStore((s) => s.chain);
+  const extensions = useStore((s) => s.extensions);
+  const point = useStore((s) => s.previewPoint);
+  const caption = showing ? pointLabel(point, chain.map((f) => ({ id: f.id, label: labelOf(f.kind, extensions) }))) : null;
+
   return (
     <section className="panel preview" aria-label="Preview">
       <div className="preview-box" ref={boxRef}>
@@ -355,11 +380,48 @@ export function Preview() {
           ) : (
             <span />
           )}
-          <label className="preview-toggle">
-            <span className="label">Preview</span>
-            <button type="button" role="switch" aria-checked={previewOn} className="switch" onClick={() => setPreviewOn(!previewOn)} />
-          </label>
+          <div className="preview-tools">
+            <button
+              type="button"
+              className="preview-compare"
+              aria-pressed={held}
+              disabled={!showing}
+              title={showing ? COMPARE_HINT : "Nothing to compare: the camera picture is not showing"}
+              onPointerDown={(e) => {
+                if (e.button !== 0) return;
+                e.currentTarget.setPointerCapture(e.pointerId);
+                press("pointerdown");
+              }}
+              onPointerUp={() => press("pointerup")}
+              onPointerCancel={() => press("pointerup")}
+              onLostPointerCapture={() => press("pointerup")}
+              onKeyDown={(e) => {
+                if (e.key !== " ") return;
+                // The button's own Space click would fire on release: the hold is the whole gesture.
+                e.preventDefault();
+                if (!e.repeat) press("keydown");
+              }}
+              onKeyUp={(e) => {
+                if (e.key !== " ") return;
+                e.preventDefault();
+                press("keyup");
+              }}
+              onBlur={() => press("blur")}
+              onContextMenu={(e) => e.preventDefault()}
+            >
+              Compare
+            </button>
+            <label className="preview-toggle">
+              <span className="label">Preview</span>
+              <button type="button" role="switch" aria-checked={previewOn} className="switch" onClick={() => setPreviewOn(!previewOn)} />
+            </label>
+          </div>
         </div>
+        {caption && (
+          <span className="preview-caption" role="status">
+            {caption}
+          </span>
+        )}
       </div>
     </section>
   );

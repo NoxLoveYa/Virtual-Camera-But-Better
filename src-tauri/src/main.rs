@@ -256,6 +256,7 @@ fn main() {
             commands::set_auto_config,
             commands::resume_auto,
             commands::set_preview,
+            commands::set_preview_point,
             commands::preview_ack,
             commands::get_autostart,
             commands::set_autostart,

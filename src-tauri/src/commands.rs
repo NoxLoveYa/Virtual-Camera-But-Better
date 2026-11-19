@@ -165,7 +165,7 @@ pub async fn set_pause(state: State<'_, AppState>, on: bool) -> Result<(), Strin
 }
 
 /// Start or stop the live preview. Frames of at most `width` x `height` pixels (and 960x540) arrive on `channel` as
-/// raw bytes: a 16-byte header and RGBA pixels (see `better_cam::preview`). A new call replaces the old stream; the
+/// raw bytes: a 24-byte header and RGBA pixels (see `better_cam::preview`). A new call replaces the old stream; the
 /// webview acknowledges each frame with `preview_ack`.
 #[tauri::command]
 pub async fn set_preview(
@@ -179,6 +179,16 @@ pub async fn set_preview(
     let sink: Sink = Arc::new(move |bytes| channel.send(InvokeResponseBody::Raw(bytes)).is_ok());
     // Creating the engine can still be in progress on first use.
     blocking(move || svc.set_preview(on, width, height, sink)).await
+}
+
+/// Which picture the preview shows (UX-PASS L1): `null` the output, `"input"` the camera picture before the chain,
+/// `{ "filter": id }` the picture entering that filter (on or off). The output to apps is the same whatever this says.
+/// The page sets it for the length of a gesture and puts it back to `null`; the engine puts it back by itself when the
+/// filter leaves the chain or the window is hidden. Not async on purpose, like `set_chain`: the calls run in order, and
+/// a point that names a filter of the chain sent just before is valid.
+#[tauri::command]
+pub fn set_preview_point(state: State<AppState>, point: serde_json::Value) -> Result<(), String> {
+    state.service.set_preview_point(&point)
 }
 
 #[tauri::command]

@@ -76,7 +76,7 @@ use crate::gpu::convert::{
 use crate::gpu::output::{FitMode, OutputParams, OutputStage};
 use crate::gpu::pattern;
 use crate::fx::assets::{AssetClient, Assets};
-use crate::fx::{Chain, FilterCfg, FilterError, FilterStatus};
+use crate::fx::{Chain, FilterCfg, FilterError, FilterStatus, PreviewPoint};
 use crate::gpu::{AdapterKind, GpuDevice, GpuError, GpuTimer, Renderer, RgbaTexture};
 use crate::output_writer::{target_from, FrameTag, OutputWriter, Published};
 
@@ -358,8 +358,9 @@ pub struct SourceUpdate {
     pub deactivate_when_not_showing: bool,
 }
 
-/// Called on the render thread with the finished output frame (RGBA, output size) after the output stage. The
-/// preview (a later phase) copies and downsizes it there; it must not keep the texture past the call.
+/// Called on the render thread once per frame with the picture the preview shows: the finished output frame (RGBA,
+/// output size) after the output stage, or, while a [`PreviewPoint`] is set, the picture at that point (its own size).
+/// The preview copies and downsizes it there; it must not keep the texture past the call.
 pub trait FrameTap: Send {
     fn on_frame(&mut self, renderer: &Renderer, frame: &RgbaTexture, capture_qpc: u64);
 
@@ -387,6 +388,9 @@ pub enum Msg {
     SetTap(Option<Box<dyn FrameTap>>),
     /// The newest filter chain. It applies to the next frame; the engine keeps it while stopped, for the next start.
     SetChain(Vec<FilterCfg>),
+    /// Where the preview takes its picture ([`PreviewPoint`]). Ordered with [`Msg::SetChain`]: a point that names a
+    /// filter of the chain sent just before it is valid when it arrives. It never changes what apps get.
+    SetPreviewPoint(PreviewPoint),
     /// Try the camera again now instead of at the next retry (the app window got the focus back: the user may have
     /// changed Windows' privacy settings or closed the other app). Only does something while `Reconnecting`.
     RetryNow,
@@ -759,6 +763,10 @@ struct Shared {
     /// The newest chain and its version: the render thread applies it when the version changed.
     chain: Mutex<Arc<Vec<FilterCfg>>>,
     chain_gen: AtomicU64,
+    /// Where the preview takes its picture and its version (UX-PASS L1). The render thread reads the version before it
+    /// reads the chain's, so a point that names a filter of a chain sent just before it never sees the older chain.
+    preview_point: Mutex<PreviewPoint>,
+    preview_point_gen: AtomicU64,
     sink: Mutex<Option<Arc<dyn EventSink>>>,
     /// Symbolic link of the open camera (for hot-plug removal), empty while none is open.
     camera_link: Mutex<Option<String>>,
@@ -939,6 +947,7 @@ impl Engine {
         let gpu =
             GpuDevice::new(AdapterKind::Hardware).map_err(|e| format!("D3D11 device: {e}"))?;
         let writer = Writer::create_default().map_err(|e| format!("frames.bin: {e}"))?;
+        eprintln!("[engine] frame event: {:?}", writer.frame_event_status());
         Engine::with_parts(Arc::new(gpu), Arc::new(writer))
     }
 
@@ -991,6 +1000,8 @@ impl Engine {
             tap: Mutex::new(None),
             chain: Mutex::new(Arc::new(Vec::new())),
             chain_gen: AtomicU64::new(0),
+            preview_point: Mutex::new(PreviewPoint::Output),
+            preview_point_gen: AtomicU64::new(0),
             sink: Mutex::new(None),
             camera_link: Mutex::new(None),
             advertised: Mutex::new(None),
@@ -1167,6 +1178,18 @@ impl Engine {
     /// `Msg::SetChain`: the render thread applies it before the next frame; no reopen, no restart.
     pub fn set_chain(&self, chain: Vec<FilterCfg>) {
         self.send(Msg::SetChain(chain));
+    }
+
+    /// `Msg::SetPreviewPoint`: the preview shows the picture at `point` from the next frame. The engine puts it back
+    /// to [`PreviewPoint::Output`] by itself when the filter it names is no longer in the chain, and when the window
+    /// is hidden.
+    pub fn set_preview_point(&self, point: PreviewPoint) {
+        self.send(Msg::SetPreviewPoint(point));
+    }
+
+    /// Where the preview takes its picture now (tests, diagnostics).
+    pub fn preview_point(&self) -> PreviewPoint {
+        lock(&self.shared.preview_point).clone()
     }
 
     /// Measurement hook for the examples: the running render thread adds `samples` made-up latencies (1 to 6 ms) to its
@@ -1657,6 +1680,7 @@ impl Control {
                 *lock(&self.shared.chain) = Arc::new(c);
                 self.shared.chain_gen.fetch_add(1, Ordering::Release);
             }
+            Msg::SetPreviewPoint(p) => self.set_preview_point(p),
             Msg::RetryNow => {
                 if self.phase == EngineState::Reconnecting && self.session.is_none() {
                     self.next_retry = Some(Instant::now());
@@ -1722,9 +1746,21 @@ impl Control {
         })
     }
 
+    fn set_preview_point(&mut self, point: PreviewPoint) {
+        let mut g = lock(&self.shared.preview_point);
+        if *g != point {
+            *g = point;
+            self.shared.preview_point_gen.fetch_add(1, Ordering::Release);
+        }
+    }
+
     fn set_window_visible(&mut self, visible: bool) {
         let was = std::mem::replace(&mut self.window_visible, visible);
         self.shared.window_visible.store(visible, Ordering::Release);
+        if !visible {
+            // A gesture is over when nobody can see the window: the preview is the output again.
+            self.set_preview_point(PreviewPoint::Output);
+        }
         if visible && !was {
             // The window heard nothing while it was hidden: it gets the numbers as they are now, once. (The controls
             // poller sees the flag and does the same for the device controls.)
@@ -3807,6 +3843,19 @@ fn store_stats(shared: &Shared, abandoned: &AtomicBool, stats: &EngineStats) {
     s.state = state;
 }
 
+/// Show `frame` to the tap (the preview), if there is one and the session is not being stopped.
+///
+/// Looked at under the tap's lock, which a rebuild of the device takes to hand the tap its new renderer
+/// ([`Control::rebuild_gpu`]): a thread that was left behind and wakes in the middle of a frame must not call a tap
+/// that has the next device's renderer.
+fn tap_frame(shared: &Shared, stop: &AtomicBool, renderer: &Renderer, frame: &RgbaTexture, capture_qpc: u64) {
+    if let Some(tap) = lock(&shared.tap).as_mut() {
+        if !stop.load(Ordering::Acquire) {
+            tap.on_frame(renderer, frame, capture_qpc);
+        }
+    }
+}
+
 /// The output size and rate in effect: the settings, else the source's, forced even and inside the protocol limits.
 fn resolve_output(o: &OutputSettings, info: &SourceInfo) -> (u32, u32, u32) {
     let even = |v: u32, max: u32| (v.clamp(2, max)) & !1;
@@ -3910,6 +3959,9 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
     chain.set_assets(ctx.assets.clone());
     // The chain version this session has applied; the session starts with none, so the first frame applies it.
     let mut chain_gen = u64::MAX;
+    // The preview point this session works with, and the version of it that was read (L1).
+    let mut point = PreviewPoint::Output;
+    let mut point_gen = u64::MAX;
     let mut output = OutputWriter::new(renderer.clone(), writer.clone())
         .map_err(|e| gpu_failure(renderer, e))?;
     let mut timer = GpuTimer::new(&renderer.gpu.device).ok();
@@ -4272,6 +4324,8 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                     eprintln!("[engine] meter: {e}");
                 }
             }
+            // The point's version is read before the chain's: a point sent after a chain sees that chain.
+            let wanted_point = shared.preview_point_gen.load(Ordering::Acquire);
             // The newest chain applies before this frame.
             let wanted = shared.chain_gen.load(Ordering::Acquire);
             if wanted != chain_gen {
@@ -4279,9 +4333,29 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                 let cfg = lock(&shared.chain).clone();
                 chain.apply(renderer, &cfg);
             }
+            if wanted_point != point_gen {
+                point_gen = wanted_point;
+                point = lock(&shared.preview_point).clone();
+            }
+            if let PreviewPoint::Filter(id) = &point {
+                if !chain.has_filter(id) {
+                    // The filter was removed (or never was a filter): the preview is the output again.
+                    let mut shared_point = lock(&shared.preview_point);
+                    if *shared_point == point {
+                        *shared_point = PreviewPoint::Output;
+                        shared.preview_point_gen.fetch_add(1, Ordering::Release);
+                    }
+                    point = PreviewPoint::Output;
+                }
+            }
             // The filters that scale to the "base (canvas) resolution" use the output size.
             chain.set_canvas((target.width, target.height));
-            let rgba = chain.run(renderer, rgba)?;
+            // The preview shows the picture at its point while a gesture runs; the frame goes on unchanged.
+            let mut tapped = false;
+            let rgba = chain.run_tapped(renderer, rgba, Instant::now(), &point, &mut |tex| {
+                tapped = true;
+                tap_frame(shared, stop, renderer, tex, capture_qpc);
+            })?;
             let fitted = stage.run(
                 &rgba,
                 &OutputParams {
@@ -4291,13 +4365,9 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                     background: out_settings.background.map(|c| c as f32 / 255.0),
                 },
             )?;
-            if let Some(tap) = lock(&shared.tap).as_mut() {
-                // Looked at under the tap's lock, which a rebuild of the device takes to hand the tap its new renderer
-                // ([`Control::rebuild_gpu`]): a thread that was left behind and wakes in the middle of this frame must
-                // not call a tap that has the next device's renderer.
-                if !stop.load(Ordering::Acquire) {
-                    tap.on_frame(renderer, &fitted, capture_qpc);
-                }
+            // The output frame is the preview's picture unless a point showed it another one this frame.
+            if !tapped {
+                tap_frame(shared, stop, renderer, &fitted, capture_qpc);
             }
             if skip.is_none() {
                 output.submit(
@@ -4774,6 +4844,103 @@ mod tests {
             reader.shared().header().writer_state,
             WriterState::Closed as u32
         );
+    }
+
+    /// Records what the preview would get: how many pictures, the size of the last and its widest channel spread (0 is
+    /// grey, the colour bars are far above 100).
+    struct ProbeTap(Probe);
+
+    /// `(pictures, size of the last, spread of the last)`.
+    type Probe = Arc<Mutex<(u64, (u32, u32), u8)>>;
+
+    impl FrameTap for ProbeTap {
+        fn on_frame(&mut self, r: &Renderer, f: &RgbaTexture, _: u64) {
+            let px = crate::gpu::pipeline_tests::read_rgba(r, f);
+            let spread = px
+                .chunks(4)
+                .map(|p| p[..3].iter().max().unwrap() - p[..3].iter().min().unwrap())
+                .max()
+                .unwrap_or(0);
+            let mut g = self.0.lock().unwrap();
+            *g = (g.0 + 1, (f.width, f.height), spread);
+        }
+    }
+
+    /// UX-PASS L1: while a point is set the preview gets the picture at that point and apps still get the output.
+    #[test]
+    fn the_preview_point_shows_the_picture_before_the_filter_and_apps_still_get_the_output() {
+        let rig = Rig::new("sm-point.bin", fast());
+        let _consumer = rig.consumer("sm-point.bin");
+        let probe = Arc::new(Mutex::new((0u64, (0u32, 0u32), 0u8)));
+        rig.engine.send(Msg::SetTap(Some(Box::new(ProbeTap(probe.clone())))));
+        let chain = |second: bool| {
+            let mut v = vec![serde_json::json!({ "id": "g", "kind": "color_filter", "enabled": true, "params": { "saturation": -1 } })];
+            if second {
+                // switched off: its point is still the picture that would enter it
+                v.push(serde_json::json!({ "id": "h", "kind": "color_filter", "enabled": false, "params": { "gamma": 0.5 } }));
+            }
+            crate::fx::parse_chain(&serde_json::Value::Array(v)).unwrap()
+        };
+        let file_spread = |rig: &Rig| -> Option<u8> {
+            let (w, h, _, buf) = latest(&rig.file)?;
+            let rgb = nv12_to_rgb(&buf, w, h, w as usize, ColorSpace::Bt709, ColorRange::Limited);
+            rgb.chunks(3).map(|p| p.iter().max().unwrap() - p.iter().min().unwrap()).max()
+        };
+        let tap_spread = || probe.lock().unwrap().2;
+        let point_is = |rig: &Rig, p: PreviewPoint| rig.wait("the point", Duration::from_secs(10), |r| r.engine.preview_point() == p);
+
+        rig.engine.set_chain(chain(true));
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("grey output in the tap and the file", Duration::from_secs(10), |r| {
+            tap_spread() <= 4 && file_spread(r).is_some_and(|s| s <= 4)
+        });
+
+        // The camera's picture, before the chain: colour in the preview, grey for the app.
+        rig.engine.set_preview_point(PreviewPoint::Input);
+        rig.wait("colour in the tap", Duration::from_secs(10), |_| tap_spread() > 100);
+        assert!(file_spread(&rig).is_some_and(|s| s <= 4), "apps still get the grey output");
+        assert_eq!(rig.engine.preview_point(), PreviewPoint::Input);
+
+        // Entering the first filter: the camera's picture; entering the second, which is off: what the first made.
+        rig.engine.set_preview_point(PreviewPoint::Filter("h".into()));
+        rig.wait("grey before h", Duration::from_secs(10), |_| tap_spread() <= 4);
+        rig.engine.set_preview_point(PreviewPoint::Filter("g".into()));
+        rig.wait("colour before g", Duration::from_secs(10), |_| tap_spread() > 100);
+        assert!(file_spread(&rig).is_some_and(|s| s <= 4));
+
+        // One picture per frame, and none from the output stage meanwhile (it is the same count as the frames rendered).
+        let (n0, rendered0) = (probe.lock().unwrap().0, rig.engine.stats().rendered);
+        rig.wait("frames", Duration::from_secs(10), |r| r.engine.stats().rendered >= rendered0 + 15);
+        let (n1, rendered1) = (probe.lock().unwrap().0, rig.engine.stats().rendered);
+        assert!(n1 - n0 <= rendered1 - rendered0 + 1, "{} pictures for {} frames", n1 - n0, rendered1 - rendered0);
+
+        // A filter that is not in the chain: the engine takes the point back, and the output is what the tap gets.
+        rig.engine.set_preview_point(PreviewPoint::Filter("nope".into()));
+        point_is(&rig, PreviewPoint::Output);
+        rig.wait("grey output", Duration::from_secs(10), |_| tap_spread() <= 4);
+
+        // Removing the filter the point names takes it back too.
+        rig.engine.set_preview_point(PreviewPoint::Filter("h".into()));
+        rig.wait("grey before h", Duration::from_secs(10), |_| tap_spread() <= 4);
+        point_is(&rig, PreviewPoint::Filter("h".into()));
+        rig.engine.set_chain(chain(false));
+        point_is(&rig, PreviewPoint::Output);
+
+        // A point set in the same breath as the chain that has the filter is valid (the messages keep their order).
+        rig.engine.set_chain(chain(true));
+        rig.engine.set_preview_point(PreviewPoint::Filter("h".into()));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(rig.engine.preview_point(), PreviewPoint::Filter("h".into()));
+
+        // The window is hidden: the gesture is over.
+        rig.engine.set_window_visible(true);
+        rig.engine.set_preview_point(PreviewPoint::Input);
+        point_is(&rig, PreviewPoint::Input);
+        rig.engine.set_window_visible(false);
+        point_is(&rig, PreviewPoint::Output);
+        assert!(file_spread(&rig).is_some_and(|s| s <= 4));
+        assert_eq!(rig.opens(), 1, "no reopen");
     }
 
     #[test]

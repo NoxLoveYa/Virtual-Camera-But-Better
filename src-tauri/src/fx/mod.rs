@@ -32,6 +32,8 @@ mod golden_tests;
 #[cfg(test)]
 mod perf_tests;
 #[cfg(test)]
+mod preview_point_tests;
+#[cfg(test)]
 mod tests;
 
 use serde::{Deserialize, Serialize};
@@ -97,6 +99,33 @@ pub fn parse_chain(value: &Value) -> Result<Vec<FilterCfg>, String> {
             })
             .collect(),
         _ => Err("invalid chain: expected an array of filters".into()),
+    }
+}
+
+/// Where the preview takes its picture (UX-PASS L1). The output to apps never depends on it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum PreviewPoint {
+    /// The finished output frame, after the output stage: what apps get.
+    #[default]
+    Output,
+    /// The camera picture as it enters the chain, before the first filter.
+    Input,
+    /// The picture entering the filter with this card id, whether that filter is switched on or not.
+    Filter(String),
+}
+
+impl PreviewPoint {
+    /// The `set_preview_point` argument: `null`, `"input"` or `{ "filter": "<id>" }`.
+    pub fn parse(value: &Value) -> Result<PreviewPoint, String> {
+        match value {
+            Value::Null => Ok(PreviewPoint::Output),
+            Value::String(s) if s == "input" => Ok(PreviewPoint::Input),
+            Value::Object(o) if o.len() == 1 => match o.get("filter") {
+                Some(Value::String(id)) if !id.is_empty() => Ok(PreviewPoint::Filter(id.clone())),
+                _ => Err("invalid preview point: `filter` must be a card id".into()),
+            },
+            _ => Err("invalid preview point: expected null, \"input\" or { filter: id }".into()),
+        }
     }
 }
 
@@ -383,7 +412,31 @@ impl Chain {
     }
 
     /// [`Chain::run`] with the frame's time given (tests drive the clock of [`GpuFilter::bypassed`] with it).
-    pub fn run_at(&mut self, r: &Renderer, mut image: Pooled, now: std::time::Instant) -> GpuResult<Pooled> {
+    pub fn run_at(&mut self, r: &Renderer, image: Pooled, now: std::time::Instant) -> GpuResult<Pooled> {
+        self.run_tapped(r, image, now, &PreviewPoint::Output, &mut |_| {})
+    }
+
+    /// [`Chain::run_at`] that also shows `tap` the picture at `point` ([`PreviewPoint`]): `Input` the picture that
+    /// enters the chain, `Filter(id)` the one that enters that filter (called whether the filter is on or off, and
+    /// after the filters before it have rendered). `tap` is called at most once, and not at all for `Output`, or for
+    /// a `Filter` id the chain does not have; the caller then falls back to the output. The texture is only borrowed:
+    /// the frame goes on to the filters unchanged.
+    pub fn run_tapped(
+        &mut self,
+        r: &Renderer,
+        mut image: Pooled,
+        now: std::time::Instant,
+        point: &PreviewPoint,
+        tap: &mut dyn FnMut(&RgbaTexture),
+    ) -> GpuResult<Pooled> {
+        let tap_at = match point {
+            PreviewPoint::Output => None,
+            PreviewPoint::Input => {
+                tap(&image);
+                None
+            }
+            PreviewPoint::Filter(id) => self.slots.iter().position(|s| s.id == *id),
+        };
         let mut notes = Vec::new();
         let info = FrameInfo {
             time: now.saturating_duration_since(self.started).as_secs_f64(),
@@ -392,7 +445,10 @@ impl Chain {
         };
         self.last_run = Some(now);
         self.frames = self.frames.wrapping_add(1);
-        for slot in self.slots.iter_mut() {
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if tap_at == Some(i) {
+                tap(&image);
+            }
             if slot.enabled {
                 slot.filter.set_frame(&info);
                 let (w, h) = slot.filter.output_size((image.width, image.height));
@@ -446,6 +502,11 @@ impl Chain {
 
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
+    }
+
+    /// The chain has a filter instance with this card id (a kind that is not registered has none).
+    pub fn has_filter(&self, id: &str) -> bool {
+        self.slots.iter().any(|s| s.id == id)
     }
 
     /// `(id, kind, enabled, serial)` of every slot, in order. The serial numbers the instances this chain has made,

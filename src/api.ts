@@ -3,6 +3,7 @@ import { emit, listen } from "@tauri-apps/api/event";
 import type { ExtensionInfo, FilterCfg } from "./filters/schema";
 import { presetChain, presetFile } from "./filters/chain";
 import { answerFlushRequest } from "./ui/saver";
+import type { PreviewPoint } from "./ui/previewFrame";
 import type { AutoCfg, AutoStatus, CameraInfo, ControlInfo, ControlKey, ControlMode, Learned, OutputCfg, SourceCfg, StoredControl } from "./camera/schema";
 
 /**
@@ -130,13 +131,22 @@ export const api = {
   resumeAuto: (id: string, key: ControlKey) => invoke<void>("resume_auto", { id, key }),
   setOutput: (output: OutputCfg) => invoke<void>("set_output", { output }),
   setPause: (on: boolean) => invoke<void>("set_pause", { on }),
-  /** Starts, resizes (a new call replaces the stream) or stops the preview; `onFrame` gets each frame: 16-byte header + RGBA pixels. */
+  /**
+   * Starts, resizes (a new call replaces the stream) or stops the preview; `onFrame` gets each frame: a 24-byte header
+   * (see `ui/previewFrame.ts`) + RGBA pixels.
+   */
   setPreview: (on: boolean, width: number, height: number, onFrame: (frame: ArrayBuffer) => void = () => {}) => {
     const channel = new Channel<ArrayBuffer>();
     channel.onmessage = onFrame;
     return invoke<void>("set_preview", { on, width, height, channel });
   },
   previewAck: (frame: number) => invoke<void>("preview_ack", { frame }),
+  /**
+   * Which picture the preview shows: `null` the output (what apps get), `"input"` the camera before the chain,
+   * `{ filter: id }` the picture entering that filter (on or off). The output to apps never changes. The engine puts it
+   * back to `null` when that filter leaves the chain or the window is hidden; the page puts it back when its gesture ends.
+   */
+  setPreviewPoint: (point: PreviewPoint) => invoke<void>("set_preview_point", { point }),
   /** Opens Windows Settings on the camera privacy page (`ms-settings:privacy-webcam`). */
   openCameraSettings: () => invoke<void>("open_camera_settings"),
   /** No elevation; takes a moment (Media Foundation enumeration). */

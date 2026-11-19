@@ -4,6 +4,7 @@ import { defOf, defaultChain, labelOf, makeFilter, type ExtensionInfo, type Filt
 import { normalizeChain, presetChain, refreshExtParams, signature } from "./filters/chain";
 import { presetNameFor, stemOf } from "./ui/fileDrop";
 import { DEFAULT_UI, normalizeUi, type UiState } from "./ui/layout";
+import { pointFilter, samePoint, type PreviewPoint } from "./ui/previewFrame";
 import { createSaver } from "./ui/saver";
 import { createReadGate, wantsVcamPoll } from "./ui/vcamPoll";
 import {
@@ -182,6 +183,8 @@ interface State extends Saved {
   filterErrors: Record<string, string>;
   /** Lines the engine shows on a card that are not errors ("Loading model…"), by filter id; gone when the engine stops or the card is. */
   filterStatus: Record<string, string>;
+  /** The picture the preview shows (see `setPreviewPoint`); `null` is the output. Not saved. */
+  previewPoint: PreviewPoint;
   presets: string[];
   /** The extensions the app found (Settings → Extensions); empty until `extensionsRead`. Not saved: the folder is the truth. */
   extensions: ExtensionInfo[];
@@ -266,6 +269,13 @@ interface State extends Saved {
   setAutostart: (on: boolean) => Promise<void>;
   setCloseToTray: (on: boolean) => void;
   setPreviewOn: (on: boolean) => void;
+  /**
+   * Which picture the preview shows (L1): `null` the output (what apps get), `"input"` the camera before the chain, or the picture
+   * entering a filter. For the length of a gesture only (hold to compare, the eyedropper, the crop handles): whoever sets it puts it
+   * back to `null`. It also goes back by itself when the filter leaves the chain, the preview is turned off, the engine stops or
+   * the window is hidden. The output to apps never changes. Not saved.
+   */
+  setPreviewPoint: (point: PreviewPoint) => void;
   /** Remembers the column split or a panel's fold (see `Saved.ui`). */
   setUi: (patch: Partial<UiState>) => void;
   dismissError: () => void;
@@ -331,12 +341,22 @@ export const useStore = create<State>((set, get) => {
   if (typeof window !== "undefined") {
     window.addEventListener("beforeunload", saver.flush);
     window.addEventListener("pagehide", saver.flush);
-    document.addEventListener("visibilitychange", () => document.visibilityState === "hidden" && saver.flush());
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState !== "hidden") return;
+      saver.flush();
+      // A hidden window shows no picture (the backend puts the output back as well).
+      endPreviewPoint();
+    });
     // Outside the app (plain browser, no Tauri) there is nobody to ask: the page events above are all there is.
     api.onFlushSave(saver.flush).catch(() => {});
   }
 
   const fail = (e: unknown) => set({ error: String(e) });
+
+  /** A gesture that showed another picture than the output is over: the preview is the output again. */
+  const endPreviewPoint = () => {
+    if (get().previewPoint !== null) get().setPreviewPoint(null);
+  };
 
   // ---- live chain: every change goes to the backend (`set_chain` is cheap, also while the engine is stopped). A drag
   // makes many changes a frame; they are folded into one call per animation frame, one call in flight at a time, and the
@@ -401,6 +421,9 @@ export const useStore = create<State>((set, get) => {
       ...(Object.keys(kept).length !== Object.keys(errors).length && { filterErrors: kept }),
       ...(Object.keys(keptStatus).length !== Object.keys(statuses).length && { filterStatus: keptStatus }),
     });
+    // The preview point names a card: it ends with the card (the engine puts the output back by itself as well).
+    const pointId = pointFilter(get().previewPoint);
+    if (pointId !== null && !chain.some((f) => f.id === pointId)) endPreviewPoint();
     if (burst) persist();
     else persistNow();
     pushChain();
@@ -625,6 +648,7 @@ export const useStore = create<State>((set, get) => {
     undo: null,
     filterErrors: {},
     filterStatus: {},
+    previewPoint: null,
     presets: [],
     extensions: [],
     extensionsRead: false,
@@ -767,7 +791,11 @@ export const useStore = create<State>((set, get) => {
           inUse: inUseAfterState(s.inUse, e),
           ...(e.state === "stopped" && { filterStatus: {}, autoStatus: null, ...(e.kind && { errorKind: e.kind }) }),
         }));
-        if (e.state === "stopped") useStats.setState({ stats: null });
+        if (e.state === "stopped") {
+          useStats.setState({ stats: null });
+          // No picture to look at: a gesture that was showing another one is over.
+          endPreviewPoint();
+        }
       });
       await api.onEnginePaused(({ paused }) => set({ paused }));
       await api.onEngineError((error) => {
@@ -1125,6 +1153,13 @@ export const useStore = create<State>((set, get) => {
     setPreviewOn: (previewOn) => {
       set({ previewOn });
       persist();
+      if (!previewOn) endPreviewPoint();
+    },
+    setPreviewPoint: (previewPoint) => {
+      if (samePoint(get().previewPoint, previewPoint)) return;
+      set({ previewPoint });
+      // The calls reach the backend in order; the engine falls back to the output by itself when it cannot show the point.
+      api.setPreviewPoint(previewPoint).catch(() => {});
     },
     setUi: (patch) => {
       set((s) => ({ ui: normalizeUi({ ...s.ui, ...patch }) }));

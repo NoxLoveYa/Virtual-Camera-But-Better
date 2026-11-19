@@ -571,9 +571,28 @@ impl Service {
         if on {
             self.preview.start(&*self.engine()?, (width, height), sink)
         } else {
-            self.preview.stop(self.existing().as_deref());
+            let engine = self.existing();
+            self.preview.stop(engine.as_deref());
+            // Nobody sees a picture any more: a gesture that was showing another one is over.
+            if let Some(e) = engine {
+                e.set_preview_point(fx::PreviewPoint::Output);
+            }
             Ok(())
         }
+    }
+
+    /// `set_preview_point(point)`: which picture the preview shows while a gesture runs: `null` the output (what apps
+    /// get), `"input"` the camera picture before the chain, `{ filter: id }` the picture entering that filter, whether
+    /// the filter is switched on or not. The output to apps never changes. The engine puts it back to `null` when that
+    /// filter leaves the chain, and when the window is hidden; the page puts it back when the gesture ends. A malformed
+    /// point is an error and changes nothing. Ordered with [`Service::set_chain`]: a point that names a filter of the
+    /// chain sent just before it is valid. Does nothing before the engine exists (no gesture can run then).
+    pub fn set_preview_point(&self, point: &Value) -> Result<(), String> {
+        let point = fx::PreviewPoint::parse(point)?;
+        if let Some(e) = self.existing() {
+            e.set_preview_point(point);
+        }
+        Ok(())
     }
 
     /// `preview_ack(frame)`: the webview drew `frame`; the next one may go out.
@@ -720,11 +739,23 @@ mod tests {
         assert!(svc.set_source(SourceCfg::default()).is_ok());
         assert!(svc.set_output(OutputCfg::default()).is_ok());
         assert!(svc.set_chain(&json!([])).is_ok());
+        assert!(svc.set_preview_point(&json!("input")).is_ok());
         svc.set_window_visible(true);
         let nowhere: Sink = Arc::new(|_| true);
         assert!(svc.set_preview(false, 0, 0, nowhere).is_ok());
         svc.preview_ack(1);
         svc.shutdown();
+    }
+
+    #[test]
+    fn set_preview_point_takes_null_input_or_a_filter_and_rejects_the_rest() {
+        let svc = Service::new();
+        for ok in [json!(null), json!("input"), json!({ "filter": "a1" })] {
+            assert!(svc.set_preview_point(&ok).is_ok(), "{ok}");
+        }
+        for bad in [json!("output"), json!({ "filter": 3 }), json!(7), json!({})] {
+            assert!(svc.set_preview_point(&bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
