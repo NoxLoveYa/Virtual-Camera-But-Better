@@ -834,10 +834,44 @@ default".
 
 - The replay is the owner's desk at one moment. A different room may have another pair of answers; `apart` is the
   general detector, the band the general cushion.
-- **Auto Adjust still has the first start's flips** (it uses `t`, `light` and `conf`, unchanged on purpose: A1-A12). Its
-  output smoothing is 0.5 s; if the owner sees the *picture* (not the Kelvin) shift when the face moves, the next step is
-  to give `gains` the same doubt (`conf × (1 − smoothstep(0.02, 0.06, apart))` and `t_alt` in the light), which A12
-  (two lights) has to be re-decided for.
+- ~~Auto Adjust still has the first start's flips~~ Done in 9.5.
 - The live after-fix run (about 8 minutes, `Slow`, on the desk with nobody in front of the camera and the room dark or
   lit by coloured lamps) held 6500 K, 0 white balance writes and no hand-back; it could not reproduce the face in
   front. The evidence for the fix is the recorded frames.
+
+### 9.5 Auto Adjust gets the same doubt (2026-11-19)
+
+Auto Adjust (the picture, not the device) used the estimator's first answer, so the *picture* shifted in colour when the
+face moved (output smoothing 0.5 s only slows it).
+
+- **`fx/awb.rs`:** `LightEstimate::undoubted()` = `1 − smoothstep(0.02, 0.06, apart)` (the constant is the device
+  loop's `meter::TWO_ANSWERS`), `middle_light()` (the light at `t = (t + t_alt) / 2`, the tint kept relative to the
+  locus: `g` moves by `LOCUS_SLOPE · Δt`) and `steady_gains(aim, limits)` = `gains(middle_light, aim, conf ·
+  undoubted, limits)`. `estimate_light`, `gains` and the device loop are unchanged.
+- **`fx/auto_adjust.rs`:** `white_balance_target` uses `steady_gains`. Time constant (0.5 s at the default speed), dead
+  band (0.8 %) and limits are unchanged.
+- **Replay** (`auto_adjust` test `auto_adjust_a_face_in_a_dim_room_does_not_make_the_picture_shift`: the 48 frames of
+  108-113.7 s through `white_balance_target` and `follow` at the frames' own timing, the settled gains measured over
+  the last forward and back pass), per channel, in `ln` of the gain:
+
+  | | range over the replay | worst step per frame |
+  |---|---|---|
+  | before (`gains`) | 0.147 | 0.022 |
+  | after (`steady_gains`) | 0.035 | 0.0067 |
+
+  The test asserts a range of at most 0.06 and a step of at most 0.012 (it fails on the old call), and that the warm
+  lamp of 164-165.4 s is still corrected (blue over red gain above `e^0.3`).
+- **A12 changes for Auto Adjust only (old → new).** Old: mixed 5500 | 2700 K, split 8 → the daylight side within ±15
+  mired (the larger side wins, D2). New: that picture has `apart` 0.7 (the two lights are two answers, `t` +0.27 and
+  −0.43), so the confidence is 0 and Auto Adjust leaves it as the camera made it; the test now asserts "no side worse
+  than uncorrected + 5 mired" (`auto_adjust_mixed_light_is_not_made_worse_and_is_no_longer_decided_by_the_larger_side`).
+  Why it must change: a bright face in a dim room (`apart` 0.15-0.55) and two lights (0.7) are the same case for the
+  estimator; no `apart` threshold separates them, and doubting the one means doubting the other. The estimator's own
+  A12 (`awb` test, `gains`) and D2 for `estimate_light` are unchanged; the device loop already holds on two answers.
+  If the owner prefers D2 in Auto Adjust, the way back is `gains` instead of `steady_gains` in `white_balance_target`
+  (and then the face flips return).
+- A1-A11, A13, W2 (grey wall at 2700 K ≤ 3°), B1-B8 pass unchanged.
+- Live (debug build, test mode, Auto Adjust with white balance on, 61 s, the preview's mean colour every 0.5 s, 113
+  samples): `ln(B/R)` of the output mean 0.089 ± 0.022 (min 0.048, max 0.144), mean R 120.5 ± 3.5, B 131.7 ± 2.7 on a
+  desk with the lens in its normal view. No before run: the scene moves by itself, so two runs are not comparable
+  (the recorded frames above are the before/after).

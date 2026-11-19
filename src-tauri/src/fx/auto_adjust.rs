@@ -34,7 +34,10 @@
 //! an orange lamp counts and a blue shirt that tungsten turned grey does not), with a blackbody prior that keeps the
 //! tint to what lamps show and lowers the confidence for what looks like skin or a coloured wall instead of a cast.
 //! The gains take that light to the aim colour, keep the luma, and are scaled by the confidence in the log domain, so
-//! a picture of one colour is corrected only as far as the evidence goes. Each is limited to `0.25 ..= 4` (two stops:
+//! a picture of one colour is corrected only as far as the evidence goes. When the estimator has two answers (a bright
+//! face beside dim walls: its two starts end `apart`) the gains aim at the light between them and the confidence is
+//! multiplied by `1 - smoothstep(0.02, 0.06, apart)`, so the picture does not shift when the face moves
+//! ([`awb::LightEstimate::steady_gains`], docs/AUTO-WHITE-BALANCE.md 9.5). Each is limited to `0.25 ..= 4` (two stops:
 //! a 2700 K lamp on a camera at 4600 K needs blue x 3.3). The wanted gains come from the input alone, every frame,
 //! without state; a dead band of 0.8 % against the held gains stops hunting. A picture with nothing to measure (too
 //! dark, clear) holds the gains.
@@ -407,8 +410,8 @@ pub fn white_aim(temperature: f32, tint: f32) -> [f32; 3] {
 
 /// The wanted white balance gains (natural logarithms, red green blue) for the measured `stats`, given the gains
 /// `ln_cur` held now and the colour `aim` a neutral surface should get (see [`white_aim`]; `[1; 3]` is gray). The
-/// light is estimated by the shared [`awb::estimate_light`]; the gains take it to `aim`, scaled by the estimate's
-/// confidence in the log domain and limited to `MIN_WB ..= MAX_WB` per channel. They are computed from the input
+/// light is estimated by the shared [`awb::estimate_light`]; the gains take the light between its two answers to
+/// `aim`, scaled by the estimate's confidence (less when the answers differ) in the log domain and limited to `MIN_WB ..= MAX_WB` per channel. They are computed from the input
 /// alone every frame (no state: the same picture gives the same target); `ln_cur` only sets the dead band. A picture
 /// with nothing to measure (too dark, clear, or every cell clipped) gives `ln_cur`.
 pub fn white_balance_target(stats: &Stats, ln_cur: [f64; 3], aim: [f32; 3]) -> [f64; 3] {
@@ -416,7 +419,7 @@ pub fn white_balance_target(stats: &Stats, ln_cur: [f64; 3], aim: [f32; 3]) -> [
     if est.reason == awb::Reason::Dark || est.share <= 0.0 {
         return ln_cur;
     }
-    let wanted = est.gains(aim, (MIN_WB, MAX_WB)).map(f64::ln);
+    let wanted = est.steady_gains(aim, (MIN_WB, MAX_WB)).map(f64::ln);
     let mut out = ln_cur;
     for k in 0..3 {
         let delta = wanted[k] - ln_cur[k];

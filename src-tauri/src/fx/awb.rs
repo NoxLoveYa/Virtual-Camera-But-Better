@@ -127,6 +127,31 @@ impl LightEstimate {
     pub fn gains(&self, aim: [f32; 3], limits: (f64, f64)) -> [f64; 3] {
         gains(self.light, aim, self.conf, limits)
     }
+
+    /// The share of the confidence a picture with two answers keeps: `1` below `TWO_ANSWERS.0` of `apart`, `0` from
+    /// `TWO_ANSWERS.1` (the device loop's doubt, `auto_controls::meter`).
+    pub fn undoubted(&self) -> f64 {
+        let (lo, hi) = crate::auto_controls::meter::TWO_ANSWERS;
+        1.0 - smoothstep(lo, hi, self.apart)
+    }
+
+    /// The light half way between the two answers: `t` is `(t + t_alt) / 2` and the tint stays what it is relative to
+    /// the locus (the locus has the slope `LOCUS_SLOPE` in `(t, g)`).
+    pub fn middle_light(&self) -> [f64; 3] {
+        let dt = 0.5 * (self.t_alt - self.t);
+        let (t, g) = (self.t + dt, self.g + LOCUS_SLOPE * dt);
+        let light = [(-t / 2.0).exp(), g.exp(), (t / 2.0).exp()];
+        let y = luma(light);
+        light.map(|c| c / y)
+    }
+
+    /// Like [`gains`](Self::gains), for a picture that may have two answers: aimed from the light between them and
+    /// scaled by the confidence times [`undoubted`](Self::undoubted), so a picture whose answer depends on the
+    /// frame is corrected little instead of following the flips (docs/AUTO-WHITE-BALANCE.md 9.4). The same as
+    /// `gains` when the two answers are the same.
+    pub fn steady_gains(&self, aim: [f32; 3], limits: (f64, f64)) -> [f64; 3] {
+        gains(self.middle_light(), aim, self.conf * self.undoubted(), limits)
+    }
 }
 
 fn smoothstep(e0: f64, e1: f64, x: f64) -> f64 {

@@ -515,11 +515,12 @@ fn auto_adjust_a_black_frame_keeps_the_gain_in_range_and_a_normal_frame_recovers
 #[test]
 fn auto_adjust_strength_zero_is_the_exact_identity() {
     let mut rig = Rig::new(json!({ "strength": 0 }));
+    // A warm picture with one answer for the light (a rainbow ramp has two and is left alone by the loop).
     let picture = |x: u32, y: u32| {
         [
-            (x * 8) as u8,
-            (y * 13) as u8,
-            ((x + y) * 5) as u8,
+            (110 + x * 3) as u8,
+            (60 + y * 2) as u8,
+            (20 + x + y) as u8,
             255 - (x * 7) as u8,
         ]
     };
@@ -1741,11 +1742,11 @@ fn after_auto_adjust(name: &str, t: f64, k: f64) -> (f64, f64) {
 }
 
 #[test]
-fn auto_adjust_the_target_is_the_shared_estimators_gains_within_the_dead_band() {
+fn auto_adjust_the_target_is_the_shared_estimators_steady_gains_within_the_dead_band() {
     for name in ["office", "grey_room", "checker", "closeup"] {
         for t in [2200.0, 2700.0, 4000.0, 5500.0, 6500.0] {
             let stats = scenes::shoot(name, t, 4600.0);
-            let want = awb::estimate_light(&stats).gains(NEUTRAL_AIM, (MIN_WB, MAX_WB));
+            let want = awb::estimate_light(&stats).steady_gains(NEUTRAL_AIM, (MIN_WB, MAX_WB));
             let got = white_balance_target(&stats, [0.0; 3], NEUTRAL_AIM);
             for k in 0..3 {
                 let miss = (got[k] - want[k].ln()).abs();
@@ -1881,6 +1882,101 @@ fn auto_adjust_an_office_under_tungsten_goes_neutral_on_the_gpu() {
         eprintln!("office {t} K: t from the chain {:+.4}, from the kit {:+.4}", real_est.t, kit_est.t);
         assert!((real_est.t - kit_est.t).abs() <= 0.0105, "{real_est:?} {kit_est:?}");
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Frames from a real camera (docs/AUTO-WHITE-BALANCE.md 9): a dim room, a bright window, a face that moves
+
+/// The white balance gains (natural logs) Auto Adjust holds when it plays `frames` through `white_balance_target` and
+/// `follow` at the default speed with the frames' own timing, `rounds` times over (forward then back, so the gains
+/// have settled before the last round). Returns the log gains after each frame of the last round.
+fn replay_wb(frames: &[crate::fx::awb::real::Frame], rounds: usize) -> Vec<[f64; 3]> {
+    let tau = time_constant(0.3);
+    let mut ln = [0.0f64; 3];
+    let mut out = Vec::new();
+    for round in 0..rounds {
+        out.clear();
+        let order: Vec<usize> = if round % 2 == 0 {
+            (0..frames.len()).collect()
+        } else {
+            (0..frames.len()).rev().collect()
+        };
+        for (n, &i) in order.iter().enumerate() {
+            let dt = if n == 0 { 0.12 } else { (frames[i].t - frames[order[n - 1]].t).abs().clamp(0.02, 0.25) };
+            let alpha = 1.0 - (-dt / tau).exp();
+            let want = white_balance_target(&frames[i].stats, ln, NEUTRAL_AIM);
+            for k in 0..3 {
+                ln[k] = follow(ln[k], want[k], alpha);
+            }
+            out.push(ln);
+        }
+    }
+    out
+}
+
+#[test]
+fn auto_adjust_mixed_light_is_not_made_worse_and_is_no_longer_decided_by_the_larger_side() {
+    // A12 through Auto Adjust (docs/AUTO-WHITE-BALANCE.md 9.5, re-decided): 5500 | 2700 K, split at column 8. The
+    // estimator has two answers (`apart` 0.7: the daylight side and the lamp side), which is what a face in a dim room
+    // looks like too, so Auto Adjust leaves the picture as the camera made it instead of picking the larger side (D2
+    // still holds for the estimator itself, `awb` A12). Neither side is worse than uncorrected.
+    let stats = scenes::mixed("office", 5500.0, 2700.0, 4600.0, 8);
+    let est = awb::estimate_light(&stats);
+    assert!(est.apart > 0.3, "two answers expected: {est:?}");
+    let g = settled_gains(&stats, NEUTRAL_AIM);
+    for light in [5500.0, 2700.0] {
+        let r = scenes::residual(scenes::neutral_out(g, light, 4600.0), [1.0; 3]);
+        let none = scenes::residual(scenes::neutral_out([1.0; 3], light, 4600.0), [1.0; 3]);
+        assert!(r.abs() <= none.abs() + 5.0, "{light} K side {r:+.1} mired, uncorrected {none:+.1}");
+    }
+}
+
+#[test]
+fn auto_adjust_a_face_in_a_dim_room_does_not_make_the_picture_shift() {
+    // The frames of 108-113.7 s: the camera's Kelvin is constant (6261 K) and the picture hardly changes, but the
+    // face moves and the estimator's first answer flipped between `t` 0 and -0.55 (docs 9.1). The gains Auto Adjust
+    // applies must stay put: the picture would shift in colour otherwise. The warm lamp of 164-165.4 s is read in full.
+    let frames = crate::fx::awb::real::between(108.0, 113.7);
+    assert!(frames.len() > 40);
+    // 4 rounds: forward, back, forward, back; the last two are measured (the gains have settled by then).
+    let gains = replay_wb(&frames, 4);
+    let mut range = 0.0f64;
+    let mut worst_step = 0.0f64;
+    for k in 0..3 {
+        let (lo, hi) = gains.iter().fold((f64::MAX, f64::MIN), |(lo, hi), g| (lo.min(g[k]), hi.max(g[k])));
+        range = range.max(hi - lo);
+    }
+    for pair in gains.windows(2) {
+        for (a, b) in pair[0].iter().zip(&pair[1]) {
+            worst_step = worst_step.max((b - a).abs());
+        }
+    }
+    // Direction reversals of the blue gain that are more than 0.01 (1 %) deep: the flip pattern.
+    let (mut reversals, mut dir, mut extreme) = (0, 0.0f64, gains[0][2]);
+    for g in &gains {
+        let b = g[2];
+        if dir >= 0.0 && b < extreme - 0.01 {
+            reversals += usize::from(dir > 0.0);
+            dir = -1.0;
+            extreme = b;
+        } else if dir <= 0.0 && b > extreme + 0.01 {
+            reversals += usize::from(dir < 0.0);
+            dir = 1.0;
+            extreme = b;
+        } else if (dir >= 0.0 && b > extreme) || (dir <= 0.0 && b < extreme) {
+            extreme = b;
+        }
+    }
+    eprintln!("face in a dim room: gain range {range:.4} (ln), worst step {worst_step:.4}, {reversals} reversals");
+    assert!(range <= 0.06, "the gains moved {range:.4} (ln) over the replay: {gains:?}");
+    assert!(worst_step <= 0.012, "a step of {worst_step:.4}");
+    assert!(reversals <= 1, "{reversals} reversals");
+
+    // A lamp that comes on is still followed.
+    let lamp = crate::fx::awb::real::between(164.0, 165.4);
+    let g = replay_wb(&lamp, 1);
+    let last = g.last().expect("frames");
+    assert!(last[2] - last[0] > 0.3, "the warm lamp is corrected: {last:?}");
 }
 
 /// Prints the table of the report (`cargo test -p better-cam --lib fx::auto_adjust::tests::report -- --ignored
