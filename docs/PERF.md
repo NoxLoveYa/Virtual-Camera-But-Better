@@ -389,3 +389,169 @@ The 5080 is far from ALU-bound at these sizes, so absolute times are tiny; the r
 * Convert is unchanged (the convert row includes the upload of the NV12 frame: 0.10 ms at 1080p and 0.3 ms at 4K on the 5080).
 * Chroma Key still encodes the four means of its box filter by hand (4 `pow` per colour channel); Lanczos still loads 36 texels per pixel. Whether either is now bound by texture reads rather than ALU was not measured.
 * Not measured: an Intel or AMD GPU, a GTX 1650, the NVIDIA final passes (one draw each), the engine end to end (`engine_script`) with these changes.
+
+
+## Frame event, phase 0 (2026-11-19)
+
+Measurement only, no product code: the gate of `docs/FRAME-EVENT.md` (does polling cost enough to justify a writer-signalled
+frame event?). Everything below that needs no elevation is measured; the WPR trace needs the owner (steps at the end). The raw
+logs, per-run summaries, per-second process samples and per-thread snapshots (`*.summary.txt`, `*.samples.csv`,
+`*.threads.csv`) and the harness are in `C:\Users\Obnoxious\AppData\Local\Temp\opencode\fe0\` (not in the repo).
+
+### Setup
+
+* Method of "Method" above (same `perf_synth1080_none.json` / `perf_4k30_none.json`, 20 s windows, pure consumer process,
+  camera service CPU = delta of the FrameServer `svchost` process time, 10 s idle baseline before each run, 0.00 % every time),
+  by `fe0\fe0_batch.ps1` = `perf_batch.ps1` plus a per-thread snapshot of that `svchost` every 2.5 s. 1080p60 and 4K30 used
+  `p6b-consumer.exe`. The 30 fps rows (360p, 720p, 1080p) and the live row used `pe-consumer.exe --fps 30` and are extra points
+  for the split (scripts `fe0\perf_s360p30.json` etc., made from `perf_synth1080_none.json`).
+* Registered DLL: `better_cam_vcam_1.fc6bfcae.dll` (SHA-256 `63EA3C52...`; not the `ac92262c` build of the P-perf section: the
+  machine was updated since). Engine: `engine_script.exe` of 01:25 that day (working tree on top of `fadc31f` with other
+  agents' uncommitted extension work; no filters in these runs, so the engine side is irrelevant to the service).
+* The machine was busy: 8 to 57 % in the windows (other agents), shown per run. One 4K30 run (55 % busy) is an outlier.
+* Thread CPU counters tick in 15.6 ms steps: one tick is 0.08 % of a core in a 20 s window, so a single thread value is good to
+  about +-0.1 % (+-0.3 % under heavy load). Every run is listed.
+
+### Camera service CPU (PERF method), % of one core
+
+| Config | Run 1 | Run 2 | Run 3 | machine busy | DLL delivered / repeated per 20 s |
+|---|---|---|---|---|---|
+| 1080p60 NV12, consumer 60 | 1.31 | 1.55 | 1.30 | 14.7, 41.3, 51.4 % | 1200, 1208, 1208 / 0, 0, 0 |
+| 4K30 NV12, consumer 30 | 3.60 | 2.21 | 2.47 | 54.7, 57.4, 55.2 % | 600, 600, 600 / 0, 0, 0 |
+| Live camera (14.39 fps, MJPEG HW decode), 1080p consumer **30 fps**, 25 s | 1.53 | 1.77 | | 43.2, 51.8 % | 728, 728 / 366, 365 (by design: 14 fps camera) |
+
+* Before this session (P-perf section of `SPIKE-VCAM.md`, DLL `ac92262c`): 1080p60 1.78 / 1.95 / 1.98, 4K30 1.97 / 2.03 / 2.68.
+  The new 1080p60 figures are lower (1.30 to 1.55). The registered DLL and the machine state differ, so this is not attributed to
+  anything. Latency in the same runs: header p50 / p95 1.99-2.18 / 2.56-2.62 ms (1080p60), 3.1-3.5 / 4.2-4.5 ms (4K30).
+* The live row includes the physical camera's own stream through Frame Server (+89 to +96 MB private bytes), as in the sign-off.
+  The consumer negotiated NV12 1080p30 (the virtual camera's 30 fps mode), so the DLL delivered 29 frames/s from a 14.4 fps
+  writer, half of them repeats.
+
+### Per-thread split of the FrameServer svchost (no elevation needed)
+
+Obtained unelevated from `Win32_PerfRawData_PerfProc_Thread` (CPU, user, kernel, `ContextSwitchesPersec`). **Thread names and
+start addresses are not available without admin** (`OpenThread` for `GetThreadDescription` gives access denied;
+`NtQuerySystemInformation` and WMI both return start address 0), so the pump thread is identified, not read: it is the only new
+thread (not in the idle snapshot taken just before the run) whose context-switch rate is in the range the code predicts for polling
+(230 to 670/s), its CPU follows the bytes copied per second (fit below) and its 4K30 figure matches the 1.36 % of P-perf. The
+other new threads switch at 30 to 90/s (Frame Server's per-sample work and, in the live runs, the camera). The trace of the
+owner's steps below puts names on them.
+
+| Config, run | pump CPU (user / kernel) | pump context switches/s | other threads of the svchost | all threads |
+|---|---|---|---|---|
+| 1080p60, 1 | 0.93 (0.75 / 0.19) | 330 | 0.47 | 1.40 |
+| 1080p60, 2 | 1.07 (1.07 / 0.00) | 342 | 0.48 | 1.55 |
+| 1080p60, 3 | 0.78 (0.61 / 0.17) | 343 | 0.53 | 1.31 |
+| 4K30, 1 (55 % busy) | 3.00 (2.38 / 0.62) | 285 | 0.52 | 3.52 |
+| 4K30, 2 | 1.12 (1.12 / 0.00) | 285 | 1.03 | 2.15 |
+| 4K30, 3 | 1.50 (1.42 / 0.09) | 283 | 0.98 | 2.48 |
+| live camera + consumer 30, 1 | 0.74 (0.44 / 0.29) | 664 | 0.83 | 1.57 |
+| live camera + consumer 30, 2 | 1.06 (0.86 / 0.20) | 675 | 0.90 | 1.96 |
+| 1080p30 synthetic, 2 runs | 0.28, 0.94 | 248, 248 | 0.09, 0.29 | 0.37, 1.23 |
+| 720p30 synthetic, 2 runs | 0.56, 0.19 | 233, 237 | 0.09, 0.10 | 0.65, 0.29 |
+| 360p30 synthetic, 2 runs | 0.37, 0.19 | 232, 235 | 0.19, 0.19 | 0.56, 0.38 |
+
+* **1080p60 (the target config).** The pump is 0.78 to 1.07 % (median 0.93) of the 1.3 to 1.55 % of the service; Frame Server's
+  other threads are 0.47 to 0.53 %. So **about two thirds of what the service spends on our stream is the DLL's pump**, and
+  the pump alone sits at the 1 % line.
+* **Split of the pump by bytes.** Least squares over the 12 synthetic runs of pump CPU against the NV12 bytes copied per second
+  (10, 41, 93, 187, 373 MB/s): pump % = 0.19 + 0.44 x (MB/s / 100); over the five medians 0.07 + 0.39 x (MB/s / 100). At 1080p60
+  (187 MB/s): **copy about 0.7 to 0.8 % of a core, everything that does not scale with bytes (polling, posting the sample, the
+  pool) 0.1 to 0.2 %**. At the smallest stream (360p30, 10 MB/s, a copy worth about 0.04 %) the whole pump is 0.19 and 0.37 %, an
+  upper bound of 0.37 % for 233 wake-ups and 30 samples a second (at most 16 us per wake-up, mean 12 us, including the per-sample
+  work). The fit's own noise is about +-0.15 %. The copy cost is higher than the 0.55 % that `FRAME-EVENT.md` estimated.
+* **4K30**: the pump is 1.12 and 1.50 % in the two quieter runs (P-perf: 1.36 %); 3.00 % in the run at 55 % machine load.
+
+### Pump wake-ups per second
+
+`vcam-tool stats` (read-only) has no poll or wake-up counter, and the DLL's logs are in a folder this user cannot read, so the
+count comes from the pump thread's context switches per second (each poll that sleeps is one switch):
+
+| Config | pump switches/s | per delivered frame | `FRAME-EVENT.md` estimate |
+|---|---|---|---|
+| 1080p60, writer 60 | 330, 342, 343 | 5.6 | 330 to 360 per s: **confirmed** |
+| 4K30, writer 30 | 285, 285, 283 | 9.5 | about 330: a little lower |
+| 1080p / 720p / 360p30, writer 30 | 248, 235, 233 (means of 2) | about 8 | about 10 per frame: a little lower |
+| live camera 14.4 fps, consumer 30 | 664, 675 | 23 | about 1000 per s with a slow writer: lower, ~670 |
+
+The same counts at 14.7 % and 51 % machine busy (330 against 343 at 1080p60) show that preemption is not what is being counted.
+The P-perf claim of "60 wake-ups plus 940 timer polls a second" is wrong by a factor of three: the pump wakes about 340 times a
+second at 1080p60 in all. With the event (two wake-ups per emitted frame, design) the counts become about 120/s (1080p60), 60/s
+(4K30), 60/s (30 fps) and about 45 to 75/s live (30 consumer + 14 camera, plus a few timers).
+
+### What the event can save (measured bounds, then estimate)
+
+* Wake-ups removed: about 220/s at 1080p60 (340 to 120), about 225/s at 4K30, 170/s at 30 fps, **about 600/s live** (670 to 75).
+* Cost of one wake-up: the fit's intercept (0.07 to 0.19 % over 230 to 340 wake-ups/s) gives 2 to 6 us; the 360p30 upper bound
+  gives at most 12 to 16 us. Both include the per-sample work that the event does not remove.
+* **Saving at 1080p60: 0.05 to 0.13 % of a core by the fit, 0.26 % at the upper bound. Most likely about 0.1 %.** Live (14 fps camera):
+  600/s x 2 to 6 us = **0.12 to 0.36 %** (0.7 % at the upper bound) of a pump that is 0.74 to 1.06 %. This is an estimate from
+  measured switches and a fitted cost per wake-up, not a measurement of an event build; only the trace of the owner's steps
+  (CPU per context switch, sampled stacks) measures the cost per wake-up directly.
+* Not covered: the effect of dropping `timeBeginPeriod(1)` (the system timer rate; needs the trace or `powercfg /energy`),
+  and the cost of the app's two `SetEvent` / `ResetEvent` calls a frame.
+
+### Is 1 % reachable at 1080p60?
+
+**Not with the event.** Today the service is at 1.30 to 1.55 %. Taking all polling and wake-up cost out (more than the event
+does) leaves the copy (0.7 to 0.8 %) plus Frame Server's own threads (0.47 to 0.53 %), which is **about 1.2 to 1.3 %**; with the
+event realistically about 1.2 to 1.5 %. Reading the target as **"the DLL's own pump thread"** it is already at the line today
+(0.78 to 1.07 %, median 0.93) and the event would take it to about 0.8 to 0.9 %. At 4K30 the pump is 1.1 to 1.5 % (inside 2 %
+in the quieter runs). Getting the whole service under 1 % needs a cheaper copy (the 3.1 MB read per frame from a mapping the
+app wrote on another core), not a different wake-up. Polling costs at most about 0.3 % at 1080p60, which is the gate's figure
+of "under about 0.3 %": the decision of open question 2 rests on the slow-camera case (about 600 fewer wake-ups a second), the
+0.5 ms of latency and the 1 kHz timer request, not on the 1 % target.
+
+### WPR trace: steps for the owner
+
+Needed for: wake-ups and their causes by readying thread, CPU per wake-up, copy share by sampled stack (`memcpy` inside the DLL),
+and names of the Frame Server threads. `wpr.exe` and `tracerpt.exe` are installed here; **Windows Performance Analyzer (WPA) and
+`wpaexporter` are not**, so a later session reads the trace with `tracerpt` (events to CSV: CSwitch, ReadyThread, SampleProfile,
+image loads) unless you install WPA from the Microsoft Store first (optional, then a later session can export tables).
+The DLL's symbols: `target\release\better_cam_vcam.pdb` belongs to the 00:28 build (`CA74DCDB...`), which is **not** the registered
+DLL (`63EA3C52...`, tag `fc6bfcae`), so stacks inside the DLL will show module + offset unless a later session rebuilds that
+commit. Do not run "Update virtual camera" for this.
+
+Before you start: no other app may use the Better Cam camera, and the test lock must be free (a waiting harness would keep
+the trace running): `Test-Path C:\Users\Obnoxious\AppData\Local\Temp\opencode\app-test.lock` must print `False`.
+
+1. **Elevated** PowerShell (Run as administrator), start the trace:
+
+   ```powershell
+   cd C:\Users\Obnoxious\AppData\Local\Temp\opencode\fe0
+   New-Item -ItemType Directory -Force wpr | Out-Null
+   wpr -cancel 2>$null
+   wpr -start CPU -filemode
+   ```
+
+2. Straight after, in a **normal (not elevated)** PowerShell, run the 1080p60 test (it takes the lock, waits 10 s idle, runs
+   the engine and the consumer for about 35 s, prints the summary and releases the lock; about 50 s in all):
+
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\Obnoxious\AppData\Local\Temp\opencode\fe0\fe0_batch.ps1 -Names synth1080_none -Tag wpr_
+   ```
+
+   Optional, about 20 s after it started (while the stream runs), in the elevated shell, for the timer-resolution request of the
+   service (a 20 s report, check "Platform Timer Resolution"):
+
+   ```powershell
+   powercfg /energy /duration 20 /output C:\Users\Obnoxious\AppData\Local\Temp\opencode\fe0\wpr\energy_during_stream.html
+   ```
+
+3. When step 2 prints `lock released after ... s`, stop the trace in the elevated shell (takes 1 to 2 minutes; the file is a few
+   hundred MB):
+
+   ```powershell
+   wpr -stop C:\Users\Obnoxious\AppData\Local\Temp\opencode\fe0\wpr\fs_1080p60_fc6bfcae.etl "Better Cam frame event phase 0"
+   ```
+
+4. Send back: nothing to copy, just tell the next session that the trace exists. It reads
+   `C:\Users\Obnoxious\AppData\Local\Temp\opencode\fe0\wpr\fs_1080p60_fc6bfcae.etl` (plus `energy_during_stream.html` if made)
+   and the matching harness output `fe0\wpr_synth1080_none_r1.summary.txt` / `.threads.csv` (thread ids and process CPU of the same
+   run). Say if step 2 printed anything other than `lock taken ...`, `lock released ...` and a summary with `PASS` lines, or if
+   `wpr -stop` reported dropped events. Do not start Better Cam or any camera app until `wpr -stop` has finished.
+
+   The analysing session starts from: FrameServer svchost pid = the `pid(s)` on the "idle baseline" line of the summary; the pump
+   = the new thread of that pid with about 340 context switches/s; its readying process = the engine's render thread (event
+   build) or the timer (today).
+

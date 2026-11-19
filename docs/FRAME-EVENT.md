@@ -39,6 +39,14 @@ the worst case is today's behaviour. **Gate it on Phase 0** (one measuring sessi
 measurement confirms that polls cost under about 0.3 % of a core at 1080p60, the owner decides whether the latency and
 slow-camera gains justify a change to privileged code, or re-baselines the 1 % target (open question 1).
 
+**Phase 0 verdict (2026-11-19, unelevated part measured; WPR trace still to do, see `PERF.md` "Frame event, phase 0"):** 1 %
+of the whole service at 1080p60 is **not reachable with the event**. Measured: service 1.30 to 1.55 %, pump thread 0.78 to
+1.07 % (copy about 0.7 to 0.8 %), Frame Server's own threads 0.47 to 0.53 %, so even with zero polling cost the floor is about
+1.2 to 1.3 %. The pump wakes about 340 times a second at 1080p60 (confirmed, 330 to 360 predicted); the event removes about 220/s
+for **about 0.1 % of a core (0.05 to 0.26 %)**, so the gate's "polls under about 0.3 %" holds. The slow-camera case is bigger:
+about 600 fewer wake-ups a second live, **0.12 to 0.36 %** of a pump at 0.74 to 1.06 %. These savings are estimates from measured
+context switches and a fitted cost per wake-up, not measurements of an event build.
+
 ## What exists today (the facts the design builds on)
 
 | Fact | Where |
