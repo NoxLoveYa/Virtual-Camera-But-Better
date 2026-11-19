@@ -12,6 +12,10 @@ const PATHS = {
   play: "M5 3.5v9l7.5-4.5z",
   stop: "M4.5 4.5h7v7h-7z",
   pause: "M5.5 3.5v9M10.5 3.5v9",
+  more: "M3.5 8v.01M8 8v.01M12.5 8v.01",
+  camera: "M2 5.5h2.5L5.7 4h4.6l1.2 1.5H14v7H2zM8 7.1a2.2 2.2 0 100 4.4 2.2 2.2 0 000-4.4z",
+  sliders: "M2 4.5h3.5M9 4.5h5M2 8h6M11.5 8H14M2 11.5h2M7.5 11.5H14M7 3v3M10 6.5v3M5 10v3",
+  output: "M2 3.5h12v8H2zM6 14h4M8 11.5V14",
 } as const;
 
 export type IconName = keyof typeof PATHS;
@@ -24,7 +28,7 @@ export function Icon({ name, size = 14 }: { name: IconName; size?: number }) {
       viewBox="0 0 16 16"
       fill="none"
       stroke="currentColor"
-      strokeWidth={name === "grip" ? 2 : 1.5}
+      strokeWidth={name === "grip" || name === "more" ? 2 : 1.5}
       strokeLinecap="round"
       strokeLinejoin="round"
       aria-hidden

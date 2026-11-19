@@ -6,6 +6,7 @@ import { useStore, type EngineInfo, type VcamAction } from "../store";
 import { ExtensionsPanel } from "./ExtensionsPanel";
 import { Icon as Glyph } from "./Icon";
 import { Popover } from "./Popover";
+import { PresetMenu } from "./PresetMenu";
 
 const win = getCurrentWindow();
 
@@ -200,6 +201,9 @@ export function TitleBar() {
         <span className={`dot ${status.dot}`} />
         <span className="name">Better Cam</span>
         <span className={`status ${status.tone}`}>{status.text}</span>
+      </div>
+      <div className="title-presets">
+        <PresetMenu />
       </div>
       <div className="actions">
         <button

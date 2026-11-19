@@ -12,8 +12,10 @@ import type { PointerEvent as ReactPointerEvent } from "react";
 import { create } from "zustand";
 import { useStore } from "../store";
 import { labelOf, type FilterKind } from "../filters/schema";
-import { edgeSpeed, insertionIndex } from "./chainDrag";
+import { edgeSpeed } from "./chainDrag";
+import { gapAt } from "./chainGeometry";
 import { classifyPress, overChain } from "./insertDrag";
+import { focusNavRow } from "./navFocus";
 import { findScroller } from "./useChainDrag";
 
 /** What the page draws while a filter is dragged out of the menu. */
@@ -22,7 +24,7 @@ export interface InsertView {
   /** The pointer, in client pixels: the chip follows it. */
   x: number;
   y: number;
-  /** Where the line goes in `.chain-block`; `null` while the pointer is not over the chain (a drop would add nothing). */
+  /** Where the line goes in the navigator's filter block; `null` while the pointer is not over the chain (a drop would add nothing). */
   lineTop: number | null;
 }
 
@@ -46,34 +48,17 @@ interface Session {
 
 let session: Session | null = null;
 
-/** The gap of the chain under client `y` and where its line goes (relative to `.chain-block`); `null` without a chain block. */
-function gapAt(block: HTMLElement, y: number): { k: number; lineTop: number } | null {
-  const ol = block.querySelector<HTMLElement>(".chain");
-  if (!ol) return null;
-  const items = Array.from(ol.children) as HTMLElement[];
-  if (items.length === 0) return null;
-  const top = block.getBoundingClientRect().top;
-  // An empty chain shows its hint between the terminals: the line goes at the top of that box, not through the text.
-  const empty = ol.querySelector(".empty");
-  if (empty && !items.some((li) => li.classList.contains("step"))) return { k: 0, lineTop: Math.round(empty.getBoundingClientRect().top - top - 1) };
-  const cards = items.filter((li) => li.classList.contains("step")).map((li) => (li.querySelector(".card") ?? li).getBoundingClientRect());
-  const k = insertionIndex(cards.map((r) => r.top + r.height / 2), y);
-  const above = k === 0 ? items[0].getBoundingClientRect().bottom : cards[k - 1].bottom;
-  const below = k === cards.length ? items[items.length - 1].getBoundingClientRect().top : cards[k].top;
-  return { k, lineTop: Math.round((above + below) / 2 - top - 1) };
-}
-
 /** Works out the gap under the pointer (the chain may have scrolled since the last move) and publishes the view. */
 function refresh(s: Session) {
   const block = document.querySelector<HTMLElement>('[data-drop="chain"]');
   const hit = block && s.scroller && overChain(s.x, s.y, block.getBoundingClientRect(), s.scroller.getBoundingClientRect()) ? gapAt(block, s.y) : null;
-  s.k = hit?.k ?? null;
+  s.k = hit?.gap ?? null;
   useInsertView.setState({ view: { label: s.label, x: s.x, y: s.y, lineTop: hit?.lineTop ?? null } });
 }
 
 function activate(s: Session, onActivate: () => void) {
   s.started = true;
-  s.scroller = findScroller(document.querySelector<HTMLElement>('[data-drop="chain"] .chain'));
+  s.scroller = findScroller(document.querySelector<HTMLElement>('[data-drop="chain"] ol.chain'));
   onActivate();
   document.body.classList.add("reordering");
   getSelection()?.removeAllRanges();
@@ -104,7 +89,7 @@ function finish(ok: boolean) {
   session = null;
   s.cleanups.forEach((fn) => fn());
   useInsertView.setState({ view: null });
-  if (ok && s.started && s.k !== null) useStore.getState().addFilter(s.kind, s.k);
+  if (ok && s.started && s.k !== null) focusNavRow(useStore.getState().addFilter(s.kind, s.k));
 }
 
 /**

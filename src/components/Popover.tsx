@@ -15,7 +15,7 @@ interface Props {
   label?: string;
   /** Move the focus into the panel when it opens (its first switch, else its first button), and back to the anchor on Escape. */
   autoFocusFirst?: boolean;
-  /** Open upwards when the room above the anchor is larger than the room below (an anchor low in the window). */
+  /** Open on the side of the anchor that has more room, up or down (an anchor low in the window opens upwards). */
   flip?: boolean;
   className?: string;
 }
@@ -39,7 +39,7 @@ export function Popover({ open, onClose, anchor, children, align = "left", match
     const r = ref.current.getBoundingClientRect();
     const below = window.innerHeight - r.bottom - 14;
     const above = r.top - 14;
-    const up = flip === true && below < 300 && above > below;
+    const up = flip === true && above > below;
     setPlace({
       ...(up ? { bottom: window.innerHeight - r.top + 6 } : { top: r.bottom + 6 }),
       ...(align === "left" ? { left: r.left } : { right: window.innerWidth - r.right }),

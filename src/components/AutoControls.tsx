@@ -190,7 +190,7 @@ export function ExposureAuto({ info, ctx }: { info: ControlInfo; ctx: AutoCtx })
         stops && (
           <p className="ctl-hint">
             Add Auto Adjust for the fine trim.
-            <button type="button" className="link" onClick={() => addFilter("auto_adjust")}>
+            <button type="button" className="link" onClick={() => addFilter("auto_adjust", undefined, undefined, { select: false })}>
               Add Auto Adjust
             </button>
           </p>
@@ -278,7 +278,7 @@ export function WhiteBalanceAuto({ ctx }: { ctx: AutoCtx }) {
         ) : (
           <p className="ctl-hint" data-hint="finish-colour">
             Add Auto Adjust to finish the colour.
-            <button type="button" className="link" onClick={() => addFilter("auto_adjust")}>
+            <button type="button" className="link" onClick={() => addFilter("auto_adjust", undefined, undefined, { select: false })}>
               Add Auto Adjust
             </button>
           </p>

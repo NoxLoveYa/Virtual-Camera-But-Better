@@ -1,72 +1,157 @@
 /**
- * Pure logic of the window layout (W3): the column split ratio and the saved fold/split state (`Saved.ui`).
- * No DOM and no store here, so `layout.test.ts` can run it in node.
+ * Pure logic of the window layout: the three docked regions (navigator | preview | inspector), their widths, the keys
+ * of the two splitters, the saved state (`Saved.ui`) and the selection rule. No DOM and no store here, so
+ * `layout.test.ts` can run it in node.
  */
 
-/** The left column's share of the body today (6fr : 7fr). */
-export const DEFAULT_SPLIT = 6 / 13;
-/** The left column never gets narrower than this (the camera panel's two-column fields), nor the right one (a card's two parameter columns plus the rail). */
-export const MIN_LEFT = 440;
-export const MIN_RIGHT = 420;
-/** Arrow keys on the splitter: 2 % of the body, 10 % with Shift. */
-export const KEY_STEP = 0.02;
-export const KEY_STEP_BIG = 0.1;
+/** Width of the 1 px hairline between two regions. */
+export const HAIRLINE = 1;
+/** The navigator's drag range, and its auto width `clamp(200px, 17vw, 260px)`. */
+export const NAV_MIN = 184;
+export const NAV_MAX = 320;
+export const NAV_AUTO_MIN = 200;
+export const NAV_AUTO_MAX = 260;
+export const NAV_AUTO_VW = 0.17;
+/** The inspector's drag range, and its auto width `clamp(340px, 25vw, 460px)`. */
+export const INSPECTOR_MIN = 300;
+export const INSPECTOR_MAX = 560;
+export const INSPECTOR_AUTO_MIN = 340;
+export const INSPECTOR_AUTO_MAX = 460;
+export const INSPECTOR_AUTO_VW = 0.25;
+/** The centre (the preview) never gets narrower than this: the navigator and the inspector give way first. */
+export const CENTER_MIN = 360;
+/** Arrow keys on a splitter: 16 px, 64 px with Shift. */
+export const KEY_STEP = 16;
+export const KEY_STEP_BIG = 64;
 
-/** What `Saved.ui` holds: the split ratio (left width / body width) and which panels are open. */
+/** What `Saved.ui` holds. */
 export interface UiState {
-  split: number;
-  camera: boolean;
-  controls: boolean;
-  output: boolean;
+  /** Navigator width in px; null = auto (clamp(200, 17vw, 260)). */
+  navWidth: number | null;
+  /** Inspector width in px; null = auto (clamp(340, 25vw, 460)). */
+  inspectorWidth: number | null;
+  /** The user collapsed the navigator to the rail (below 1100 px it is the rail anyway). */
+  navRail: boolean;
+  /** "camera" | "controls" | "output" | "filter:<id>". */
+  selected: string;
+  /** The Advanced group of the Camera inspector is open. */
   advanced: boolean;
 }
 
-export const DEFAULT_UI: UiState = { split: DEFAULT_SPLIT, camera: true, controls: true, output: true, advanced: false };
+export const DEFAULT_UI: UiState = { navWidth: null, inspectorWidth: null, navRail: false, selected: "camera", advanced: false };
 
-/** The saved value, repaired: a number outside (0.05, 0.95) or a non-number is the default; flags default to the table above. */
+const SECTIONS = ["camera", "controls", "output"] as const;
+const FILTER_PREFIX = "filter:";
+
+/** The selection string of a filter. */
+export const filterSelection = (id: string) => `${FILTER_PREFIX}${id}`;
+/** The filter id a selection names, or null for a section. */
+export const selectedFilterId = (selected: string): string | null => (selected.startsWith(FILTER_PREFIX) ? selected.slice(FILTER_PREFIX.length) : null);
+
+const isSelection = (v: unknown): v is string =>
+  typeof v === "string" && ((SECTIONS as readonly string[]).includes(v) || (v.startsWith(FILTER_PREFIX) && v.length > FILTER_PREFIX.length));
+
+const width = (v: unknown, min: number, max: number): number | null =>
+  typeof v === "number" && Number.isFinite(v) && v >= min && v <= max ? Math.round(v) : null;
+
+/**
+ * The saved value, repaired: a width outside its drag range or a non-number is `null` (auto), a selection that is not
+ * one of the four shapes is "camera", flags default to the table above. The old `split`, `camera`, `controls` and
+ * `output` keys are dropped.
+ */
 export function normalizeUi(raw: unknown): UiState {
   const r = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
-  const split = typeof r.split === "number" && Number.isFinite(r.split) && r.split > 0.05 && r.split < 0.95 ? r.split : DEFAULT_SPLIT;
   return {
-    split,
-    camera: r.camera !== false,
-    controls: r.controls !== false,
-    output: r.output !== false,
+    navWidth: width(r.navWidth, NAV_MIN, NAV_MAX),
+    inspectorWidth: width(r.inspectorWidth, INSPECTOR_MIN, INSPECTOR_MAX),
+    navRail: r.navRail === true,
+    selected: isSelection(r.selected) ? r.selected : DEFAULT_UI.selected,
     advanced: r.advanced === true,
   };
 }
 
-/** The ratios the splitter may take in a body `total` px wide. A body too narrow for both minimums has one ratio: the default. */
-export function splitBounds(total: number): { min: number; max: number } {
-  if (!(total > 0)) return { min: DEFAULT_SPLIT, max: DEFAULT_SPLIT };
-  const min = MIN_LEFT / total;
-  const max = 1 - MIN_RIGHT / total;
-  return min > max ? { min: DEFAULT_SPLIT, max: DEFAULT_SPLIT } : { min, max };
+const clamp = (v: number, min: number, max: number) => Math.min(max, Math.max(min, v));
+
+/** `clamp(200px, 17vw, 260px)`. `total` is the workspace width, which is the window width. */
+export const autoNavWidth = (total: number) => Math.round(clamp(total * NAV_AUTO_VW, NAV_AUTO_MIN, NAV_AUTO_MAX));
+/** `clamp(340px, 25vw, 460px)`. */
+export const autoInspectorWidth = (total: number) => Math.round(clamp(total * INSPECTOR_AUTO_VW, INSPECTOR_AUTO_MIN, INSPECTOR_AUTO_MAX));
+
+/** What the workspace width minus its two hairlines leaves for the three regions. */
+const roomOf = (total: number) => total - 2 * HAIRLINE;
+
+/** The room the navigator may take: up to its own maximum, leaving the inspector at least its minimum and the centre its own. */
+const navCeiling = (total: number) => Math.max(NAV_MIN, Math.min(NAV_MAX, roomOf(total) - INSPECTOR_MIN - CENTER_MIN));
+
+export interface Widths {
+  nav: number;
+  inspector: number;
+  /** What is left for the preview. */
+  center: number;
 }
 
-export function clampSplit(ratio: number, total: number): number {
-  const { min, max } = splitBounds(total);
-  return Math.min(max, Math.max(min, ratio));
+/**
+ * The widths the three regions have in a workspace `total` px wide: the navigator is its saved or auto width clamped to
+ * [184, room − 300 − 360]; the inspector is its saved or auto width clamped to [300, min(560, room − nav − 360)]. The
+ * saved values are never changed by a narrow window, so widening the window restores them.
+ */
+export function effectiveWidths(total: number, navSaved: number | null, inspectorSaved: number | null): Widths {
+  const nav = clamp(navSaved ?? autoNavWidth(total), NAV_MIN, navCeiling(total));
+  const inspectorMax = Math.max(INSPECTOR_MIN, Math.min(INSPECTOR_MAX, roomOf(total) - nav - CENTER_MIN));
+  const inspector = clamp(inspectorSaved ?? autoInspectorWidth(total), INSPECTOR_MIN, inspectorMax);
+  return { nav, inspector, center: roomOf(total) - nav - inspector };
 }
 
-/** The ratio for a left column `left` px wide. */
-export const splitFromWidth = (left: number, total: number): number => clampSplit(left / total, total);
+export type Side = "nav" | "inspector";
 
-/** The ratio after a key press on the splitter, or null for a key it does not handle. */
-export function splitAfterKey(key: string, shift: boolean, current: number, total: number): number | null {
+/**
+ * The widths a splitter may take, given the other region's current width. Dragging the navigator leaves the inspector
+ * as it is, and the other way round.
+ */
+export function widthRange(side: Side, total: number, other: number): { min: number; max: number } {
+  if (side === "nav") return { min: NAV_MIN, max: Math.max(NAV_MIN, Math.min(NAV_MAX, roomOf(total) - other - CENTER_MIN)) };
+  return { min: INSPECTOR_MIN, max: Math.max(INSPECTOR_MIN, Math.min(INSPECTOR_MAX, roomOf(total) - other - CENTER_MIN)) };
+}
+
+/** The width after dragging `dx` px to the right from `start` (the inspector's left edge: to the right is narrower). */
+export function widthFromDrag(side: Side, start: number, dx: number, range: { min: number; max: number }): number {
+  return Math.round(clamp(side === "nav" ? start + dx : start - dx, range.min, range.max));
+}
+
+/**
+ * What a key does to a splitter: the new width, `null` for "back to auto" (Enter), `undefined` for a key it does not
+ * handle. The arrows move the line the way they point, so for the inspector ArrowLeft widens it. Home and End go to the
+ * left-most and right-most line, which are the smallest and the largest navigator, the largest and the smallest inspector.
+ */
+export function widthAfterKey(side: Side, key: string, shift: boolean, current: number, range: { min: number; max: number }): number | null | undefined {
   const step = shift ? KEY_STEP_BIG : KEY_STEP;
+  const towards = (dir: 1 | -1) => clamp(current + (side === "nav" ? dir : -dir) * step, range.min, range.max);
   switch (key) {
     case "ArrowLeft":
-      return clampSplit(current - step, total);
+      return towards(-1);
     case "ArrowRight":
-      return clampSplit(current + step, total);
+      return towards(1);
     case "Home":
-      return splitBounds(total).min;
+      return side === "nav" ? range.min : range.max;
     case "End":
-      return splitBounds(total).max;
+      return side === "nav" ? range.max : range.min;
     case "Enter":
-      return clampSplit(DEFAULT_SPLIT, total);
-    default:
       return null;
+    default:
+      return undefined;
   }
+}
+
+/**
+ * The selection after the chain changed from `prev` to `next`: unchanged while the selected filter is still there (or a
+ * section is selected); else the filter that took its place (the next one, else the previous one), else "output" (the
+ * row above FILTERS). A selected filter that was not in `prev` either is "camera".
+ */
+export function selectionAfter(prev: readonly { id: string }[], next: readonly { id: string }[], selected: string): string {
+  const id = selectedFilterId(selected);
+  if (id === null || next.some((f) => f.id === id)) return selected;
+  const i = prev.findIndex((f) => f.id === id);
+  if (i < 0) return DEFAULT_UI.selected;
+  if (next.length === 0) return "output";
+  return filterSelection(next[Math.min(i, next.length - 1)].id);
 }

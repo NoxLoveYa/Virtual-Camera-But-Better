@@ -1,9 +1,12 @@
 /**
  * Reorder of the filter chain by pointer and by keyboard (W1). The pure rules (which gap the pointer is in, how fast the
- * column scrolls, what the arrow keys do) are in `chainDrag.ts`; this file wires them to pointer events, the scrolling
- * column and the store.
+ * column scrolls, what the arrow keys do) are in `chainDrag.ts`, the row geometry in `chainGeometry.ts`; this file wires
+ * them to pointer events, the scrolling navigator and the store.
  *
- * Nothing is written to the store while a card is being dragged or lifted: only the state that draws the drop line, the
+ * The rows are the navigator's (`li.nav-step[data-filter-id]`). A drag or a lift can start on a row or on the inspector's
+ * grip: either way the drop line is drawn in the navigator list.
+ *
+ * Nothing is written to the store while a filter is being dragged or lifted: only the state that draws the drop line, the
  * lifted copy and the faded slot changes. The order is committed once, on drop, through `moveFilter` (one `set_chain`,
  * one Undo step). Cancelling never touches the store.
  */
@@ -11,6 +14,7 @@ import { useLayoutEffect, useEffect, useMemo, useRef, useState, type KeyboardEve
 import { useStore } from "../store";
 import { labelOf } from "../filters/schema";
 import { DRAG_THRESHOLD, edgeSpeed, finalIndex, insertionIndex, keyboardGap, snapToSource, type StepKey } from "./chainDrag";
+import { gapLine, rowRects } from "./chainGeometry";
 
 export interface DragView {
   id: string;
@@ -20,7 +24,7 @@ export interface DragView {
   mode: "pointer" | "keyboard";
 }
 
-/** The copy of the card's header that follows the pointer. */
+/** The copy of the filter's row that follows the pointer. */
 export interface LiftView {
   id: string;
   label: string;
@@ -38,61 +42,75 @@ interface Session {
   pointerId: number;
   startX: number;
   startY: number;
-  /** Latest pointer Y in client pixels. */
+  /** Latest pointer position in client pixels. */
+  x: number;
   y: number;
-  /** Distance from the card's top edge to the pointer at the press: the lifted copy keeps it. */
+  /** Distance from the row's top edge to the pointer at the press: the lifted copy keeps it. */
   grabY: number;
+  /** A drag that started outside the navigator (the inspector's grip): the lifted copy follows the pointer sideways too, with this offset. */
+  grabX: number | null;
   left: number;
   width: number;
   cleanups: Array<() => void>;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Focus: a moved card keeps the focus on the control the user was on.
+// Focus: a moved row keeps the focus on the control the user was on. Only a focus in a navigator row is put back: a move
+// does not touch the inspector's DOM, so its focus survives (the grip, a range input). The one exception is the
+// inspector header's Move up / Move down, which can disable themselves at an end of the chain.
 
 interface FocusSpot {
   id: string;
   index: number;
   act?: string;
+  /** Where the focus was: a navigator row, or the inspector. */
+  scope: "nav" | "inspector";
 }
 
 const FOCUSABLE = "button, input, select, textarea, a[href], [tabindex]";
 
-const cardOf = (id: string) => document.querySelector<HTMLElement>(`[data-filter-id="${CSS.escape(id)}"]`);
+/** The navigator row of a filter. */
+const rowOf = (id: string) => document.querySelector<HTMLElement>(`li.nav-step[data-filter-id="${CSS.escape(id)}"]`);
+const inspectorOf = (id: string) => document.querySelector<HTMLElement>(`[data-inspects="${CSS.escape(id)}"]`);
 
-/** The card's own controls, without the "+" of the gap above it (the first card has none, so counting it would shift the index when a card moves to or from the top). */
-const focusablesOf = (card: HTMLElement) => Array.from(card.querySelectorAll<HTMLElement>(FOCUSABLE)).filter((el) => !el.closest(".gap-add"));
+/** The row's own controls, without the "+" of the gap above it (the first row has none, so counting it would shift the index when a row moves to or from the top). */
+const focusablesOf = (row: HTMLElement) => Array.from(row.querySelectorAll<HTMLElement>(FOCUSABLE)).filter((el) => !el.closest(".gap-add"));
 
 function captureFocus(): FocusSpot | null {
   const el = document.activeElement as HTMLElement | null;
-  const card = el?.closest<HTMLElement>("[data-filter-id]");
-  if (!el || !card?.dataset.filterId || el.closest(".gap-add")) return null;
-  return { id: card.dataset.filterId, index: focusablesOf(card).indexOf(el), act: el.dataset.act };
+  if (!el || el.closest(".gap-add")) return null;
+  const row = el.closest<HTMLElement>("li.nav-step[data-filter-id]");
+  if (row?.dataset.filterId) return { id: row.dataset.filterId, index: focusablesOf(row).indexOf(el), act: el.dataset.act, scope: "nav" };
+  const insp = el.closest<HTMLElement>("[data-inspects]");
+  if (insp?.dataset.inspects && (el.dataset.act === "up" || el.dataset.act === "down")) {
+    return { id: insp.dataset.inspects, index: -1, act: el.dataset.act, scope: "inspector" };
+  }
+  return null;
 }
 
-/** After the next frame, focuses the same control of the same card. A "Move up" that became disabled hands over to "Move down" (and the reverse). */
+/** After the next frame, focuses the same control of the same row. A "Move up" that became disabled hands over to "Move down" (and the reverse). */
 function restoreFocus(spot: FocusSpot | null) {
   if (!spot) return;
   requestAnimationFrame(() => {
-    const card = cardOf(spot.id);
-    if (!card) return;
-    let target: HTMLElement | null = focusablesOf(card)[spot.index] ?? null;
+    const root = spot.scope === "nav" ? rowOf(spot.id) : inspectorOf(spot.id);
+    if (!root) return;
+    let target: HTMLElement | null = spot.scope === "nav" ? (focusablesOf(root)[spot.index] ?? null) : root.querySelector<HTMLElement>(`[data-act="${spot.act}"]`);
     if (!target || (target as HTMLButtonElement).disabled) {
       const other = spot.act === "up" ? "down" : spot.act === "down" ? "up" : "grip";
-      target = card.querySelector<HTMLElement>(`[data-act="${other}"]:not(:disabled)`) ?? card.querySelector<HTMLElement>('[data-act="grip"]');
+      target = root.querySelector<HTMLElement>(`[data-act="${other}"]:not(:disabled)`) ?? root.querySelector<HTMLElement>('[data-act="grip"]');
     }
     target?.focus();
   });
 }
 
-/** Moves a card (with its Undo toast) and keeps the focus on the control that was used. */
+/** Moves a filter (with its Undo toast) and keeps the focus on the control that was used. */
 export function moveWithFocus(from: number, to: number) {
   const spot = captureFocus();
   useStore.getState().moveFilter(from, to);
   restoreFocus(spot);
 }
 
-/** The nearest ancestor that scrolls (`.col-right` in two columns, `.cols` when stacked: there `.col` is `display: contents`). */
+/** The nearest ancestor that scrolls (`.nav-scroll`, the navigator's list). */
 export function findScroller(from: HTMLElement | null): HTMLElement {
   for (let p = from?.parentElement; p; p = p.parentElement) {
     const o = getComputedStyle(p).overflowY;
@@ -120,24 +138,19 @@ export function useChainDrag() {
   const api = useMemo(() => {
     const say = (text: string) => setAnnouncement(text);
 
-    /** Rects of the cards and of the two terminals, to place the line and to find the gap under the pointer. */
+    /** Rects of the rows, the list and the block, to place the line and to find the gap under the pointer. */
     const measure = () => {
       const ol = chainRef.current;
       const block = blockRef.current;
       if (!ol || !block) return null;
-      const items = Array.from(ol.children) as HTMLElement[];
-      const cards = items.filter((li) => li.classList.contains("step")).map((li) => (li.querySelector(".card") ?? li).getBoundingClientRect());
+      const cards = rowRects(block);
       if (cards.length === 0) return null;
-      return { cards, first: items[0].getBoundingClientRect(), last: items[items.length - 1].getBoundingClientRect(), block: block.getBoundingClientRect() };
+      return { cards, list: ol.getBoundingClientRect(), block: block.getBoundingClientRect() };
     };
     type Measure = NonNullable<ReturnType<typeof measure>>;
 
-    /** The line goes in the middle of the gap above card k (under the last card for k = n). */
-    const gapTop = (m: Measure, k: number) => {
-      const above = k === 0 ? m.first.bottom : m.cards[k - 1].bottom;
-      const below = k === m.cards.length ? m.last.top : m.cards[k].top;
-      return Math.round((above + below) / 2 - m.block.top - 1);
-    };
+    /** The line goes in the middle of the gap above row k (under the last row for k = n). */
+    const gapTop = (m: Measure, k: number) => gapLine(m.cards, k, m.list.top, m.list.bottom, m.block.top);
 
     const showGap = (k: number) => {
       const m = measure();
@@ -165,6 +178,16 @@ export function useChainDrag() {
       const el = liftRef.current;
       if (!s || !el) return;
       el.style.top = `${Math.max(0, Math.min(window.innerHeight - el.offsetHeight, s.y - s.grabY))}px`;
+      if (s.grabX !== null) el.style.left = `${Math.max(0, Math.min(window.innerWidth - el.offsetWidth, s.x - s.grabX))}px`;
+    };
+
+    /** When the last pointer drag ended (0: none): the click that follows a drag must not select the row. */
+    let dragEnd = 0;
+    /** True once for the click that comes straight after a pointer drag ended on the element it started on. */
+    const consumeDragClick = () => {
+      const was = performance.now() - dragEnd < 100;
+      dragEnd = 0;
+      return was;
     };
 
     const commit = (s: Session, announce: boolean) => {
@@ -185,6 +208,7 @@ export function useChainDrag() {
       const s = session.current;
       if (!s) return;
       if (ok && s.started && s.mode === "pointer") updatePointer();
+      if (s.started && s.mode === "pointer") dragEnd = performance.now();
       session.current = null;
       s.cleanups.forEach((fn) => fn());
       setDrag(null);
@@ -229,8 +253,11 @@ export function useChainDrag() {
       const chain = useStore.getState().chain;
       const from = chain.findIndex((f) => f.id === id);
       const target = e.currentTarget;
-      const card = target.closest(".card")?.getBoundingClientRect();
-      if (from < 0 || chain.length < 2 || !card) return;
+      const row = rowOf(id)?.getBoundingClientRect();
+      if (from < 0 || chain.length < 2 || !row) return;
+      // On a navigator row the lifted copy stays over the row's column; from the inspector's grip the pointer is somewhere
+      // else, so the copy hangs from the pointer (half a row down and a little to the right).
+      const onRow = target.closest("li.nav-step") !== null;
 
       const s: Session = {
         id,
@@ -241,10 +268,12 @@ export function useChainDrag() {
         pointerId: e.pointerId,
         startX: e.clientX,
         startY: e.clientY,
+        x: e.clientX,
         y: e.clientY,
-        grabY: e.clientY - card.top,
-        left: card.left,
-        width: card.width,
+        grabY: onRow ? e.clientY - row.top : row.height / 2,
+        grabX: onRow ? null : 16,
+        left: onRow ? row.left : e.clientX - 16,
+        width: row.width,
         cleanups: [],
       };
       session.current = s;
@@ -259,6 +288,7 @@ export function useChainDrag() {
       const scroller = findScroller(chainRef.current);
       const move = (ev: PointerEvent) => {
         if (ev.pointerId !== s.pointerId) return;
+        s.x = ev.clientX;
         s.y = ev.clientY;
         if (!s.started) {
           if (Math.hypot(ev.clientX - s.startX, ev.clientY - s.startY) < DRAG_THRESHOLD) return;
@@ -315,7 +345,7 @@ export function useChainDrag() {
       const chain = useStore.getState().chain;
       const from = chain.findIndex((f) => f.id === id);
       if (session.current || from < 0 || chain.length < 2) return;
-      const s: Session = { id, from, k: from, mode: "keyboard", started: true, pointerId: 0, startX: 0, startY: 0, y: 0, grabY: 0, left: 0, width: 0, cleanups: [] };
+      const s: Session = { id, from, k: from, mode: "keyboard", started: true, pointerId: 0, startX: 0, startY: 0, x: 0, y: 0, grabY: 0, grabX: null, left: 0, width: 0, cleanups: [] };
       session.current = s;
       const abort = () => finish(false);
       window.addEventListener("blur", abort);
@@ -369,7 +399,7 @@ export function useChainDrag() {
       if (s && s.mode === "keyboard" && s.id === id) finish(false);
     };
 
-    /** Alt+ArrowUp / Alt+ArrowDown with the focus anywhere inside a card moves it one step. */
+    /** Alt+ArrowUp / Alt+ArrowDown with the focus on the filter's navigator row or anywhere in its inspector moves it one step. */
     const onCardKeyDown = (e: ReactKeyboardEvent<HTMLElement>, id: string) => {
       if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown")) return;
       e.preventDefault();
@@ -382,7 +412,7 @@ export function useChainDrag() {
       say(`${labelAt(to)} moved to step ${to + 1}.`);
     };
 
-    return { moveLift, onPointerDown, onGripKeyDown, onGripBlur, onCardKeyDown, cancel: () => finish(false) };
+    return { moveLift, onPointerDown, onGripKeyDown, onGripBlur, onCardKeyDown, consumeDragClick, cancel: () => finish(false) };
   }, []);
 
   // The lifted copy is mounted after the first move: put it at the pointer before it is painted.
@@ -393,9 +423,9 @@ export function useChainDrag() {
   // Leaving the page in the middle of a drag releases everything it holds.
   useEffect(() => api.cancel, [api]);
 
-  // `handlers` is one object for the life of the component, so a memoised card does not re-render for it.
+  // `handlers` is one object for the life of the component, so a memoised row does not re-render for it.
   return { drag, lineTop, lift, announcement, chainRef, blockRef, liftRef, handlers: api };
 }
 
-/** The pointer and key handlers of a card; the same object on every render. */
+/** The pointer and key handlers of a row or an inspector; the same object on every render. */
 export type ChainHandlers = ReturnType<typeof useChainDrag>["handlers"];
