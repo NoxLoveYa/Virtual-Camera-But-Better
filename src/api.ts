@@ -2,6 +2,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import type { ExtensionInfo, FilterCfg } from "./filters/schema";
 import { presetChain, presetFile } from "./filters/chain";
+import type { PresetFileV2 } from "./presets/preset";
 import { answerFlushRequest } from "./ui/saver";
 import type { PreviewPoint } from "./ui/previewFrame";
 import type { AutoCfg, AutoStatus, CameraInfo, ControlInfo, ControlKey, ControlMode, Learned, OutputCfg, SourceCfg, StoredControl } from "./camera/schema";
@@ -188,6 +189,12 @@ export const api = {
    */
   loadPreset: (name: string, extensions: readonly ExtensionInfo[] = []) =>
     invoke<unknown>("load_preset", { name }).then((raw) => presetChain(raw, extensions)),
+  /** Writes a version 2 preset file (see `presetFileOf`) under `name`; ids are dropped, the file is replaced atomically. */
+  savePresetFile: (name: string, file: PresetFileV2) => invoke<void>("save_preset", { name, preset: file }),
+  /** The preset file as the backend returns it (`chain`, and `camera` and `output` when the file has them), still raw: run it through `parsePreset`. */
+  loadPresetRaw: (name: string) => invoke<unknown>("load_preset", { name }),
+  /** Renames a preset file. Rejects when `from` is missing or `to` is another preset; a change of letter case only is allowed. */
+  renamePreset: (from: string, to: string) => invoke<void>("rename_preset", { from, to }),
   deletePreset: (name: string) => invoke<void>("delete_preset", { name }),
   /**
    * The preset file at `path` (a file dropped on the window; the object format, or the old bare array wrapped in it),

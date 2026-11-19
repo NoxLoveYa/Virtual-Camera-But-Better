@@ -234,8 +234,8 @@ export const nearestInterval = (intervals: number[], target: number): number | n
 // Finding the camera a config names
 
 /** The link without its reference string (`\global`), lower case: the part Windows keeps stable. */
-const linkKey = (id: string) => id.toLowerCase().replace(/\\[^\\]*$/, "");
-const vidPid = (id: string) => /vid_[0-9a-f]{4}&pid_[0-9a-f]{4}/i.exec(id)?.[0].toLowerCase() ?? null;
+export const linkKey = (id: string) => id.toLowerCase().replace(/\\[^\\]*$/, "");
+export const vidPid = (id: string) => /vid_[0-9a-f]{4}&pid_[0-9a-f]{4}/i.exec(id)?.[0].toLowerCase() ?? null;
 
 /** The camera `id` names: the same link, else the only camera with the same vid/pid (the device moved to another port). */
 export const findCamera = (cams: CameraInfo[], id: string | null): CameraInfo | null => {

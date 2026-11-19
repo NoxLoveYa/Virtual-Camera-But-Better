@@ -264,6 +264,7 @@ fn main() {
             commands::set_close_to_tray,
             commands::list_presets,
             commands::save_preset,
+            commands::rename_preset,
             commands::load_preset,
             commands::delete_preset,
             commands::read_preset_file,
