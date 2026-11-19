@@ -81,10 +81,8 @@ pub(crate) fn with_nonces<R>(nonces: Vec<io::Result<u128>>, run: impl FnOnce() -
 
 // ---- helpers ---------------------------------------------------------------------------------------------------
 
-fn temp_file(name: &str) -> std::path::PathBuf {
-    let dir = crate::test_dir("signal");
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.join(name)
+fn temp_file(name: &str) -> crate::testdir::TestFile {
+    crate::testdir::TestFile::new("bettercam-signal", name)
 }
 
 /// Heap memory with the alignment of a mapping, for a view of a whole header.
@@ -1054,7 +1052,7 @@ fn run_pair(name: &str, period: Duration, run_for: Duration) -> (u64, u64, Reade
     w.set_state(WriterState::Live);
     let stop = Arc::new(AtomicBool::new(false));
     let reader = {
-        let (path, stop) = (path.clone(), stop.clone());
+        let (path, stop) = (path.to_path_buf(), stop.clone());
         std::thread::spawn(move || follow(&path, &stop))
     };
     // the reader needs a moment to open its events

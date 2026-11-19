@@ -795,8 +795,8 @@ mod tests {
 
     fn warp_service_maker_with(timings: Timings) -> EngineMaker {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let dir = std::env::temp_dir().join(format!("bettercam-api-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // the maker owns the folder: it goes with the service that holds the maker
+        let dir = vcam_protocol::testdir::TestDir::new("bettercam-api");
         Arc::new(move || {
             let path = dir.join(format!("engine-{}.bin", N.fetch_add(1, Ordering::SeqCst)));
             let _ = std::fs::remove_file(&path);

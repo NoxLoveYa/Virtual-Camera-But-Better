@@ -962,8 +962,7 @@ fn nvidia_the_engine_live_with_the_real_camera() {
     output.background_color = 0xFF00_FF00; // 0xAABBGGRR: pure green
     let bg = [0u8, 255, 0];
 
-    let path = std::env::temp_dir().join(format!("bc-nv-live-{}.bin", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let path = vcam_protocol::testdir::TestFile::new("bc-nv-live", "frames.bin");
     let writer = Arc::new(vcam_protocol::Writer::create(&path).expect("writer"));
     let engine = Engine::with_parts(r.gpu.clone(), writer).expect("engine");
     let events: Events = Arc::default();

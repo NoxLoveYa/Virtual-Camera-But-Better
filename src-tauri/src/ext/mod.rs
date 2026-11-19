@@ -628,14 +628,11 @@ mod registry_tests {
     use std::sync::atomic::AtomicUsize;
 
     /// A scratch folder that goes away with the test.
-    struct Scratch(PathBuf);
+    struct Scratch(vcam_protocol::testdir::TestDir);
 
     impl Scratch {
         fn new(name: &str) -> Scratch {
-            let dir = std::env::temp_dir().join(format!("better-cam-registry-{name}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            Scratch(dir)
+            Scratch(vcam_protocol::testdir::TestDir::new(&format!("better-cam-registry-{name}")))
         }
         fn root(&self) -> PathBuf {
             self.0.join("extensions")
@@ -645,11 +642,6 @@ mod registry_tests {
         }
     }
 
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
 
     const MANIFEST: &str = r#"{ "apiVersion": 1, "id": "ID", "name": "NAME", "version": "1.0.0", "kind": "filter", "shader": "a.wgsl",
         "params": [ { "type": "slider", "key": "amount", "label": "Amount", "min": 0, "max": 1, "step": 0.1, "def": 0.5 } ] }"#;

@@ -1675,10 +1675,8 @@ mod tests {
         use crate::gpu::pattern::smpte_bars;
 
         let gpu = Arc::new(GpuDevice::new(AdapterKind::Warp).expect("WARP"));
-        let dir = std::env::temp_dir().join(format!("bettercam-preview-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = vcam_protocol::testdir::TestDir::new("bettercam-preview");
         let path = dir.join("engine.bin");
-        let _ = std::fs::remove_file(&path);
         let writer = Arc::new(vcam_protocol::Writer::create(&path).unwrap());
         let engine = Engine::with_parts(gpu, writer).unwrap();
         engine.start(Settings {
@@ -1826,13 +1824,8 @@ mod tests {
 
         for policy in [ReadbackPolicy::Immediate, ReadbackPolicy::NextFrame] {
             let gpu = Arc::new(GpuDevice::new(AdapterKind::Warp).expect("WARP"));
-            let dir = std::env::temp_dir().join(format!(
-                "bettercam-preview-order-{}-{policy:?}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
+            let dir = vcam_protocol::testdir::TestDir::new(&format!("bettercam-preview-order-{policy:?}"));
             let path = dir.join("engine.bin");
-            let _ = std::fs::remove_file(&path);
             let writer = Arc::new(vcam_protocol::Writer::create(&path).unwrap());
             let engine = Engine::with_parts(gpu, writer).unwrap();
             engine.start(Settings {
@@ -2001,10 +1994,8 @@ mod tests {
         use crate::gpu::convert::ColorSettings;
 
         let gpu = Arc::new(GpuDevice::new(AdapterKind::Warp).expect("WARP"));
-        let dir = std::env::temp_dir().join(format!("bettercam-preview-loss-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = vcam_protocol::testdir::TestDir::new("bettercam-preview-loss");
         let path = dir.join("engine.bin");
-        let _ = std::fs::remove_file(&path);
         let writer = Arc::new(vcam_protocol::Writer::create(&path).unwrap());
         let engine = Engine::with_parts(gpu, writer).unwrap();
         engine.start(Settings {

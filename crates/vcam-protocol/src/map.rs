@@ -879,20 +879,19 @@ mod tests {
     use super::*;
     use crate::header::{SUBTYPE_NV12, SUBTYPE_RGB32};
     use crate::seqlock::{Disposition, Read};
+    use crate::testdir::{TestDir, TestFile};
     use crate::validate::validate_header;
     use windows::Win32::Storage::FileSystem::GetFileAttributesW;
 
-    fn temp_file(name: &str) -> PathBuf {
-        let dir = crate::test_dir("proto");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(name)
+    /// A path in a folder of its own, removed when the value drops (a frame file is 37 MB).
+    fn temp_file(name: &str) -> TestFile {
+        TestFile::new("bettercam-proto", name)
     }
 
     /// A fresh folder for one test, with the temp dir below it as the trusted root of a pin.
-    fn sandbox(name: &str) -> (PathBuf, PathBuf) {
-        let root = crate::test_dir("writer");
+    fn sandbox(name: &str) -> (TestDir, PathBuf) {
+        let root = TestDir::new("bettercam-writer");
         let dir = root.join(name);
-        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         (root, dir)
     }
@@ -1697,7 +1696,7 @@ mod tests {
 
     /// A file with a valid header and published frames (the writer alternates between slots 0 and 1, so the latest
     /// slot is slot 1, about 12 MB into the file), the writer already gone so nothing maps it.
-    fn file_with_three_frames(name: &str) -> PathBuf {
+    fn file_with_three_frames(name: &str) -> TestFile {
         let path = temp_file(name);
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
@@ -1732,7 +1731,7 @@ mod tests {
     #[test]
     fn a_file_that_shrinks_between_the_size_check_and_the_mapping_is_refused() {
         let path = file_with_three_frames("shrink-hook.bin");
-        let p = path.clone();
+        let p = path.to_path_buf();
         AFTER_SIZE_HOOK.with(|h| {
             *h.borrow_mut() = Some(Box::new(move || {
                 let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
@@ -1752,7 +1751,7 @@ mod tests {
         }
         // the read-only path behaves the same
         let path = file_with_three_frames("shrink-hook-ro.bin");
-        let p = path.clone();
+        let p = path.to_path_buf();
         AFTER_SIZE_HOOK.with(|h| {
             *h.borrow_mut() = Some(Box::new(move || {
                 let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
@@ -1769,7 +1768,7 @@ mod tests {
         let path = file_with_three_frames("shrink-race.bin");
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let toggler = {
-            let (p, stop) = (path.clone(), stop.clone());
+            let (p, stop) = (path.to_path_buf(), stop.clone());
             std::thread::spawn(move || {
                 let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2195,7 +2194,7 @@ mod tests {
         use std::sync::Mutex;
         let path = temp_file("ev-torn.bin");
         let _ = std::fs::remove_file(&path);
-        let _cleanup = RemoveOnDrop(path.clone());
+        let _cleanup = RemoveOnDrop(path.to_path_buf());
         // the first writer makes the file; the reader maps it once and sees every later start over
         let first = Writer::create(&path).unwrap();
         let m = MappedFile::open(&path, Access::ReadOnly).unwrap();

@@ -640,8 +640,9 @@ mod tests {
 
     #[test]
     fn nvidia_inspect_reads_the_folder() {
-        let dir = std::env::temp_dir().join(format!("bc-nv-inspect-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let root = vcam_protocol::testdir::TestDir::new("bc-nv-inspect");
+        // a folder that is not there yet
+        let dir = root.join("runtime");
         assert!(!inspect(&dir, None).dir_exists);
         std::fs::create_dir_all(dir.join("models")).unwrap();
         let l = inspect(&dir, None);
@@ -663,14 +664,11 @@ mod tests {
         assert!(inspect(&dir, Some("turing")).complete());
         // The files of another generation do not help.
         assert_eq!(inspect(&dir, Some("blackwell")).missing_models.len(), 4);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn nvidia_a_runtime_that_cannot_load_gives_a_readable_reason() {
-        let dir = std::env::temp_dir().join(format!("bc-nv-junk-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = vcam_protocol::testdir::TestDir::new("bc-nv-junk");
         // Not a DLL at all, and a folder with no DLLs.
         std::fs::write(dir.join(CVIMAGE_DLL), b"this is not a dll").unwrap();
         std::fs::write(dir.join(VIDEOFX_DLL), b"this is not a dll").unwrap();
@@ -684,7 +682,6 @@ mod tests {
         let empty = dir.join("nothing-here");
         std::fs::create_dir_all(&empty).unwrap();
         assert!(Runtime::load(&empty).err().is_some_and(|e| e.contains("NVCVImage.dll")));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -770,13 +767,10 @@ mod tests {
     }
 
     fn run_script_pinned(url: &str, pins: &[Pin], name: &str) -> (Vec<ScriptLine>, Result<(), String>, bool) {
-        let temp = std::env::temp_dir().join(format!("bc-nv-script-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
-        std::fs::create_dir_all(&temp).unwrap();
+        let temp = vcam_protocol::testdir::TestDir::new(&format!("bc-nv-script-{name}"));
         let mut lines = Vec::new();
-        let result = run_install(url, pins, Some(&temp), |l| lines.push(l.clone()));
+        let result = run_install(url, pins, Some(temp.path()), |l| lines.push(l.clone()));
         let leftover = temp.join("better-cam-nvidia").exists();
-        let _ = std::fs::remove_dir_all(&temp);
         (lines, result, leftover)
     }
 
@@ -823,14 +817,12 @@ mod tests {
 
     /// SHA-256 of `bytes` by Windows' own tool, not by the script under test.
     fn sha256_of(bytes: &[u8]) -> String {
-        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let f = std::env::temp_dir().join(format!("bc-nv-hash-{}-{}.bin", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
+        let f = vcam_protocol::testdir::TestFile::new("bc-nv-hash", "bytes.bin");
         std::fs::write(&f, bytes).unwrap();
         let out = std::process::Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &format!("(Get-FileHash -Algorithm SHA256 -LiteralPath '{}').Hash", f.display())])
             .output()
             .unwrap();
-        let _ = std::fs::remove_file(&f);
         String::from_utf8_lossy(&out.stdout).trim().to_ascii_uppercase()
     }
 

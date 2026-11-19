@@ -971,9 +971,7 @@ mod tests {
         use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
 
         let q = queue();
-        let path = crate::test_dir("stream").join("cycles.bin");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let _ = std::fs::remove_file(&path);
+        let path = vcam_protocol::testdir::TestFile::new("bettercam-stream", "cycles.bin");
         probe::reset(&path);
         let fmt = FrameFormat {
             pixel: PixelFormat::Nv12,
@@ -1010,7 +1008,7 @@ mod tests {
             n as i64
         };
         let one_cycle = || {
-            let p = path.clone();
+            let p = path.to_path_buf();
             let mut pump = Pump::spawn_with(q.clone(), move |shared, queue| {
                 pump_loop(shared, queue, fmt, &AtomicU64::new(0), p);
             })

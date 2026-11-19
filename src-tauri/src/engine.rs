@@ -4792,14 +4792,15 @@ mod tests {
     use crate::camera_controls::fake::FakeControls;
     use crate::gpu::pattern::{bar_edges, bgrx_to_rgb, max_diff, nv12_to_rgb, smpte_bars};
     use std::path::PathBuf;
+    use vcam_protocol::testdir::{TestDir, TestFile};
     use vcam_protocol::{
         Access, Disposition, Format, MappedFile, Read, SUBTYPE_NV12, SUBTYPE_RGB32,
     };
 
-    fn temp_file(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("bettercam-engine-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(name)
+    /// A path in a folder of its own that is removed when the value drops (a frame file is 37 MB). A test with a
+    /// [`Rig`] finds its files with [`Rig::file`].
+    fn temp_file(name: &str) -> TestFile {
+        TestFile::new("bettercam-engine", name)
     }
 
     /// Latest published frame of the file as `(width, height, subtype, bytes)`.
@@ -5641,9 +5642,16 @@ mod tests {
         /// Every state and error event with the file's writer state at the moment the sink got it.
         writer_at: Arc<Mutex<Vec<(EngineEvent, u32)>>>,
         started: Instant,
+        /// The folder of the test's files. Last, so the engine and the file go first.
+        dir: TestDir,
     }
 
     impl Rig {
+        /// The path of a file of this rig's folder.
+        fn file(&self, name: &str) -> PathBuf {
+            self.dir.join(name)
+        }
+
         fn new(name: &str, timings: Timings) -> Rig {
             Rig::with_opener(name, timings, |fake| {
                 Arc::new(crate::camera_controls::fake::FakeOpener {
@@ -5662,8 +5670,8 @@ mod tests {
             make_opener: impl FnOnce(&Arc<Fake>) -> Arc<dyn ControlsOpener>,
         ) -> Rig {
             let gpu = Arc::new(GpuDevice::new(AdapterKind::Warp).expect("WARP"));
-            let path = temp_file(name);
-            let _ = std::fs::remove_file(&path);
+            let dir = TestDir::new("bettercam-engine");
+            let path = dir.join(name);
             let writer = Arc::new(Writer::create(&path).unwrap());
             let fake = Arc::new(Fake {
                 opens: Default::default(),
@@ -5719,6 +5727,7 @@ mod tests {
                 events,
                 writer_at,
                 started: Instant::now(),
+                dir,
             }
         }
 
@@ -5785,12 +5794,12 @@ mod tests {
 
         /// A consumer attached to the file (what the DLL does while a stream runs), until dropped.
         fn consumer(&self, path_name: &str) -> Consumer {
-            Consumer::start(&temp_file(path_name))
+            Consumer::start(&self.file(path_name))
         }
 
         /// The same with the format the app negotiated.
         fn consumer_with(&self, path_name: &str, format: Format) -> Consumer {
-            Consumer::start_with(&temp_file(path_name), format)
+            Consumer::start_with(&self.file(path_name), format)
         }
     }
 
@@ -6324,11 +6333,13 @@ mod tests {
     struct TestSources {
         log: std::path::PathBuf,
         child: Option<std::process::Child>,
+        _dir: TestDir,
     }
 
     impl TestSources {
         fn new(name: &str) -> TestSources {
-            let log = std::env::temp_dir().join(format!("better-cam-{name}-{}.txt", std::process::id()));
+            let dir = TestDir::new(&format!("better-cam-{name}"));
+            let log = dir.join("log.txt");
             std::fs::write(&log, "").unwrap();
             std::env::set_var(crate::capture::in_use_log::TEST_LOG_ENV, &log);
             // a registry root that does not exist: no record from the real consent store
@@ -6336,7 +6347,7 @@ mod tests {
                 crate::capture::in_use::TEST_ROOT_ENV,
                 format!(r"Software\BetterCamTest\none-{}", std::process::id()),
             );
-            TestSources { log, child: None }
+            TestSources { log, child: None, _dir: dir }
         }
 
         /// Starts a program that stays for a minute; returns its process id.
@@ -9924,7 +9935,7 @@ mod tests {
         assert_eq!(rig.engine.state(), EngineState::Live);
         assert!(rig.engine.last_error().is_none());
 
-        std::fs::remove_file(temp_file("l4-deleted.bin")).unwrap();
+        std::fs::remove_file(rig.file("l4-deleted.bin")).unwrap();
         assert!(rig.engine.wait_stopped(Duration::from_secs(5)), "{:?}", rig.states());
         let err = rig.engine.last_error().expect("an error");
         assert!(
@@ -9955,8 +9966,7 @@ mod tests {
     fn a_frame_file_that_is_away_for_a_single_look_does_not_stop_the_engine() {
         let rig = Rig::new("l4-swap.bin", fast());
         *rig.engine.shared.file_check_interval.lock().unwrap() = Some(Duration::from_millis(100));
-        let (path, away) = (temp_file("l4-swap.bin"), temp_file("l4-swap-away.bin"));
-        let _ = std::fs::remove_file(&away);
+        let (path, away) = (rig.file("l4-swap.bin"), rig.file("l4-swap-away.bin"));
         // No timing: the control thread itself moves the file away just before its first look and back just before its
         // second, so the first look says "replaced" and the second does not, whatever the machine is doing.
         {
@@ -10464,7 +10474,7 @@ mod tests {
         rig.engine.close();
         assert_eq!(rig.alive(), 1, "setup: the thread is not stuck");
         // a new engine's writer on the same path
-        let path = temp_file("m2-replaced.bin");
+        let path = rig.file("m2-replaced.bin");
         let new = Writer::create(&path).unwrap();
         new.set_state(WriterState::Live);
         // the app is still there: it announces itself to the new header (the old thread would publish for it)

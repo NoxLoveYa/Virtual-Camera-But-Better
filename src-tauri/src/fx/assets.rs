@@ -1349,23 +1349,14 @@ pub(crate) mod testgen {
     };
 
     /// A temporary folder that goes away with the value.
-    pub struct TempDir(pub PathBuf);
+    pub struct TempDir(pub vcam_protocol::testdir::TestDir);
 
     impl TempDir {
         pub fn new(name: &str) -> TempDir {
-            let p = std::env::temp_dir().join(format!("better-cam-test-{}-{name}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&p);
-            std::fs::create_dir_all(&p).expect("temp dir");
-            TempDir(p)
+            TempDir(vcam_protocol::testdir::TestDir::new(&format!("better-cam-test-{name}")))
         }
         pub fn join(&self, f: &str) -> PathBuf {
             self.0.join(f)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 

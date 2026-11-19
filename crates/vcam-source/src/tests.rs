@@ -3,7 +3,6 @@
 //! `frames.bin` (the path is overridden for the test thread only; see `frames::set_test_path`).
 
 use std::os::windows::io::OwnedHandle;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -11,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use vcam_protocol::pattern::{self, Analysis};
 use vcam_protocol::slate::SlateKind;
+use vcam_protocol::testdir::TestFile;
 use vcam_protocol::{
     off, qpc_now, Format, SlotFormat, Writer, WriterOptions, WriterState, SUBTYPE_NV12,
     SUBTYPE_RGB32,
@@ -57,12 +57,9 @@ fn activate_source() -> (IMFActivate, IMFMediaSource) {
 }
 
 /// A temporary frame file path for this test, set as the override of the calling thread.
-fn test_file(name: &str) -> PathBuf {
-    let dir = crate::test_dir("dll-tests");
-    std::fs::create_dir_all(&dir).unwrap();
-    let p = dir.join(name);
-    let _ = std::fs::remove_file(&p);
-    set_test_path(Some(p.clone()));
+fn test_file(name: &str) -> TestFile {
+    let p = TestFile::new("bettercam-dll-tests", name);
+    set_test_path(Some(p.to_path_buf()));
     p
 }
 

@@ -30,21 +30,19 @@ static SEQ: AtomicUsize = AtomicUsize::new(0);
 
 /// A folder with an `extensions` directory and a registry on it. Deleted on drop.
 struct Fixture {
-    base: PathBuf,
+    _base: vcam_protocol::testdir::TestDir,
     root: PathBuf,
     reg: ExtRegistry,
 }
 
 impl Fixture {
     fn new() -> Fixture {
-        let n = SEQ.fetch_add(1, Ordering::SeqCst);
-        let base = std::env::temp_dir().join(format!("better-cam-ext-filter-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let base = vcam_protocol::testdir::TestDir::new("better-cam-ext-filter");
         let root = base.join("extensions");
         std::fs::create_dir_all(&root).unwrap();
         let reg = ExtRegistry::new();
         reg.configure(root.clone(), base.join("state.json"), None);
-        Fixture { base, root, reg }
+        Fixture { _base: base, root, reg }
     }
 
     fn folder(&self, id: &str) -> PathBuf {
@@ -83,8 +81,8 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        // the registry stops first; the folder goes with the field
         self.reg.stop();
-        let _ = std::fs::remove_dir_all(&self.base);
     }
 }
 

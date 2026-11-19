@@ -643,20 +643,11 @@ mod tests {
     }
 
     /// A scratch folder that goes away with the test.
-    struct TempDir(PathBuf);
+    struct TempDir(vcam_protocol::testdir::TestDir);
 
     impl TempDir {
         fn new(name: &str) -> TempDir {
-            let dir = std::env::temp_dir().join(format!("better-cam-{name}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            TempDir(dir)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            TempDir(vcam_protocol::testdir::TestDir::new(&format!("better-cam-{name}")))
         }
     }
 

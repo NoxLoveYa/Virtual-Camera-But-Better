@@ -3568,10 +3568,7 @@ fn a_data_folder_made_in_this_run_and_encrypted_says_the_refusal_not_that_it_was
 /// `made_since` is what tells a folder of this run from an older one.
 #[test]
 fn a_folder_is_made_since_when_it_was_created_at_or_after_the_start() {
-    let dir = std::env::temp_dir().join(format!("bc-made-since-{}", std::process::id()));
-    // a folder left by an earlier run with the same pid would have an older creation time
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = vcam_protocol::testdir::TestDir::new("bc-made-since");
     let hour = Duration::from_secs(3600);
     let now = SystemTime::now();
     assert!(
@@ -3586,7 +3583,6 @@ fn a_folder_is_made_since_when_it_was_created_at_or_after_the_start() {
         !made_since(&dir.join("missing"), now - hour),
         "a folder that is not there was not made"
     );
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// A standard user can list the data folder, so a program of theirs can hold it with share mode 0: the open of the

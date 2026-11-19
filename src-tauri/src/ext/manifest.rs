@@ -1035,15 +1035,12 @@ mod tests {
 
     #[test]
     fn check_files_refuses_missing_and_oversize_files() {
-        let dir = std::env::temp_dir().join(format!("better-cam-manifest-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = vcam_protocol::testdir::TestDir::new("better-cam-manifest");
         let m = parse(&base()).unwrap();
         assert!(check_files(&dir, &m).unwrap_err().message.starts_with("shader: x.wgsl does not exist"));
         std::fs::write(dir.join("x.wgsl"), "// ok").unwrap();
         assert!(check_files(&dir, &m).is_ok());
         std::fs::write(dir.join("x.wgsl"), vec![b' '; MAX_FILE_BYTES as usize + 1]).unwrap();
         assert!(check_files(&dir, &m).unwrap_err().message.contains("the limit is 256 KB"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -540,8 +540,7 @@ mod tests {
 
     #[test]
     fn a_real_file_check_rejects_the_build_placeholder() {
-        let dir = std::env::temp_dir().join(format!("better-cam-dll-pick-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = vcam_protocol::testdir::TestDir::new("better-cam-dll-pick");
         let fake = dir.join("better_cam_vcam.dll");
         std::fs::write(&fake, b"placeholder").unwrap();
         assert_eq!(pick_dll(std::slice::from_ref(&fake), vcam_install::file_looks_like_dll), None);
@@ -552,7 +551,6 @@ mod tests {
             pick_dll(std::slice::from_ref(&fake), vcam_install::file_looks_like_dll),
             Some(fake)
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- the helper's arguments and the outcome of a launch
@@ -798,8 +796,8 @@ mod tests {
     /// A service whose engines run on WARP and write to temporary files (never the real `frames.bin`).
     fn warp_service() -> Service {
         static N: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!("bettercam-vadmin-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // the maker owns the folder: it goes with the service that holds the maker
+        let dir = vcam_protocol::testdir::TestDir::new("bettercam-vadmin");
         Service::with_maker(Arc::new(move || {
             let path = dir.join(format!("engine-{}.bin", N.fetch_add(1, Ordering::SeqCst)));
             let _ = std::fs::remove_file(&path);

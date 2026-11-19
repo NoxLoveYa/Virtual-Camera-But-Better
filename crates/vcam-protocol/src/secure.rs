@@ -1548,12 +1548,12 @@ pub fn strip_prefix_ignore_case(path: &Path, root: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testdir::TestDir;
 
     /// A fresh folder under the temp dir, with the temp dir itself as trusted root.
-    fn sandbox(name: &str) -> (PathBuf, PathBuf) {
-        let root = crate::test_dir("secure");
+    fn sandbox(name: &str) -> (TestDir, PathBuf) {
+        let root = TestDir::new("bettercam-secure");
         let dir = root.join(name);
-        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         (root, dir)
     }
@@ -1751,7 +1751,7 @@ mod tests {
             }
         };
         for (write, pinned) in [(false, false), (true, false), (false, true), (true, true)] {
-            let (p, r) = (f.clone(), root.clone());
+            let (p, r) = (f.clone(), root.to_path_buf());
             let e = within(
                 &format!("open, write {write}, pinned {pinned}"),
                 Box::new(move || {

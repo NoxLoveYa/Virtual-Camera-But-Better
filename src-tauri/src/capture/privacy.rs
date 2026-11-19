@@ -218,10 +218,8 @@ mod tests {
 
     #[test]
     fn the_simulated_refusal_needs_its_file() {
-        let dir = std::env::temp_dir().join(format!("bettercam-priv-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = vcam_protocol::testdir::TestDir::new("bettercam-priv");
         let flag = dir.join("deny.flag");
-        let _ = std::fs::remove_file(&flag);
         assert!(!flag_file_exists(None));
         assert!(!flag_file_exists(Some("".into())));
         assert!(!flag_file_exists(Some(flag.clone().into_os_string())));

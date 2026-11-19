@@ -415,19 +415,21 @@ pub mod slot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vcam_protocol::testdir::TestDir;
 
-    /// `<temp>\bettercam-log-<pid>` as the trusted root with an empty `BetterCam\logs` below it.
+    /// A folder of its own under `<temp>` as the trusted root with an empty `BetterCam\logs` below it.
     struct Sandbox {
         root: PathBuf,
         dir: PathBuf,
+        _guard: TestDir,
     }
 
     fn sandbox(name: &str) -> Sandbox {
-        let root = crate::test_dir("log").join(name);
-        let _ = std::fs::remove_dir_all(&root);
+        let guard = TestDir::new(&format!("bettercam-log-{name}"));
+        let root = guard.to_path_buf();
         let dir = root.join("BetterCam").join("logs");
         std::fs::create_dir_all(&dir).unwrap();
-        Sandbox { root, dir }
+        Sandbox { root, dir, _guard: guard }
     }
 
     fn junction(link: &Path, target: &Path) {
@@ -479,9 +481,8 @@ mod tests {
 
     #[test]
     fn missing_folders_are_never_created() {
-        let root = crate::test_dir("log").join("missing");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let guard = TestDir::new("bettercam-log-missing");
+        let root = guard.to_path_buf();
         // neither BetterCam nor logs exists
         let dir = root.join("BetterCam").join("logs");
         let mut l = LogFile::new(root.clone(), dir.clone(), "vcam-1.log".into());

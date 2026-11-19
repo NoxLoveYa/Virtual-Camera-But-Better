@@ -1187,12 +1187,11 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
     use vcam_protocol::pattern;
+    use vcam_protocol::testdir::TestFile;
     use vcam_protocol::{qpc_now, SlotFormat, Writer, SUBTYPE_NV12, SUBTYPE_RGB32};
 
-    fn temp_path(name: &str) -> PathBuf {
-        let dir = crate::test_dir("frames");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(name)
+    fn temp_path(name: &str) -> TestFile {
+        TestFile::new("bettercam-frames", name)
     }
 
     fn nv12(w: u32, h: u32, fps: u32) -> FrameFormat {
@@ -1249,13 +1248,13 @@ mod tests {
     impl Rig {
         fn new(path: PathBuf, fmt: FrameFormat) -> Rig {
             let pitch = fmt.pixel.stride(fmt.width) as usize;
-            Rig::with_pitch(path, fmt, pitch)
+            Rig::with_pitch(path.to_path_buf(), fmt, pitch)
         }
 
         fn with_pitch(path: PathBuf, fmt: FrameFormat, pitch: usize) -> Rig {
             let rows = fmt.pixel.rows(fmt.height) as usize;
             Rig {
-                src: FrameSource::new(path, fmt),
+                src: FrameSource::new(path.to_path_buf(), fmt),
                 // a poisoned start: nothing may rely on the buffer being clean
                 sink: VecSink {
                     buf: vec![0xA5; pitch * rows],
@@ -1352,7 +1351,7 @@ mod tests {
     fn advertised_comes_from_the_header_or_defaults() {
         let path = temp_path("adv.bin");
         let _ = std::fs::remove_file(&path);
-        set_test_path(Some(path.clone()));
+        set_test_path(Some(path.to_path_buf()));
         assert_eq!(advertised(), vcam_protocol::default_advertised());
         let w = Writer::create(&path).unwrap();
         w.set_advertised(&vcam_protocol::advertised_for_output(1920, 1080, 60));
@@ -1369,7 +1368,7 @@ mod tests {
     fn missing_file_shows_the_not_running_slate() {
         let path = temp_path("missing.bin");
         let _ = std::fs::remove_file(&path);
-        let mut src = Rig::new(path, nv12(640, 360, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(640, 360, 30));
         src.start();
         let e = next_ready(&mut src, Duration::from_secs(1));
         assert_eq!(e.kind, Kind::Slate(SlateKind::NotRunning));
@@ -1389,7 +1388,7 @@ mod tests {
         let path = temp_path("states.bin");
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
-        let mut src = Rig::new(path, nv12(320, 180, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(320, 180, 30));
         src.start();
         for (state, kind) in [
             (WriterState::Closed, SlateKind::NotRunning),
@@ -1410,7 +1409,7 @@ mod tests {
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
         let (fw, fh) = (640u32, 360u32);
-        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(fw, fh, 30));
         src.start();
         // live but no frame yet: after 1.5 frame durations the "starting" slate
         let e = next_ready(&mut src, Duration::from_secs(1));
@@ -1466,7 +1465,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
-        let mut src = Rig::new(path, nv12(320, 180, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(320, 180, 30));
         src.start();
         publish_pattern(&w, 320, 180, 1);
         assert_eq!(
@@ -1500,7 +1499,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
-        let mut src = Rig::new(path.clone(), nv12(320, 180, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(320, 180, 30));
         src.start();
         let sh = w.shared();
         publish_pattern(&w, 320, 180, 1);
@@ -1596,7 +1595,7 @@ mod tests {
                 }
             })
         };
-        let mut src = Rig::new(path, nv12(fw, fh, consumer_fps));
+        let mut src = Rig::new(path.to_path_buf(), nv12(fw, fh, consumer_fps));
         src.start();
         let mut slots = Vec::new();
         let mut began = None;
@@ -1647,8 +1646,7 @@ mod tests {
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
         let (fw, fh) = (320u32, 180u32);
-        let mut src = Rig::new(
-            path,
+        let mut src = Rig::new(path.to_path_buf(),
             FrameFormat {
                 pixel: PixelFormat::Rgb32,
                 width: fw,
@@ -1778,7 +1776,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
         w.shared().poke32(vcam_protocol::off::MAGIC, 0);
-        let mut src = Rig::new(path, nv12(320, 180, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(320, 180, 30));
         src.start();
         let e = next_ready(&mut src, Duration::from_secs(1));
         assert_eq!(e.kind, Kind::Slate(SlateKind::NotRunning));
@@ -1887,7 +1885,7 @@ mod tests {
             return;
         };
         let (tx, rx) = std::sync::mpsc::channel();
-        let p = path.clone();
+        let p = path.to_path_buf();
         std::thread::spawn(move || {
             let t = Instant::now();
             set_test_path(Some(p.clone()));
@@ -1934,7 +1932,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
-        let mut src = Rig::new(path, nv12(320, 180, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(320, 180, 30));
         src.start();
         let freq = qpc_frequency();
         let hostile = [
@@ -2057,7 +2055,7 @@ mod tests {
         let w = std::rc::Rc::new(Writer::create(&path).unwrap());
         w.set_state(WriterState::Live);
         let (fw, fh) = (320u32, 180u32);
-        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(fw, fh, 30));
         src.start();
         publish_pattern(&w, fw, fh, 5);
         assert_eq!(
@@ -2118,7 +2116,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
-        let mut src = Rig::new(path, nv12(320, 180, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(320, 180, 30));
         src.start();
         publish_pattern(&w, 320, 180, 1);
         let _ = next_ready(&mut src, Duration::from_secs(1));
@@ -2170,7 +2168,7 @@ mod tests {
                 fps: 30,
             };
             let rb = pixel.stride(fw) as usize;
-            let mut src = Rig::with_pitch(path, fmt, rb + sink_pad);
+            let mut src = Rig::with_pitch(path.to_path_buf(), fmt, rb + sink_pad);
             src.start();
             let stride = (rb + slot_pad) as u32;
             let (subtype, rows) = match pixel {
@@ -2239,7 +2237,7 @@ mod tests {
                 height: h,
                 fps: 30,
             };
-            let mut src = Rig::with_pitch(path, fmt, pixel.stride(w) as usize + pad);
+            let mut src = Rig::with_pitch(path.to_path_buf(), fmt, pixel.stride(w) as usize + pad);
             src.start();
             let e = next_ready(&mut src, Duration::from_secs(2));
             assert_eq!(e.kind, Kind::Slate(SlateKind::NotRunning));
@@ -2260,7 +2258,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
-        let mut src = Rig::new(path, nv12(640, 360, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(640, 360, 30));
         src.start();
         let e = next_ready(&mut src, Duration::from_secs(1));
         assert_eq!(e.kind, Kind::Slate(SlateKind::Starting));
@@ -2285,7 +2283,7 @@ mod tests {
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
         let (fw, fh) = (640u32, 360u32);
-        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(fw, fh, 30));
         src.start();
         publish_pattern(&w, fw, fh, 5);
         assert_eq!(
@@ -2327,7 +2325,7 @@ mod tests {
         let w = std::rc::Rc::new(Writer::create(&path).unwrap());
         w.set_state(WriterState::Live);
         let (fw, fh) = (320u32, 180u32);
-        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(fw, fh, 30));
         src.start();
         publish_pattern(&w, fw, fh, 5);
         assert_eq!(
@@ -2382,7 +2380,7 @@ mod tests {
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
         let (fw, fh) = (320u32, 180u32);
-        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(fw, fh, 30));
         src.start();
         publish_pattern(&w, fw, fh, 3);
         // the pool has nothing for the next few asks: the frame stays in the file, nothing is emitted
@@ -2411,7 +2409,7 @@ mod tests {
         // a slate that finds no buffer
         let path = temp_path("no-buffer-wait-none.bin");
         let _ = std::fs::remove_file(&path);
-        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(fw, fh, 30));
         src.start();
         src.sink.refuse = 1;
         let now = qpc_now();
@@ -2426,7 +2424,7 @@ mod tests {
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
         publish_pattern(&w, fw, fh, 3);
-        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(fw, fh, 30));
         src.start();
         src.sink.refuse = 1;
         let now = qpc_now();
@@ -2494,7 +2492,7 @@ mod tests {
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
         let (fw, fh) = (320u32, 180u32);
-        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(fw, fh, 30));
         src.start();
         publish_pattern(&w, fw, fh, 5);
         assert_eq!(
@@ -2529,7 +2527,7 @@ mod tests {
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
         let (fw, fh) = (320u32, 180u32);
-        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(fw, fh, 30));
         src.start();
         publish_pattern(&w, fw, fh, 5);
         assert_eq!(
@@ -2561,7 +2559,7 @@ mod tests {
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
         let (fw, fh) = (320u32, 180u32);
-        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(fw, fh, 30));
         src.start();
         publish_pattern(&w, fw, fh, 5);
         assert_eq!(
@@ -2587,7 +2585,7 @@ mod tests {
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
         let (fw, fh) = (320u32, 180u32);
-        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(fw, fh, 30));
         src.start();
         publish_pattern(&w, fw, fh, 5);
         let first = next_ready(&mut src, Duration::from_secs(1));
@@ -2645,7 +2643,7 @@ mod tests {
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
         let (fw, fh) = (320u32, 180u32);
-        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(fw, fh, 30));
         src.start();
         publish_pattern(&w, fw, fh, 5);
         assert_eq!(
@@ -2681,7 +2679,7 @@ mod tests {
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
         let (fw, fh) = (320u32, 180u32);
-        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(fw, fh, 30));
         src.start();
         publish_pattern(&w, fw, fh, 5);
         assert_eq!(
@@ -2720,7 +2718,7 @@ mod tests {
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
         let (fw, fh) = (320u32, 180u32);
-        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(fw, fh, 30));
         src.start();
         publish_pattern(&w, fw, fh, 5);
         let first = next_ready(&mut src, Duration::from_secs(1));
@@ -2788,7 +2786,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
-        let mut src = Rig::new(path, nv12(320, 180, 60));
+        let mut src = Rig::new(path.to_path_buf(), nv12(320, 180, 60));
         src.start();
         let freq = qpc_frequency();
         let t0 = qpc_now();
@@ -2938,7 +2936,7 @@ mod tests {
         let freq = qpc_frequency();
         // what an earlier session left: a frame captured a second ago, with a writer that is alive again
         publish_at(&w, 320, 180, 1, qpc_now() - freq);
-        let mut src = Rig::new(path, nv12(320, 180, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(320, 180, 30));
         src.start();
         let began = Instant::now();
         while began.elapsed() < Duration::from_millis(200) {
@@ -2977,7 +2975,7 @@ mod tests {
             let w = Writer::create(&path).unwrap();
             w.set_state(WriterState::Live);
             // the writer has been publishing at 14 fps: the newest frame is `age_ms` older than the attach
-            let mut src = Rig::new(path, nv12(320, 180, 14));
+            let mut src = Rig::new(path.to_path_buf(), nv12(320, 180, 14));
             src.start();
             publish_at(&w, 320, 180, 3, src.attach - freq * age_ms / 1000);
             w.heartbeat();
@@ -3001,7 +2999,7 @@ mod tests {
             let _ = std::fs::remove_file(&path);
             let w = Writer::create(&path).unwrap();
             w.set_state(WriterState::Live);
-            let mut src = Rig::new(path, nv12(320, 180, 4));
+            let mut src = Rig::new(path.to_path_buf(), nv12(320, 180, 4));
             src.start();
             publish_at(&w, 320, 180, 3, src.attach - freq * before_ms / 1000);
             w.heartbeat();
@@ -3024,7 +3022,7 @@ mod tests {
             let _ = std::fs::remove_file(&path);
             let w = Writer::create(&path).unwrap();
             w.set_state(WriterState::Live);
-            let mut src = Rig::new(path, nv12(320, 180, 30));
+            let mut src = Rig::new(path.to_path_buf(), nv12(320, 180, 30));
             src.start();
             publish_at(&w, 320, 180, 3, src.attach - before);
             let began = Instant::now();
@@ -3055,7 +3053,7 @@ mod tests {
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
         unlock(true);
-        let mut src = Rig::new(path.clone(), nv12(320, 180, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(320, 180, 30));
         src.start();
         // a writer that is alive and a frame captured after the attach: the DLL cannot announce itself, so the
         // engine would never publish like this: the slate, not the frame
@@ -3094,7 +3092,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
-        let mut src = FrameSource::new(path, nv12(320, 180, 30));
+        let mut src = FrameSource::new(path.to_path_buf(), nv12(320, 180, 30));
         src.start();
         publish_pattern(&w, 320, 180, 3);
         let mut sink = Short(vec![7u8; 320 * 180]); // a Y plane, no UV rows
@@ -3151,7 +3149,7 @@ mod tests {
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
         let (fw, fh) = (320u32, 180u32);
-        let mut src = Rig::new(path, nv12(fw, fh, stream_fps));
+        let mut src = Rig::new(path.to_path_buf(), nv12(fw, fh, stream_fps));
         src.start();
         let freq = qpc_frequency();
         let t0 = qpc_now();
@@ -3282,7 +3280,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
-        let mut src = Rig::new(path, nv12(320, 180, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(320, 180, 30));
         src.start();
         let t0 = qpc_now();
         assert_eq!(src.poll(t0), Poll::Wait(Wait::Frame(t0 + period * 3 / 2)));
@@ -3295,7 +3293,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
-        let mut src = Rig::new(path, nv12(320, 180, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(320, 180, 30));
         src.start();
         let t0 = qpc_now();
         publish_at(&w, 320, 180, 1, t0);
@@ -3337,7 +3335,7 @@ mod tests {
         let w = std::rc::Rc::new(Writer::create(&path).unwrap());
         w.set_state(WriterState::Live);
         let (fw, fh) = (320u32, 180u32);
-        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(fw, fh, 30));
         src.start();
         publish_pattern(&w, fw, fh, 5);
         assert_eq!(
@@ -3373,7 +3371,7 @@ mod tests {
         let path = temp_path("wf-report.bin");
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
-        let mut src = Rig::new(path, nv12(320, 180, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(320, 180, 30));
         src.start();
         w.set_state(WriterState::Paused);
         let _ = src.poll(qpc_now());
@@ -3405,7 +3403,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
-        let mut src = Rig::new(path, nv12(320, 180, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(320, 180, 30));
         src.start();
         publish_pattern(&w, 320, 180, 1);
         let _ = src.poll(qpc_now());
@@ -3470,7 +3468,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
-        let mut src = Rig::new(path, nv12(320, 180, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(320, 180, 30));
         src.start();
         publish_pattern(&w, 320, 180, 1);
         let _ = src.poll(qpc_now());
@@ -3485,7 +3483,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let w = Writer::create(&path).unwrap();
         w.set_state(WriterState::Live);
-        let mut src = Rig::new(path, nv12(320, 180, 30));
+        let mut src = Rig::new(path.to_path_buf(), nv12(320, 180, 30));
         src.start();
         publish_pattern(&w, 320, 180, 1);
         let _ = src.poll(qpc_now());

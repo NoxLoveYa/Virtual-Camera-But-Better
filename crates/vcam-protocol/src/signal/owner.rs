@@ -381,6 +381,7 @@ mod tests {
     use crate::signal::{
         current_user_sid_text, descriptor_text, make_event_for_test, system_nonce, FrameSignal,
     };
+    use crate::testdir::TestDir;
     use std::path::PathBuf;
     use windows::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -543,11 +544,11 @@ mod tests {
 
     // ---- the DACL of the frame file ---------------------------------------------------------------------------------
 
-    fn frame_file(name: &str, sddl: &str) -> (PathBuf, PathBuf, OwnedHandle) {
-        let root = crate::test_dir("owner");
-        std::fs::create_dir_all(&root).unwrap();
+    /// The folder (a test keeps it for as long as it uses the file; the folder goes after the handle), the file and
+    /// its handle.
+    fn frame_file(name: &str, sddl: &str) -> (TestDir, PathBuf, OwnedHandle) {
+        let root = TestDir::new("bettercam-owner");
         let path = root.join(name);
-        let _ = std::fs::remove_file(&path);
         let w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
         let mut psd = PSECURITY_DESCRIPTOR::default();
         unsafe {

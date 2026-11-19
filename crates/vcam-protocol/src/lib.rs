@@ -5,6 +5,7 @@
 //!   [`validate`] (every field is checked before use), and on Windows [`map`] (file mapping, QPC, [`Writer`]).
 //! * [`signal`] (Windows): the frame event that wakes the camera service's pump when the writer has something new.
 //! * [`pattern`] (checkerboard + stripe test pattern) and [`slate`] (RLE slates), used by `vcam-tool` and the tests.
+//! * `testdir` (Windows, tests only): the scratch folder every test goes through, so none leaves files in `%TEMP%`.
 
 pub mod header;
 #[cfg(windows)]
@@ -16,6 +17,8 @@ pub mod seqlock;
 #[cfg(windows)]
 pub mod signal;
 pub mod slate;
+#[cfg(all(windows, any(test, feature = "test-support")))]
+pub mod testdir;
 pub mod validate;
 
 pub use header::{
@@ -80,34 +83,6 @@ pub const SIZES: [(u32, u32); 2] = [(1920, 1080), (1280, 720)];
 
 /// File name of the shared frame file inside the data folder.
 pub const FRAMES_FILE_NAME: &str = "frames.bin";
-
-/// The scratch folder of one kind of test, `%TEMP%\bettercam-<kind>-<pid>`. It is made on first use and removed, with
-/// everything in it, when the test process exits: a frame file is 37 MB and a run of the tests used to leave about a
-/// gigabyte behind. The tests of a kind share the folder and use names of their own.
-#[cfg(all(test, windows))]
-pub(crate) fn test_dir(kind: &str) -> std::path::PathBuf {
-    use std::sync::Mutex;
-    static MADE: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
-    extern "C" fn remove_all() {
-        let made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-        for dir in made.iter() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-    extern "C" {
-        fn atexit(callback: extern "C" fn()) -> i32;
-    }
-    let dir = std::env::temp_dir().join(format!("bettercam-{kind}-{}", std::process::id()));
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if !made.contains(&dir) {
-        if made.is_empty() {
-            // SAFETY: `remove_all` is a plain `extern "C"` function that does not unwind
-            unsafe { atexit(remove_all) };
-        }
-        made.push(dir.clone());
-    }
-    dir
-}
 
 #[cfg(test)]
 mod tests {

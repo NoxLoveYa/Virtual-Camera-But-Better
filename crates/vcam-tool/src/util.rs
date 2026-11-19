@@ -35,27 +35,17 @@ pub fn run_output_here(verb: &str, started: SystemTime) -> Vec<String> {
 /// panics. A frame file is 37 MB: a test that leaves its files behind costs that much on every run. Declare it before
 /// the writers and mappings of the test, so they are dropped (and the files free to delete) first.
 #[cfg(test)]
-pub struct ScratchDir(std::path::PathBuf);
+pub struct ScratchDir(vcam_protocol::testdir::TestDir);
 
 #[cfg(test)]
 impl ScratchDir {
-    /// `what` names the test; it must be unique among the tests of one process.
+    /// `what` names the test.
     pub fn new(what: &str) -> ScratchDir {
-        let dir = std::env::temp_dir().join(format!("bettercam-{what}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        ScratchDir(dir)
+        ScratchDir(vcam_protocol::testdir::TestDir::new(&format!("bettercam-{what}")))
     }
 
     pub fn join(&self, name: &str) -> std::path::PathBuf {
         self.0.join(name)
-    }
-}
-
-#[cfg(test)]
-impl Drop for ScratchDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -65,19 +55,11 @@ mod tests {
     use std::io::Write;
     use std::time::Duration;
 
-    struct Sandbox(std::path::PathBuf);
-
-    impl Drop for Sandbox {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    struct Sandbox(vcam_protocol::testdir::TestDir);
 
     /// A machine layout below the temp folder with an `install.log` that holds `lines`.
     fn machine(name: &str, lines: &[&str]) -> (Sandbox, Paths) {
-        let root =
-            std::env::temp_dir().join(format!("vcam-tool-util-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = vcam_protocol::testdir::TestDir::new(&format!("vcam-tool-util-{name}"));
         let paths = Paths::below(&root);
         std::fs::create_dir_all(paths.logs()).unwrap();
         let mut f = std::fs::File::create(paths.install_log()).unwrap();

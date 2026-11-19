@@ -625,6 +625,7 @@ pub fn owner_trusted(owner: &str, trusted: &[String]) -> bool {
 mod tests {
     use super::*;
     use std::os::windows::fs::MetadataExt;
+    use vcam_protocol::testdir::TestDir;
 
     const USER: &str = "S-1-5-21-1004336348-1177238915-682003330-1001";
 
@@ -893,9 +894,7 @@ mod tests {
     fn the_frame_file_acl_denies_hard_links_and_attributes_but_not_a_read_write_mapping() {
         use vcam_protocol::secure::{self, DISP_CREATE_NEW};
         let me = crate::current_user_sid().unwrap();
-        let dir = std::env::temp_dir().join(format!("vcam-acl-frames-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("vcam-acl-frames");
         // a file that gives `me` exactly one ACE, with the given mask, from the create call on
         let make = |name: &str, mask: u32| {
             let sd = SecurityDescriptor::from_aces(&[ace(&me, mask, 0)]).unwrap();
@@ -958,7 +957,6 @@ mod tests {
         #[allow(clippy::permissions_set_readonly_false)]
         perm.set_readonly(false);
         let _ = std::fs::set_permissions(&old, perm);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// What the mask `0x12008f` does *not* prevent (the reviewer's reproduction, on temp files with the same DACL):
@@ -971,9 +969,7 @@ mod tests {
         use std::os::windows::fs::OpenOptionsExt;
         use vcam_protocol::secure::{self, DISP_CREATE_NEW};
         let me = crate::current_user_sid().unwrap();
-        let dir = std::env::temp_dir().join(format!("vcam-acl-writedata-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("vcam-acl-writedata");
         let path = dir.join("frames.bin");
         let sd = SecurityDescriptor::from_aces(&[ace(&me, FRAMES_READ_WRITE, 0)]).unwrap();
         let h = unsafe {
@@ -1036,7 +1032,6 @@ mod tests {
         assert!(std::fs::set_permissions(&path, perm).is_err());
 
         drop((write_only, read_write));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A file made with a protected DACL that only SYSTEM and Administrators have, then moved to its final name by a
@@ -1101,15 +1096,12 @@ mod tests {
             "{:?}",
             after.aces
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A temp folder owned by the current user whose DACL is `aces` (the user is the owner and the "administrator"
     /// of the test).
-    fn object_with(aces: &[Ace], name: &str) -> (std::path::PathBuf, OwnedHandle) {
-        let dir = std::env::temp_dir().join(format!("vcam-acl-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    fn object_with(aces: &[Ace], name: &str) -> (TestDir, OwnedHandle) {
+        let dir = TestDir::new(&format!("vcam-acl-{name}"));
         let h = vcam_protocol::secure::open_with(
             &dir,
             0x8000_0000 | SECURITY_ACCESS,
@@ -1176,9 +1168,7 @@ mod tests {
             // the test process must keep access to the temp folder it applies to: system and admins are "me"
             p.admins = me.clone();
             let want = expected(Object::FramesFile, &p);
-            let dir = std::env::temp_dir().join(format!("vcam-acl-alias-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
+            let dir = TestDir::new("vcam-acl-alias");
             let f = dir.join("frames.bin");
             std::fs::write(&f, b"x").unwrap();
             let h = vcam_protocol::secure::open_with(
@@ -1213,7 +1203,6 @@ mod tests {
                 assert!(snap.aces.iter().any(|a| sid_eq(&a.sid, &user)));
             }
             drop(h);
-            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
@@ -1224,7 +1213,7 @@ mod tests {
         p.owner = me.clone();
         p.admins = me.clone();
         let want = expected(Object::FramesFile, &p);
-        let (dir, h) = object_with(&[ace(SID_LOCAL_SERVICE, FRAMES_READ_WRITE, 0)], "extra");
+        let (_dir, h) = object_with(&[ace(SID_LOCAL_SERVICE, FRAMES_READ_WRITE, 0)], "extra");
         let snap = read(&h).unwrap();
         // the user's own ACE of `object_with` is inheritable (OICI): it is not what `want` says
         assert!(check(&snap, &want, &me).is_err());
@@ -1249,7 +1238,6 @@ mod tests {
         denied.aces[0].kind = 1;
         assert!(check(&denied, &with_extra, &me).is_err());
         drop(h);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

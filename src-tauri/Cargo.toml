@@ -62,3 +62,7 @@ features = [
     "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
 ]
+
+[dev-dependencies]
+# `testdir`: the scratch folder of a test that removes itself
+vcam-protocol = { workspace = true, features = ["test-support"] }

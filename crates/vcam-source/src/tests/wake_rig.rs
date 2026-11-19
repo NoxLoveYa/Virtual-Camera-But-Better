@@ -7,6 +7,7 @@
 use super::*;
 
 use crate::frames::test_owner;
+use vcam_protocol::testdir::TestFile;
 use crate::wake::probe;
 use vcam_protocol::signal::{
     current_user_sid_text, descriptor_text, event_name, make_event_for_test, FrameSignal,
@@ -96,6 +97,21 @@ fn watch(run: &Running, secs: f64, steps: &mut Vec<u64>, live: &mut u64, slates:
 fn drive(
     name: &str,
     opts: WriterOptions,
+    fps: (u32, u32, u32),
+    warm: f64,
+    window: f64,
+    prepare: impl FnOnce(&Writer),
+    during: impl FnOnce(&Feeder, &std::path::Path),
+) -> Seen {
+    drive_at(&test_file(name), name, opts, fps, warm, window, prepare, during)
+}
+
+/// [`drive`] on a file the test made itself (`test_file` gives a folder of its own at every call).
+#[allow(clippy::too_many_arguments)]
+fn drive_at(
+    path: &TestFile,
+    name: &str,
+    opts: WriterOptions,
     (advertised_fps, publish_fps, stream_fps): (u32, u32, u32),
     warm: f64,
     window: f64,
@@ -103,8 +119,7 @@ fn drive(
     during: impl FnOnce(&Feeder, &std::path::Path),
 ) -> Seen {
     init();
-    let path = test_file(name);
-    probe::reset(&path);
+    probe::reset(path);
     let feeder = Feeder::start_with(&path, &opts, (W, H), (advertised_fps, publish_fps), prepare);
     let run = Running::start_fps(PixelFormat::Nv12, W, H, stream_fps);
     let began = Instant::now();
@@ -658,15 +673,18 @@ fn polling_because_of(
     opens: std::ops::RangeInclusive<u64>,
     prepare: impl FnOnce(&Writer, &std::path::Path) + 'static,
 ) -> Seen {
-    // `drive` makes the same path from the name
     let path = test_file(name);
-    let r = drive(
+    let r = drive_at(
+        &path,
         name,
         no_signal(),
         (30, 30, 30),
         0.3,
         2.5,
-        move |w| prepare(w, &path),
+        {
+            let path = path.to_path_buf();
+            move |w| prepare(w, &path)
+        },
         nothing_during,
     );
     assert!(r.live >= 60, "{name}: {} live samples", r.live);

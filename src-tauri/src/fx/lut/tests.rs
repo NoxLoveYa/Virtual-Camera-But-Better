@@ -784,7 +784,7 @@ fn bad_files_leave_the_picture_alone_and_report_once() {
         ("missing file", dir.join("gone.cube")),
         ("missing picture", dir.join("gone.png")),
         ("text in a png", write(&dir, "text.png", "this is not a picture")),
-        ("a folder", dir.0.clone()),
+        ("a folder", dir.0.to_path_buf()),
     ];
     for (what, path) in &cases {
         let e = rig.load(path, json!({}));

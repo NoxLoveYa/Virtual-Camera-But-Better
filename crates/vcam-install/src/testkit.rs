@@ -4,6 +4,7 @@ use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use vcam_protocol::secure;
+use vcam_protocol::testdir::TestDir;
 
 use crate::acl::{self, Principals, Snapshot};
 use crate::datadir::remove_no_follow;
@@ -15,6 +16,9 @@ pub struct Sandbox {
     pub root: PathBuf,
     pub paths: Paths,
     pub p: Principals,
+    /// Removes what the sandbox leaves, and sweeps what a killed run left (after the drop below, which does the
+    /// delicate part).
+    _dir: TestDir,
 }
 
 impl Drop for Sandbox {
@@ -27,8 +31,8 @@ impl Drop for Sandbox {
 /// A sandbox folder with `Paths::below`; the current user plays the administrators (so the test keeps access to
 /// what it locks), the owner and the only trusted owner. The "user" of the camera is a made-up SID.
 pub fn sandbox(name: &str) -> Sandbox {
-    let root = std::env::temp_dir().join(format!("vcam-test-{}-{name}", std::process::id()));
-    let _ = remove_no_follow(&root);
+    let dir = TestDir::new(&format!("vcam-test-{name}"));
+    let root = dir.to_path_buf();
     let paths = Paths::below(&root);
     std::fs::create_dir_all(&paths.program_data).unwrap();
     let me = crate::current_user_sid().unwrap();
@@ -41,7 +45,12 @@ pub fn sandbox(name: &str) -> Sandbox {
         // an elevated test run makes folders owned by Administrators
         trusted_owners: vec![me, acl::SID_ADMINS.into()],
     };
-    Sandbox { root, paths, p }
+    Sandbox {
+        root,
+        paths,
+        p,
+        _dir: dir,
+    }
 }
 
 pub fn junction(link: &Path, target: &Path) {
