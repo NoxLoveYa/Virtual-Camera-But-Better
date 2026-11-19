@@ -353,7 +353,8 @@ same(autoAction("slow"), null, "no button on the slow lane");
 
 // limits on the sliders and the "Longest exposure" list
 const stops = longestOptions({ min: -13, max: -1 }, 30);
-same(stops[0], { value: "fit", label: "Fit the frame rate (1/32 s at 30 fps)" }, "fit option");
+same(stops[0], { value: "fit", label: "Fit the frame rate (1/32 s at 30 fps, one stop longer in a dark room at most gain)" }, "fit option");
+same(longestOptions({ min: -13, max: -5 }, 30)[0].label, "Fit the frame rate (1/32 s at 30 fps)", "fit option: no longer stop in the range, no hint");
 same(stops.length, 14, "fit and 13 whole stops");
 same(stops.find((o) => o.value === "-6")?.label, "1/64 s (sharper motion, more gain)", "shorter than the frame time");
 same(stops.find((o) => o.value === "-5")?.label, "1/32 s (the frame-rate limit)", "at the frame time");
@@ -362,7 +363,7 @@ same(stops.find((o) => o.value === "-3")?.label, "1/8 s (camera drops to ≈ 8 f
 same(stops.find((o) => o.value === "-1")?.label, "1/2 s (camera drops to ≈ 2 fps)", "1/2 s");
 // A rate below what the frame time alone gives is never above the asked rate (F = 15: the limit is 1/16 s, 1/8 s is 8).
 same(longestOptions({ min: -6, max: -1 }, 15).find((o) => o.value === "-3")?.label, "1/8 s (camera drops to ≈ 8 fps)", "slow camera");
-same(longestOptions({ min: -13, max: -1 }, 60)[0].label, "Fit the frame rate (1/64 s at 60 fps)", "fit at 60 fps");
+same(longestOptions({ min: -13, max: -1 }, 60)[0].label, "Fit the frame rate (1/64 s at 60 fps, one stop longer in a dark room at most gain)", "fit at 60 fps");
 same(longestOptions({ min: -3, max: -1 }, null).map((o) => o.label), ["Fit the frame rate", "1/8 s", "1/4 s", "1/2 s"], "no frame rate: no meanings");
 same(maxGainValue(null, { min: 0, max: 100, step: 1 }), 75, "default most gain: 75 % of the range");
 same(maxGainValue(null, { min: 0, max: 100, step: 10 }), 80, "default most gain on the step grid");

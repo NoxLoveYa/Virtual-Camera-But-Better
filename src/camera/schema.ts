@@ -1002,7 +1002,9 @@ export const parseLongest = (s: string): "fit" | number => (s === "fit" ? "fit" 
  */
 export const longestOptions = (range: { min: number; max: number }, fps: number | null): Option[] => {
   const limit = fps && fps > 0 ? rateStop(fps) : null;
-  const fit = limit === null ? "Fit the frame rate" : `Fit the frame rate (${exposureText(limit)} at ${Math.round(fps!)} fps)`;
+  // In a dark room the loop may go one stop past the limit once gain is at its maximum (2.5.12): say so where it is chosen.
+  const darker = limit !== null && range.max > limit ? ", one stop longer in a dark room at most gain" : "";
+  const fit = limit === null ? "Fit the frame rate" : `Fit the frame rate (${exposureText(limit)} at ${Math.round(fps!)} fps${darker})`;
   const out: Option[] = [{ value: "fit", label: fit }];
   for (let n = Math.round(range.min); n <= Math.round(range.max); n++) {
     const meaning = limit === null ? "" : n < limit ? " (sharper motion, more gain)" : n === limit ? " (the frame-rate limit)" : ` (camera drops to ≈ ${droppedFps(n, fps!)} fps)`;

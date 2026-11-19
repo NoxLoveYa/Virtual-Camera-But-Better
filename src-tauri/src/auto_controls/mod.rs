@@ -807,4 +807,9 @@ impl AutoController {
     pub fn learned(&self) -> &Learned {
         &self.learned
     }
+
+    /// The exposure loop's log line (`ExposureLoop::diag`); `None` while it does not run.
+    pub fn exposure_diag(&self) -> Option<String> {
+        self.exposure.as_ref().and_then(|e| e.diag(&self.learned))
+    }
 }

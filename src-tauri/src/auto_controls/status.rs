@@ -145,6 +145,10 @@ pub struct ExposureFacts {
     pub gain_off: bool,
     pub cap: i32,
     pub cap_reason: CapReason,
+    /// The loop goes past the frame-rate limit for light (2.5.12): the frame rate is lowered on purpose.
+    pub lowered: bool,
+    /// ... and the exposure is on its way past the frame-rate limit now (not a gain move while lowered).
+    pub lowering: bool,
     pub fps: f64,
     pub target_fps: f64,
     /// The rate the camera dropped to when the learned cap was set.
@@ -162,7 +166,17 @@ pub fn exposure_message(f: &ExposureFacts) -> Option<String> {
         return Some(fault_message(fault, ControlKey::Exposure, f.handed_back));
     }
     match f.state {
+        ExposureState::Starting | ExposureState::Adjusting if f.lowering => {
+            Some("Lowering frame rate for light…".to_string())
+        }
         ExposureState::Starting | ExposureState::Adjusting => Some("Adjusting…".to_string()),
+        ExposureState::Holding if f.lowered => {
+            let fps = f.fps.round();
+            Some(match (f.gain, f.max_gain) {
+                (Some(g), Some(m)) => format!("Lowered frame rate for light: holding {fps:.0} fps · gain {g} of {m}"),
+                _ => format!("Lowered frame rate for light: holding {fps:.0} fps · {}", exposure_time(f.exposure)),
+            })
+        }
         ExposureState::Holding => {
             if f.cap_reason == CapReason::Learned {
                 let fps = f.dropped_to.unwrap_or(f.fps).round();
@@ -179,9 +193,21 @@ pub fn exposure_message(f: &ExposureFacts) -> Option<String> {
                 _ => format!("Holding {fps:.0} fps · {}", exposure_time(f.exposure)),
             })
         }
+        ExposureState::LimitGain if f.lowered => Some(format!(
+            "Gain at its maximum ({}) and exposure at its longest ({}, {:.0} fps). Add light or allow a longer exposure.",
+            f.max_gain.unwrap_or_default(),
+            exposure_time(f.exposure),
+            f.fps.round()
+        )),
         ExposureState::LimitGain => Some(format!(
             "Gain at its maximum ({}). Add light, allow more gain, or allow a longer exposure.",
             f.max_gain.unwrap_or_default()
+        )),
+        ExposureState::LimitExposure if f.lowered => Some(format!(
+            "Exposure at its longest ({}, {:.0} fps) and {}. Add light or allow a longer exposure.",
+            exposure_time(f.exposure),
+            f.fps.round(),
+            if f.gain_off { "gain is off" } else { "this camera has no gain" }
         )),
         ExposureState::LimitExposure if f.gain_off => Some(format!(
             "Exposure at the {:.0} fps limit and gain is off. Add light, allow more gain, or allow a longer exposure.",
@@ -237,6 +263,8 @@ mod tests {
             gain_off: false,
             cap: -5,
             cap_reason: CapReason::Fps,
+            lowered: false,
+            lowering: false,
             fps: 30.0,
             target_fps: 30.0,
             dropped_to: None,
@@ -286,6 +314,45 @@ mod tests {
         f.max_gain = None;
         f.gain_off = true;
         assert_eq!(exposure_message(&f).as_deref(), Some("Holding 30 fps · 1/32 s · gain off"));
+    }
+
+    #[test]
+    fn a_lowered_frame_rate_says_so() {
+        let t = |s, f: &dyn Fn(&mut ExposureFacts)| {
+            let mut x = facts(s);
+            x.lowered = true;
+            x.exposure = -4;
+            x.fps = 15.9;
+            f(&mut x);
+            exposure_message(&x)
+        };
+        // Only while the exposure goes past the frame-rate limit; a gain move at the lowered rate is plain adjusting.
+        assert_eq!(t(ExposureState::Adjusting, &|_| {}).as_deref(), Some("Adjusting…"));
+        assert_eq!(t(ExposureState::Starting, &|_| {}).as_deref(), Some("Adjusting…"));
+        assert_eq!(
+            t(ExposureState::Adjusting, &|x| x.lowering = true).as_deref(),
+            Some("Lowering frame rate for light…")
+        );
+        assert_eq!(
+            t(ExposureState::Holding, &|_| {}).as_deref(),
+            Some("Lowered frame rate for light: holding 16 fps · gain 48 of 75")
+        );
+        assert_eq!(
+            t(ExposureState::Holding, &|x| {
+                x.gain = None;
+                x.max_gain = None;
+            })
+            .as_deref(),
+            Some("Lowered frame rate for light: holding 16 fps · 1/16 s")
+        );
+        assert_eq!(
+            t(ExposureState::LimitGain, &|_| {}).as_deref(),
+            Some("Gain at its maximum (75) and exposure at its longest (1/16 s, 16 fps). Add light or allow a longer exposure.")
+        );
+        assert_eq!(
+            t(ExposureState::LimitExposure, &|x| x.gain_off = true).as_deref(),
+            Some("Exposure at its longest (1/16 s, 16 fps) and gain is off. Add light or allow a longer exposure.")
+        );
     }
 
     #[test]

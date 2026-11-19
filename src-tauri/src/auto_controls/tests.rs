@@ -167,11 +167,18 @@ fn case_02_light_steps() {
     assert!(under >= -0.5, "overshoot {under}");
 }
 
+/// "Longest exposure" set to the frame-rate limit of 30 fps (1/32 s): the frame rate is never lowered (2.5.12).
+fn at_the_frame_rate() -> AutoCfg {
+    let mut cfg = AutoCfg::default();
+    cfg.exposure.longest = Longest::Stop(-5);
+    cfg
+}
+
 #[test]
 fn case_03_darker_than_the_limits_allow() {
     // The scene needs -1.0; the limits give E = -5 and Most gain 75 = 2.25 stops: -2.75 at most.
     let mut sim = Sim::new(SimCfg::default(), dim(-1.0));
-    let mut ctrl = engage(&sim, resume(-6, 0), false);
+    let mut ctrl = engage_with(&sim, at_the_frame_rate(), resume(-6, 0), false);
     let states = run_states(&mut sim, &mut ctrl, 12.0);
     let (limit_at, _) = states
         .iter()
@@ -202,12 +209,12 @@ fn most_gain_off_drives_the_gain_to_its_minimum() {
         ..SimCfg::default()
     };
     let mut sim = Sim::new(cfg, dim(-1.0));
-    let mut ctrl = engage(&sim, resume(-5, 0), true);
+    let mut ctrl = engage_with(&sim, at_the_frame_rate(), resume(-5, 0), true);
     sim.run(&mut ctrl, 8.0);
     assert_eq!(sim.device(), (-5, 75), "the gain did not climb to Most gain first");
     assert_eq!(state(&ctrl), ExposureState::LimitGain);
     // The user drags Most gain to its minimum.
-    let mut cfg = AutoCfg::default();
+    let mut cfg = at_the_frame_rate();
     cfg.exposure.max_gain = Some(0);
     ctrl.set_cfg(cfg);
     let off_at = sim.t;
@@ -265,8 +272,9 @@ fn the_resume_point_is_stored_after_three_seconds_at_a_limit() {
             stored_at = Some(sim.t);
             assert_eq!(
                 st.resume,
+                // The limit of this room is the lowered frame rate's: one stop past 1/32 s (2.5.12).
                 Some(Resume {
-                    exposure: Some(-5),
+                    exposure: Some(-4),
                     gain: Some(75),
                     white_balance: None
                 })
@@ -284,14 +292,14 @@ fn the_resume_point_is_stored_after_three_seconds_at_a_limit() {
     // A reopen with it starts at the limit: no climb, the seed is the stored point.
     let sim2 = Sim::new(
         SimCfg {
-            start_e: -5,
+            start_e: -4,
             start_g: 75,
             ..SimCfg::default()
         },
         dim(-1.0),
     );
-    let ctrl2 = engage(&sim2, resume(-5, 75), true);
-    assert_eq!(ctrl2.seeds(30.0).exposure, Some((-5, Some(75))));
+    let ctrl2 = engage(&sim2, resume(-4, 75), true);
+    assert_eq!(ctrl2.seeds(30.0).exposure, Some((-4, Some(75))));
 }
 
 #[test]
@@ -2305,4 +2313,750 @@ fn cfg_and_learned_round_trip_as_json() {
     let l: Learned = serde_json::from_str(r#"{"rate_caps":{"30":-6},"gain_stops":2.5}"#).unwrap();
     assert_eq!(l.rate_caps.get("30"), Some(&-6));
     assert_eq!(serde_json::from_str::<Learned>(&serde_json::to_string(&l).unwrap()).unwrap(), l);
+}
+
+/// The owner's settings on the W4GS (Most gain 100, Response Fast, 30 fps), from the two ways a loop starts: the seed
+/// (-6, 0) and the resume point a limit state stored on an earlier run (-5, 100, the one the owner's record holds).
+/// A scene the full-rate limits can reach ends within the band and at the lowest gain that gets there. One that is up
+/// to a stop short of them stays at E = -5, G = 100 in `limit_gain`. One that is more than a stop short goes one stop
+/// past (E = -4, 16 fps, 2.5.12) and, if that is still not enough, ends there at G = 100 in `limit_gain`.
+#[test]
+fn owner_settings_settle_inside_the_limits_and_sit_at_them_outside() {
+    // The most light the limits give: -5 + 3 stops of gain, and with the frame rate lowered -4 + 3.
+    let (top, top_lowered) = (-2.0, -1.0);
+    for need in [-9.0, -7.0, -5.0, -4.0, -3.0, -2.5, -2.0, -1.5, -1.2, -0.5, 0.0, 1.0] {
+        for (start, seeded) in [((-6, 0), false), ((-5, 100), true)] {
+            let cfg = SimCfg {
+                start_e: start.0,
+                start_g: start.1,
+                ..SimCfg::default()
+            };
+            let mut sim = Sim::new(cfg, dim(need));
+            let mut ac = AutoCfg::default();
+            ac.exposure.max_gain = Some(100);
+            ac.exposure.speed = Speed::Fast;
+            let mut ctrl = engage_with(&sim, ac, resume(start.0, start.1), seeded);
+            sim.run(&mut ctrl, 20.0);
+            let last = sim.history.last().expect("ticks");
+            let what = format!("need {need} from {start:?}: device {:?}, err {:+.2}", sim.device(), last.err);
+            assert!(sim.max_e_applied <= -4, "{what}: never past one stop over the frame rate");
+            if need <= top {
+                assert!(last.err.abs() <= 0.33, "{what}");
+                assert!(sim.max_e_applied <= -5, "{what}: full frame rate");
+                // Gain is not bought where a longer exposure gives the same light: at most the crossover's stop and a
+                // quarter on top of what the scene needs.
+                let gs = sim.true_gs(sim.device().1);
+                assert!(gs <= (need - f64::from(sim.device().0)).max(0.0) + 1.5, "{what}: {gs} stops of gain");
+            } else if need < top + 1.0 {
+                // Under a stop short: the full frame rate is kept.
+                assert_eq!(sim.device(), (-5, 100), "{what}");
+                assert_eq!(state(&ctrl), ExposureState::LimitGain, "{what}");
+                assert!((0.0..=1.0).contains(&last.err), "{what}");
+            } else {
+                assert_eq!(sim.device(), (-4, 100), "{what}");
+                assert!(sim.fps_between(sim.t - 5.0, sim.t) < 20.0, "{what}");
+                if need <= top_lowered {
+                    assert!(last.err.abs() <= 0.33, "{what}");
+                } else {
+                    assert_eq!(state(&ctrl), ExposureState::LimitGain, "{what}");
+                    assert!(last.err > 0.0, "{what}");
+                }
+            }
+        }
+    }
+}
+
+/// The owner's settings, 30 fps: Most gain 100, Response Fast, target 0.45.
+fn owner_cfg() -> AutoCfg {
+    let mut ac = AutoCfg::default();
+    ac.exposure.max_gain = Some(100);
+    ac.exposure.speed = Speed::Fast;
+    ac
+}
+
+fn owner_sim(light: Light) -> Sim {
+    Sim::new(
+        SimCfg {
+            start_e: -5,
+            start_g: 100,
+            ..SimCfg::default()
+        },
+        light,
+    )
+}
+
+/// (a) A scene two stops under what 1/32 s and full gain give: the exposure goes longer than the frame-rate limit, one
+/// stop (the ceiling for `fit`), and the picture is that much brighter. The frame-rate guard does not take the low rate
+/// for a camera that drops frames.
+#[test]
+fn a_room_two_stops_too_dark_lowers_the_frame_rate() {
+    let mut sim = owner_sim(dim(0.0));
+    let mut ctrl = engage_with(&sim, owner_cfg(), resume(-5, 100), true);
+    let mut states = Vec::new();
+    while sim.t < 30.0 {
+        sim.run(&mut ctrl, sim.t + 0.1);
+        states.push(ctrl.status().exposure.unwrap());
+    }
+    let last = sim.history.last().unwrap();
+    assert_eq!(sim.device(), (-4, 100));
+    assert_eq!(sim.max_e_applied, -4, "never past the ceiling");
+    // Two stops under at (-5, 100); one stop under at the ceiling. The ceiling is as far as `fit` goes.
+    assert!((last.err - 1.0).abs() <= 0.1, "err {}", last.err);
+    assert!(sim.fps_between(20.0, 30.0) < 20.0, "{}", sim.fps_between(20.0, 30.0));
+    // Not before 3 s of it (not a single frame), and the card says what the loop is doing.
+    let first = sim.writes.iter().find(|w| w.key == ControlKey::Exposure && w.value == -4).expect("never went longer");
+    assert!((3.0..=5.0).contains(&first.started), "went longer at {}", first.started);
+    assert!(states.iter().any(|s| s.message.as_deref() == Some("Lowering frame rate for light…")));
+    let st = states.last().unwrap();
+    assert_eq!((st.state, st.cap, st.cap_reason), (ExposureState::LimitGain, -5, CapReason::Fps));
+    let message = st.message.as_deref().unwrap();
+    assert!(message.starts_with("Gain at its maximum (100) and exposure at its longest (1/16 s, 1"), "{message}");
+    // The frame-rate guard (2.5.8) learned nothing from the low rate it was asked for.
+    assert!(sim.emitted.iter().filter_map(|s| s.learned.as_ref()).all(|l| l.rate_caps.is_empty()));
+    // And the loop is quiet.
+    assert!(sim.writes_between(15.0, 30.0).is_empty());
+
+    // 1.4 stops short at (-5, 100): the error is under half a stop at the ceiling.
+    let mut sim = owner_sim(dim(-0.6));
+    let mut ctrl = engage_with(&sim, owner_cfg(), resume(-5, 100), true);
+    sim.run(&mut ctrl, 30.0);
+    assert_eq!(sim.device(), (-4, 100));
+    assert!(sim.history.last().unwrap().err.abs() <= 0.5, "err {}", sim.history.last().unwrap().err);
+}
+
+/// With the frame rate lowered, gain is not kept at its limit where exposure alone covers the need.
+#[test]
+fn a_brighter_room_needs_less_gain_at_the_longer_exposure() {
+    let light: Light = Box::new(|t| if t < 15.0 { 1.0 } else { 1.8_f64.exp2() });
+    // need = 0 until 15 s, then -1.8: inside the dead band (the exit is at -2.5), so the exposure stays at 1/16 s.
+    let mut sim = owner_sim(light);
+    let mut ctrl = engage_with(&sim, owner_cfg(), resume(-5, 100), true);
+    sim.run(&mut ctrl, 15.0);
+    assert_eq!(sim.device(), (-4, 100));
+    // The gain coming down at the lowered rate is plain adjusting: the card says "Lowering" only while the exposure
+    // goes past the frame-rate limit.
+    let mut texts = Vec::new();
+    while sim.t < 40.0 {
+        sim.run(&mut ctrl, sim.t + 0.1);
+        texts.push(ctrl.status().exposure.unwrap().message);
+    }
+    assert!(texts.iter().any(|m| m.as_deref() == Some("Adjusting…")));
+    assert!(!texts.iter().flatten().any(|m| m.starts_with("Lowering")), "{texts:?}");
+    let (e, g) = sim.device();
+    assert_eq!(e, -4);
+    // 2.2 stops of gain of 3: well under the limit.
+    assert!(sim.true_gs(g) < 2.5, "gain {g} = {} stops", sim.true_gs(g));
+    assert!(sim.history.last().unwrap().err.abs() <= 0.33);
+}
+
+/// (b) A normally lit scene never leaves the frame-rate limit, from either start.
+#[test]
+fn a_lit_room_keeps_the_frame_rate() {
+    for need in [-9.0, -6.0, -4.0, -2.5] {
+        for (start, seeded) in [((-6, 0), false), ((-5, 100), true)] {
+            let mut sim = Sim::new(
+                SimCfg {
+                    start_e: start.0,
+                    start_g: start.1,
+                    ..SimCfg::default()
+                },
+                dim(need),
+            );
+            let mut ctrl = engage_with(&sim, owner_cfg(), resume(start.0, start.1), seeded);
+            sim.run(&mut ctrl, 30.0);
+            let what = format!("need {need} from {start:?}");
+            assert!(sim.max_e_applied <= -5, "{what}: exposure {}", sim.max_e_applied);
+            assert!(sim.history.last().unwrap().err.abs() <= 0.33, "{what}");
+            assert!(sim.fps_between(10.0, 30.0) >= 29.5, "{what}");
+            assert_eq!(state(&ctrl), ExposureState::Holding, "{what}");
+        }
+    }
+}
+
+/// (c) Dark, then bright: the exposure returns to the frame-rate limit with gain still high (the full frame rate
+/// first, then less gain), and nothing swings afterwards.
+#[test]
+fn light_back_restores_the_frame_rate_before_it_cuts_gain() {
+    // need 0 until 20 s, then -4 (the exit is at -2.5).
+    let light: Light = Box::new(|t| if t < 20.0 { 1.0 } else { 4.0_f64.exp2() });
+    let mut sim = owner_sim(light);
+    let mut ctrl = engage_with(&sim, owner_cfg(), resume(-5, 100), true);
+    sim.run(&mut ctrl, 20.0);
+    assert_eq!(sim.device(), (-4, 100));
+    sim.run(&mut ctrl, 60.0);
+    assert_eq!(sim.device().0, -5, "back at 1/32 s");
+    let g_end = sim.device().1;
+    assert!(sim.history.last().unwrap().err.abs() <= 0.33);
+    // The first moment the exposure is short again, gain has not gone below where it ends.
+    let back = sim.history.iter().find(|s| s.t > 20.0 && s.e == -5).expect("never back");
+    assert!(back.g >= g_end, "gain {} when the exposure came back, {g_end} at the end", back.g);
+    // After that the exposure never goes longer again, and a settled loop does not write.
+    assert!(sim.history.iter().filter(|s| s.t >= back.t).all(|s| s.e == -5));
+    assert!(sim.writes_between(40.0, 60.0).is_empty());
+    assert!(sim.fps_between(40.0, 60.0) >= 29.5);
+    assert_eq!(state(&ctrl), ExposureState::Holding);
+}
+
+/// No flipping at the entry boundary: a light that wobbles across the point where the frame rate would be lowered
+/// does not move the exposure back and forth. (The exit boundary is `a_light_at_the_exit_boundary_...`, which first
+/// lets the loop enter for real.)
+#[test]
+fn a_light_at_the_boundary_does_not_flip_the_frame_rate() {
+    // At (-5, 100): err = need + 2. The entry needs more than +1 for 3 s; the exit needs need under -2.5.
+    for (low, high, start) in [(-1.3, -0.7, (-5, 100)), (-2.4, -1.6, (-5, 100))] {
+        let light: Light = Box::new(move |t| {
+            let need: f64 = if ((t / 7.0) as u32).is_multiple_of(2) { high } else { low };
+            (-need).exp2()
+        });
+        let mut sim = Sim::new(
+            SimCfg {
+                start_e: start.0,
+                start_g: start.1,
+                ..SimCfg::default()
+            },
+            light,
+        );
+        let mut ctrl = engage_with(&sim, owner_cfg(), resume(start.0, start.1), true);
+        sim.run(&mut ctrl, 150.0);
+        let e_writes = sim.writes.iter().filter(|w| w.key == ControlKey::Exposure).count();
+        assert!(e_writes <= 1, "{low}/{high}: the exposure was written {e_writes} times: {:?}", sim.writes);
+    }
+}
+
+/// (d) `Longest exposure` at the frame-rate limit: gain only, as before. A longer user stop is the ceiling.
+#[test]
+fn the_longest_exposure_setting_is_never_passed() {
+    let mut cfg = owner_cfg();
+    cfg.exposure.longest = Longest::Stop(-5);
+    let mut sim = owner_sim(dim(1.0));
+    let mut ctrl = engage_with(&sim, cfg, resume(-5, 100), true);
+    sim.run(&mut ctrl, 30.0);
+    assert_eq!(sim.device(), (-5, 100));
+    assert_eq!(sim.max_e_applied, -5);
+    assert_eq!(state(&ctrl), ExposureState::LimitGain);
+    assert!(sim.fps_between(5.0, 30.0) >= 29.5);
+    assert!(sim.writes.is_empty(), "{:?}", sim.writes);
+
+    // The user allows 1/8 s: exposure goes there first, before gain, as before (no 3 s wait, no ceiling of one stop).
+    let mut cfg = owner_cfg();
+    cfg.exposure.longest = Longest::Stop(-3);
+    let mut sim = Sim::new(SimCfg::default(), dim(-1.0));
+    let mut ctrl = engage_with(&sim, cfg, resume(-6, 0), false);
+    sim.run(&mut ctrl, 20.0);
+    assert!(sim.max_e_applied <= -3);
+    assert!(sim.history.last().unwrap().err.abs() <= 0.33);
+    let mut cfg = owner_cfg();
+    cfg.exposure.longest = Longest::Stop(-4);
+    let mut sim = owner_sim(dim(4.0));
+    let mut ctrl = engage_with(&sim, cfg, resume(-5, 100), true);
+    sim.run(&mut ctrl, 30.0);
+    assert_eq!(sim.device(), (-4, 100));
+    assert_eq!(sim.max_e_applied, -4);
+}
+
+/// A reopen from the resume point of a lowered frame rate stays there: no climb back to 1/32 s, no write.
+#[test]
+fn a_reopen_keeps_the_lowered_frame_rate() {
+    let mut sim = Sim::new(
+        SimCfg {
+            start_e: -4,
+            start_g: 100,
+            ..SimCfg::default()
+        },
+        dim(0.0),
+    );
+    let mut ctrl = engage_with(&sim, owner_cfg(), resume(-4, 100), true);
+    assert_eq!(ctrl.seeds(30.0).exposure, Some((-4, Some(100))));
+    sim.run(&mut ctrl, 10.0);
+    assert!(sim.writes.is_empty(), "{:?}", sim.writes);
+    assert_eq!(state(&ctrl), ExposureState::LimitGain);
+    // A frame-rate limit that does not allow it (the user's own stop) cuts the seed to it.
+    let mut cfg = owner_cfg();
+    cfg.exposure.longest = Longest::Stop(-5);
+    let ctrl = engage_with(&sim, cfg, resume(-4, 100), false);
+    assert_eq!(ctrl.seeds(30.0).exposure, Some((-5, Some(100))));
+}
+
+#[test]
+fn the_log_line_says_where_the_loop_is_and_what_it_saw() {
+    let mut sim = Sim::new(SimCfg::default(), dim(-1.0));
+    let mut ctrl = engage(&sim, resume(-6, 0), false);
+    // Not before the camera is open (the first tick).
+    assert_eq!(ctrl.exposure_diag(), None);
+    sim.run(&mut ctrl, 0.2);
+    assert_eq!(ctrl.exposure_diag().as_deref().map(|l| l.contains("Starting")), Some(true));
+    sim.run(&mut ctrl, 12.0);
+    let line = ctrl.exposure_diag().expect("engaged");
+    // The room is darker than 1/32 s and Most gain give: the loop went one stop past (2.5.12) and sits at that limit.
+    for part in ["LimitGain", "E=-4", "G=75", "cap=-5 (Fps)", "ceil=-4", "over=true", "maxG=75", "err=+"] {
+        assert!(line.contains(part), "{part} not in {line}");
+    }
+    assert!(line.contains("fps=15."), "{line}");
+    // Held at the frame-rate limit: the same room, `over=false`.
+    let mut sim = Sim::new(SimCfg::default(), dim(-1.0));
+    let mut ctrl = engage_with(&sim, at_the_frame_rate(), resume(-6, 0), false);
+    sim.run(&mut ctrl, 12.0);
+    let line = ctrl.exposure_diag().expect("engaged");
+    for part in ["LimitGain", "E=-5", "G=75", "cap=-5 (User)", "ceil=-5", "over=false", "fps=30.0/30"] {
+        assert!(line.contains(part), "{part} not in {line}");
+    }
+    // Not engaged: no line.
+    let off = AutoController::new(&sim.caps(), AutoCfg::default(), Learned::default(), Modes::default());
+    assert_eq!(off.exposure_diag(), None);
+}
+
+// --- lowering the frame rate for light: the audit's cases (2.5.11, 2.5.12) ---
+
+/// Whether the log line says the loop lowers the frame rate.
+fn lowered(ctrl: &AutoController) -> bool {
+    ctrl.exposure_diag().expect("running").contains("over=true")
+}
+
+/// The first exposure write of `value` at or after `from`.
+fn first_exposure_write(sim: &Sim, value: i32, from: f64) -> Option<f64> {
+    sim.writes
+        .iter()
+        .find(|w| w.key == ControlKey::Exposure && w.value == value && w.started >= from)
+        .map(|w| w.started)
+}
+
+/// A reopen in a normal room: the resume point is a value from some earlier run (it carries no frame rate), so a
+/// seed above the frame-rate limit is only a guess. The room needs 3.8 stops: 1/64 s (the limit at 60 fps) and the
+/// gain it leaves, not the 1/32 s of the seed (31 fps).
+#[test]
+fn a_reopen_in_a_normal_room_leaves_the_lowered_frame_rate() {
+    let mut sim = Sim::new(
+        SimCfg {
+            fps: 60.0,
+            start_e: -5,
+            start_g: 40,
+            ..SimCfg::default()
+        },
+        dim(-3.8),
+    );
+    let mut ctrl = engage(&sim, resume(-5, 40), true);
+    sim.run(&mut ctrl, 30.0);
+    assert_eq!(sim.device().0, -6, "{:?}", sim.device());
+    assert!(!lowered(&ctrl), "{:?}", ctrl.exposure_diag());
+    assert!(sim.fps_between(20.0, 30.0) >= 59.0, "{}", sim.fps_between(20.0, 30.0));
+    assert!(sim.history.last().unwrap().err.abs() <= 0.33);
+    assert_eq!(state(&ctrl), ExposureState::Holding);
+
+    // A room that does need the longer exposure keeps it (the seed was right).
+    let mut sim = Sim::new(
+        SimCfg {
+            fps: 60.0,
+            start_e: -5,
+            start_g: 75,
+            ..SimCfg::default()
+        },
+        dim(-1.0),
+    );
+    let mut ctrl = engage(&sim, resume(-5, 75), true);
+    sim.run(&mut ctrl, 30.0);
+    assert!(lowered(&ctrl));
+    assert_eq!(sim.device(), (-5, 75));
+    assert!(sim.writes.is_empty(), "{:?}", sim.writes);
+}
+
+/// The same with a frame-rate limit the loop learned: a stored value above it is not kept either, and the seed is the
+/// stored value until the first decision says otherwise.
+#[test]
+fn a_reopen_above_a_learned_rate_cap_leaves_the_lowered_frame_rate() {
+    let mut sim = Sim::new(
+        SimCfg {
+            start_e: -5,
+            start_g: 40,
+            ..SimCfg::default()
+        },
+        dim(-3.8),
+    );
+    let mut learned = Learned::default();
+    learned.rate_caps.insert("30".to_string(), -6);
+    let mut ctrl = AutoController::new(
+        &sim.caps(),
+        AutoCfg::default(),
+        learned,
+        Modes {
+            exposure: Mode::App,
+            resume: resume(-5, 40),
+            seeded: true,
+            ..Modes::default()
+        },
+    );
+    assert_eq!(ctrl.seeds(30.0).exposure, Some((-5, Some(40))));
+    sim.run(&mut ctrl, 30.0);
+    assert_eq!(sim.device().0, -6, "{:?}", sim.device());
+    assert!(!lowered(&ctrl), "{:?}", ctrl.exposure_diag());
+    assert!(sim.history.last().unwrap().err.abs() <= 0.33);
+    assert_eq!(ctrl.learned().rate_caps.get("30"), Some(&-6));
+}
+
+/// The entry timer runs only while the loop sits at its limits with the picture over a stop dark: a dip in between
+/// (too bright, the lens covered) starts it again, so the loop does not lower the frame rate on the first reading
+/// after it.
+#[test]
+fn a_dip_in_the_light_starts_the_entry_timer_again() {
+    // (when the dip ends, the light of the dip)
+    for (name, dip) in [("too bright", 4.0_f64.exp2()), ("lens covered", 0.0)] {
+        let light: Light = Box::new(move |t| {
+            if (2.0..8.0).contains(&t) {
+                dip
+            } else {
+                1.0
+            }
+        });
+        let mut sim = owner_sim(light);
+        let mut ctrl = engage_with(&sim, owner_cfg(), resume(-5, 100), true);
+        sim.run(&mut ctrl, 25.0);
+        assert_eq!(sim.device(), (-4, 100), "{name}");
+        let at = first_exposure_write(&sim, -4, 0.0).unwrap_or_else(|| panic!("{name}: never went longer"));
+        // The picture is dark again from 8 s on and at its limits from the last gain write that brought it there:
+        // 3 s of that, not the time before the dip.
+        let back = sim
+            .writes
+            .iter()
+            .filter(|w| w.key == ControlKey::Gain && w.value == 100 && w.started >= 8.0)
+            .map(|w| w.done)
+            .fold(8.0, f64::max);
+        assert!(at - back >= 2.9, "{name}: went longer at {at}, back at the limits at {back}");
+    }
+}
+
+/// No gain, no room above the frame-rate limit left once the light is back: the lowered state ends when the exposure
+/// is back at the frame-rate limit, not only when the scene is half a stop under what the limit gives.
+#[test]
+fn a_camera_without_gain_ends_the_lowered_frame_rate() {
+    let light: Light = Box::new(|t| if t < 10.0 { 3.0_f64.exp2() } else { 5.0_f64.exp2() });
+    let mut sim = Sim::new(
+        SimCfg {
+            gain: false,
+            start_e: -5,
+            ..SimCfg::default()
+        },
+        light,
+    );
+    let mut ctrl = engage_with(&sim, owner_cfg(), resume(-5, 0), false);
+    sim.run(&mut ctrl, 10.0);
+    assert_eq!(sim.device().0, -4, "one stop past the frame rate in the dark room");
+    assert!(lowered(&ctrl));
+    sim.run(&mut ctrl, 30.0);
+    assert_eq!(sim.device().0, -5, "{:?}", sim.device());
+    assert!(!lowered(&ctrl), "{:?}", ctrl.exposure_diag());
+    assert!(sim.fps_between(20.0, 30.0) >= 29.5);
+    assert_eq!(state(&ctrl), ExposureState::Holding);
+}
+
+/// A reading with no confidence (a mostly dark picture: under 20 % confidence) never lowers the frame rate, however
+/// long it lasts and however far off its error is (2.5.12). The picture alternates so that the median of three has no
+/// confidence while the window still has a sure sample (all unsure is the no-signal path of 2.5.5 step 1).
+#[test]
+fn an_unsure_picture_never_lowers_the_frame_rate() {
+    use super::meter::{measure_exposure, GRID};
+    // `lit` cells at 0.05 of the full signal (about 1.8 stops dark), the rest black.
+    let picture = |lit: usize| Stats {
+        cells: (0..GRID * GRID)
+            .map(|i| if i < lit { [0.05, 0.05, 0.05, 1.0] } else { [0.0, 0.0, 0.0, 1.0] })
+            .collect(),
+    };
+    let sure = (1..GRID * GRID).find(|&n| measure_exposure(&picture(n), 0.45).confidence >= 0.2).expect("a lit picture");
+    let (unsure, sure) = (picture(sure - 1), picture(sure));
+    let (a, b) = (measure_exposure(&unsure, 0.45), measure_exposure(&sure, 0.45));
+    assert!(a.confidence < 0.2 && a.error > 1.0 && b.confidence >= 0.2 && b.error > 1.0, "{a:?} {b:?}");
+
+    let sim = owner_sim(dim(0.0));
+    let mut ctrl = engage_with(&sim, owner_cfg(), resume(-5, 100), true);
+    let facts = SessionFacts {
+        token: Some(1),
+        target_fps: 30.0,
+        capture_fps: 30.0,
+        paused: false,
+        resumed_at: f64::NEG_INFINITY,
+    };
+    let mut writes = Vec::new();
+    let mut next_sample = 0.0;
+    for i in 0..=100 {
+        let now = f64::from(i) * 0.1;
+        while next_sample <= now {
+            let n = (next_sample / 0.066).round() as usize;
+            let stats = if n % 3 == 2 { sure.clone() } else { unsure.clone() };
+            ctrl.on_sample(&MeterSample { token: 1, capture_qpc: 0, stats }, next_sample);
+            next_sample += 0.066;
+        }
+        writes.extend(ctrl.tick(now, &facts).into_iter().filter(|a| matches!(a, Action::Write { .. })));
+    }
+    assert!(writes.is_empty(), "{writes:?}");
+    assert!(!lowered(&ctrl), "{:?}", ctrl.exposure_diag());
+    // The same picture with its confidence in the clear does lower it (the test is not vacuous).
+    let mut ctrl = engage_with(&sim, owner_cfg(), resume(-5, 100), true);
+    let mut writes = Vec::new();
+    let mut next_sample = 0.0;
+    for i in 0..=100 {
+        let now = f64::from(i) * 0.1;
+        while next_sample <= now {
+            ctrl.on_sample(&MeterSample { token: 1, capture_qpc: 0, stats: sure.clone() }, next_sample);
+            next_sample += 0.066;
+        }
+        writes.extend(ctrl.tick(now, &facts).into_iter().filter(|a| matches!(a, Action::Write { .. })));
+        if !writes.is_empty() {
+            break;
+        }
+    }
+    assert!(lowered(&ctrl), "{:?}", ctrl.exposure_diag());
+    assert!(writes.contains(&Action::Write { key: ControlKey::Exposure, value: -4 }), "{writes:?}");
+}
+
+/// No line in the log while the camera is closed or the loop paused (it has nothing to say then).
+#[test]
+fn the_log_line_is_silent_while_closed_or_paused() {
+    let mut sim = Sim::new(SimCfg::default(), dim(-3.5));
+    let mut ctrl = engage(&sim, resume(-6, 0), false);
+    sim.run(&mut ctrl, 2.0);
+    assert!(ctrl.exposure_diag().is_some());
+    let mut facts = sim.facts();
+    facts.paused = true;
+    ctrl.tick(2.1, &facts);
+    assert_eq!(ctrl.exposure_diag(), None, "paused");
+    facts.paused = false;
+    ctrl.tick(2.2, &facts);
+    assert!(ctrl.exposure_diag().is_some());
+    facts.token = None;
+    ctrl.tick(2.3, &facts);
+    assert_eq!(ctrl.exposure_diag(), None, "closed");
+}
+
+/// A change of `Most gain` ends the lowered frame rate (2.5.12): the loop works from the new limits, brightness-
+/// neutral first, and lowers it again only after 3 s at them.
+#[test]
+fn a_most_gain_change_ends_the_lowered_frame_rate() {
+    let mut sim = owner_sim(dim(0.0));
+    let mut ctrl = engage_with(&sim, owner_cfg(), resume(-5, 100), true);
+    sim.run(&mut ctrl, 15.0);
+    assert!(lowered(&ctrl));
+    assert_eq!(sim.device(), (-4, 100));
+    let mut cfg = owner_cfg();
+    cfg.exposure.max_gain = Some(60);
+    ctrl.set_cfg(cfg);
+    sim.run(&mut ctrl, 16.5);
+    assert_eq!(sim.device().0, -5, "{:?}", sim.device());
+    assert!(!lowered(&ctrl), "{:?}", ctrl.exposure_diag());
+    assert!(sim.device().1 <= 60);
+    // Still too dark at the new limits: the exposure goes longer again, not before the timer is out.
+    assert!(first_exposure_write(&sim, -4, 16.0).is_none());
+    sim.run(&mut ctrl, 30.0);
+    assert_eq!(sim.device(), (-4, 60));
+    assert!(lowered(&ctrl));
+}
+
+/// No entry while the frame-rate guard (2.5.8) is on a trial: the camera that drops frames at 1/32 s is taken to
+/// 1/64 s first, and that stays learned; only afterwards may the loop go longer for a dark room.
+#[test]
+fn the_frame_rate_is_not_lowered_while_the_guard_tries_a_cap() {
+    let mut sim = Sim::new(
+        SimCfg {
+            rate_drop: true,
+            start_e: -5,
+            start_g: 100,
+            ..SimCfg::default()
+        },
+        dim(0.0),
+    );
+    let mut ctrl = engage_with(&sim, owner_cfg(), resume(-5, 100), true);
+    sim.run(&mut ctrl, 20.0);
+    assert_eq!(ctrl.learned().rate_caps.get("30"), Some(&-6), "the guard's cap was taken back");
+    // The trial ran at 1/64 s; the loop went longer afterwards (the room is two stops dark).
+    let trial = first_exposure_write(&sim, -6, 0.0).expect("the guard never tried");
+    let longer = first_exposure_write(&sim, -5, trial).expect("never went longer");
+    assert!(longer - trial >= 3.0, "trial {trial}, longer {longer}");
+}
+
+// --- lowering the frame rate for light: the second audit's cases (2.5.12) ---
+
+/// The exposure writes the camera received, as values.
+fn exposure_attempts(sim: &Sim) -> Vec<i32> {
+    sim.attempts.iter().filter(|w| w.key == ControlKey::Exposure).map(|w| w.value).collect()
+}
+
+/// A camera that takes an exposure up to the frame time and no longer (it reads back the old value): the one stop past
+/// the frame-rate limit is refused once, and that is no ignored control. The loop stays at the frame-rate limit for
+/// the rest of the session, asks again after a new one, and is not handed back or blocked.
+#[test]
+fn a_camera_that_refuses_a_longer_exposure_keeps_the_frame_rate() {
+    let mut sim = owner_sim(dim(0.0));
+    sim.faults.ignore = vec![ControlKey::Exposure];
+    let mut ctrl = engage_with(&sim, owner_cfg(), resume(-5, 100), true);
+    sim.run(&mut ctrl, 30.0);
+    assert!(sim.handbacks.is_empty(), "{:?}", sim.handbacks);
+    assert!(ctrl.learned().blocked.is_empty(), "{:?}", ctrl.learned().blocked);
+    assert_eq!(exposure_attempts(&sim), vec![-4], "asked once, not again this session");
+    assert_eq!(state(&ctrl), ExposureState::LimitGain);
+    assert!(!lowered(&ctrl), "{:?}", ctrl.exposure_diag());
+    assert!(ctrl.exposure_diag().unwrap().contains("ceil=-5"), "{:?}", ctrl.exposure_diag());
+    let st = ctrl.status().exposure.expect("running");
+    assert_eq!(st.handed_back, None);
+    assert_eq!(
+        st.message.as_deref(),
+        Some("Gain at its maximum (100). Add light, allow more gain, or allow a longer exposure.")
+    );
+
+    // A new session asks again (the next camera may take it).
+    ctrl.set_modes(Modes {
+        exposure: Mode::Camera,
+        ..Modes::default()
+    });
+    ctrl.set_modes(Modes {
+        exposure: Mode::App,
+        resume: resume(-5, 100),
+        seeded: true,
+        ..Modes::default()
+    });
+    sim.run(&mut ctrl, 45.0);
+    assert_eq!(exposure_attempts(&sim), vec![-4, -4]);
+    assert!(sim.handbacks.is_empty(), "{:?}", sim.handbacks);
+    assert!(ctrl.learned().blocked.is_empty());
+}
+
+/// A camera that ignores the exposure at the frame-rate limit too is still an ignored control (the refusal is only for
+/// the stop past it).
+#[test]
+fn a_camera_that_ignores_every_exposure_write_is_still_ignored() {
+    let mut sim = Sim::new(
+        SimCfg {
+            start_e: -9,
+            ..SimCfg::default()
+        },
+        dim(-3.5),
+    );
+    sim.faults.ignore = vec![ControlKey::Exposure];
+    let mut ctrl = engage_with(&sim, owner_cfg(), resume(-6, 0), false);
+    sim.run(&mut ctrl, 15.0);
+    assert_eq!(handed_back(&sim, ControlKey::Exposure), vec![HandBack::CameraAuto]);
+    assert_eq!(ctrl.learned().blocked, vec![ControlKey::Exposure]);
+}
+
+/// A gap of frames (2 s without a sample, 2.5.12 and W5) breaks the 3 s of the entry timer: the loop that has seen the
+/// room dark for 1 s, then nothing for 5 s, does not lower the frame rate on the first picture after it.
+#[test]
+fn a_gap_in_the_frames_starts_the_entry_timer_again() {
+    let mut sim = owner_sim(dim(0.0));
+    let mut ctrl = engage_with(&sim, owner_cfg(), resume(-5, 100), true);
+    sim.run(&mut ctrl, 1.0);
+    sim.no_samples = true;
+    sim.run(&mut ctrl, 6.0);
+    sim.no_samples = false;
+    sim.run(&mut ctrl, 14.0);
+    let at = first_exposure_write(&sim, -4, 0.0).expect("never went longer");
+    assert!(at >= 9.0, "went longer at {at}: the 3 s began again with the first picture after the gap");
+    assert!(at <= 11.0, "went longer at {at}");
+}
+
+/// The room brightens between the entry and the move up (2.5.12): gain alone covers it at the full frame rate, and
+/// the loop must not stay "lowered" there (the guard off, the text, the next darkening without its 3 s). Whenever in
+/// the second after the entry the light changes.
+#[test]
+fn a_room_that_brightens_after_the_entry_does_not_stay_lowered() {
+    let mut cfg = owner_cfg();
+    cfg.exposure.max_gain = Some(50);
+    let mut caught = 0;
+    for step in 0..24 {
+        let at = 3.0 + f64::from(step) * 0.05;
+        // At (-5, 50) the limits give need -3.5: -2.0 is 1.5 stops short, -3.9 within the gain's reach.
+        let light: Light = Box::new(move |t| if t < at { 2.0_f64.exp2() } else { 3.9_f64.exp2() });
+        let mut sim = Sim::new(
+            SimCfg {
+                start_e: -5,
+                start_g: 50,
+                ..SimCfg::default()
+            },
+            light,
+        );
+        let mut ctrl = engage_with(&sim, cfg, resume(-5, 50), true);
+        let mut texts = Vec::new();
+        while sim.t < 20.0 {
+            sim.run(&mut ctrl, sim.t + 0.1);
+            texts.push(ctrl.status().exposure.unwrap().message.unwrap_or_default());
+        }
+        let what = format!("light changes at {at}: device {:?}, {:?}", sim.device(), ctrl.exposure_diag());
+        if first_exposure_write(&sim, -4, 0.0).is_some() {
+            // The move came first: inside the dead band (the exit is at need -4.0) the loop stays where it is.
+            assert!(lowered(&ctrl), "{what}");
+            continue;
+        }
+        caught += 1;
+        assert_eq!(sim.device().0, -5, "{what}");
+        assert!(!lowered(&ctrl), "{what}");
+        assert_eq!(state(&ctrl), ExposureState::Holding, "{what}");
+        let last = ctrl.status().exposure.unwrap().message.unwrap();
+        assert!(last.starts_with("Holding 30 fps"), "{what}: {last}");
+        // Not "Lowered" at any time after the light was gone.
+        let after = (at / 0.1) as usize + 20;
+        assert!(!texts[after..].iter().any(|m| m.starts_with("Lower")), "{what}: {texts:?}");
+        assert!(sim.history.last().unwrap().err.abs() <= 0.33, "{what}");
+    }
+    assert!(caught > 0, "no light change fell between the entry and the move");
+}
+
+/// A room that brightens a little inside the dead band, and then darkens again, ends the state only where it should:
+/// after the entry and a hold at the frame-rate limit the lowered state is over, and a later darkening waits for its
+/// own 3 s.
+#[test]
+fn a_darkening_after_a_cancelled_entry_waits_for_its_own_timer() {
+    let mut cfg = owner_cfg();
+    cfg.exposure.max_gain = Some(50);
+    // need -2.0 (1.5 short) until the entry (3.35 s, as in the case above), then -3.9 (reachable), then -2.0 again from
+    // 12 s.
+    let light: Light = Box::new(|t| {
+        if !(3.35..12.0).contains(&t) {
+            2.0_f64.exp2()
+        } else {
+            3.9_f64.exp2()
+        }
+    });
+    let mut sim = Sim::new(
+        SimCfg {
+            start_e: -5,
+            start_g: 50,
+            ..SimCfg::default()
+        },
+        light,
+    );
+    let mut ctrl = engage_with(&sim, cfg, resume(-5, 50), true);
+    sim.run(&mut ctrl, 12.0);
+    assert!(!lowered(&ctrl), "{:?}", ctrl.exposure_diag());
+    sim.run(&mut ctrl, 14.5);
+    assert!(first_exposure_write(&sim, -4, 12.0).is_none(), "went longer within 2.5 s of the darkening");
+    sim.run(&mut ctrl, 25.0);
+    assert!(first_exposure_write(&sim, -4, 12.0).is_some(), "never went longer");
+}
+
+/// The exit's dead band: a light that wobbles across the exit point (`need` under -2.5 at E_rate -5 and full gain)
+/// is taken back to the frame rate once, and not again. The loop enters for real first (need 0 for 12 s).
+#[test]
+fn a_light_at_the_exit_boundary_does_not_flip_the_frame_rate() {
+    for (high, low) in [(-2.3, -2.7), (-2.45, -2.55)] {
+        let light: Light = Box::new(move |t| {
+            let need: f64 = if t < 12.0 {
+                0.0
+            } else if (((t - 12.0) / 7.0) as u32).is_multiple_of(2) {
+                high
+            } else {
+                low
+            };
+            (-need).exp2()
+        });
+        let mut sim = owner_sim(light);
+        let mut ctrl = engage_with(&sim, owner_cfg(), resume(-5, 100), true);
+        sim.run(&mut ctrl, 12.0);
+        assert!(lowered(&ctrl), "{high}/{low}: {:?}", ctrl.exposure_diag());
+        assert_eq!(sim.device().0, -4, "{high}/{low}");
+        sim.run(&mut ctrl, 150.0);
+        let writes = exposure_attempts(&sim);
+        let first_back = writes.iter().position(|&v| v == -5);
+        assert!(writes.starts_with(&[-4]), "{high}/{low}: {writes:?}");
+        // No exposure write after the first -5.
+        if let Some(i) = first_back {
+            assert_eq!(writes.len(), i + 1, "{high}/{low}: {writes:?}");
+        }
+        assert!(writes.len() <= 2, "{high}/{low}: {writes:?}");
+    }
 }

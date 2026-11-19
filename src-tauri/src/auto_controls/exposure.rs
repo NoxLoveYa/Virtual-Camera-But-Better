@@ -68,6 +68,13 @@ const GUARD_RECOVERED: f64 = 0.95;
 const GUARD_QUIET: f64 = 1.0;
 const GUARD_LOW_FOR: f64 = 3.0;
 const GUARD_VERIFY: f64 = 3.0;
+/// Lowering the frame rate for light (2.5.12): at its gain limit and the exposure at the frame-rate limit, the picture
+/// must stay more than this many stops too dark for `LIMIT_AFTER` seconds before the exposure may go one stop longer.
+const OVER_ENTER: f64 = 1.0;
+/// Back to the frame-rate limit once the scene needs this many stops less light than the frame-rate limit and `Most
+/// gain` give together: gain then lands this far under its limit, and `OVER_ENTER + OVER_EXIT` stops of scene change
+/// are needed to turn round (no flipping at the boundary).
+const OVER_EXIT: f64 = 0.5;
 /// The resume point is reported at most this often (2.5.11).
 const RESUME_EVERY: f64 = 10.0;
 /// The resume point is also reported once the loop has sat in a limit state this long (2.5.11).
@@ -181,7 +188,13 @@ pub fn rate_limit(fps: f64) -> i32 {
 /// The limits for the current settings, frame rate and learned values (2.5.2).
 #[derive(Clone, Copy, Debug)]
 struct Limits {
+    /// The longest exposure the loop may use now: `e_ceil` while it lowers the frame rate for light, else `e_rate`.
     e_cap: i32,
+    /// The longest exposure that keeps the frame rate (the user's stop, the learned cap, or `E_rate`).
+    e_rate: i32,
+    /// The longest exposure at all, reached only while the frame rate is lowered (2.5.12). One stop above `e_rate`
+    /// with `Longest exposure = fit`, else `e_rate`.
+    e_ceil: i32,
     reason: CapReason,
     /// Gain is used (exists, manual, `Most gain` above its minimum).
     gain_usable: bool,
@@ -236,6 +249,8 @@ struct Pending {
     issued_at: f64,
     /// Part of the seed (a failed seed is written again).
     seed: bool,
+    /// An exposure write above the frame-rate limit (2.5.12): a camera may refuse it.
+    past_rate: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -332,6 +347,20 @@ pub struct ExposureLoop {
     last_no_signal_move: f64,
     limit_since: Option<f64>,
     dark_since: Option<f64>,
+    /// Since when the picture is more than `OVER_ENTER` stops too dark at the gain limit and the frame-rate limit.
+    over_since: Option<f64>,
+    /// The loop lowers the frame rate for light: exposure may go up to `e_ceil` (2.5.12).
+    over: bool,
+    /// `over` came from the seed (a resume point above `E_rate`) and no confident decision has judged it yet.
+    over_seeded: bool,
+    /// The exposure has been above `E_rate` since `over` began: back at `E_rate` it ends (2.5.12).
+    over_above: bool,
+    /// The camera did not take an exposure above `E_rate` this session: `E_ceil` is `E_rate` until the next one.
+    over_refused: bool,
+    /// `E_rate` of the last tick (what `issue` compares a write with).
+    e_rate: i32,
+    /// The loop is taking the exposure past `E_rate` now (the entry, or a move up there): the card says so (4.2).
+    lowering: bool,
     probe: Option<Probe>,
     batch: Option<Batch>,
     guard: Guard,
@@ -345,6 +374,8 @@ pub struct ExposureLoop {
     limit_stored: bool,
     /// The error of the last decision's reading; infinite before the first.
     last_e: f64,
+    /// Confidence and clipped share of the last decision's reading, for the log line (`diag`).
+    last_conf_clip: (f64, f64),
     /// Seconds without a sample, when it is long enough to matter (W5).
     no_picture: Option<f64>,
     /// Values another program changed: written again (W6).
@@ -383,6 +414,13 @@ impl ExposureLoop {
             last_no_signal_move: f64::NEG_INFINITY,
             limit_since: None,
             dark_since: None,
+            over_since: None,
+            over: false,
+            over_seeded: false,
+            over_above: false,
+            over_refused: false,
+            e_rate: i32::MAX,
+            lowering: false,
             probe: None,
             batch: None,
             guard: Guard::Watching { low_since: None },
@@ -393,6 +431,7 @@ impl ExposureLoop {
             limit_state_since: None,
             limit_stored: false,
             last_e: f64::INFINITY,
+            last_conf_clip: (0.0, 0.0),
             no_picture: None,
             retakes: Vec::new(),
             watchdog: Watchdog::new(Unit::Stops),
@@ -413,8 +452,27 @@ impl ExposureLoop {
         if cfg.longest != self.cfg.longest || cfg.max_gain != self.cfg.max_gain {
             self.limit_since = None;
             self.dark_since = None;
+            self.end_lowered();
         }
         self.cfg = cfg;
+    }
+
+    /// 2.5.12: the entry (`over` with the exposure still at `E_rate`, never past it) is over when the decision after it
+    /// leaves the exposure at or below `E_rate` (`e2`): the room got brighter in between and gain covers it. Else the
+    /// state would stay "lowered" at the full frame rate, the guard off and the next darkening without its timer.
+    fn end_idle_lowered(&mut self, e2: i32, lim: &Limits) {
+        if self.over && !self.over_above && self.e <= lim.e_rate && e2 <= lim.e_rate {
+            self.end_lowered();
+        }
+    }
+
+    /// The frame rate is no longer lowered for light (2.5.12).
+    fn end_lowered(&mut self) {
+        self.over = false;
+        self.over_seeded = false;
+        self.over_above = false;
+        self.lowering = false;
+        self.over_since = None;
     }
 
     /// The mode the hub holds for exposure now. A halted loop keeps its status while the mode is the one the control
@@ -460,6 +518,7 @@ impl ExposureLoop {
         self.last_no_signal_move = f64::NEG_INFINITY;
         self.limit_since = None;
         self.dark_since = None;
+        self.end_lowered();
         self.probe = None;
         self.batch = None;
         self.guard = Guard::Watching { low_since: None };
@@ -470,6 +529,7 @@ impl ExposureLoop {
         self.resumed_at = f64::NEG_INFINITY;
         self.last_arrival = f64::NEG_INFINITY;
         self.last_e = f64::INFINITY;
+        self.last_conf_clip = (0.0, 0.0);
         self.no_picture = None;
         self.watchdog.reset();
     }
@@ -516,7 +576,15 @@ impl ExposureLoop {
                 }
             }
         }
-        let e_cap = e_cap.clamp(self.caps.e_min, self.caps.e_max);
+        let e_rate = e_cap.clamp(self.caps.e_min, self.caps.e_max);
+        // 2.5.12: with `fit`, one stop (twice the frame time) more may be used while the frame rate is lowered for
+        // light; the user's own stop is never exceeded, and a camera that refused it this session gets none.
+        let e_ceil = if self.cfg.longest == super::Longest::Fit && !self.over_refused {
+            (e_rate + 1).min(self.caps.e_max)
+        } else {
+            e_rate
+        };
+        let e_cap = if self.over { e_ceil } else { e_rate };
         let (g_cap, gain_usable) = match self.caps.gain {
             Some(gc) => {
                 let range = f64::from(gc.max - gc.min);
@@ -535,6 +603,8 @@ impl ExposureLoop {
         };
         Limits {
             e_cap,
+            e_rate,
+            e_ceil,
             reason,
             gain_usable,
             g_cap,
@@ -639,9 +709,22 @@ impl ExposureLoop {
             return;
         };
         let p = self.pending.remove(at);
-        let matched = w.readback.is_none_or(|r| r == self.snap(w.key, w.requested));
+        // 2.5.12: a camera that takes no exposure longer than its frame time reads back the old (or the longest) value
+        // for the stop past `E_rate`. That is a limit of the camera, not an ignored control: no mismatch, and the
+        // loop keeps the frame-rate limit for the rest of the session.
+        let refused = w.ok
+            && w.key == ControlKey::Exposure
+            && p.past_rate
+            && w.readback.is_some_and(|r| r <= self.e_rate && r < w.requested);
+        let matched = refused || w.readback.is_none_or(|r| r == self.snap(w.key, w.requested));
         if let Some(f) = self.watchdog.write_done(&w, matched) {
             self.raise(f);
+        }
+        if refused {
+            self.over_refused = true;
+            self.end_lowered();
+            self.batch = None;
+            self.probe = None;
         }
         if w.ok {
             // The model believes the device: a read-back that differs is what the camera has now (W2 counts it).
@@ -788,6 +871,7 @@ impl ExposureLoop {
             self.no_signal_since = None;
             self.limit_since = None;
             self.dark_since = None;
+            self.over_since = None;
             self.no_picture = None;
             return Vec::new();
         }
@@ -803,7 +887,10 @@ impl ExposureLoop {
             if now < self.watchdog.retry_at() {
                 return Vec::new();
             }
+            // A new session (a reopen, a new engagement): the camera may take the longer exposure this time.
+            self.over_refused = false;
             let lim = self.limits(learned);
+            self.e_rate = lim.e_rate;
             return self.start(now, &lim);
         }
         // W1: a write that never reports back.
@@ -815,6 +902,11 @@ impl ExposureLoop {
         // W5: no sample for 2 s: hold, no writes.
         let quiet = self.watchdog.quiet(now, self.last_arrival);
         self.no_picture = (quiet >= NO_PICTURE_AFTER).then_some(quiet);
+        if self.no_picture.is_some() {
+            // The 3 s of the entry timer are unbroken (2.5.12): a gap in the frames starts them again.
+            self.over_since = None;
+        }
+        self.e_rate = self.limits(learned).e_rate;
         self.guard_step(now, learned);
         self.track_limit(now);
         if !self.pending.is_empty() || now < self.watchdog.retry_at() || self.no_picture.is_some() || other_busy {
@@ -857,6 +949,11 @@ impl ExposureLoop {
     /// device's reported value is never used (stale while Camera auto is on).
     fn start(&mut self, now: f64, lim: &Limits) -> Vec<Action> {
         let (e0, g0) = self.seed_in(lim);
+        // A resume point above `E_rate` is only a guess (the resume point carries no frame rate): the first confident
+        // decision judges whether the room still needs it (2.5.11).
+        self.end_lowered();
+        self.over = e0 > lim.e_rate;
+        self.over_seeded = self.over;
         self.started = true;
         self.state = ExposureState::Starting;
         self.band = Band::Adjusting;
@@ -876,10 +973,13 @@ impl ExposureLoop {
 
     /// `(E0, G0)` within `lim`.
     fn seed_in(&self, lim: &Limits) -> (i32, i32) {
-        let e0 = lim
-            .e_cap
-            .min(self.resume.exposure.unwrap_or(self.caps.e_default))
-            .clamp(self.caps.e_min, self.caps.e_max);
+        // A resume point from a lowered frame rate (2.5.12) is a valid seed (`start` takes the state with it); the
+        // device's default is cut to the frame-rate limit.
+        let e0 = match self.resume.exposure {
+            Some(e) => e.min(lim.e_ceil),
+            None => self.caps.e_default.min(lim.e_rate),
+        }
+        .clamp(self.caps.e_min, self.caps.e_max);
         let g0 = match self.caps.gain {
             Some(gc) if lim.gain_usable => self
                 .resume
@@ -911,6 +1011,7 @@ impl ExposureLoop {
                 prev,
                 issued_at: self.now,
                 seed,
+                past_rate: key == ControlKey::Exposure && value > self.e_rate,
             });
             out.push(Action::Write { key, value });
         }
@@ -950,6 +1051,9 @@ impl ExposureLoop {
             self.raise(Fault::Hunting);
             return Some(Vec::new());
         }
+        // A gain-only move (or none past `E_rate`) from the frame-rate limit: nothing is lowered after all.
+        self.end_idle_lowered(e2, lim);
+        self.lowering = self.over && e2 > lim.e_rate && e2 > self.e;
         let gain_only = plan.len() == 1 && plan[0].0 == ControlKey::Gain;
         self.probe = probe.filter(|p| gain_only && p.dgs.abs() >= LEARN_MIN_STEP);
         self.batch = before
@@ -1032,6 +1136,7 @@ impl ExposureLoop {
         // needed and not bounded by `step_max`. Most gain at its minimum is one too (2.5.2: `Gs_cap = 0`): gain goes
         // to `G_min` and exposure takes the stops it gave, as far as whole stops allow.
         if self.e > lim.e_cap || self.gain_stuck(lim) {
+            self.over_since = None;
             let (e2, g2) = self.allocate(self.x(s), lim);
             return self.move_to(e2, g2, lim, None, None).unwrap_or_default();
         }
@@ -1040,6 +1145,7 @@ impl ExposureLoop {
             return Vec::new();
         };
         self.last_e = r.e;
+        self.last_conf_clip = (r.conf, r.clip);
         self.learn(&r, learned);
         // W3: did the picture answer the last batch?
         match self.assess(now, &valid, &r) {
@@ -1051,11 +1157,32 @@ impl ExposureLoop {
             }
         }
         let s = learned.gain_stops.unwrap_or(S_INITIAL).clamp(S_MIN, S_MAX);
-        let lim = &Limits {
+        let mut lim = Limits {
             s,
             gs_cap: if lim.gain_usable { self.gs_with(lim.g_cap, s) } else { 0.0 },
             ..*lim
         };
+        // The entry timer runs only through `saturated` (2.5.12): any other decision starts it again.
+        let over_since = self.over_since.take();
+        if self.over {
+            let need = self.x(s) + r.e;
+            let sure = r.conf >= NO_SIGNAL_CONFIDENCE;
+            // Back at the frame-rate limit after the loop went past it: the lowered state has nothing left to do.
+            let back = self.over_above && self.e <= lim.e_rate;
+            self.over_above |= self.e > lim.e_rate;
+            // 2.5.12: the scene needs `OVER_EXIT` stops less than the frame-rate limit and `Most gain` give: back to
+            // the frame-rate limit (this decision's allocation takes the exposure down first, then gain). A lowered
+            // start (2.5.11) stays only where the entry condition holds.
+            let exit = need < f64::from(lim.e_rate) + lim.gs_cap - OVER_EXIT;
+            let enter = need > f64::from(lim.e_rate) + lim.gs_cap + OVER_ENTER;
+            if back || (sure && (exit || (self.over_seeded && !enter))) {
+                self.end_lowered();
+                lim.e_cap = lim.e_rate;
+            } else if sure {
+                self.over_seeded = false;
+            }
+        }
+        let lim = &lim;
         let before = Before {
             e: r.e,
             judgeable: r.conf >= JUDGE_CONFIDENCE && r.clip < JUDGE_CLIP && r.e.abs() < METER_EDGE,
@@ -1095,6 +1222,7 @@ impl ExposureLoop {
         // 3. Quantum.
         let up = r.e > 0.0;
         let Some(q) = self.quantum(up, lim) else {
+            self.over_since = over_since;
             self.saturated(now, lim, &r, up, bands);
             return Vec::new();
         };
@@ -1106,6 +1234,7 @@ impl ExposureLoop {
             if r.e.abs() <= b_in {
                 self.limit_since = None;
                 self.dark_since = None;
+                self.end_idle_lowered(self.e, lim);
                 self.enter_holding(now);
             }
             return Vec::new();
@@ -1144,6 +1273,7 @@ impl ExposureLoop {
         match self.move_to(e2, g2, lim, probe, Some(before)) {
             Some(actions) => actions,
             None => {
+                self.end_idle_lowered(self.e, lim);
                 self.enter_holding(now);
                 Vec::new()
             }
@@ -1218,6 +1348,27 @@ impl ExposureLoop {
     fn saturated(&mut self, now: f64, lim: &Limits, r: &Reading, up: bool, bands: f64) {
         let b_out = OUT_MIN.max(OUT_SIGMA * r.sigma) * bands;
         let b_in = IN_MIN.max(IN_SIGMA * r.sigma) * bands;
+        // 2.5.12: more than a stop too dark with gain and exposure at their limits, and a longer exposure is allowed:
+        // lower the frame rate (the frame-rate guard is not in the middle of a trial).
+        let may_lower_rate = up
+            && !self.over
+            && r.conf >= NO_SIGNAL_CONFIDENCE
+            && lim.e_ceil > lim.e_rate
+            && r.e > OVER_ENTER
+            && matches!(self.guard, Guard::Watching { .. } | Guard::Done);
+        if !may_lower_rate {
+            self.over_since = None;
+        } else if now - *self.over_since.get_or_insert(now) >= LIMIT_AFTER {
+            self.over = true;
+            self.over_above = false;
+            self.lowering = true;
+            self.over_since = None;
+            self.limit_since = None;
+            self.state = ExposureState::Adjusting;
+            // Not holding while the move up is due: the card must not say "holding" for it.
+            self.band = Band::Adjusting;
+            return;
+        }
         if r.e.abs() <= b_in {
             self.limit_since = None;
             self.dark_since = None;
@@ -1225,7 +1376,8 @@ impl ExposureLoop {
         } else if up && r.e > b_out {
             self.dark_since = None;
             let since = *self.limit_since.get_or_insert(now);
-            if now - since >= LIMIT_AFTER {
+            // Not a limit while the frame rate is about to be lowered (2.5.12): that is no limit yet.
+            if now - since >= LIMIT_AFTER && !may_lower_rate {
                 self.state = if lim.gain_usable {
                     ExposureState::LimitGain
                 } else {
@@ -1310,7 +1462,9 @@ impl ExposureLoop {
         let key = rate_key(self.f);
         match &mut self.guard {
             Guard::Watching { low_since } => {
+                // Not while the frame rate is lowered on purpose (2.5.12): a low rate is then what the loop asked for.
                 let eligible = !self.guard_spent
+                    && !self.over
                     && self.cfg.longest == super::Longest::Fit
                     && lim.reason == CapReason::Fps
                     && self.e == lim.e_cap
@@ -1374,6 +1528,37 @@ impl ExposureLoop {
         }
     }
 
+    /// One line for the log while the loop runs: where the camera is, what the limits are and what the picture said
+    /// last (`err` in stops, positive = wants more light; `-` before the first decision). With this a dark picture can be
+    /// told apart: a loop at its limits (`cap`, `maxG`) from a loop that is on target.
+    pub fn diag(&self, learned: &Learned) -> Option<String> {
+        if !self.engaged() || self.closed || self.paused {
+            return None;
+        }
+        let lim = self.limits(learned);
+        let err = if self.last_e.is_finite() {
+            format!("{:+.2}", self.last_e)
+        } else {
+            "-".to_string()
+        };
+        let g = self.caps.gain.map_or("-".to_string(), |_| self.g.to_string());
+        let max_g = lim.gain_usable.then_some(lim.g_cap).map_or("-".to_string(), |m| m.to_string());
+        Some(format!(
+            "exposure {:?} E={} G={g} cap={} ({:?}) ceil={} over={} maxG={max_g} S={:.2} err={err} conf={:.2} clip={:.2} fps={:.1}/{:.0}",
+            self.state,
+            self.e,
+            lim.e_rate,
+            lim.reason,
+            lim.e_ceil,
+            self.over,
+            lim.s,
+            self.last_conf_clip.0,
+            self.last_conf_clip.1,
+            self.capture_fps,
+            self.f,
+        ))
+    }
+
     pub fn status(&self, learned: &Learned, mains: Option<u32>) -> Option<ExposureStatus> {
         if !self.mode_app && self.halt.is_none() {
             return None;
@@ -1402,8 +1587,11 @@ impl ExposureLoop {
             e_min: self.caps.e_min,
             gain_min: self.caps.gain.map_or(0, |g| g.min),
             gain_off: self.gain_off(&lim),
-            cap: lim.e_cap,
+            cap: lim.e_rate,
             cap_reason: lim.reason,
+            // Lowered texts only while the exposure is past the frame-rate limit (or on its way: `lowering`).
+            lowered: self.over && self.e > lim.e_rate,
+            lowering: self.over && self.lowering,
             fps: self.capture_fps,
             target_fps: self.f,
             dropped_to: self.dropped_to,
@@ -1416,7 +1604,8 @@ impl ExposureLoop {
             state,
             exposure: self.e,
             gain,
-            cap: lim.e_cap,
+            // The frame-rate limit, also while the loop goes past it: the card's tick marks where the frame rate ends.
+            cap: lim.e_rate,
             cap_reason: lim.reason,
             max_gain,
             fps: self.capture_fps,

@@ -41,6 +41,9 @@ use crate::capture::controls::{device_gone, ControlInfo, ControlKey};
 /// Between two ticks of the controller.
 pub const TICK: Duration = Duration::from_millis(100);
 
+/// Seconds between two `[auto] ... exposure <state> E=.. G=..` log lines while the exposure loop runs.
+const DIAG_EVERY: f64 = 5.0;
+
 /// The `auto-status` event (docs/AUTO-CONTROLS.md 5.4): the controller's status for the camera `id`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AutoStatusEvent {
@@ -105,6 +108,8 @@ struct Runner {
     /// The controls whose "units unknown" line was logged.
     logged: HashSet<(String, ControlKey)>,
     metering: bool,
+    /// When the exposure loop's state line was last logged.
+    last_diag: f64,
 }
 
 impl Runner {
@@ -118,6 +123,7 @@ impl Runner {
             id: String::new(),
             logged: HashSet::new(),
             metering: false,
+            last_diag: f64::NEG_INFINITY,
         }
     }
 
@@ -226,6 +232,12 @@ impl Runner {
         };
         let actions = sess.ctrl.tick(now, &cf);
         let on = usable.is_some() && sess.ctrl.wants_meter();
+        if usable.is_some() && now - self.last_diag >= DIAG_EVERY {
+            if let Some(line) = sess.ctrl.exposure_diag() {
+                self.last_diag = now;
+                eprintln!("[auto] t={now:.1} {line}");
+            }
+        }
         if !actions.is_empty() {
             self.execute(usable, actions);
         }

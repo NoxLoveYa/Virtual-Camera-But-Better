@@ -26,13 +26,17 @@ Terms used below:
 1. Exposure and white balance get a third mode next to Manual and Camera auto: **Better Cam auto**.
 2. In Better Cam auto, Better Cam meters the camera picture (before any filter) and writes the camera's exposure,
    gain and white balance itself, a few times a second at most.
-3. Exposure never gets longer than one frame time, so the camera keeps the frame rate you asked for. In the owner's
-   dim room this means 30 fps (or 60) instead of the 14-17 fps the camera's own auto gives.
+3. Exposure does not get longer than one frame time, so the camera keeps the frame rate you asked for. In the owner's
+   dim room this means 30 fps (or 60) instead of the 14-17 fps the camera's own auto gives. **One exception (2.5.12):**
+   when the picture is still more than a stop too dark with gain at its limit, exposure may go one stop (twice the
+   frame time) longer, and the frame rate drops with it (30 → about 16 fps).
 4. When exposure is at that limit, gain makes up the rest, up to a **Most gain** limit you set.
 5. The cost: gain adds noise. Each halving of exposure time needs one more stop of gain. At 30 fps that is about one
-   stop more than the camera's 15 fps auto: visibly grainier shadows (about 1.4-2× the noise).
-6. You choose per camera: target brightness, longest exposure (default "fit the frame rate"), most gain, response
-   speed, and white balance warmth.
+   stop more than the camera's 15 fps auto: visibly grainier shadows (about 1.4-2× the noise). The exception of 3 is
+   what takes that stop back in a room too dark for the gain limit: a brighter, cleaner picture at the cost of frame
+   rate (the owner's room needed it: at 1/32 s and full gain the picture was still 1.7-2.2 stops dark, green and grainy).
+6. You choose per camera: target brightness, longest exposure (default "fit the frame rate"; a stop at the frame-rate
+   limit never lowers the frame rate), most gain, response speed, and white balance warmth.
 7. When a limit is reached the card says so in words: "Gain at its maximum (70). Add light, allow more gain, or allow
    a longer exposure."
 8. It never stays black or white, moves in bounded steps, and gives the control back to Camera auto if the camera
@@ -51,7 +55,8 @@ One controller thread next to the controls hub runs two independent **step-and-s
 gain as one quantity in stops) and white balance (Kelvin, worked in mired). Each loop meters a dedicated cheap GPU
 statistics pass on the converted camera picture before the filter chain, waits until a frame captured after its last
 write has been measured, then moves once, by a bounded fraction of the error, with hysteresis wide enough for the
-coarse UVC steps. Exposure prefers the **longest exposure within the frame time**, then gain. The core is a pure
+coarse UVC steps. Exposure prefers the **longest exposure within the frame time**, then gain; only a picture that is
+still more than a stop too dark at full gain may go one stop past the frame time (2.5.12). The core is a pure
 struct driven by an injected clock, tested against a simulated camera.
 
 ### 2.2 Controls and modes
@@ -188,7 +193,14 @@ hunt. Hence step-and-settle: one move, wait for proof, decide again.
   **Follow-up F3:** the shown rate is `min(F, 1/τ)` rounded to a whole number (it was `0.95 / τ`, which said 15 where
   W4GS measured 16.2 fps at 1/16 s); `longestOptions` in `src/camera/schema.ts` is the one place that makes the text.
 - **Learned cap** (2.5.8): `E_learned[F]`, only applies with `fit`.
-- `E_cap = clamp(min(longest, E_learned[F] if any), E_min, E_max)`.
+- `E_rate = clamp(min(longest, E_learned[F] if any), E_min, E_max)`: the longest exposure that keeps the frame rate
+  (named `E_cap` in the rest of this document, and still the cap everywhere except where 2.5.12 says otherwise; the
+  card's tick and the status field `cap` are `E_rate`).
+- **Ceiling** `E_ceil` (2.5.12): `E_rate + 1` (clamped to `E_max`) with `longest = fit`, so one stop, twice the frame
+  time (at 30 fps -5 → -4 = 1/16 s ≈ 16 fps; at 60 fps -6 → -5 = 1/32 s ≈ 30 fps; a learned cap makes it
+`E_learned + 1`); with a stop `n` it is `E_rate = n`: the user's stop is a
+  limit the loop never passes, and a stop at the frame-rate limit means the frame rate is never lowered.
+- `E_cap` (the cap the allocation uses) is `E_rate`, or `E_ceil` while the loop lowers the frame rate (2.5.12).
 - **Most gain** (user): `G_cap`, default `G_min + round(0.75 · (G_max − G_min))` (75 on W4GS). `Gs_cap = gs(G_cap)`.
   Most gain = `G_min` turns gain off (exposure-only behaviour). **Follow-up F1:** "off" also drives the device gain to
   `G_min`: the loop treats it like a constraint (the allocation with `Gs_cap = 0`, one gain write, no samples needed,
@@ -199,7 +211,9 @@ hunt. Hence step-and-settle: one move, wait for proof, decide again.
 
 Longest exposure up to `E_cap` first, then gain. Not the shortest exposure with more gain: gain multiplies noise, and
 short exposures make mains-light banding worse. Motion blur at 1/32 s is acceptable for a webcam; a user who wants
-sharper motion picks a shorter Longest exposure. Going darker, gain goes down first, then exposure.
+sharper motion picks a shorter Longest exposure. Going darker, gain goes down first, then exposure. The one
+exception is 2.5.12: past the frame-rate limit exposure is the last resort, used only after gain is at its limit, and
+given up first (before gain is cut) when the light comes back.
 
 #### 2.5.4 Validity of samples and timing
 
@@ -275,7 +289,8 @@ decoded values, so the error is exact only for an sRGB-like camera curve; the sa
 
 #### 2.5.8 Frame-rate guard (learned cap)
 
-With Longest exposure = `fit`, `E == E_cap`, no write in the last 1 s, and the 2-second capture rate `< 0.95 · F` for
+With Longest exposure = `fit`, the loop **not** lowering the frame rate on purpose (2.5.12: the low rate is then what
+it asked for), `E == E_cap`, no write in the last 1 s, and the 2-second capture rate `< 0.95 · F` for
 3 s (**A6: constant changed, old → new: `0.9 · F` → `0.95 · F`**; live on W4GS at 60 fps, 1/64 s gives 55.1 fps = 92 %
 of the request, so `0.9` never fired and the rate stayed short of 59; see 9.2): set `E_learned[F] = E_cap - 1` (not below `E_min`); the next decision applies it as a constraint. If the rate
 recovers to `≥ 0.95 · F` within 3 s, keep it (stored per camera and frame rate). If not, the cause is not exposure:
@@ -285,7 +300,8 @@ Cam keeps exposure at 1/64 s or shorter."
 #### 2.5.9 Saturation (limits reached)
 
 - `E' == E_cap`, `G' == G_cap` and `ê > B_out` for 3 s: state `limit_gain` (or `limit_exposure` on whole-stops
-  cameras).
+  cameras). With `fit` and `ê` more than 1 stop, this is not a limit yet: the loop first lowers the frame rate
+  (2.5.12), so `limit_gain` shows at `E_ceil`, or at `E_rate` for a picture at most a stop too dark.
 - `E' == E_min`, `G' == G_min` and `ê < −B_out` for 3 s: state `too_bright`.
 - Saturation is not a fault. The loop stays engaged at the limit (it is the best picture the limits allow) and shows
   the text (4.2). It leaves the state when `|ê| ≤ B_in` or a limit changes.
@@ -304,7 +320,13 @@ the median of 3 rejects single outliers. The card shows "Short exposures under m
 On engagement (user picks Better Cam auto, or a camera open with the mode stored):
 
 1. Remember `prior` = the control's mode and value before engagement (for hand-back, 2.7).
-2. Seed: `E0 = min(E_cap, resume.exposure ?? device default)`, `G0 = resume.gain ?? G_min`. The device's reported
+2. Seed: `E0 = min(E_ceil, resume.exposure)`, or `min(E_rate, device default)` without a resume point;
+   `G0 = resume.gain ?? G_min`. An `E0` above `E_rate` starts the loop with the frame rate lowered (2.5.12), but only
+   **provisionally**: the resume point is the last value written and says nothing about the frame rate (a value from an
+   earlier room, from before a learned cap, or from another frame rate). The first decision with `conf ≥ 0.2` judges
+   it: the loop stays lowered only when the entry condition holds already (`X + ê > E_rate + gs(G_cap) + OVER_ENTER`,
+   no timer), else it ends the lowered state and takes the exposure to `E_rate` (a normal room reopens at the full frame
+   rate; a dark room stays where it was, with no write). The device's reported
    exposure is not used while Camera auto is on: W4GS then reports a stale manual value.
 3. Write `exposure = E0` (manual; this is the slow 200-700 ms first write), then `gain = G0`. On open these are part of
    `apply_on_open` (the stored resume values), so the loop's first move never waits on a slow first write.
@@ -317,6 +339,78 @@ keeps values across a reopen (measured on W4GS), so a reopen shows no flash.
 `too_bright`; white balance `at_limit`) for 3 s, under the same once-per-10-s rule. A dark room never reaches
 `holding`; without this each reopen climbed from the seed (-6, 0) for about 2 s. The stored point rides the `resume`
 of the status while the state lasts (not before the 3 s are over).
+
+#### 2.5.12 Lowering the frame rate for light (reverses the decision of 1.5 and 8.2)
+
+Live finding (the owner's room, W4GS at 30 fps and 2560×1440, Most gain 100, Fast): the room needed 1.7-2.2 stops more
+than `E_rate = -5` and full gain give. The loop sat in `limit_gain` at `E = -5, G = 100`: maximum sensor gain, a
+green, dark, grainy picture. The camera's own auto drops to about 16 fps with 1/16 s and is clean. Holding 30 fps was
+the wrong trade there.
+
+The rule: while gain is at `G_cap` and exposure at `E_rate`, and `ê > OVER_ENTER = 1.0` stop with `conf ≥ 0.2` for
+`LIMIT_AFTER = 3 s` (the median of the valid samples, so not one frame; the 3 s are the saturation timer of 2.5.9,
+which does not show `limit_gain` meanwhile), the loop **lowers the frame rate**: `E_cap = E_ceil` (2.5.2), the one stop
+past `E_rate`. The 3 s must be unbroken: any decision that does not reach the saturation check (a dip to a bright or
+covered picture, a move, the highlight guard, a constraint move, a pause, a gap of 2 s without a frame: W5) starts the
+timer again. (The 3 s limit timer of 2.5.9 is not touched by a frame gap; it only shows a text.) The entry itself
+writes nothing and leaves the band `adjusting`: the move up to `E_ceil` is the next decision. If that decision finds
+the room brighter and holds, or moves gain only, with the exposure still at `E_rate` (gain alone covers it), the
+lowered state ends there: it never stays "lowered" at the full frame rate (the guard back on, the next darkening
+waiting for its own 3 s).
+Nothing else changes: the allocation of 2.5.6 then moves exposure up to `E_ceil` in a crossover and gain drops by the
+stop it was giving where exposure alone covers the need (gain is only at its limit when the scene needs the whole
+stop). It never passes `Longest exposure` (a stop `n` is the ceiling itself, so a stop at the frame-rate limit means
+the old behaviour: gain only) nor the camera's `E_max`.
+
+Back to the frame rate: when the scene needs `OVER_EXIT = 0.5` stop less light than `E_rate` and `Most gain` give
+together (`X + ê < E_rate + gs(G_cap) − 0.5`), the loop stops lowering it (`E_cap = E_rate`). The exposure then goes
+down to `E_rate` before gain is cut (2.5.6: the exposure goes first, gain takes the rest): in the exit decision itself
+when the reading is outside its band; when the reading is in the band that decision writes nothing, and the next
+decision's constraint move (`E > E_cap`, brightness-neutral, no samples needed) does it. The frame rate returns first
+and gain lands at least half a stop under its limit. Hysteresis: 1 stop of enter and 0.5 stop
+of exit make a dead band of 1.5 stops of scene change; between them the exposure stays where it is (and gain follows
+the light, so a scene that brightens inside the band lowers gain at the longer exposure). Exit needs `conf ≥ 0.2`.
+The state also ends once the exposure, after it was above `E_rate`, is back at or below `E_rate` (a no-gain camera, a
+small `Most gain` or a small learned `S` whose `Gs_cap` is under 1.5 stops would otherwise stay "lowered" at the full
+frame rate for good, and `E_ceil` would stay allowed): nothing is written for it.
+
+Choices of the numbers: **one stop** is the camera's own auto (W4GS: 1/16 s at about 16 fps) and halves the gain
+that was needed; more stops would take the frame rate below what a video call tolerates (8 fps at 1/8 s) and the
+user who wants that has `Longest exposure`. **1 stop to enter** (not 0.33) because up to a stop of darkness at 30 fps
+and full gain is a picture the owner can use, and a smaller error does not pay for half the frame rate. **0.5 to
+exit** because the step back to `E_rate` costs one stop of gain (a visible noise step); landing half a stop under
+`G_cap` keeps the loop from being at its limit again straight away.
+
+Other rules: the frame-rate guard (2.5.8) is off while the frame rate is lowered, and the loop does not start lowering
+it while the guard is trying a learned cap; a change of `Longest exposure` or `Most gain` ends it (the loop starts again from the new
+limits); a reopen from a resume point above `E_rate` starts lowered but is judged by the first confident decision
+(2.5.11); a camera that does not take the longer exposure (the write above `E_rate` reads back `E_rate` or less) has
+refused it: that is no mismatch for W2 (no hand-back, nothing `blocked`), the lowered state ends and `E_ceil = E_rate`
+for the rest of the session (a reopen or a new engagement asks again), so the card shows the normal limit text; a
+picture without confidence (`conf < 0.2`: a covered lens, a nearly black one) never lowers it and starts the
+entry timer again. Status: "Lowering frame rate for light…" only while the exposure goes past `E_rate` (the entry and
+the move up to `E_ceil`; a gain move at the lowered rate, or a start from a lowered resume point, says "Adjusting…"; the "Lowered…" texts show only while the exposure is past `E_rate`),
+"Lowered frame rate for light: holding 16 fps · gain 80 of 100" when it holds, and at `E_ceil` with gain at its limit "Gain at its maximum
+(100) and exposure at its longest (1/16 s, 16 fps). Add light or allow a longer exposure." (4.2). The card's exposure
+tick and `cap` stay at the frame-rate limit (`E_rate`), so the value is shown beyond the tick.
+
+Tests (`auto_controls/tests.rs`, owner's settings): `a_room_two_stops_too_dark_lowers_the_frame_rate` (a),
+`a_lit_room_keeps_the_frame_rate` (b), `light_back_restores_the_frame_rate_before_it_cuts_gain` (c),
+`a_light_at_the_boundary_does_not_flip_the_frame_rate`, `a_brighter_room_needs_less_gain_at_the_longer_exposure`,
+`the_longest_exposure_setting_is_never_passed` (d), `a_reopen_keeps_the_lowered_frame_rate`,
+`owner_settings_settle_inside_the_limits_and_sit_at_them_outside`; `case_03` and the F1/F2 tests run with
+`Longest exposure` at the frame-rate limit or with the new limit. The audit's cases:
+`a_reopen_in_a_normal_room_leaves_the_lowered_frame_rate` and
+`a_reopen_above_a_learned_rate_cap_leaves_the_lowered_frame_rate` (a provisional lowered start),
+`a_dip_in_the_light_starts_the_entry_timer_again`, `a_camera_without_gain_ends_the_lowered_frame_rate`,
+`an_unsure_picture_never_lowers_the_frame_rate`, `a_most_gain_change_ends_the_lowered_frame_rate`,
+`the_frame_rate_is_not_lowered_while_the_guard_tries_a_cap`, `the_log_line_is_silent_while_closed_or_paused`. The
+second audit's: `a_camera_that_refuses_a_longer_exposure_keeps_the_frame_rate`,
+`a_camera_that_ignores_every_exposure_write_is_still_ignored`, `a_gap_in_the_frames_starts_the_entry_timer_again`,
+`a_room_that_brightens_after_the_entry_does_not_stay_lowered`,
+`a_darkening_after_a_cancelled_entry_waits_for_its_own_timer` and
+`a_light_at_the_exit_boundary_does_not_flip_the_frame_rate` (the loop enters for real, then the light wobbles across
+the exit point). A change of `Longest exposure` or `Most gain` ends the lowered state and does not restore it (a reopen judges it again).
 
 ### 2.6 The white balance loop
 
@@ -513,7 +607,7 @@ Powerline frequency                                               [50 Hz ▾]
 Exposure                                1/32 s                  [Better Cam auto ▾]
 [═════════════════●│▒▒▒▒▒▒▒▒▒▒▒▒▒▒]        (disabled; │ = 30 fps limit, shaded beyond)
     Target brightness [─────────●─────────]                      0.45
-    Longest exposure  [Fit the frame rate (1/32 s at 30 fps) ▾]
+    Longest exposure  [Fit the frame rate (1/32 s at 30 fps, one stop longer in a dark room at most gain) ▾]
     Most gain         [───────────────●───]                      75
     Response          [Normal ▾]
     ● Holding 30 fps · gain 48 of 75
@@ -527,9 +621,12 @@ Focus                                         512                      Auto (○
   the slider is disabled, like Camera auto today. Limit markers: the exposure slider shows a tick at `E_cap` labelled
   by its tooltip ("30 fps limit" / "Your limit" / "Learned limit") with the range beyond shaded; the gain slider
   shows a tick at Most gain, range beyond shaded.
-- Longest exposure options: "Fit the frame rate (1/32 s at 30 fps)", then every whole stop of the camera's range from
+- Longest exposure options: "Fit the frame rate (1/32 s at 30 fps, one stop longer in a dark room at most gain)" (the
+  hint only when the camera has a longer stop; without a known frame rate just "Fit the frame rate"), then every whole stop of the camera's range from
   shortest to longest, each with what it means: "1/64 s (sharper motion, more gain)", "1/16 s (camera drops to
-  ≈ 16 fps)" (2.5.2: `min(F, 1/τ)`).
+  ≈ 16 fps)" (2.5.2: `min(F, 1/τ)`). The default "Fit the frame rate" keeps the rate except in a room that is still
+  more than a stop too dark at full gain: then one stop longer, and the status line says so (2.5.12). The stop "1/32 s
+  (the frame-rate limit)" never lowers the rate.
 - **Slow-camera hint (F6).** Better Cam auto cannot change the camera's own auto. While exposure is in **Camera auto**
   and the measured capture rate (`stats.capture.fps`, about once a second) stays under 0.9 × the rate asked for for
   3 s, the exposure row shows "Camera auto is slowing the camera to N fps in this light. Better Cam auto keeps F fps."
@@ -557,6 +654,10 @@ Focus                                         512                      Auto (○
 | `slow` (WB, V2, reason `two_answers`; neutral dot, no resume point) | "Unsure of the light (a bright face or two lights): adjusting slowly · 4650 K" |
 | `limit_exposure`, gain off (F1) | "Exposure at the 30 fps limit and gain is off. Add light, allow more gain, or allow a longer exposure." |
 | `limit_gain` | "Gain at its maximum (75). Add light, allow more gain, or allow a longer exposure." |
+| `starting` / `adjusting`, while the exposure goes past the frame-rate limit (2.5.12; any other adjusting step at the lowered rate says "Adjusting…") | "Lowering frame rate for light…" |
+| `holding`, frame rate lowered (2.5.12) | "Lowered frame rate for light: holding 16 fps · gain 80 of 100" (without gain: "… holding 16 fps · 1/16 s") |
+| `limit_gain`, frame rate lowered (2.5.12) | "Gain at its maximum (100) and exposure at its longest (1/16 s, 16 fps). Add light or allow a longer exposure." |
+| `limit_exposure`, frame rate lowered (2.5.12) | "Exposure at its longest (1/16 s, 16 fps) and gain is off. Add light or allow a longer exposure." (or "… and this camera has no gain. …") |
 | `limit_exposure` | "Exposure at the 30 fps limit and this camera has no gain. Add light or allow a longer exposure." |
 | `too_bright` | "Too bright: exposure at its shortest (1/8192 s) and gain at 0." |
 | learned cap | "The camera dropped to 24 fps at 1/32 s, so Better Cam keeps exposure at 1/64 s or shorter." |
@@ -806,7 +907,7 @@ A discrete-event model that implements `CameraControls` (so it also plugs into t
 |---|---|---|
 | 1 | Dim room, F = 30, needs `E = −5` and ≈ 1.5 stops of gain; cold start `E = −6, G = 0` | Within ±0.33 stop of target in ≤ 3 s; `E` never above −5; sim fps ≥ 29.5 for every 1 s window after the first write; ≤ 15 writes to converge; 0 writes in the next 60 s. |
 | 2 | Step +2 stops (light on), then −2 stops | Back within the band in ≤ 2 s each; overshoot past target ≤ 0.5 stop. |
-| 3 | Darker than the limits allow | Ends at `E_cap`, `G_cap`; state `limit_gain` within 5 s; no writes afterwards; fps held. |
+| 3 | Darker than the limits allow | Ends at `E_cap`, `G_cap`; state `limit_gain` within 5 s; no writes afterwards; fps held. (Run with `Longest exposure` at the frame-rate limit; with `fit` and more than a stop dark it ends at `E_ceil`, 2.5.12 and case 25.) |
 | 4 | Bright scene needing `E = −11` | Reached with gain at `G_min`; no decision moves more than `step_max`. |
 | 5 | 100 Hz flicker, a = 0.3, at F = 30 | Steady state: ≤ 1 write per 5 s, no exposure write after convergence, no reversal pattern. |
 | 6 | Gain curve mismatch (`S_true` 1.5 and 5 with initial `S = 3`), and the bent curve | Converges in ≤ 5 s with ≤ 2 reversals; learned `S` within 30 % of `S_true` after 20 gain moves (straight curves). |
@@ -828,6 +929,7 @@ A discrete-event model that implements `CameraControls` (so it also plugs into t
 | 22 | `slow` writes | Never more than 1 batch per `2 ×` write time; converges in ≤ 6 s. |
 | 23 | Paused for 5 s mid-adjustment | No writes while paused; samples before resume ignored; converges after. |
 | 24 | Engagement from `stale_auto` | Seed from resume/default, not from the stale read; first write is the exposure manual write. |
+| 25 | Lowering the frame rate (2.5.12), owner's settings (F = 30, Most gain 100, Fast): (a) 2 stops too dark at `E = −5, G = 100`; (b) a lit room; (c) dark, then bright; (d) `Longest exposure` at −5 | (a) `E = −4` after 3-5 s, never above, error ≤ 1.0 stop (≤ 0.5 when ≤ 1.4 stops short), fps < 20, no learned cap; (b) `E ≤ −5`, `holding`, fps ≥ 29.5; (c) `E` back at −5 with gain not yet below its final value, never −4 again, 0 writes in the last 20 s; boundary wobble: ≤ 1 exposure write in 150 s; (d) `E = −5`, `G = 100`, no write, fps ≥ 29.5. |
 
 Notes W3 (2026-11-19): cases 15-17 run twice, on the grey wall and in the coloured office (B6). Case 15's text of the
 `at_limit` state (case 16) is the new one of 4.2. In the office the estimator has a constant error of 4 mired
@@ -979,7 +1081,7 @@ A3 engine meter (parallel with A1, A2) ─────────────�
 | # | Question | Recommendation |
 |---|---|---|
 | 1 | Default **Most gain**: the full range, or a cap for noise? | 75 % of the range (75 on W4GS). You can raise it; A6 shows you the noise at both. |
-| 2 | Default **Longest exposure**: fit the frame rate, or allow the camera to drop to half rate in very dim light? | Fit the frame rate. Full frame rate is the reason for the feature. |
+| 2 | Default **Longest exposure**: fit the frame rate, or allow the camera to drop to half rate in very dim light? | ~~Fit the frame rate. Full frame rate is the reason for the feature.~~ **Reversed (live finding, owner's room, 2.5.12):** fit the frame rate, **except** that a picture still more than a stop too dark at full gain may go one stop past it (30 → about 16 fps), as the camera's own auto does; the green, grainy picture at full gain cost more than the frame rate. Picking a stop at the frame-rate limit in the list never lowers the rate. |
 | 3 | Should the exposure target be **shared with Auto Adjust's target**? | No. Separate, same scale, same default; Auto Adjust is per chain and in presets, this is per camera. The card shows Auto Adjust's target when both are on. |
 | 4 | **Metering area:** the whole camera picture (centre-weighted), or only the part the output shows after Crop / Scaling? | Whole picture in v1. Cropped metering needs the chain's geometry in the meter; revisit if you crop a lot. |
 | 5 | **Hand-back target** when the watchdog gives up: Camera auto, or your last manual value? | Camera auto where the camera has it: a correct picture at a lower frame rate beats a frozen wrong one. |
@@ -1097,7 +1199,7 @@ No other constant is contradicted by the live data. `E_rate`'s `0.95` stays (cha
 | Persistence | Record in `localStorage`: `exposure {value -6, auto false, mode "app"}`, `gain {…, mode "app"}`, `white_balance {value 4600, mode "app"}` and `auto {exposure {target .45, longest "fit", max_gain 75, speed "normal"}, white_balance {warmth 0, speed "normal"}}`; after Stop → Start the log wrote `exposure=-6, gain=0, white_balance=4600` and the modes were still `app` |
 | Status line and dot | Neutral (teal) while adjusting, grey when closed, **warning (amber, `rgb(255,184,77)`)** at `limit_gain` with the text "Gain at its maximum (75). Add light, allow more gain, or allow a longer exposure." The dot colour follows the text with a fade of about 0.3 s. Error colour not produced (no hand-back without a faulty camera) |
 | Limit markers | Exposure tick "30 fps limit" at 0.667 of the range (E -5 of -13…-1), range beyond shaded; gain tick "Most gain: 75" at 0.75. With Longest exposure 1/16 s the exposure tick reads "Your limit" at 0.75 and the camera ran at 16.2 fps |
-| Longest exposure options | "Fit the frame rate (1/32 s at 30 fps)", 1/8192 s … 1/64 s "(sharper motion, more gain)", "1/32 s (the frame-rate limit)", "1/16 s (camera drops to ≈ 15 fps)", 1/8 s ≈ 8 fps, 1/4 s ≈ 4 fps, 1/2 s ≈ 2 fps (see F3) |
+| Longest exposure options | "Fit the frame rate (1/32 s at 30 fps, one stop longer in a dark room at most gain)", 1/8192 s … 1/64 s "(sharper motion, more gain)", "1/32 s (the frame-rate limit)", "1/16 s (camera drops to ≈ 15 fps)", 1/8 s ≈ 8 fps, 1/4 s ≈ 4 fps, 1/2 s ≈ 2 fps (see F3) |
 | Most gain "Off" | Shows "Off" at the minimum; behaviour wrong, see F1. Double-click resets it to 75 |
 | Reset all | Exposure, gain and white balance went back to Camera auto / manual 0 / Camera auto, every Better Cam auto mode ended, `controls` values cleared, **`auto` kept** with the changed `max_gain`; `learned` did not exist to keep (nothing was learned) |
 | Not produced | `conflict`, `ignored`, `no_response`, `not_answering`, `hunting` (need a faulty camera or another program meddling); the sim covers them (6.2 cases 18-22) |
@@ -1122,6 +1224,24 @@ log lines are `[auto] t=… exposure -5 -> -5 (… ms)` in the app's stderr.
    Better Cam auto run: after about 20 gain moves `learned.gain_stops` is in `localStorage["better-cam"]`). Compare a
    screenshot at 30 fps Better Cam auto with one in Camera auto (≈ 15 fps) for grain.
 6. **Check 6 flash:** with the lit scene, Stop → Start and look for a flash longer than 1 s.
+
+**State line in the log (added after "the picture turns green, dark and noisy").** While the exposure loop runs, the
+app's stderr gets one line every 5 s (only while the camera is open and the loop is not paused) next to the `[auto] t=… exposure -5 -> -5` write lines:
+`[auto] t=84.2 exposure LimitGain E=-4 G=100 cap=-5 (Fps) ceil=-4 over=true maxG=100 S=2.88 err=+0.90 conf=1.00 clip=0.00 fps=15.9/30`.
+`err` is the meter's reading in stops (positive: the picture wants more light), `cap` the longest exposure the frame
+rate allows (`Fps`, `User` or `Learned`), `ceil` the longest the loop may use with the frame rate lowered and `over`
+whether it does (2.5.12), `maxG` the gain limit, `fps` the measured/requested rate. A dark, grainy picture
+with `LimitGain`, `E` at `ceil` (or at `cap` when `ceil` is the same) and `G` at `maxG` is the loop at its limits (the
+room needs more light than that exposure and gain give: see 2.5.3, 2.5.9 and 2.5.12); `err` near 0 means the loop is on
+target and the cause is elsewhere. Test: `the_log_line_says_where_the_loop_is_and_what_it_saw`;
+`owner_settings_settle_inside_the_limits_and_sit_at_them_outside` pins the loop's behaviour with the owner's settings
+(Most gain 100, Fast, 30 fps) over room brightnesses 10 stops apart: it settles inside `E_rate` and full gain, stays at
+`E = -5, G = 100` up to a stop short of it, and goes to `E = -4` beyond that (2.5.12).
+
+**To check on the real camera after 2.5.12:** in the dim room the `[auto]` line should show `over=true`, `E=-4`,
+`fps≈16/30` and `err` under about 0.5 at `G` below 100 or at most 1 stop at `G=100`; with the light on again, `over=false`,
+`E=-5`, `fps≈30`; no `rate_caps` is learned from the low rate (`learned` unchanged); and the same room with `Longest
+exposure` set to 1/32 s must give the old `E=-5, G=100` at 30 fps.
 
 ### 9.7 What the run changed, and how it was put back
 

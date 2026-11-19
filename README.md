@@ -11,8 +11,10 @@ React, and runs on Windows 11 only.
 - Camera controls: the controls the camera itself offers (brightness, exposure, focus, gain and so on). Exposure and
   white balance each have three modes: Manual, Camera auto and Better Cam auto. Focus keeps its Auto switch.
 - Better Cam auto: the app sets the camera's exposure, gain and white balance itself, from the picture before the
-  filters. In dim light it keeps the frame rate you asked for, up to the most gain you allow, but gain adds noise.
-  You set the target brightness, the longest exposure, the most gain, the warmth and the response speed. It is offered
+  filters. In dim light it keeps the frame rate you asked for, up to the most gain you allow, but gain adds noise. When
+  the picture is still more than a stop too dark at the most gain, it lets the camera drop to about half the frame rate
+  (one stop longer exposure) for a brighter, cleaner picture; set the longest exposure to the frame-rate limit to never
+  do that. You set the target brightness, the longest exposure, the most gain, the warmth and the response speed. It is offered
   only on cameras that support manual exposure and white balance.
 - Filters, in a chain you can reorder by dragging a card and insert where you want: Color Correction, Crop/Pad,
   Scaling/Aspect Ratio, Transform, Sharpen, Apply LUT, Chroma Key, Color Key, Luma Key, Image Mask/Blend, Auto Adjust,
