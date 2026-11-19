@@ -1,9 +1,16 @@
 /**
  * The eyedropper (UX-PASS L2): the pixel of the preview under the pointer, the average of the 5×5 around it from the last frame's
- * RGBA bytes (no GL readback), and the OBS colour int for it. Pure: no DOM, no store.
+ * NV12 bytes (no GL readback: each sampled pixel is converted to RGB here with the matrix of `yuv.ts`, the one the shader uses),
+ * and the OBS colour int for it. Pure: no DOM, no store.
+ *
+ * Why JS and not a readback of the canvas: `gl.readPixels` stalls the page on the GPU and needs the drawing buffer kept, and the
+ * pick would then depend on when the canvas was last drawn. 25 pixels converted from the frame the page already holds are
+ * exact for the same matrix (the shader differs only in that it interpolates chroma between texels, which a flat patch and a
+ * 25 pixel average do not show: `eyedropper.test.ts` pins it within 2 codes).
  */
 import { withRgb } from "../filters/values";
-import { HEADER_BYTES, letterbox, type FrameHeader, type Rect } from "./previewFrame";
+import { HEADER_BYTES, chromaOffset, letterbox, type FrameHeader, type Rect } from "./previewFrame";
+import { nv12ToRgb } from "./yuv";
 
 /** The window around the pointer the eyedropper averages: 5×5 preview pixels. */
 export const SAMPLE_RADIUS = 2;
@@ -20,11 +27,13 @@ export function toCanvasPixel(clientX: number, clientY: number, box: Rect, canva
 }
 
 /**
- * The average colour of the pixels within `radius` of (`x`, `y`) in the frame `buf` (header and RGBA rows, as the engine sends it),
- * as whole [r, g, b] bytes; the window is cut at the picture's edge. Alpha does not count: the preview is drawn opaque.
+ * The average colour of the pixels within `radius` of (`x`, `y`) in the frame `buf` (header, Y plane and UV plane, as the engine
+ * sends it), as whole [r, g, b] bytes: each pixel is converted to RGB first (its Y and the Cb, Cr of its 2×2 block), then the
+ * RGB values are averaged. The window is cut at the picture's edge.
  */
 export function sampleAverage(buf: ArrayBuffer, header: FrameHeader, x: number, y: number, radius = SAMPLE_RADIUS): [number, number, number] {
-  const bytes = new Uint8Array(buf, HEADER_BYTES);
+  const bytes = new Uint8Array(buf);
+  const uv = chromaOffset(header);
   const x0 = Math.max(0, x - radius);
   const x1 = Math.min(header.width - 1, x + radius);
   const y0 = Math.max(0, y - radius);
@@ -32,11 +41,13 @@ export function sampleAverage(buf: ArrayBuffer, header: FrameHeader, x: number, 
   const sum = [0, 0, 0];
   let n = 0;
   for (let j = y0; j <= y1; j++) {
+    const row = uv + (j >> 1) * header.stride;
     for (let i = x0; i <= x1; i++) {
-      const at = j * header.stride + i * 4;
-      sum[0] += bytes[at];
-      sum[1] += bytes[at + 1];
-      sum[2] += bytes[at + 2];
+      const c = row + (i >> 1) * 2;
+      const rgb = nv12ToRgb(bytes[HEADER_BYTES + j * header.stride + i], bytes[c], bytes[c + 1]);
+      sum[0] += rgb[0];
+      sum[1] += rgb[1];
+      sum[2] += rgb[2];
       n++;
     }
   }

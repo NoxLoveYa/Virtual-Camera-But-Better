@@ -5,13 +5,20 @@
  * Pure: no DOM, no store.
  */
 
-/** Six little-endian `u32`: width, height, stride, frame, source width, source height. Then the RGBA pixels. */
-export const HEADER_BYTES = 24;
+/**
+ * Seven little-endian `u32`: width, height, stride, frame, source width, source height, format. Then the pixels. The one format
+ * is `FORMAT_NV12` (BT.709 limited range, see `yuv.ts`): the Y plane, `height` rows of `stride` bytes, then the UV plane,
+ * `height / 2` rows of `stride` bytes (`width / 2` interleaved Cb, Cr pairs).
+ */
+export const HEADER_BYTES = 28;
+
+/** The `format` word of an NV12 frame. */
+export const FORMAT_NV12 = 1;
 
 export interface FrameHeader {
   width: number;
   height: number;
-  /** Bytes per row. */
+  /** Bytes per row of the Y plane and of the UV plane. */
   stride: number;
   frame: number;
   /** The full size of the tapped picture before the downscale: what a point on the canvas maps back to. */
@@ -19,19 +26,26 @@ export interface FrameHeader {
   sourceHeight: number;
 }
 
-/** The header of a frame, or `null` when the frame is shorter than its header says or a field is impossible. */
+/** Where the UV plane starts in a frame buffer (after the header and the Y plane). */
+export const chromaOffset = (h: FrameHeader): number => HEADER_BYTES + h.stride * h.height;
+
+/** The header of a frame, or `null` when the frame is shorter than its header says, a field is impossible or the format is not NV12. */
 export function readHeader(buf: ArrayBuffer): FrameHeader | null {
   if (buf.byteLength < HEADER_BYTES) return null;
   const v = new DataView(buf);
-  const [width, height, stride, frame, sourceWidth, sourceHeight] = [0, 4, 8, 12, 16, 20].map((at) => v.getUint32(at, true));
+  const [width, height, stride, frame, sourceWidth, sourceHeight, format] = [0, 4, 8, 12, 16, 20, 24].map((at) => v.getUint32(at, true));
+  // 4:2:0 needs whole 2 x 2 blocks, and the chroma rows are read as `stride / 2` texels of 2 bytes
   const complete =
+    format === FORMAT_NV12 &&
     width > 0 &&
     height > 0 &&
+    width % 2 === 0 &&
+    height % 2 === 0 &&
     sourceWidth > 0 &&
     sourceHeight > 0 &&
-    stride >= width * 4 &&
-    stride % 4 === 0 &&
-    buf.byteLength >= HEADER_BYTES + stride * height;
+    stride >= width &&
+    stride % 2 === 0 &&
+    buf.byteLength >= HEADER_BYTES + (stride * height * 3) / 2;
   return complete ? { width, height, stride, frame, sourceWidth, sourceHeight } : null;
 }
 

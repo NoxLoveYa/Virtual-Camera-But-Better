@@ -555,3 +555,117 @@ the trace running): `Test-Path C:\Users\Obnoxious\AppData\Local\Temp\opencode\ap
    = the new thread of that pid with about 340 context switches/s; its readying process = the engine's render thread (event
    build) or the timer (today).
 
+
+## Preview path (2026-11-19)
+
+The in-app preview, measured for the first time (the sign-off row "Preview: 30 fps, <= 60 ms, <= 3 % CPU incl. WebView2" had no
+number), then changed: one frame of delay removed, NV12 on the wire, back-pressure that makes nothing the page cannot show. Raw
+logs, per-run JSON (`results-first.jsonl`, `results.jsonl`), the regression outputs and the harness (`start.ps1`, `cpu.ps1`,
+`measure.mjs`, `run.ps1`) are in `C:\Users\Obnoxious\AppData\Local\Temp\opencode\prevperf\` (not in the repo).
+
+### What changed
+
+| # | Finding | Change |
+|---|---|---|
+| 1 | `on_frame` mapped the previous frame's picture **before** it queued its own, so the page got the frame before the one apps got (one camera period late, and a frame lost whenever the ring was not drained) | `FrameTap::frame_done(wait)`: the engine calls it after its own readback of the same frame; the tap maps its picture there. The preview copy is queued first, the engine's readback then waits for the GPU, so the preview's map is free |
+| 2 | A 960x540 RGBA frame: GPU readback, `pack` copy, Tauri send, 2 MB upload (about four 2 MB copies) | NV12 (Y plane + half height UV plane), 1.5 bytes a pixel: **0.78 MB instead of 2.07 MB**. The conversion is the engine's own one-dispatch encoder (`encode_nv12_cs.hlsl`, shared through `gpu::output::dispatch_packed_nv12`), the page converts in the fragment shader |
+| 3 | A frame was produced while one waited in the sender and one was in flight (it only replaced the waiting one) | `PreviewTap::busy`: no downscale, no dispatch, no copy while a frame waits in the gate (one in flight, one pending) or one is still on the GPU. Counted: `skipped` (the 30 fps limit is not counted) |
+
+**Wire format** (`preview.rs`, `src/ui/previewFrame.ts`; little endian): seven `u32`, 28 bytes: `width`, `height`, `stride`, `frame`,
+`source_width`, `source_height`, `format` (1 = NV12). Then `stride x height` bytes of Y and `stride x height / 2` bytes of UV
+(`width / 2` interleaved Cb, Cr pairs a row). `stride` is the pitch of both planes (today `width`). The reader refuses any other
+`format`, an odd `width` or `height`, an odd `stride` and a buffer shorter than the planes. The preview size is `fit_within` then
+the width down to a multiple of 4 and the height down to an even number (the encoder's block of 4 x 2 pixels): at most 3 pixels
+narrower and 1 shorter than the box; the header's source size maps a point back as before.
+
+**Matrix**: BT.709, **limited range**, 8 bit, 4:2:0 with each chroma sample the mean of its 2 x 2 pixels: the matrix of
+`rgb_to_yuv_rows(Bt709, Limited)` that the encoder writes for the virtual camera, and the inverse `yuv_to_rgb_rows(Bt709, Limited, 8)`:
+`R = 1.164384 Y' + 1.792741 Cr' - 0.972945`, `G = 1.164384 Y' - 0.213249 Cb' - 0.532909 Cr' + 0.301483`,
+`B = 1.164384 Y' + 2.112402 Cb' - 1.133402` (Y', Cb', Cr' = bytes / 255). One set of constants in `src/ui/yuv.ts`: it makes the GLSL
+of the shader and the JS of the eyedropper, and the Rust test `the_page_matrix_is_the_inverse_of_the_encoders` and
+`eyedropper.test.ts` pin the same numbers. The shader samples Y (`R8`) and UV (`RG8`) with linear filtering, so chroma is
+interpolated between its texels.
+
+**Eyedropper** (`sampleAverage`): converts the 25 sampled pixels to RGB **in JS with the same matrix** and averages the RGB
+(not a canvas readback). Why: `gl.readPixels` stalls the page on the GPU and needs the drawing buffer kept; the pick would
+depend on when the canvas was last drawn; 25 pixels from the frame the page already holds are exact for the same matrix. The
+only difference to the shader is that a pixel takes the chroma of its 2 x 2 block (no interpolation), which a flat patch and
+a 25 pixel average do not show (`eyedropper.test.ts`: flat colours within 2 codes, the gradient fixture within 3).
+
+**Colour** against the old RGBA path: on a 640x360 test picture (colour blocks and a grey ramp) the NV12 round trip is within
+3 codes of the RGBA picture away from hard colour edges (`the_nv12_picture_matches_the_rgba_reference...`); the live picture
+`#336699` (Color Correction: multiply black, add `#336699`) shows as `#336599`: 1 code in green, from the 8 bit limited range
+(the swatch and the canvas agree exactly). It is the encoder's own quantisation, the same one apps get.
+
+### Measurement
+
+The app (`better-cam.exe`, debug profile of this repo, which is optimised) in test mode, the live camera (W4GS, MJPEG 1280x720 at
+30 requested; **the camera gives 16.7 to 17.5 fps in this room**, so 30 fps could not be reached: every rate-dependent figure is at
+the camera's rate and the 30 fps line below is a linear extrapolation, not a measurement), window 1200x800, preview at the default
+size (the preview is 476x268; the cap of 960x540 is not reached). CPU of the app process and of every WebView2 process
+below it (`cpu.ps1`: `TotalProcessorTime` deltas over a 20 s window, % of one core; `renderer` hosts the page, `browser` is the
+WebView2 broker that carries the IPC, `gpu` draws the WebGL). Each window is taken with the preview on, then off, in the same
+run; **the preview's cost is on minus off**. "Before" is the `HEAD` preview (`abf95dd`) in a copy of the working tree with a
+measurement-only patch (`BETTER_CAM_PREVIEW_LOG` additionally prints the age of a frame at the sink and the round trip of an
+acknowledgement: the same code in both builds); "after" is this working tree. The machine was busy 2 to 87 % in the windows
+(other agents), so a single window is good to about +-1.5 % of a core; 7 on/off pairs per build: 2 at 1280x720 and 2 with the
+output set to 1920x1080 (the engine renders 1920x1080 and the preview shrinks it: the same preview payload; the camera has no
+real 1080p mode at a usable rate here) in the first set, 3 at 1280x720 in the second (with the page's own busy time added):
+
+| Per second, means of 7 pairs | before (RGBA, collect first) | after (NV12, collect after the readback) |
+|---|---|---|
+| Preview frames sent to the page | 14.97 (camera 16.7 to 17.5) | **17.00** (every camera frame) |
+| Bytes a frame, 476x268 (at the 960x540 cap: 2.07 MB / 0.78 MB) | 510 KB | 191 KB (**-62 %**) |
+| CPU on, app process | 5.03 % | 4.16 % |
+| CPU off, app process | 1.31 % | 1.12 % |
+| **Preview cost: app process** | **3.72 %** | **3.05 %** |
+| Preview cost: renderer | 2.40 % | 2.81 % |
+| Preview cost: WebView2 browser (IPC) | 2.35 % | 2.11 % |
+| Preview cost: WebView2 gpu process | 1.13 % | 0.95 % |
+| **Preview cost, all processes** | **10.12 %** (range of on 13.7 to 20.4, off 5.2 to 7.0) | **9.42 %** (on 13.2 to 16.1, off 4.5 to 6.2) |
+| Preview cost a frame per second drawn (all processes) | 0.676 % | **0.554 %** (-18 %) |
+| App process, a frame per second | 0.249 % | 0.180 % (-28 %) |
+| Page main thread busy, on minus off (`TaskDuration`, 3 pairs) | 2.00 % (15 fps) | 1.56 % (17 fps): 0.133 vs 0.092 a frame per second (-31 %) |
+| Page script time (`ScriptDuration`, on minus off) | 0.09 % | 0.08 % |
+| Age of a frame at the sink (capture time to the sender; p50 / worst second) | **81.1 ms** / 112 ms | **33.1 ms** / 39.4 ms |
+| Round trip of a frame (send to ack: IPC, upload, draw; p50 / max) | 3.37 ms / 7.6 ms | 1.94 ms / 3.9 ms |
+| Frames skipped by the tap / offers that overwrote a waiting frame / ack time-outs | n.a. / 0 / 0 | 0 / 0 / 0 |
+
+* **At 30 fps** (extrapolated, linear in the per-frame figures above, not measured): about 20 % of one core before and about **16.6 %
+  after** for the whole preview, of which the app process is 7.5 % and 5.4 %. That is 1.0 % of this 16 thread machine (2.8 % of a
+  6 core desktop), inside the plan's 3 % row for a desktop, which this camera could not prove at 30 fps.
+* **What the saving is made of**: the app process (the readback copy and the packing of a frame, and the channel send) fell by
+  28 % a frame, the page's main thread by 31 % and the IPC round trip by 42 %. The **renderer process as a whole did not fall** (0.160
+  to 0.165 % a frame per second: its share is the fixed cost of a message and a draw, not the bytes), and the gpu process is
+  about the same. So the copies the audit counted were real but a minority of the cost: **the total fell by about a fifth, not
+  by 60 %**, and what is left is per message (the channel's fetch, the `preview_ack` call, the draw), which this change does not touch.
+  A single window is within noise of the table's difference; the per-frame figures over 7 pairs and the page's own busy time
+  (a main-thread metric that does not depend on the other processes) agree on the direction.
+* **Latency**: the preview used to be one frame behind the output (it mapped the previous frame before it made its own).
+  Now it is the same frame: the age of a frame at the sink fell from 81.1 to 33.1 ms (48 ms, most of one camera period at this
+  light; the 33 ms left are the camera's and decoder's time before the engine renders plus the pass itself, not split here),
+  the worst second from 112 to 39 ms. The test `the_preview_frame_is_the_frame_the_engine_outputs_in_every_readback_policy`
+  checks it frame by frame inside a real engine: the capture time of the frame the tap hands to the gate equals the one the
+  engine passed to `on_frame` in the same pass, for both readback policies.
+* **Frames lost**: the old tap sent 15.0 of 16.7 to 17.5 camera frames a second (a frame that was in the ring when the next
+  `on_frame` came was replaced); the new one sends all 17.
+
+### Back-pressure
+
+Unit tests: `no_frame_is_made_while_one_waits_and_one_is_in_flight` (a frame in flight and one waiting: four frames come, none is
+captured, no staging slot is made, `skipped` is 4, `overwritten` stays 0, and after the ack the next frame is made and takes the
+next number), `a_frame_still_on_the_gpu_holds_the_next_one_back`, and the engine test `the_tap_runs_inside_the_engine_and_stop_ends_the_stream`
+(nothing acknowledged: 2 frames made, the rest skipped, none overwritten). `Preview::stats()` and the `BETTER_CAM_PREVIEW_LOG`
+line carry `made`, `sent`, `skipped`, `overwritten`, `ack_timeouts`.
+
+Live (CDP `Emulation.setCPUThrottlingRate` 25 on the page for 14 s, then off; camera at 17 fps): the round trip of a frame rose from
+2 ms to 33 ms (p50; worst 185 ms) and the tap **skipped 9 frames** (6 in the first seconds, 3 more in a later spike) instead of making
+frames that would only have replaced the waiting one: `overwritten` 0 and `ack_timeouts` 0 over the 300 frames, `made` = `sent` + 1
+all the way. The page kept drawing 17 fps; with the throttle off the round trip was back at 2.0 ms.
+
+### Not measured
+
+30 fps (camera), the 960x540 cap (the preview is 476x268 at 1200x800), a window larger than that, 4K, a second WebView2
+renderer, and the energy cost on a laptop. The `next-frame` readback policy: the preview maps without waiting there, so it shows
+the frame a frame later (as the apps do under that policy); it is covered by the unit test of the wrapper only.
+

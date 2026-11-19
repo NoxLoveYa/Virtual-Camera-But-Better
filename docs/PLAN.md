@@ -545,7 +545,11 @@ can use it.
   window is visible (`document.visibilityState`) and the preview is on.
 - Backpressure: the sender keeps one frame in flight; JS acknowledges by calling `preview_ack`. New frames
   overwrite the pending one.
-- Payload: 24-byte header (width, height, stride, frame number, `source_width`, `source_height`) + pixels.
+- Payload: 28-byte header (width, height, stride, frame number, `source_width`, `source_height`, `format`; little endian) + pixels.
+  `format` 1 is NV12, BT.709 limited range (the matrix the engine encodes): the Y plane (`height` rows of `stride` bytes), then the
+  UV plane (`height / 2` rows); the page converts in a WebGL fragment shader (`src/ui/yuv.ts`). 1.5 bytes a pixel instead of 4.
+  The tap makes no frame while one waits in the sender or is still on the GPU, and maps its picture after the engine's own
+  readback of the same frame. Measurements: `docs/PERF.md`, "Preview path".
 - Upgrade path if profiling shows the copy matters: the WebView2 shared buffer, same JS drawing code.
 
 ### 4.5 Filter architecture

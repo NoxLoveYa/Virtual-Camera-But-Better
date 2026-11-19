@@ -20,7 +20,9 @@ use windows::Win32::Graphics::Dxgi::Common::{
 
 use super::convert::{rgb_to_yuv_rows, ColorRange, ColorSpace};
 use super::readback::PlaneDesc;
-use super::{ConstantBuffer, GpuError, GpuResult, Pass, Pooled, Renderer, RgbaTexture, ShaderId};
+use super::{
+    ConstantBuffer, GpuDevice, GpuError, GpuResult, Pass, Pooled, Renderer, RgbaTexture, ShaderId,
+};
 
 // ---------------------------------------------------------------------------------------------------------------
 // Fit modes
@@ -224,8 +226,114 @@ struct EncodeCsParams {
 
 /// Whether one compute dispatch can write both NV12 planes of a `w` x `h` frame: a thread owns 4 x 2 pixels, and the
 /// planes are `R32_UINT` textures of whole texels.
-fn packs(w: u32, h: u32) -> bool {
+pub fn packs(w: u32, h: u32) -> bool {
     w.is_multiple_of(4) && h.is_multiple_of(2)
+}
+
+/// A plane written by draws (`packed` false) or by the compute shader (`packed` true: `R32_UINT`).
+fn make_plane(
+    gpu: &GpuDevice,
+    f: DXGI_FORMAT,
+    w: u32,
+    h: u32,
+    bpt: u32,
+    packed: bool,
+) -> GpuResult<EncodePlane> {
+    let texture = gpu.create_texture(&D3D11_TEXTURE2D_DESC {
+        Width: w,
+        Height: h,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: f,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: if packed {
+            D3D11_BIND_UNORDERED_ACCESS.0
+        } else {
+            D3D11_BIND_RENDER_TARGET.0
+        } as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    })?;
+    let (rtv, uav) = if packed {
+        (None, Some(gpu.create_uav(&texture, f)?))
+    } else {
+        (Some(gpu.create_rtv(&texture)?), None)
+    };
+    Ok(EncodePlane {
+        texture,
+        rtv,
+        uav,
+        desc: PlaneDesc {
+            format: f,
+            width: w,
+            height: h,
+            bytes_per_texel: bpt,
+        },
+    })
+}
+
+/// The planes of the one-dispatch NV12 encode for a `w` x `h` frame ([`packs`] must hold): the same bytes as the R8 and
+/// R8G8 planes (a row is `w` bytes in both), four to a texel.
+pub fn packed_nv12_targets(gpu: &GpuDevice, w: u32, h: u32) -> GpuResult<EncodeTargets> {
+    if !packs(w, h) {
+        return Err(GpuError::Invalid(format!(
+            "NV12 in one dispatch needs a width of 4n and an even height, got {w}x{h}"
+        )));
+    }
+    Ok(EncodeTargets {
+        format: EncodeFormat::Nv12,
+        width: w,
+        height: h,
+        packed: true,
+        planes: vec![
+            make_plane(gpu, DXGI_FORMAT_R32_UINT, w / 4, h, 4, true)?,
+            make_plane(gpu, DXGI_FORMAT_R32_UINT, w / 4, h / 2, 4, true)?,
+        ],
+    })
+}
+
+/// The constant buffer [`dispatch_packed_nv12`] writes.
+pub fn nv12_cs_constants(r: &Renderer) -> GpuResult<ConstantBuffer> {
+    r.constants(std::mem::size_of::<EncodeCsParams>())
+}
+
+/// Write both NV12 planes of `input` (BT.709 limited range, the media type the virtual camera advertises, and what the
+/// preview's shader decodes) into `targets` with one dispatch: every thread reads a block of 4 x 2 pixels once.
+pub fn dispatch_packed_nv12(
+    r: &Renderer,
+    constants: &ConstantBuffer,
+    input: &RgbaTexture,
+    targets: &EncodeTargets,
+) -> GpuResult<()> {
+    let (w, h) = (input.width, input.height);
+    let rows =
+        rgb_to_yuv_rows(ColorSpace::Bt709, ColorRange::Limited).map(|row| row.map(|v| v as f32));
+    constants.write(
+        &r.gpu.context,
+        &EncodeCsParams {
+            rows: EncodeParams {
+                row_y: rows[0],
+                row_u: rows[1],
+                row_v: rows[2],
+            },
+            blocks: [w / 4, h / 2],
+            pad: [0; 2],
+        },
+    )?;
+    let cs = r.shaders.compute(ShaderId::EncodeNv12Cs)?;
+    let uavs = [targets.planes[0].uav.clone(), targets.planes[1].uav.clone()];
+    r.dispatch(
+        &cs,
+        &[Some(input.srv.clone())],
+        Some(constants),
+        &uavs,
+        ((w / 4).div_ceil(8), (h / 2).div_ceil(8)),
+    );
+    Ok(())
 }
 
 /// Stage 4: RGBA to the consumer's format.
@@ -254,40 +362,9 @@ impl Encoder {
     }
 
     fn make_targets(&self, format: EncodeFormat, w: u32, h: u32) -> GpuResult<EncodeTargets> {
-        let gpu = &self.renderer.gpu;
-        // A plane written by draws (`packed` false) or by the compute shader (`packed` true: `R32_UINT`).
-        let plane = |f: DXGI_FORMAT, w: u32, h: u32, bpt: u32, packed: bool| -> GpuResult<EncodePlane> {
-            let texture = gpu.create_texture(&D3D11_TEXTURE2D_DESC {
-                Width: w,
-                Height: h,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: f,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: if packed { D3D11_BIND_UNORDERED_ACCESS.0 } else { D3D11_BIND_RENDER_TARGET.0 } as u32,
-                CPUAccessFlags: 0,
-                MiscFlags: 0,
-            })?;
-            let (rtv, uav) = if packed {
-                (None, Some(gpu.create_uav(&texture, f)?))
-            } else {
-                (Some(gpu.create_rtv(&texture)?), None)
-            };
-            Ok(EncodePlane {
-                texture,
-                rtv,
-                uav,
-                desc: PlaneDesc {
-                    format: f,
-                    width: w,
-                    height: h,
-                    bytes_per_texel: bpt,
-                },
-            })
+        let gpu = &*self.renderer.gpu;
+        let plane = |f: DXGI_FORMAT, w: u32, h: u32, bpt: u32, packed: bool| {
+            make_plane(gpu, f, w, h, bpt, packed)
         };
         let mut packed = false;
         let planes = match format {
@@ -360,23 +437,12 @@ impl Encoder {
                 let rows = rgb_to_yuv_rows(ColorSpace::Bt709, ColorRange::Limited)
                     .map(|row| row.map(|v| v as f32));
                 if targets.packed {
-                    // One dispatch writes both planes: every thread reads a block of 4 x 2 pixels once.
-                    let constants = self.cs_constants.as_ref().expect("made above");
-                    constants.write(
-                        &r.gpu.context,
-                        &EncodeCsParams {
-                            rows: EncodeParams {
-                                row_y: rows[0],
-                                row_u: rows[1],
-                                row_v: rows[2],
-                            },
-                            blocks: [w / 4, h / 2],
-                            pad: [0; 2],
-                        },
+                    dispatch_packed_nv12(
+                        r,
+                        self.cs_constants.as_ref().expect("made above"),
+                        input,
+                        targets,
                     )?;
-                    let cs = r.shaders.compute(ShaderId::EncodeNv12Cs)?;
-                    let uavs = [targets.planes[0].uav.clone(), targets.planes[1].uav.clone()];
-                    r.dispatch(&cs, &srvs, Some(constants), &uavs, ((w / 4).div_ceil(8), (h / 2).div_ceil(8)));
                 } else {
                     self.constants.write(
                         &r.gpu.context,

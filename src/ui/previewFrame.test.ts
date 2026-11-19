@@ -2,33 +2,40 @@
  * Checks of the preview helpers: the 24-byte frame header, the preview point and its caption, hold to compare, and the
  * mapping from the canvas to the tapped picture. `npm run test:ui` bundles and runs it. It throws at the first failure.
  */
-import { HEADER_BYTES, NOT_HELD, holdStep, isHeld, letterbox, pointFilter, pointLabel, readHeader, samePoint, toSourcePixel, type Hold, type HoldEvent } from "./previewFrame";
+import { FORMAT_NV12, HEADER_BYTES, NOT_HELD, chromaOffset, holdStep, isHeld, letterbox, pointFilter, pointLabel, readHeader, samePoint, toSourcePixel, type Hold, type HoldEvent } from "./previewFrame";
 
 function eq<T>(actual: T, expected: T, what: string) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error(`${what}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
 }
 
-/** A frame as `preview.rs` packs it: six little-endian words, then `stride * height` bytes. */
-function frame(words: number[], pixelBytes: number): ArrayBuffer {
+/** A frame as `preview.rs` packs it: seven little-endian words (the last is the format), then the Y plane and the UV plane. */
+function frame(words: number[], pixelBytes: number, format = FORMAT_NV12): ArrayBuffer {
   const buf = new ArrayBuffer(HEADER_BYTES + pixelBytes);
   const v = new DataView(buf);
-  words.forEach((w, i) => v.setUint32(i * 4, w, true));
+  [...words, format].forEach((w, i) => v.setUint32(i * 4, w, true));
   return buf;
 }
 
-// ---- the header
-eq(HEADER_BYTES, 24, "header size");
-eq(readHeader(frame([4, 2, 16, 9, 1920, 1080], 32)), { width: 4, height: 2, stride: 16, frame: 9, sourceWidth: 1920, sourceHeight: 1080 }, "a good frame");
-eq(readHeader(frame([4, 2, 20, 9, 8, 4], 40)), { width: 4, height: 2, stride: 20, frame: 9, sourceWidth: 8, sourceHeight: 4 }, "a stride wider than the row");
-eq(readHeader(frame([4, 2, 16, 9, 1920, 1080], 31)), null, "pixels cut short");
-eq(readHeader(frame([4, 2, 16, 9, 1920, 1080], 0).slice(0, 23)), null, "shorter than the header");
-eq(readHeader(new ArrayBuffer(16)), null, "an old 16-byte header is not a frame");
-eq(readHeader(frame([0, 2, 16, 9, 1920, 1080], 32)), null, "zero width");
-eq(readHeader(frame([4, 2, 12, 9, 1920, 1080], 32)), null, "stride under a row");
-eq(readHeader(frame([4, 2, 18, 9, 1920, 1080], 40)), null, "stride not a multiple of 4");
-eq(readHeader(frame([4, 2, 16, 9, 0, 1080], 32)), null, "no source width");
-eq(readHeader(frame([4, 2, 16, 9, 1920, 0], 32)), null, "no source height");
-eq(readHeader(frame([0xffffffff, 2, 0xffffffff, 9, 1, 1], 32)), null, "huge numbers do not overflow into a pass");
+// ---- the header (NV12: `stride * height` bytes of Y, then `stride * height / 2` of UV)
+eq(HEADER_BYTES, 28, "header size");
+eq(FORMAT_NV12, 1, "the format word of NV12");
+eq(readHeader(frame([4, 2, 4, 9, 1920, 1080], 12)), { width: 4, height: 2, stride: 4, frame: 9, sourceWidth: 1920, sourceHeight: 1080 }, "a good frame");
+eq(readHeader(frame([4, 2, 6, 9, 8, 4], 18)), { width: 4, height: 2, stride: 6, frame: 9, sourceWidth: 8, sourceHeight: 4 }, "a stride wider than the row");
+eq(chromaOffset({ width: 4, height: 2, stride: 6, frame: 0, sourceWidth: 1, sourceHeight: 1 }), HEADER_BYTES + 12, "the UV plane starts after the Y rows");
+eq(readHeader(frame([4, 2, 4, 9, 1920, 1080], 11)), null, "pixels cut short (the UV plane is part of the pixels)");
+eq(readHeader(frame([4, 2, 4, 9, 1920, 1080], 8)), null, "a Y plane without its UV plane");
+eq(readHeader(frame([4, 2, 4, 9, 1920, 1080], 0).slice(0, 27)), null, "shorter than the header");
+eq(readHeader(new ArrayBuffer(24)), null, "an old 24-byte header is not a frame");
+eq(readHeader(frame([4, 2, 16, 9, 1920, 1080], 48, 0)), null, "an RGBA frame (no format word) is not read as NV12");
+eq(readHeader(frame([4, 2, 4, 9, 1920, 1080], 12, 2)), null, "an unknown format");
+eq(readHeader(frame([0, 2, 4, 9, 1920, 1080], 12)), null, "zero width");
+eq(readHeader(frame([3, 2, 4, 9, 1920, 1080], 12)), null, "an odd width has no whole chroma block");
+eq(readHeader(frame([4, 3, 4, 9, 1920, 1080], 18)), null, "an odd height has no whole chroma block");
+eq(readHeader(frame([4, 2, 2, 9, 1920, 1080], 12)), null, "stride under a row");
+eq(readHeader(frame([4, 2, 5, 9, 1920, 1080], 15)), null, "stride not even (the UV rows are read as pairs)");
+eq(readHeader(frame([4, 2, 4, 9, 0, 1080], 12)), null, "no source width");
+eq(readHeader(frame([4, 2, 4, 9, 1920, 0], 12)), null, "no source height");
+eq(readHeader(frame([0xffffffff, 2, 0xffffffff, 9, 1, 1], 12)), null, "huge numbers do not overflow into a pass");
 
 // ---- the point and its caption
 const steps = [

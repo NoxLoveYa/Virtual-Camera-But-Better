@@ -364,6 +364,11 @@ pub struct SourceUpdate {
 pub trait FrameTap: Send {
     fn on_frame(&mut self, renderer: &Renderer, frame: &RgbaTexture, capture_qpc: u64);
 
+    /// Called once per rendered frame after the engine's own readback of it. `wait` says the engine may block on the
+    /// GPU for this frame (its readback just did, or nothing is read back): a tap that queued a copy in `on_frame`
+    /// maps it here, so what it shows is the frame the apps get, not the one before.
+    fn frame_done(&mut self, _wait: bool) {}
+
     /// The engine built a new GPU device (the old one was lost): drop every resource made on the old one. The next
     /// `on_frame` gets a renderer of the new device.
     fn device_changed(&mut self) {}
@@ -3856,6 +3861,16 @@ fn tap_frame(shared: &Shared, stop: &AtomicBool, renderer: &Renderer, frame: &Rg
     }
 }
 
+/// Tell the tap (the preview) the frame's readback is done ([`FrameTap::frame_done`]), under the same lock and stop rule
+/// as [`tap_frame`].
+fn tap_done(shared: &Shared, stop: &AtomicBool, wait: bool) {
+    if let Some(tap) = lock(&shared.tap).as_mut() {
+        if !stop.load(Ordering::Acquire) {
+            tap.frame_done(wait);
+        }
+    }
+}
+
 /// The output size and rate in effect: the settings, else the source's, forced even and inside the protocol limits.
 fn resolve_output(o: &OutputSettings, info: &SourceInfo) -> (u32, u32, u32) {
     let even = |v: u32, max: u32| (v.clamp(2, max)) & !1;
@@ -4491,6 +4506,14 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
                 }
             }
         }
+        // The preview's picture is mapped now, after the readback above: under the default policy that waited for the
+        // GPU, which had the preview's copy queued ahead of the output's, so the preview shows this frame. Where the
+        // engine did not wait (next-frame policy with an app reading) the preview does not either.
+        tap_done(
+            shared,
+            stop,
+            matches!(ctx.readback, ReadbackPolicy::Immediate) || skip.is_some(),
+        );
         // Draw calls report nothing when the device is gone; this does (one cheap call a frame).
         if let Some(hr) = renderer.gpu.removed_reason() {
             break Err(Failure::GpuLost(format!(

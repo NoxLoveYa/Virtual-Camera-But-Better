@@ -3,7 +3,8 @@ import { api } from "../api";
 import { CAPTURE_KEYS, effectiveSource, problemText } from "../camera/schema";
 import { useStore } from "../store";
 import { labelOf } from "../filters/schema";
-import { HEADER_BYTES, NOT_HELD, holdStep, isHeld, pointLabel, readHeader, type FrameHeader, type HoldEvent } from "../ui/previewFrame";
+import { HEADER_BYTES, NOT_HELD, chromaOffset, holdStep, isHeld, pointLabel, readHeader, type FrameHeader, type HoldEvent } from "../ui/previewFrame";
+import { YUV_TO_RGB_GLSL } from "../ui/yuv";
 import { lastFrame } from "../ui/lastFrame";
 import { sourceChange, type SourceSize } from "../ui/previewTool";
 import { CropOverlay } from "./CropOverlay";
@@ -22,17 +23,22 @@ void main() {
   gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
 }`;
 
+// The frame is NV12: Y is one R8 texture, UV one RG8 texture of half the size (linear filtering interpolates the chroma
+// between its texels). The matrix (BT.709 limited range, what the engine encodes) is `yuv.ts`'s, the one the eyedropper uses.
 const FRAGMENT = `#version 300 es
-precision mediump float;
-uniform sampler2D picture;
+precision highp float;
+uniform sampler2D luma;
+uniform sampler2D chroma;
 in vec2 uv;
 out vec4 color;
-void main() { color = vec4(texture(picture, uv).rgb, 1.0); }`;
+${YUV_TO_RGB_GLSL}
+void main() { color = vec4(yuvToRgb(texture(luma, uv).r, texture(chroma, uv).rg), 1.0); }`;
 
-/** One WebGL texture the frames are uploaded to and drawn from. The pixels are RGBA, top row first: no swap or flip on the CPU. */
+/** The two WebGL textures the frames are uploaded to and drawn from. The planes are top row first: no swap or flip on the CPU. */
 class FrameView {
   private gl: WebGL2RenderingContext;
-  private texture: WebGLTexture;
+  private luma: WebGLTexture;
+  private chroma: WebGLTexture;
   private w = 0;
   private h = 0;
 
@@ -52,13 +58,22 @@ class FrameView {
     gl.linkProgram(program);
     if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program) ?? "link error");
     gl.useProgram(program);
-    this.texture = gl.createTexture()!;
-    gl.bindTexture(gl.TEXTURE_2D, this.texture);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    // unit 0: Y, unit 1: UV
+    const plane = (unit: number, name: string) => {
+      const texture = gl.createTexture()!;
+      gl.activeTexture(gl.TEXTURE0 + unit);
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.uniform1i(gl.getUniformLocation(program, name), unit);
+      return texture;
+    };
+    this.luma = plane(0, "luma");
+    this.chroma = plane(1, "chroma");
+    // rows of the planes are `stride` bytes apart, which is `UNPACK_ROW_LENGTH` texels of 1 byte (Y) or `stride / 2` of 2 (UV)
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     this.gl = gl;
   }
 
@@ -70,15 +85,21 @@ class FrameView {
       canvas.height = h.height;
     }
     gl.viewport(0, 0, h.width, h.height);
-    gl.pixelStorei(gl.UNPACK_ROW_LENGTH, h.stride / 4);
-    const pixels = new Uint8Array(buf, HEADER_BYTES, h.stride * h.height);
-    if (this.w !== h.width || this.h !== h.height) {
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, h.width, h.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
-      this.w = h.width;
-      this.h = h.height;
-    } else {
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, h.width, h.height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
-    }
+    const y = new Uint8Array(buf, HEADER_BYTES, h.stride * h.height);
+    const uv = new Uint8Array(buf, chromaOffset(h), (h.stride * h.height) / 2);
+    const fresh = this.w !== h.width || this.h !== h.height;
+    const upload = (unit: number, texture: WebGLTexture, internal: number, format: number, w: number, hh: number, rowLength: number, data: Uint8Array) => {
+      gl.activeTexture(gl.TEXTURE0 + unit);
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      // rows packed with no padding (the stride the engine sends today) take the browser's plain copy
+      gl.pixelStorei(gl.UNPACK_ROW_LENGTH, rowLength === w ? 0 : rowLength);
+      if (fresh) gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, hh, 0, format, gl.UNSIGNED_BYTE, data);
+      else gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, hh, format, gl.UNSIGNED_BYTE, data);
+    };
+    upload(0, this.luma, gl.R8, gl.RED, h.width, h.height, h.stride, y);
+    upload(1, this.chroma, gl.RG8, gl.RG, h.width / 2, h.height / 2, h.stride / 2, uv);
+    this.w = h.width;
+    this.h = h.height;
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 }

@@ -1,5 +1,5 @@
 /**
- * The last preview frame, for the tools that read it (the eyedropper samples its bytes; the crop frame maps pointer positions with its
+ * The last preview frame, for the tools that read it (the eyedropper samples its NV12 bytes; the crop frame maps pointer positions with its
  * sizes). `Preview` puts each frame here; a frame is the engine's buffer as it came, kept by reference, no copy. `subscribe` calls
  * back only when the picture's geometry (canvas size or source size) changes, not on every frame.
  */
