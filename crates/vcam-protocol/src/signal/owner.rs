@@ -33,7 +33,7 @@ use windows::Win32::Security::Authorization::{
     SE_KERNEL_OBJECT,
 };
 use windows::Win32::Security::{
-    EqualSid, GetAce, ACL, DACL_SECURITY_INFORMATION, OBJECT_SECURITY_INFORMATION,
+    EqualSid, GetAce, IsValidSid, ACL, DACL_SECURITY_INFORMATION, OBJECT_SECURITY_INFORMATION,
     OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
 };
 use windows::Win32::System::Threading::{OpenEventW, SYNCHRONIZATION_ACCESS_RIGHTS};
@@ -127,38 +127,99 @@ impl Drop for Descriptor {
     }
 }
 
-/// `ACCESS_ALLOWED_ACE` and `SYSTEM_MANDATORY_LABEL_ACE` start alike: type, flags, size, a mask, then the SID.
-#[repr(C)]
-struct AceHead {
-    kind: u8,
-    flags: u8,
-    size: u16,
-    mask: u32,
-    sid_start: u32,
+/// `ACCESS_ALLOWED_ACE` and `SYSTEM_MANDATORY_LABEL_ACE` start alike: a header (type, flags, size: 4 bytes), a mask
+/// (4 bytes), then the SID. Other types (denied, audit, the object ACEs) are laid out differently or are not read at all.
+const ACE_SID_OFFSET: usize = 8;
+
+/// The smallest SID: revision, sub-authority count and the 6-byte authority.
+const SID_FIXED: usize = 8;
+
+/// The `i`-th ACE of `acl` as (pointer, type, size), after checking that its 4-byte header lies inside the list and that
+/// its size field is at least the header and reaches no further than the end of the list. **Every** ACE is checked,
+/// whatever its type, before anything of it is read: a list that holds one that does not fit is an error.
+fn ace_header(acl: *mut ACL, acl_size: usize, i: u32) -> io::Result<(*const u8, u8, usize)> {
+    let mut p: *mut c_void = std::ptr::null_mut();
+    unsafe { GetAce(acl, i, &mut p) }.map_err(win_err)?;
+    let ace = p as *const u8;
+    let at = (ace as usize).wrapping_sub(acl as usize);
+    if !at.checked_add(4).is_some_and(|end| end <= acl_size) {
+        return Err(io::Error::other("an ACE header lies outside its list"));
+    }
+    // SAFETY: the 4-byte header (the part every ACE has) is inside the list (checked above).
+    let (ty, size) = unsafe {
+        (
+            *ace,
+            u16::from_le_bytes([*ace.add(2), *ace.add(3)]) as usize,
+        )
+    };
+    if size < 4 || size > acl_size - at {
+        return Err(io::Error::other("an ACE does not fit inside its list"));
+    }
+    Ok((ace, ty, size))
 }
 
-/// `(type, mask, sid text)` of each ACE of `acl` (a null list has none).
-fn aces(acl: *mut ACL) -> io::Result<Vec<(u8, u32, String)>> {
+/// `ACCESS_ALLOWED_COMPOUND`, `_OBJECT`, `_CALLBACK` and `_CALLBACK_OBJECT`: access-allowed ACEs of other layouts, that
+/// [`aces`] does not read. A DACL that holds one grants access to somebody this module did not see.
+const OTHER_ALLOWED_ACES: [u8; 4] = [4, 5, 9, 0xB];
+
+/// `(mask, sid text)` of each ACE of `acl` that is of type `kind` (a null list has none). **Only** an ACE of that type
+/// is looked at beyond its header, and its SID must lie inside the ACE and inside the list: an ACE of another type, with
+/// whatever it holds in the place of a SID, is skipped without a read; one that does not fit (of any type) is an error.
+fn aces(acl: *mut ACL, kind: u8) -> io::Result<Vec<(u32, String)>> {
     let mut out = Vec::new();
     if acl.is_null() {
         return Ok(out);
     }
-    let count = unsafe { (*acl).AceCount };
+    // SAFETY: a list that `GetSecurityInfo` (or a caller that built one) gave: its header is readable.
+    let (count, acl_size) = unsafe { ((*acl).AceCount, (*acl).AclSize as usize) };
     for i in 0..count as u32 {
-        let mut p: *mut c_void = std::ptr::null_mut();
-        unsafe { GetAce(acl, i, &mut p) }.map_err(win_err)?;
-        // SAFETY: GetAce returned a pointer to the i-th ACE inside the list; only the common head is read, and the SID
-        // starts at `sid_start`.
-        let a = unsafe { &*(p as *const AceHead) };
-        let sid = PSID(&a.sid_start as *const u32 as *mut c_void);
-        out.push((a.kind, a.mask, sid_text(sid)?));
+        let (ace, ty, size) = ace_header(acl, acl_size, i)?;
+        if ty != kind {
+            continue;
+        }
+        if size < ACE_SID_OFFSET + SID_FIXED {
+            return Err(io::Error::other("an ACE does not fit inside its list"));
+        }
+        // SAFETY: the ACE has at least `ACE_SID_OFFSET + SID_FIXED` bytes (checked above).
+        let sub_authorities = unsafe { *ace.add(ACE_SID_OFFSET + 1) } as usize;
+        if size < ACE_SID_OFFSET + SID_FIXED + 4 * sub_authorities {
+            return Err(io::Error::other("the SID of an ACE does not fit inside it"));
+        }
+        // SAFETY: the mask and the whole SID are inside the ACE (checked above).
+        let mask = unsafe { (ace.add(4) as *const u32).read_unaligned() };
+        let sid = PSID(unsafe { ace.add(ACE_SID_OFFSET) } as *mut c_void);
+        if !unsafe { IsValidSid(sid) }.as_bool() {
+            return Err(io::Error::other("an ACE holds no valid SID"));
+        }
+        out.push((mask, sid_text(sid)?));
     }
     Ok(out)
 }
 
-/// The SID texts of the access-allowed ACEs in the DACL of the file behind `h` (opened with `READ_CONTROL`). A file with
-/// no DACL at all (everyone may do everything) is an error: no user can be named from it.
-pub fn allowed_trustees(h: HANDLE) -> io::Result<Vec<String>> {
+/// The SID texts of the access-allowed ACEs of the DACL `acl`; `None` when it also holds an access-allowed ACE of another
+/// layout ([`OTHER_ALLOWED_ACES`]), whose trustee is not read here: the list then names more than it shows, so no user
+/// can be named from it. An ACE that does not fit is an error.
+fn dacl_trustees(acl: *mut ACL) -> io::Result<Option<Vec<String>>> {
+    let trustees: Vec<String> = aces(acl, ALLOWED_ACE)?.into_iter().map(|a| a.1).collect();
+    // SAFETY: `aces` has just walked this list (a null one has no ACEs): its header is readable.
+    let (count, acl_size) = if acl.is_null() {
+        (0, 0)
+    } else {
+        unsafe { ((*acl).AceCount, (*acl).AclSize as usize) }
+    };
+    for i in 0..count as u32 {
+        let (_, ty, _) = ace_header(acl, acl_size, i)?;
+        if OTHER_ALLOWED_ACES.contains(&ty) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(trustees))
+}
+
+/// The SID texts of the access-allowed ACEs in the DACL of the file behind `h` (opened with `READ_CONTROL`); `None` when
+/// the DACL also holds an access-allowed ACE of a layout that is not read ([`dacl_trustees`]). A file with no DACL at
+/// all (everyone may do everything) is an error: no user can be named from it.
+pub fn allowed_trustees(h: HANDLE) -> io::Result<Option<Vec<String>>> {
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut psd = PSECURITY_DESCRIPTOR::default();
     let r = unsafe {
@@ -180,16 +241,12 @@ pub fn allowed_trustees(h: HANDLE) -> io::Result<Vec<String>> {
     if dacl.is_null() {
         return Err(io::Error::other("the file has no DACL"));
     }
-    Ok(aces(dacl)?
-        .into_iter()
-        .filter(|a| a.0 == ALLOWED_ACE)
-        .map(|a| a.2)
-        .collect())
+    dacl_trustees(dacl)
 }
 
 /// The user the events must belong to, from the DACL of the frame file at `path` (the file the caller has mapped:
 /// `same_as` is its identity, and the file read here must be that very file). `Ok(None)` when the DACL names no single
-/// user ([`expected_owner`]). The file is opened with `READ_CONTROL | FILE_READ_ATTRIBUTES` and nothing else, never
+/// user ([`expected_owner`]) or holds an access-allowed ACE of a layout that is not read ([`allowed_trustees`]). The file is opened with `READ_CONTROL | FILE_READ_ATTRIBUTES` and nothing else, never
 /// through a link, and, with `pin`, only when it really is `path` below the trusted folder `pin`.
 pub fn frames_expected_owner(
     path: &Path,
@@ -207,7 +264,7 @@ pub fn frames_expected_owner(
             "the frame file at the path is not the file that is mapped",
         ));
     }
-    Ok(expected_owner(&allowed_trustees(raw)?))
+    Ok(allowed_trustees(raw)?.and_then(|t| expected_owner(&t)))
 }
 
 /// A SID parsed from its text, freed on drop.
@@ -264,12 +321,11 @@ pub fn check_event(h: HANDLE, expected: &str) -> Result<(), String> {
         let got = sid_text(owner).unwrap_or_else(|_| "?".into());
         return Err(format!("the event is owned by {got}, not by {expected}"));
     }
-    let labels: Vec<u32> = aces(sacl)
+    let labels: Vec<u32> = aces(sacl, LABEL_ACE)
         .map_err(|e| format!("reading the label: {e}"))?
         .into_iter()
-        .filter(|a| a.0 == LABEL_ACE)
         .filter_map(|a| {
-            a.2.strip_prefix("S-1-16-")
+            a.1.strip_prefix("S-1-16-")
                 .and_then(|rid| rid.parse::<u32>().ok())
         })
         .collect();
@@ -572,6 +628,135 @@ mod tests {
         let elsewhere = std::env::temp_dir().join("bettercam-owner-no-such-root");
         let e = frames_expected_owner(&path, &elsewhere, identity_of(&h)).unwrap_err();
         assert!(secure::is_refused(&e), "{e}");
+    }
+
+    /// A list of the given complete ACEs, in memory that is 4-byte aligned like the system's.
+    fn acl_of(aces: &[Vec<u8>]) -> Vec<u32> {
+        let body: usize = aces.iter().map(Vec::len).sum();
+        let size = 8 + body;
+        let mut bytes = vec![2u8, 0];
+        bytes.extend((size as u16).to_le_bytes());
+        bytes.extend((aces.len() as u16).to_le_bytes());
+        bytes.extend([0, 0]);
+        for a in aces {
+            bytes.extend(a);
+        }
+        bytes.resize(size.div_ceil(4) * 4, 0);
+        bytes
+            .chunks(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    /// An ACE of `kind` with `mask` and the SID `sid` (bytes), its size field `size` (the real size when `None`).
+    fn ace(kind: u8, mask: u32, sid: &[u8], size: Option<u16>) -> Vec<u8> {
+        let real = 8 + sid.len();
+        let mut a = vec![kind, 0];
+        a.extend(size.unwrap_or(real as u16).to_le_bytes());
+        a.extend(mask.to_le_bytes());
+        a.extend(sid);
+        a
+    }
+
+    /// `S-1-5-18` as bytes.
+    const SYSTEM_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+
+    fn read(acl: &mut [u32], kind: u8) -> io::Result<Vec<(u32, String)>> {
+        aces(acl.as_mut_ptr() as *mut ACL, kind)
+    }
+
+    #[test]
+    fn only_aces_of_the_wanted_type_are_read_and_their_sid_must_fit() {
+        // an ACE of another type is skipped without a look at what it holds where a SID would be: a denied ACE (type 1)
+        // with 4 bytes of rubbish after its mask, and an audit ACE (type 2) that is only a header and a mask
+        let mut acl = acl_of(&[
+            ace(1, 2, &[0xff, 0xff, 0xff, 0xff], None),
+            ace(2, 2, &[], None),
+            ace(0, 0x12008f, &SYSTEM_SID, None),
+        ]);
+        assert_eq!(
+            read(&mut acl, ALLOWED_ACE).unwrap(),
+            vec![(0x12008f, "S-1-5-18".to_string())]
+        );
+        // the same list read for labels has none
+        assert!(read(&mut acl, LABEL_ACE).unwrap().is_empty());
+        // a wanted ACE whose size is too small for its SID is an error, not a read past it
+        let mut short = acl_of(&[ace(0, 1, &SYSTEM_SID, Some(12))]);
+        assert!(read(&mut short, ALLOWED_ACE).is_err());
+        // a count of sub-authorities that is larger than the ACE (a SID of 15 of them in an ACE that holds one)
+        let mut lying = SYSTEM_SID;
+        lying[1] = 15;
+        let mut acl = acl_of(&[ace(0, 1, &lying, None)]);
+        assert!(read(&mut acl, ALLOWED_ACE).is_err());
+        // an ACE that claims to reach past the end of its list
+        let mut acl = acl_of(&[ace(0, 1, &SYSTEM_SID, Some(60))]);
+        assert!(read(&mut acl, ALLOWED_ACE).is_err());
+        // no SID at all (revision 0) in an ACE of the wanted type
+        let mut bad = SYSTEM_SID;
+        bad[0] = 0;
+        let mut acl = acl_of(&[ace(0, 1, &bad, None)]);
+        assert!(read(&mut acl, ALLOWED_ACE).is_err());
+        // a list with nothing in it, and no list
+        assert!(read(&mut acl_of(&[]), ALLOWED_ACE).unwrap().is_empty());
+        assert!(aces(std::ptr::null_mut(), ALLOWED_ACE).unwrap().is_empty());
+    }
+
+    #[test]
+    fn every_ace_must_fit_its_list_whatever_its_type() {
+        // an ACE of a type that is not wanted is still checked: it is not skipped on the word of its own header
+        // (a size of 0 would otherwise be walked past, and a header that is cut off by the end of the list read)
+        let mut zero = acl_of(&[
+            ace(0, 0x12008f, &SYSTEM_SID, None),
+            ace(1, 2, &SYSTEM_SID, Some(0)),
+        ]);
+        assert!(read(&mut zero, LABEL_ACE).is_err(), "size 0, not wanted");
+        assert!(read(&mut zero, ALLOWED_ACE).is_err(), "size 0, other");
+        // a size that is smaller than the header
+        let mut tiny = acl_of(&[ace(1, 2, &SYSTEM_SID, Some(3))]);
+        assert!(read(&mut tiny, LABEL_ACE).is_err(), "size 3");
+        // a size that reaches past the end of the list
+        let mut past = acl_of(&[ace(1, 2, &SYSTEM_SID, Some(500))]);
+        assert!(read(&mut past, LABEL_ACE).is_err(), "size past the end");
+        // the last ACE starts within 3 bytes of the end of the list: its header is not all inside it
+        for rest in [1usize, 2, 3] {
+            let mut cut = acl_of(&[
+                ace(0, 0x12008f, &SYSTEM_SID, None),
+                vec![0u8; rest], // a cut-off ACE of type 0
+            ]);
+            assert!(read(&mut cut, LABEL_ACE).is_err(), "{rest} bytes left");
+            assert!(read(&mut cut, ALLOWED_ACE).is_err(), "{rest} bytes left");
+        }
+        // a last ACE that is just a header (4 bytes, of another type) does fit
+        let mut header_only = acl_of(&[ace(0, 0x12008f, &SYSTEM_SID, None), vec![1, 0, 4, 0]]);
+        assert_eq!(read(&mut header_only, ALLOWED_ACE).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_dacl_with_an_allowed_ace_of_another_layout_names_nobody() {
+        let user = ace(0, 0x12008f, &SYSTEM_SID, None);
+        let mut plain = acl_of(std::slice::from_ref(&user));
+        let names = dacl_trustees(plain.as_mut_ptr() as *mut ACL).unwrap();
+        assert_eq!(names, Some(vec!["S-1-5-18".to_string()]));
+        // compound (4), object (5), callback (9) and callback object (0xB): each makes the list unreadable for the check
+        for ty in OTHER_ALLOWED_ACES {
+            let mut acl = acl_of(&[user.clone(), ace(ty, 0x12008f, &SYSTEM_SID, None)]);
+            assert_eq!(
+                dacl_trustees(acl.as_mut_ptr() as *mut ACL).unwrap(),
+                None,
+                "ACE type {ty:#x}"
+            );
+        }
+        // a denied ACE (1), an audit ACE (2) and a denied callback ACE (6) are not access that is given
+        for ty in [1u8, 2, 6] {
+            let mut acl = acl_of(&[user.clone(), ace(ty, 2, &SYSTEM_SID, None)]);
+            assert_eq!(
+                dacl_trustees(acl.as_mut_ptr() as *mut ACL).unwrap(),
+                Some(vec!["S-1-5-18".to_string()]),
+                "ACE type {ty:#x}"
+            );
+        }
+        // a null list has none
+        assert_eq!(dacl_trustees(std::ptr::null_mut()).unwrap(), Some(vec![]));
     }
 
     #[test]

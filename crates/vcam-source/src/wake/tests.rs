@@ -37,6 +37,8 @@ struct World {
     /// Every `set_period` call.
     periods: Vec<bool>,
     no_timer: bool,
+    /// `open_events` panics (after recording the attempt).
+    panic_open: bool,
 }
 
 #[derive(Clone, Default)]
@@ -58,6 +60,10 @@ impl Sys for Fake {
         let mut w = self.0.borrow_mut();
         let now = w.now;
         w.opens.push((now, nonces, owner.to_string()));
+        if w.panic_open {
+            drop(w);
+            panic!("a panic in the open (a test)");
+        }
         if w.opens_result.pop_front().unwrap_or(true) {
             Ok(())
         } else {
@@ -101,6 +107,8 @@ struct Src {
     owner: Option<String>,
     owner_calls: u32,
     diag: Vec<Diag>,
+    /// `expected_owner` panics.
+    panic_owner: bool,
 }
 
 impl WakeSource for Src {
@@ -112,6 +120,9 @@ impl WakeSource for Src {
     }
     fn expected_owner(&mut self) -> Option<String> {
         self.owner_calls += 1;
+        if self.panic_owner {
+            panic!("a panic in the DACL read (a test)");
+        }
         self.owner.clone()
     }
     fn publish_diag(&mut self, d: &Diag) {
@@ -134,6 +145,7 @@ fn rig() -> (Wake<Fake>, Fake, Src) {
         owner: Some("S-1-5-21-1-2-3-1001".into()),
         owner_calls: 0,
         diag: Vec::new(),
+        panic_owner: false,
     };
     (Wake::new(fake.clone()), fake, src)
 }
@@ -576,7 +588,10 @@ fn a_stop_ends_the_wait_and_changes_nothing_else() {
 #[test]
 fn the_diagnostics_are_given_to_the_source_when_they_change() {
     let (mut w, f, mut s) = rig();
-    w.wait(Wait::Soon, &mut s); // opens nothing (Soon is a poll step)... but the mode is known
+    // even a `Soon` wait of a live writer with an advert opens the events: the open is made at every wait, not only at
+    // `Frame`
+    w.wait(Wait::Soon, &mut s);
+    assert!(w.in_event_mode());
     into_event_mode(&mut w, &f, &mut s);
     let last = *s.diag.last().expect("the mode change was published");
     assert_eq!(last.mode, wake_mode::EVENT);
@@ -595,5 +610,80 @@ fn the_diagnostics_are_given_to_the_source_when_they_change() {
     w.finish(&mut s);
     let last = s.diag.last().unwrap();
     assert_eq!(last.events, 40);
-    assert_eq!(last.mode, wake_mode::EVENT);
+    // the pump has ended: nothing waits on the events any more
+    assert_eq!(last.mode, wake_mode::POLLING);
+}
+
+/// `wake_mode` 2, 3 and 4 say why the pump polls while a writer is there; with no Live writer (or none with an advert)
+/// the header documents 0, whatever the pump remembers.
+#[test]
+fn the_mode_is_zero_while_the_writer_is_not_live_whatever_the_pump_remembers() {
+    for (name, expect) in [
+        ("failed", wake_mode::POLLING_OPEN_FAILED),
+        ("spurious", wake_mode::POLLING_SPURIOUS),
+        ("missed", wake_mode::POLLING_MISSED),
+    ] {
+        let (mut w, f, mut s) = rig();
+        match name {
+            "failed" => {
+                f.0.borrow_mut().opens_result = VecDeque::from([false]);
+                w.wait(Wait::Frame(now(&f) + 50 * MS), &mut s);
+            }
+            "spurious" => {
+                into_event_mode(&mut w, &f, &mut s);
+                for _ in 0..9 {
+                    f.0.borrow_mut().now += 20 * MS;
+                    spurious_wake(&mut w, &f, &mut s);
+                }
+            }
+            _ => {
+                into_event_mode(&mut w, &f, &mut s);
+                for _ in 0..3 {
+                    f.0.borrow_mut().now += 2 * SEC;
+                    missed_wake(&mut w, &f, &mut s);
+                }
+            }
+        }
+        assert_eq!(w.diag().mode, expect, "{name}: while the writer is live");
+        // a slate state, or an old writer: no advert and not live
+        s.rep = WakeReport::default();
+        w.wait(Wait::Until(now(&f) + 20 * MS), &mut s);
+        assert_eq!(w.diag().mode, wake_mode::POLLING, "{name}: not live");
+        assert_eq!(s.diag.last().unwrap().mode, wake_mode::POLLING, "{name}");
+        // the writer is back (live, with its advert): the reason is shown again
+        s.rep = WakeReport {
+            live: true,
+            advert: advert(10, 100),
+            writer_frames: 5,
+        };
+        w.wait(Wait::Until(now(&f) + 20 * MS), &mut s);
+        assert_eq!(w.diag().mode, expect, "{name}: live again");
+    }
+}
+
+#[test]
+fn a_panic_while_opening_the_events_is_an_open_that_failed() {
+    // in the DACL read
+    let (mut w, f, mut s) = rig();
+    s.panic_owner = true;
+    w.wait(Wait::Frame(now(&f) + 50 * MS), &mut s);
+    assert!(!w.in_event_mode());
+    assert_eq!(w.diag().mode, wake_mode::POLLING_OPEN_FAILED);
+    // in the open itself; the retry pacing is the one of any failed open
+    let (mut w, f, mut s) = rig();
+    f.0.borrow_mut().panic_open = true;
+    w.wait(Wait::Frame(now(&f) + 50 * MS), &mut s);
+    assert!(!w.in_event_mode());
+    assert_eq!(w.diag().mode, wake_mode::POLLING_OPEN_FAILED);
+    assert_eq!(f.0.borrow().opens.len(), 1);
+    for _ in 0..100 {
+        f.0.borrow_mut().now += 10 * MS;
+        w.wait(Wait::Frame(now(&f) + 50 * MS), &mut s);
+    }
+    assert_eq!(f.0.borrow().opens.len(), 1, "a panicked pair was retried");
+    // and the pump goes on: a pair that opens later is used
+    f.0.borrow_mut().panic_open = false;
+    f.0.borrow_mut().now += 31 * SEC;
+    w.wait(Wait::Frame(now(&f) + 50 * MS), &mut s);
+    assert!(w.in_event_mode());
 }

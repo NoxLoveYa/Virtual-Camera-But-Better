@@ -41,10 +41,11 @@
 use std::collections::VecDeque;
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use vcam_protocol::signal::awaited_event;
 use vcam_protocol::{wake_mode, WakeAdvert};
-use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{GetLastError, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::System::Threading::{
     CreateWaitableTimerExW, SetWaitableTimer, WaitForMultipleObjects, WaitForSingleObject,
@@ -234,10 +235,15 @@ impl<S: Sys> Wake<S> {
         }
     }
 
+    /// `wake_mode` as the header documents it: 0 while the writer is not Live (or has no advert, or the pump has ended),
+    /// whatever the pump remembers of its last attempts; otherwise the mode the pump is in.
     fn diag_mode(&self) -> u32 {
+        if !self.eligible {
+            return wake_mode::POLLING;
+        }
         match self.mode {
-            Mode::Event if self.eligible => wake_mode::EVENT,
-            Mode::Event | Mode::Poll => wake_mode::POLLING,
+            Mode::Event => wake_mode::EVENT,
+            Mode::Poll => wake_mode::POLLING,
             Mode::Demoted {
                 why: Why::Spurious, ..
             } => wake_mode::POLLING_SPURIOUS,
@@ -283,8 +289,9 @@ impl<S: Sys> Wake<S> {
         woke
     }
 
-    /// The pump is ending: write the last numbers.
+    /// The pump is ending: write the last numbers, with `wake_mode` 0 (nothing waits any more).
     pub fn finish(&mut self, src: &mut dyn WakeSource) {
+        self.eligible = false;
         let now = self.sys.now();
         self.publish(src, now, true);
     }
@@ -369,13 +376,17 @@ impl<S: Sys> Wake<S> {
         if !self.may_open(nonces, now) {
             return;
         }
-        let result = match src.expected_owner() {
-            Some(owner) => self.sys.open_events(nonces, &owner),
+        // this runs in the camera service: a panic in the DACL read or the open is an open that failed (polling), not a
+        // pump that dies
+        let sys = &mut self.sys;
+        let result = catch_unwind(AssertUnwindSafe(|| match src.expected_owner() {
+            Some(owner) => sys.open_events(nonces, &owner),
             None => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "the DACL of the frame file names no single user: no event is trusted",
             )),
-        };
+        }))
+        .unwrap_or_else(|_| Err(io::Error::other("a panic while opening the frame events")));
         self.attempt = Some(Attempt {
             nonces,
             at: now,
@@ -395,7 +406,8 @@ impl<S: Sys> Wake<S> {
             Err(e) => {
                 self.events = None;
                 self.mode = Mode::OpenFailed;
-                crate::log::log_sampled(crate::log::slot::WAKE_OPEN, 20, || {
+                // its own counter: a failing pair must not use up the lines of the opens that worked
+                crate::log::log_sampled(crate::log::slot::WAKE_OPEN_FAILED, 20, || {
                     format!(
                         "wake: frame events not used ({:08x}...): {e}",
                         nonces[0] >> 96
@@ -723,14 +735,17 @@ impl Sys for Os {
             return Woke::Timer;
         }
         // stop first: of several signalled objects the lowest index is reported
-        let mut handles: Vec<HANDLE> = Vec::with_capacity(3);
+        let mut handles = [HANDLE(std::ptr::null_mut()); 3];
+        let mut n = 0usize;
         let stop_at = self.stop.map(|s| {
-            handles.push(s);
-            handles.len() - 1
+            handles[n] = s;
+            n += 1;
+            n - 1
         });
         let ev_at = ev.map(|(e, p)| {
-            handles.push(HANDLE(e.handles[p & 1].as_raw_handle()));
-            handles.len() - 1
+            handles[n] = HANDLE(e.handles[p & 1].as_raw_handle());
+            n += 1;
+            n - 1
         });
         // without a stop event the pump could not be woken, so no wait is long: it looks at the stop flag every 20 ms
         let limit = if self.stop.is_some() {
@@ -746,18 +761,19 @@ impl Sys for Os {
             let due = (left as u128 * 10_000_000 / self.freq as u128)
                 .clamp(1, limit as u128 * 10_000) as i64;
             if unsafe { SetWaitableTimer(t, &-due, 0, None, None, false) }.is_ok() {
-                handles.push(t);
-                timer_at = Some(handles.len() - 1);
+                handles[n] = t;
+                n += 1;
+                timer_at = Some(n - 1);
                 // the timer is what ends the wait; the timeout is a net under a call that went wrong
                 timeout_ms = (left_ms + 50) as u32;
             }
         }
-        if handles.is_empty() {
+        if n == 0 {
             // no stop event, no timer, no event: a short step, so that the stop flag is seen soon
             std::thread::sleep(std::time::Duration::from_millis(1));
             return Woke::Timer;
         }
-        let r = unsafe { WaitForMultipleObjects(&handles, false, timeout_ms) };
+        let r = unsafe { WaitForMultipleObjects(&handles[..n], false, timeout_ms) };
         if r == WAIT_TIMEOUT {
             return Woke::Timer;
         }
@@ -769,7 +785,20 @@ impl Sys for Os {
         } else if Some(i) == timer_at {
             Woke::Timer
         } else {
-            // WAIT_FAILED or an abandoned object: never spin on it
+            // WAIT_FAILED or an abandoned object: never spin on it, and say what the system said (about once a second).
+            // The last error means something only after WAIT_FAILED (nothing between the call and this touches it)
+            let last_error = if r == WAIT_FAILED {
+                Some(unsafe { GetLastError() }.0)
+            } else {
+                None
+            };
+            crate::log::log_sampled(crate::log::slot::WAKE_WAIT_FAILED, 1000, || {
+                let err = last_error.map_or(String::new(), |e| format!(", last error {e}"));
+                format!(
+                    "wake: wait returned {:#x} (index {i}, {n} handles){err}",
+                    r.0
+                )
+            });
             std::thread::sleep(std::time::Duration::from_millis(1));
             Woke::Timer
         }

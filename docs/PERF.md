@@ -556,6 +556,85 @@ the trace running): `Test-Path C:\Users\Obnoxious\AppData\Local\Temp\opencode\ap
    build) or the timer (today).
 
 
+## Frame event, phase 4: after the change (2026-11-19)
+
+The numbers next to phase 0, with the DLL that waits on the writer's frame events (`FRAME-EVENT.md`, phases 1 to 3 plus the review
+fixes of the same day). Registered build `better_cam_vcam_1.b6dbe5ca.dll` (SHA-256 `82971908...B380F4`, byte-identical to
+`target\release\better_cam_vcam.dll`), installed by one click on "Update virtual camera" in the dev app (CDP, silent elevation, it
+replaced `fc6bfcae` of phase 0). Same harness as phase 0 plus a header-counter sample every 4 s (`fe4\fe4_batch.ps1`, scripts
+`fe4\perf_*.json`, `fe4\fe4_ab.ps1`, `fe4\fe4_cycles.ps1`, `fe4\fe4_timer.ps1`, all logs in
+`C:\Users\Obnoxious\AppData\Local\Temp\opencode\fe4\`, not in the repo). Engine: `engine_script.exe` (release) of 04:02, working tree
+on `62e4742`. Machine busy 7 to 27 % in the windows (other agents).
+
+### Counters, wake-ups per second, latency: exact, and clearly better
+
+| Config | `wake_mode` | `wake_events` / `signal_seq` per s | missed / spurious | pump context switches/s (phase 0) | header latency p50 / p95 (phase 0) | consumer max gap (phase 0) |
+|---|---|---|---|---|---|---|
+| 1080p60, 3 runs of 20 s | 1 (event) | 60.4 / 60.0, 60.0 / 60.0, 59.5 / 60.0 | 0 / 0 | 178, 177, 176 (330, 342, 343) | 0.91 / 1.47, 1.11 / 1.41, 0.88 / 1.17 ms (1.99-2.18 / 2.56-2.62) | 18, 36, 18 ms (19, 48, 43) |
+| 1080p60, one run of 60 s | 1 | 59.9 / 60.0 (3149 / 3155 in the window) | 0 / 0 | 174 | 0.95 / 1.15 ms | 18 ms |
+| 4K30, 3 runs | 1 | 30.1 / 30.0, 30.4 / 30.0, 30.1 / 30.0 | 0 / 0 | 88, 88, 88 (285, 285, 283) | 2.44 / 3.24, 2.42 / 3.01, 2.46 / 3.24 ms (3.1-3.5 / 4.2-4.5) | 35, 40, 35 ms (71, 74, 75) |
+| live camera 14.4 fps, 1080p consumer **30** | 1 | 14.5 / 14.4, 14.5 / 14.4, 14.4 / 14.4 | 0 / 0 | 71, 70, 70 (664, 675) | 17.9 / 18.2, 17.9 / 18.2, 17.9 / 18.3 ms (the camera's own 17.5 ms is in it) | 51, 51, 51 ms (76, 66) |
+
+* **Pump wake-ups.** At 1080p60 the pump thread switches 177 times a second (phase 0: 330 to 343): **2.95 a frame**, not the
+  5.6 of polling. Of the three per frame, one is the wake for the consumer's `RequestSample` token (a condvar; the polling pump
+  had it too) and two are the pump's waits ending (one on the event, 60/s as `wake_events` says, one on the timer to `next_ok`):
+  **2.0 waits a frame, which meets the rig's "at most 2.5"; counted as context switches like phase 0 it is 2.95 and does not.**
+  4K30: 88/s, 2.93 a frame (phase 0: 285, 9.5). **Live camera: 70 to 71 a second against 664 and 675, about nine times fewer**
+  (the 600 fewer wake-ups a second that phase 0 predicted).
+* **Missed and spurious are 0 in every run**, and `wake_events` follows `signal_seq` to within 1 % (the few lost are the ones
+  before the first poll opened the events). Over the 60 s window: 3149 event wake-ups for 3155 signals, missed 0, spurious 0.
+* **Latency fell by about 1.1 ms (p50) and 1.3 ms (p95) at 1080p60, 0.7 to 0.9 ms at 4K30**: a frame no longer waits for the next
+  millisecond poll. The worst gap the consumer saw fell too (4K30: 35 to 40 ms instead of 71 to 75 ms; 1080p60 18 to 36 against 19
+  to 48; run 2 of each is the 36 ms one). Phase 0's 4K30 runs were at 55 % machine busy, these at 10 to 12 %, so part of the 4K gap is
+  the machine.
+* **Same session, same feeder, with and without events** (`vcam-tool feed` against `vcam-tool feed --no-signal`, which is today's
+  polling pump in the same DLL; 8 pairs of 20 s windows, 1080p60, consumer `p6b-consumer`): pump context switches **175 to 177 a
+  second with events, 302 to 314 polling**; all threads of the service 418 to 426 against 546 to 562; header latency p50 **156 to
+  204 us against 593 to 817 us**, p95 337 to 376 us against 1556 to 1784 us (the feeder stamps frames itself, so these are only
+  comparable with each other); `wake_mode` 1 against 0; `wake_events` 63.5 to 65.1 a second for a feeder that signals 64.1 to 64.9.
+
+### Camera service CPU, % of one core: no change that this method can show
+
+Same method as phase 0 (WMI process counters of the FrameServer `svchost`, 20 s windows, 3 runs, idle baseline taken first).
+
+| Config | Phase 0 | After (3 runs) | machine busy |
+|---|---|---|---|
+| 1080p60 NV12, consumer 60 | 1.31, 1.55, 1.30 | **1.52, 1.65, 2.34** (one 60 s run: 0.32) | 10.3, 26.5, 8.3 % (60 s run 8.4 %) |
+| 4K30 NV12, consumer 30 | 3.60, 2.21, 2.47 (busy 55-57 %) | **2.42, 1.61, 2.43** (minus a 0.63 baseline in run 3: 1.80) | 10.2, 11.7, 10.6 % |
+| live camera 14.4 fps, consumer 30 | 1.53, 1.77 | **0.97, 0.63, 1.17** | 7.3, 6.9, 8.0 % |
+| pump thread, 1080p60 | 0.93, 1.07, 0.78 | 0.87, 1.05, 1.29 | |
+| pump thread, 4K30 | 3.00, 1.12, 1.50 | 1.29, 0.89, 1.62 | |
+| signal storm (polling), 1080p60, 20 s | | 0.96 | 15.3 % |
+
+**The CPU is not measurably different, and this method cannot settle it.** The design's estimate was 0.1 % of a core at 1080p60
+(0.12 to 0.36 % live), which is below what the counters resolve. What the numbers say: the 20 s runs after the change are as
+spread as before (1.5 to 2.3 against 1.3 to 1.55; the live runs are lower, 0.6 to 1.2 against 1.5 to 1.8), and the A/B in one
+session shows the spread is the method's, not the DLL's: with events 0.00, 1.46, 0.51, 3.14 % and with the timer period held by the
+harness 0.36, 2.69, 0.00, 0.00 %; polling 0.44, 0.44, 0.44, 0.95 % and 1.52, 0.29, 4.17, 3.37 %. A pump that switches 177 times a
+second cannot cost 0.00 % over 20 s, so the counters (process and thread times are sampled at clock ticks, not by cycles; the
+cycle counters of another process need elevation here: `OpenProcess` for `QUERY_LIMITED_INFORMATION` on the service host is refused)
+can miss or over-count short bursts by several tenths of a percent, depending on how the bursts line up with the ticks. The
+**exact** results above (switches, wake counters, latency) are the evidence; CPU needs the elevated WPR trace of the phase 0 steps
+(it gives CPU per context switch from the CPU's cycle counter). The 1 % target at 1080p60 stays as phase 0 said: not reachable
+with the event, the copy and Frame Server's own threads are the floor.
+
+### The rest
+
+* **Hostile signaller** (`vcam-tool signal-storm --seconds 20` against the 1080p60 stream): `wake_mode` went to **2** (polling after
+  spurious wake-ups; `wake_spurious` 9, the ninth within the second demotes), the pump switched 338 times a second (polling),
+  service CPU 0.96 % (phase 0 polling: 1.30 to 1.55), the consumer got every frame (60 s run: 3721 frames, max gap 18 ms; the DLL
+  delivered 1200 and repeated 0 in the storm's 20 s window), header latency p50 1.87 ms in polling against 0.91 ms in event mode.
+  Right after the storm `wake_mode` was still 2 and 16 s later (36 s after the storm began, the 30 s demotion over) **1** again.
+* **Handles** (`fe4_cycles.ps1`): 50 start/stop cycles of the consumer (1.5 s each at 1080p60, a signalling feeder keeping the
+  writer Live, one warm-up cycle first), the FrameServer svchost's handle count **388 at the start, 388, 387, 387, 388, 388 after
+  each ten cycles, 387 at the end (min 387, max 388)**, threads 9 to 10, private bytes 3.4 to 3.5 MB; a first pass of the same 50 cycles (its consumer-failure counter was wrong, all
+  cycles delivered video) gave 390 to 391. No leak. At the end `wake_mode` is **0** (the pump has ended and writes 0).
+* **System timer resolution** (`NtQueryTimerResolution`): 1.00 ms with no stream, in event mode and in polling mode, so another
+  program holds `timeBeginPeriod(1)` on this machine all the time and the DLL's choice to give it back in event mode **cannot be
+  seen here**. Not measured: the timer's cost, the energy effect, the WPR trace.
+* Real consumer checks: `capture-test --expect slate` PASS after the runs (120 of 120 frames, the "not running" slate), and the 16
+  consumer runs of 36 s at 1080p60 of the A/B showed 2161 or 2162 distinct frames each, in event and in polling mode.
+
 ## Preview path (2026-11-19)
 
 The in-app preview, measured for the first time (the sign-off row "Preview: 30 fps, <= 60 ms, <= 3 % CPU incl. WebView2" had no

@@ -405,6 +405,11 @@ pub mod slot {
     pub const WAKE_DEMOTE: usize = 9;
     /// The user the frame events must belong to could not be read from the frame file.
     pub const WAKE_OWNER: usize = 10;
+    /// The frame events could not be opened or were not the writer's (its own counter: a pair that keeps failing must
+    /// not use up the lines of [`WAKE_OPEN`]).
+    pub const WAKE_OPEN_FAILED: usize = 11;
+    /// A kernel wait of the pump returned something other than an object or the timeout.
+    pub const WAKE_WAIT_FAILED: usize = 12;
 }
 
 #[cfg(test)]

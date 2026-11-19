@@ -1410,3 +1410,73 @@ follows from it:
 * There is no gain in privilege. The Keep path (an encrypted data folder in an encrypted `%ProgramData%` is kept, not
   replaced) needs the data folder itself to be encrypted, and the data folder is locked: the user gets only
   `READ_TRAVERSE` on it. An encrypted data folder that is kept is refused, never used.
+
+# P-frame-event: the camera service's pump waits on the writer's frame events
+
+Design and the five earlier phases are in `docs/FRAME-EVENT.md`; this is what the live run on this machine showed (2026-11-19,
+phase 4) and what the review of phase 3 changed. Numbers next to phase 0: `docs/PERF.md`, "Frame event, phase 4".
+
+## What changed
+
+* **Writer** (`crates/vcam-protocol`, in the app's `Writer`): two manual-reset events `Global\BetterCam.FrameEvent.<nonce>.0` and
+  `.1` (independent 128-bit nonces), signalled in turn after every publish and state change, with the nonces and a counter in header
+  bytes 448..528 and `FEATURE_FRAME_EVENT`. No `PROTOCOL_VERSION` bump, no installer change.
+* **Pump** (`crates/vcam-source/src/wake.rs`, in Frame Server): while the writer is Live with a fresh heartbeat it opens the two
+  events (`SYNCHRONIZE | READ_CONTROL`, owner and mandatory label checked against the user named in the DACL of `frames.bin`) and waits
+  on the stop event, the event the next signal sets and a high-resolution timer. Guards: one open attempt per 500 ms (30 s for a
+  pair that failed), at most one event-driven poll per millisecond, demotion to polling for 30 s after more than 8 spurious wake-ups in
+  a second or 3 missed ones in 10 s, every wait at most 100 ms. `timeBeginPeriod(1)` is held only while the pump polls.
+* **Diagnostics** in the header (`vcam-tool stats`): `features`, `signal_seq`, `wake_mode` (0 polling or no Live writer or the pump
+  ended, 1 event, 2 and 3 demoted for spurious or missed wake-ups, 4 the events could not be opened or were not the writer's),
+  `wake_events`, `wake_missed`, `wake_spurious`.
+* **Low findings of the phase 3 review, fixed in this session**: a panic in the DACL read or the open is an open that failed
+  (`catch_unwind`, mode 4, polling); a failed kernel wait logs `GetLastError` (sampled); `wake_mode` is 0 while the writer is not
+  Live, and 0 when the pump ends (`finish`), and a change made while the header did not validate is written at the first poll at
+  which it does; open failures have their own sampled log slot (`WAKE_OPEN_FAILED`) so that they cannot use up the lines of the opens
+  that worked; the ACE parser of the owner check reads the SID of an ACE only for the type it wants (allowed, label) and only when
+  it lies inside the ACE and the list (`IsValidSid`); the wait uses `[HANDLE; 3]` instead of a `Vec`. Tests: `wake::tests` (mode 0
+  while not live for each reason, mode 0 after `finish`, a panic in either call), `owner::tests::only_aces_of_the_wanted_type...`,
+  `frames::tests::the_wait_diagnostics_are_written_only_into_a_valid_header` (extended). Each fails with the old code put back.
+  **Not done:** reading the DACL through the mapping's own handle (it would add `READ_CONTROL` to the access of every mapping of
+  `frames.bin`, writer and tools included, so a stream would fail outright where an older ACL lacks it, instead of polling, and it
+  would drop the identity check of the second open); the test of `vcam-tool feed` no longer names a drive letter.
+
+## Live results (this machine, DLL `b6dbe5ca`)
+
+* **LOCAL SERVICE in session 0 opens the user's `Global\` events.** After "Update virtual camera" (once, from the dev app through
+  CDP; the registered file `C:\Program Files\Better Cam\vcam\better_cam_vcam_1.b6dbe5ca.dll` is byte-identical to the build, the
+  `fc6bfcae` one was deleted, Frame Server was stopped and restarted by the update): with the app Live on the real camera (1280x720,
+  16.8 fps) and a 30 fps consumer, `vcam-tool stats` showed `features 1`, `frame_event_advert yes`, `wake_mode 1`, `signal_seq`
+  growing (103, then 270 ten seconds later) with `wake_events` 97, then 265, and `wake_missed` / `wake_spurious` 0. So the unverified
+  facts 1 and 4 of `FRAME-EVENT.md` hold: the open works, the owner check passes (the events carry the user as owner and the explicit
+  medium label), and the label could be set without a privilege.
+* **Counters**: `wake_missed` and `wake_spurious` stayed 0 in every run: 1080p60 (3 x 20 s and one 60 s: 59.9 events/s for 60.0
+  signals/s), 4K30 (3 runs), the real camera at 14.4 fps with a 30 fps consumer (3 runs); the 8 event runs of the feeder A/B
+  kept `wake_events` within 1.5 % of `signal_seq` (they did not print the other two counters).
+* **Wake-ups**: the pump thread switches 177 times a second at 1080p60 (330 to 343 before): 2.95 a frame as context switches, 2.0 a
+  frame as waits (one event, one timer; the third switch is the consumer's `RequestSample`). 88 at 4K30 (285 before). **70 with the real
+  camera and a 30 fps consumer (664 and 675 before).**
+* **Latency** of the header: p50 0.88 to 1.11 ms and p95 1.2 to 1.5 ms at 1080p60 (before: 1.99 to 2.18 and 2.56 to 2.62), 2.4 / 3.0 to
+  3.2 ms at 4K30 (3.1 to 3.5 / 4.2 to 4.5).
+* **CPU of the camera service: not measurably different** (1080p60 1.52, 1.65, 2.34 % against 1.31, 1.55, 1.30; 4K30 2.42, 1.61, 2.43
+  against 3.60, 2.21, 2.47; live 0.97, 0.63, 1.17 against 1.53, 1.77). The counters of the service's process and threads are sampled at
+  clock ticks and could not resolve a 0.1 to 0.3 % change: the same configuration gave 0.00 to 4.17 % in the A/B. The cycle-accurate
+  measurement needs the elevated WPR trace of phase 0.
+* **Hostile signaller**: `vcam-tool signal-storm --seconds 20` while streaming: `wake_mode` 2 (9 spurious, the ninth demotes), service CPU
+  0.96 % in the window (polling level before: 1.3 to 1.55), every frame delivered (1200 delivered, 0 repeated in the window, max gap
+  18 ms at the consumer), back to `wake_mode` 1 about 36 s after the storm began.
+* **Handles**: 50 start/stop cycles of a consumer (twice): the FrameServer host's handle count 387 to 388, flat (390 to 391 in the
+  first pass); `wake_mode` 0 after the last stream ended.
+* **The system timer cannot be seen to relax**: `NtQueryTimerResolution` says 1.00 ms with no stream running (another program holds
+  `timeBeginPeriod(1)`), so the effect of event mode giving its request back was not measurable here.
+* Not run this time: Windows Camera and Edge for two minutes (live check 3), a feeder from before phase 1 against the new DLL (check
+  4: `--no-signal` gave `wake_mode` 0 and the same frames, which is the same code path), a Frame Server restart with the app Live
+  (check 6), `capture-test --expect feed` for the format matrix, the WPR trace, a second local account for the access-denied check.
+
+## Machine state at the end
+
+* Registered DLL `better_cam_vcam_1.b6dbe5ca.dll` (SHA-256 `829719085CDA5035CC52D9F354C4EAAB6BE21E5303D8D3FF7390891421B380F4`); the
+  virtual camera is listed (Media Foundation and DirectShow) and `capture-test --expect slate` passes after the runs.
+* The dev app, vite and every consumer and feeder were closed; `localStorage` key `better-cam` read back byte-identical to what was
+  found; the `presets` folder was empty before and after; no camera control was touched; the test lock is free.
+* The harness, its logs and the scripts are in `C:\Users\Obnoxious\AppData\Local\Temp\opencode\fe4\` (not in the repo).

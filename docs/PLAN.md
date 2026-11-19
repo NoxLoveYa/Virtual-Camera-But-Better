@@ -179,9 +179,17 @@ Rules:
 - Heartbeat older than 1 s, or file missing → slate "Better Cam is not running".
 - RGB32 is advertised only up to 1920×1080, so the slot capacity covers every case.
 
-Sync: the DLL does not wait on a kernel event. A worker thread in the DLL polls `latest_slot` with a 1 ms
-high-resolution waitable timer (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) only while a `RequestSample` is pending.
-Cost is negligible and it sidesteps the namespace problem in section 4.3.
+Sync: the seqlock in the file stays the only source of truth; an event only says "look now". The app's writer creates two
+manual-reset events (`Global\BetterCam.FrameEvent.<128-bit random hex>.0` and `.1`, signalled in turn, DACL: user
+`EVENT_MODIFY_STATE | SYNCHRONIZE | READ_CONTROL`, LOCAL SERVICE `SYNCHRONIZE | READ_CONTROL`, medium integrity label), advertises
+the two nonces and a signal counter in the header (bytes 448..528, no `PROTOCOL_VERSION` change) and signals after every publish and
+state change. The DLL's pump, only while the writer is Live with a fresh heartbeat, opens them (after checking that their owner is the
+user named in the DACL of `frames.bin`) and waits on the event, its stop event and a high-resolution timer
+(`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) for its own next deadline. **Every failure ends in the old polling**: no advert, a failed
+open or owner check, spurious or missed wake-ups (demotion for 30 s), a Live writer that is gone. Polling is a 1 ms
+high-resolution timer wait, with `timeBeginPeriod(1)` held, only while a `RequestSample` is pending. Verified live: LOCAL SERVICE in
+session 0 opens the user's `Global\` events. Design, guards and measurements: `docs/FRAME-EVENT.md`, `docs/PERF.md` "Frame event,
+phase 4".
 
 ### 2.6 Room for later phases
 
@@ -439,7 +447,8 @@ The DLL runs inside Frame Server as `LOCAL SERVICE` in session 0. The app runs a
 **Pick: file-backed shared memory, `%ProgramData%\BetterCam\frames.bin`, layout in section 2.5.**
 Fallback if phase 2 measures sustained disk writes above 5 MB/s: the handle-duplication option.
 
-Sync primitive: seqlock in the file plus DLL-side polling (section 2.5). `IMFVirtualCamera::CreateSyncEvent`
+Sync primitive: seqlock in the file, plus the writer's frame events with DLL-side polling as the fallback (section 2.5;
+v1 shipped polling only, the events came with `docs/FRAME-EVENT.md`). `IMFVirtualCamera::CreateSyncEvent`
 exists as a documented app↔source event channel; its cross-process handle behaviour is **(unverified)**, so v1 does
 not depend on it.
 

@@ -43,8 +43,8 @@ use std::sync::{Mutex, OnceLock};
 
 use vcam_protocol::slate::{Slate, SlateKind};
 use vcam_protocol::{
-    is_stale, qpc_frequency, validate_header, Access, Disposition, Format, MappedFile, Read,
-    ReadError, SlotData, ValidHeader, WriterState,
+    is_stale, qpc_frequency, validate_header, wake_mode, Access, Disposition, Format, MappedFile,
+    Read, ReadError, SlotData, ValidHeader, WriterState,
 };
 
 use crate::mediatype::{FrameFormat, PixelFormat};
@@ -472,7 +472,13 @@ impl FrameSource {
             return;
         }
         self.running = false;
+        // what is written below is written only into a file whose header validates *now*
+        self.header_ok = self.header_valid(vcam_protocol::qpc_now());
         self.publish_stats();
+        // the pump normally ends with `Wake::finish`, which has put this in already; a pump that panicked has not
+        // (this runs from `Drop` then): nothing waits on the events any more, so the header must not say it does
+        self.wake_diag.mode = wake_mode::POLLING;
+        self.write_wake_diag();
         let left = active_adjust(&self.path, -1);
         if left == 0 && self.header_ok {
             if let Some(m) = &self.map {
@@ -592,7 +598,13 @@ impl FrameSource {
                 Some(now),
             )
         });
+        let was_ok = self.header_ok;
         self.header_ok = matches!(checked, Some(Ok(_)));
+        if self.header_ok && !was_ok {
+            // the header validates again (the writer started over and wiped it): what the pump published while it did
+            // not, and what the wipe took out, goes back in
+            self.write_wake_diag();
+        }
         let v = match checked {
             None => return Status::Slate(SlateKind::NotRunning),
             Some(Ok(v)) => v,
@@ -3430,8 +3442,65 @@ mod tests {
         let _ = src.poll(qpc_now());
         src.publish_diag(&Diag { mode: 3, ..d });
         assert_eq!(w.header().wake_mode, 1);
-        // a read-only mapping cannot be written at all
+        // the header validates again: the last numbers the pump gave (mode 3, not the 4 and the 99s of the invalid
+        // time that came before it) go in at that poll, and not only when the file is reopened
         w.shared()
             .poke32(vcam_protocol::off::MAGIC, vcam_protocol::MAGIC);
+        let _ = src.poll(qpc_now());
+        let h = w.header();
+        assert_eq!(
+            (h.wake_mode, h.wake_events, h.wake_missed, h.wake_spurious),
+            (3, 7, 2, 3),
+            "a change made while the header was invalid is lost"
+        );
+    }
+
+    /// A pump that ends without `Wake::finish` (a panic) leaves the last diagnostics it published, `wake_mode` 1 among
+    /// them: the stop of the source (its `Drop`) says that nothing waits any more, and only into a valid header.
+    #[test]
+    fn stopping_the_source_writes_wake_mode_zero_into_a_valid_header_only() {
+        let events = Diag {
+            mode: 1,
+            events: 7,
+            missed: 0,
+            spurious: 0,
+        };
+        // the pump died with the mode at 1: the drop of the source writes 0
+        let path = temp_path("wf-stop-diag.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        let mut src = Rig::new(path, nv12(320, 180, 30));
+        src.start();
+        publish_pattern(&w, 320, 180, 1);
+        let _ = src.poll(qpc_now());
+        src.publish_diag(&events);
+        assert_eq!(w.header().wake_mode, 1);
+        drop(src);
+        let h = w.header();
+        assert_eq!((h.wake_mode, h.wake_events), (0, 7), "after the drop");
+
+        // the file was replaced by a foreign one since the last poll: the stop checks the header itself and writes nothing
+        let path = temp_path("wf-stop-foreign.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        let mut src = Rig::new(path, nv12(320, 180, 30));
+        src.start();
+        publish_pattern(&w, 320, 180, 1);
+        let _ = src.poll(qpc_now());
+        src.publish_diag(&events);
+        assert!(w.header().consumer_active != 0);
+        w.shared().poke32(vcam_protocol::off::PROTOCOL, 9);
+        src.stop();
+        let h = w.header();
+        assert_eq!(
+            h.wake_mode, 1,
+            "written into a header that did not validate"
+        );
+        assert!(
+            h.consumer_active != 0,
+            "consumer_active cleared in a foreign file"
+        );
     }
 }

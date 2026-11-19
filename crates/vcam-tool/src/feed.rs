@@ -430,15 +430,22 @@ mod tests {
     /// The "run vcam-tool register" hint belongs to the installer's folder only.
     #[test]
     fn the_register_hint_is_for_the_default_path_only() {
+        // a path below a file can never be made, on any machine (a drive letter that is "free" here is a drive there)
+        let dir = ScratchDir::new("feed-hint");
+        let blocker = dir.join("not-a-folder");
+        std::fs::write(&blocker, b"x").unwrap();
+        let path = blocker.join("frames.bin");
+        let shown = path.display().to_string();
         let e = std::io::Error::from_raw_os_error(3);
-        let p = std::path::Path::new(r"Q:\nowhere\frames.bin");
+        let p = path.as_path();
         assert!(create_failure(p, &e, false).contains("vcam-tool register"));
         let scratch = create_failure(p, &e, true);
         assert!(!scratch.contains("register"), "{scratch}");
-        assert!(scratch.contains(r"Q:\nowhere\frames.bin"), "{scratch}");
+        assert!(scratch.contains(&shown), "{scratch}");
         // through `run`: a scratch path that cannot be made reports without the hint and fails
-        let args = s(&["--seconds", "0.2", "--file", r"Q:\nowhere\frames.bin"]);
+        let args = s(&["--seconds", "0.2", "--file", &shown]);
         assert_eq!(run(&args), 1);
+        assert_eq!(std::fs::read(&blocker).unwrap(), b"x");
     }
 
     #[test]
