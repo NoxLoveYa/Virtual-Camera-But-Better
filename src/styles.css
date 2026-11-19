@@ -232,6 +232,15 @@ button.ghost:hover:not(:disabled) { color: var(--text); box-shadow: none; border
   grid-template-columns: var(--nav) 1px minmax(0, 1fr) 1px var(--insp); grid-template-rows: minmax(0, 1fr);
 }
 .navigator, .inspector { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+/* Every region has its own column, so the navigator's splitter can be hidden (the rail) without moving the others. The hairline
+   it leaves is drawn by the workspace itself. */
+.navigator { grid-column: 1; grid-row: 1; position: relative; }
+.splitter[data-side="nav"] { grid-column: 2; grid-row: 1; }
+.center { grid-column: 3; grid-row: 1; }
+.splitter[data-side="inspector"] { grid-column: 4; grid-row: 1; }
+.inspector { grid-column: 5; grid-row: 1; }
+.workspace[data-nav-mode="rail"] .splitter[data-side="nav"] { display: none; }
+.workspace[data-nav-mode="rail"]::before { content: ""; grid-column: 2; grid-row: 1; background: var(--line); }
 /* The centre is a size container: the preview is the largest 16:9 box that fits it with 16 px all round (the border is the 2 px
    in the formula), a whole number of pixels so the box and the picture the backend sizes for it agree to the pixel, in the middle both ways. */
 .center { min-width: 0; min-height: 0; display: flex; align-items: center; justify-content: center; container-type: size; }
@@ -318,9 +327,13 @@ input[type="color"]::-webkit-color-swatch { border: 0; border-radius: 2px; }
 /* ---------- navigator ---------- */
 /* Section rows (44 px), the FILTERS heading, the filter rows (32 px) and the Add filter row, in one list that scrolls inside the
    navigator. Nothing is boxed: rows are told apart by hover, selection (a 2 px accent bar and a soft fill) and hairlines. */
+.nav-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .nav-scroll { flex: 1; min-height: 0; overflow-x: hidden; overflow-y: auto; }
+/* The strip above the rows holds the one button that collapses the navigator to the rail, or brings it back. */
+.nav-bar { flex: none; height: 28px; display: flex; align-items: center; justify-content: flex-end; padding: 0 4px; }
+button.nav-toggle { width: 24px; height: 24px; }
 .nav-sections, .chain { list-style: none; margin: 0; padding: 0; }
-.nav-sections { display: flex; flex-direction: column; padding: 8px 0 4px; }
+.nav-sections { display: flex; flex-direction: column; padding: 0 0 4px; }
 button.nav-row, button.nav-main, button.nav-add { background: none; border: 0; border-radius: 0; font-weight: 400; text-align: left; }
 button.nav-row { position: relative; display: flex; align-items: center; gap: 10px; width: 100%; height: 44px; padding: 0 12px 0 14px; }
 button.nav-row:hover:not(:disabled), button.nav-add:hover:not(:disabled) { background: rgba(255, 255, 255, 0.04); box-shadow: none; }
@@ -357,6 +370,41 @@ button.nav-main:hover:not(:disabled) { box-shadow: none; }
 /* A file of a fitting kind is over a filter that has a file parameter. */
 .nav-step.drop-over { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent), var(--glow-soft); }
 .row-menu { min-width: 0; width: 170px; }
+
+/* Status dot of a row (8 px; the spinner of a model that loads is the 10 px .spinner in its place). Neutral is the accent colour. */
+.nav-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: var(--glow-soft); }
+.nav-dot[data-tone="warn"] { background: var(--warn); box-shadow: 0 0 6px rgba(255, 184, 77, 0.55); }
+.nav-dot[data-tone="error"] { background: var(--danger); box-shadow: 0 0 6px rgba(255, 92, 108, 0.55); }
+.nav-section .nav-dot { margin-left: auto; }
+.nav-step > .nav-dot, .nav-step > .nav-spin { margin: 0 4px; }
+
+/* The icon rail (52 px): the sections as 36 px icon buttons, a 36x28 chip per filter, and one "+". The dot sits on the top right of
+   the icon or chip. A pointer drag on a chip reorders as on a row; the bypass switch, the grip and ⋯ are not shown (Space bypasses,
+   the inspector has the rest). */
+.nav-panel.compact .nav-bar { height: 40px; justify-content: center; padding: 8px 0 0; }
+.compact button.nav-toggle { width: 36px; height: 32px; }
+.compact .nav-sections { align-items: center; gap: 2px; }
+.compact button.nav-row { width: 36px; height: 36px; padding: 0; justify-content: center; border-radius: var(--r); }
+.compact .nav-section .nav-dot { position: absolute; top: 5px; right: 5px; margin: 0; }
+.compact .nav-rule { margin: 4px 12px 0; }
+.compact .chain { gap: 2px; padding: 6px 0; }
+.compact .nav-step { justify-content: center; height: 28px; margin: 0 8px; padding: 0; border-radius: var(--r); }
+.compact button.nav-main { width: 100%; height: 28px; padding: 0; justify-content: center; }
+.compact .nav-num { width: auto; color: var(--accent); font-size: 12px; font-weight: 600; }
+.compact .nav-step > .nav-dot, .compact .nav-step > .nav-spin { position: absolute; top: 4px; right: 3px; margin: 0; }
+.compact .nav-step > .nav-spin { top: 2px; right: 1px; }
+.compact .chain > li.empty { height: 28px; padding: 0; }
+.compact .nav-addrow { padding: 0 0 8px; }
+.compact button.nav-add { width: 36px; height: 28px; margin: 0 auto; padding: 0; justify-content: center; border-radius: var(--r); }
+/* The rail has no room for a scrollbar: a long chain scrolls by wheel and by the drag's edge zone. */
+.compact .nav-scroll { scrollbar-width: none; }
+
+/* The flyout: the same panel at 232 px, over the left of the preview (the rail's column stays 52 px), frosted like a menu. */
+.nav-flyout {
+  position: absolute; z-index: 12; top: 0; bottom: 0; left: 0; width: 232px;
+  background: var(--pop); backdrop-filter: var(--blur);
+  border-right: 1px solid var(--line-strong); box-shadow: 8px 0 24px rgba(0, 0, 0, 0.35);
+}
 
 .nav-addrow { padding: 0 0 8px; }
 .nav-addrow .pop { display: block; }

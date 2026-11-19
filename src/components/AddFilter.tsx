@@ -88,7 +88,7 @@ function AddMenu({ at, open, setOpen, anchor, align, here }: MenuProps) {
 }
 
 /** The "Add filter" row at the end of the navigator's list: adds at the end, or drag an item into the chain. */
-export function AddFilter() {
+export function AddFilter({ compact = false }: { compact?: boolean }) {
   const [open, setOpen] = useState(false);
   return (
     <AddMenu
@@ -96,8 +96,17 @@ export function AddFilter() {
       setOpen={setOpen}
       align="left"
       anchor={
-        <button className="nav-add" data-add-filter aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen(!open)}>
-          <Icon name="plus" /> Add filter
+        <button
+          className="nav-add"
+          data-add-filter
+          aria-haspopup="menu"
+          aria-expanded={open}
+          aria-label={compact ? "Add filter" : undefined}
+          title={compact ? "Add filter" : undefined}
+          onClick={() => setOpen(!open)}
+        >
+          <Icon name="plus" />
+          {!compact && " Add filter"}
         </button>
       }
     />

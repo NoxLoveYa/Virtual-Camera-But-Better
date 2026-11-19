@@ -19,6 +19,9 @@ const PATHS = {
   compare: "M8 2.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM8 2.5v11M8 5.2a2.8 2.8 0 000 5.6",
   eyedropper: "M10.8 2.4l2.8 2.8-1.6 1.6-2.8-2.8zM9.2 4.4l-5.7 5.7v2.4h2.4l5.7-5.7",
   crop: "M4.5 2v9.5H14M2 4.5h9.5V14",
+  chevronsLeft: "M12.5 4l-4 4 4 4M7.5 4l-4 4 4 4",
+  chevronsRight: "M3.5 4l4 4-4 4M8.5 4l4 4-4 4",
+  dock: "M2.5 3h11v10h-11zM6 3v10",
 } as const;
 
 export type IconName = keyof typeof PATHS;

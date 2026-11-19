@@ -1,7 +1,8 @@
 import { memo, useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { useStore } from "../store";
 import { stripCodes } from "../camera/schema";
-import { defOf, extIdOf, extOf, isExtKind, labelOf, type ExtensionInfo, type ParamValue } from "../filters/schema";
+import { defOf, extIdOf, extOf, isExtKind, labelOf, type ParamValue } from "../filters/schema";
+import { extNoteOf, needsOf } from "../ui/navSummary";
 import { Icon } from "./Icon";
 import { InspectorHeader } from "./InspectorHeader";
 import { ParamField } from "./ParamField";
@@ -21,14 +22,6 @@ interface Props {
   id: string;
   dragMode: DragView["mode"] | null;
   reorder: ChainHandlers;
-}
-
-/** What a filter of an extension says when the extension is not running: not installed, failed to load, or switched off. */
-function extNoteOf(id: string, ext: ExtensionInfo | undefined) {
-  if (!ext) return { state: "missing", failed: true, text: `Extension “${id}” is not installed. The filter is bypassed and keeps its settings.` };
-  if (ext.state === "error") return { state: "error", failed: true, text: `Extension “${id}” failed to load: ${ext.error ?? "unknown error"}` };
-  if (ext.state === "disabled") return { state: "disabled", failed: false, text: `Extension “${ext.name}” is switched off in Settings → Extensions. The filter is bypassed.` };
-  return null;
 }
 
 // The actions never change: read them when used, so the inspector does not subscribe to them.
@@ -192,14 +185,7 @@ export const FilterInspector = memo(function FilterInspector({ id, dragMode: mod
   // What an NVIDIA filter needs before it can run, in the order of precedence: an RTX GPU, then the runtime. The app knows
   // both without the engine, so a filter in a loaded preset says it before the first frame (the engine says the same
   // thing, and the picture is passed through meanwhile).
-  const needs =
-    !def?.rtx || !gpuRead
-      ? null
-      : !gpu
-        ? { text: "Needs an NVIDIA RTX GPU (GeForce RTX 20 series or newer).", install: false }
-        : nvidia && !nvidia.available
-          ? { text: nvidia.detail, install: true }
-          : null;
+  const needs = needsOf(def?.rtx, gpuRead, gpu, nvidia);
 
   const movable = count > 1;
   const gripDown = (e: ReactPointerEvent<HTMLElement>) => reorder.onPointerDown(e, id);

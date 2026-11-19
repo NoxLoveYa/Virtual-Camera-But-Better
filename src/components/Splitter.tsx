@@ -21,12 +21,13 @@ const LABEL: Record<Side, string> = { nav: "Resize navigator", inspector: "Resiz
 export function Splitter({ side, total, workspaceRef }: Props) {
   const navSaved = useStore((s) => s.ui.navWidth);
   const inspectorSaved = useStore((s) => s.ui.inspectorWidth);
+  const navRail = useStore((s) => s.ui.navRail);
   const { setUi } = useStore.getState();
   // The width while a drag runs; null otherwise.
   const [live, setLive] = useState<number | null>(null);
   const drag = useRef<{ x: number; start: number; range: { min: number; max: number }; width: number } | null>(null);
 
-  const widths = effectiveWidths(total, navSaved, inspectorSaved);
+  const widths = effectiveWidths(total, navSaved, inspectorSaved, navRail);
   const own = side === "nav" ? widths.nav : widths.inspector;
   const range = widthRange(side, total, side === "nav" ? widths.inspector : widths.nav);
   const width = live ?? own;

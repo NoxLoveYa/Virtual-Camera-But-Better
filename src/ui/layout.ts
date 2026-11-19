@@ -20,6 +20,11 @@ export const INSPECTOR_AUTO_MAX = 460;
 export const INSPECTOR_AUTO_VW = 0.25;
 /** The centre (the preview) never gets narrower than this: the navigator and the inspector give way first. */
 export const CENTER_MIN = 360;
+/** Below this window width the navigator is the icon rail. */
+export const RAIL_BELOW = 1100;
+/** The icon rail's width, and the full navigator's width as a flyout over the preview. */
+export const RAIL_WIDTH = 52;
+export const FLYOUT_WIDTH = 232;
 /** Arrow keys on a splitter: 16 px, 64 px with Shift. */
 export const KEY_STEP = 16;
 export const KEY_STEP_BIG = 64;
@@ -88,18 +93,25 @@ export interface Widths {
   inspector: number;
   /** What is left for the preview. */
   center: number;
+  /** The navigator is the icon rail. */
+  rail: boolean;
 }
 
+/** Whether the navigator is the icon rail in a workspace `total` px wide: below 1100 px, or when the user collapsed it. */
+export const isRail = (total: number, navRail: boolean) => navRail || total < RAIL_BELOW;
+
 /**
- * The widths the three regions have in a workspace `total` px wide: the navigator is its saved or auto width clamped to
- * [184, room − 300 − 360]; the inspector is its saved or auto width clamped to [300, min(560, room − nav − 360)]. The
- * saved values are never changed by a narrow window, so widening the window restores them.
+ * The widths the three regions have in a workspace `total` px wide: the navigator is the 52 px rail below 1100 px (or when
+ * `navRail` is set), else its saved or auto width clamped to [184, room − 300 − 360]; the inspector is its saved or auto
+ * width clamped to [300, min(560, room − nav − 360)]. The saved values are never changed by a narrow window, so widening
+ * the window restores them.
  */
-export function effectiveWidths(total: number, navSaved: number | null, inspectorSaved: number | null): Widths {
-  const nav = clamp(navSaved ?? autoNavWidth(total), NAV_MIN, navCeiling(total));
+export function effectiveWidths(total: number, navSaved: number | null, inspectorSaved: number | null, navRail = false): Widths {
+  const rail = isRail(total, navRail);
+  const nav = rail ? RAIL_WIDTH : clamp(navSaved ?? autoNavWidth(total), NAV_MIN, navCeiling(total));
   const inspectorMax = Math.max(INSPECTOR_MIN, Math.min(INSPECTOR_MAX, roomOf(total) - nav - CENTER_MIN));
   const inspector = clamp(inspectorSaved ?? autoInspectorWidth(total), INSPECTOR_MIN, inspectorMax);
-  return { nav, inspector, center: roomOf(total) - nav - inspector };
+  return { nav, inspector, center: roomOf(total) - nav - inspector, rail };
 }
 
 export type Side = "nav" | "inspector";

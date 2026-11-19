@@ -412,7 +412,7 @@ export function useChainDrag() {
       say(`${labelAt(to)} moved to step ${to + 1}.`);
     };
 
-    return { moveLift, onPointerDown, onGripKeyDown, onGripBlur, onCardKeyDown, consumeDragClick, cancel: () => finish(false) };
+    return { moveLift, onPointerDown, onGripKeyDown, onGripBlur, onCardKeyDown, consumeDragClick, announce: say, cancel: () => finish(false) };
   }, []);
 
   // The lifted copy is mounted after the first move: put it at the pointer before it is painted.

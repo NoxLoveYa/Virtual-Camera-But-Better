@@ -17,6 +17,17 @@ export function focusNavRow(id: string) {
   });
 }
 
+const CONTROLS = ["button", "input", "select", "textarea", "a[href]", '[tabindex]:not([tabindex="-1"])'].map((s) => `.inspector ${s}`).join(", ");
+
+/** Focuses the first control of the inspector (the header's grip, or the section's action). `false` when it has none. */
+export function focusInspector(): boolean {
+  const first = Array.from(document.querySelectorAll<HTMLElement>(CONTROLS)).find(
+    (el) => !(el as HTMLButtonElement).disabled && el.getClientRects().length > 0 && el.tabIndex >= 0,
+  );
+  first?.focus();
+  return !!first;
+}
+
 /** Focuses whichever navigator row is selected now (after the selected filter was removed, that is the one that took its place). */
 export function focusSelectedRow() {
   requestAnimationFrame(() => {

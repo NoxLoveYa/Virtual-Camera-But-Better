@@ -9,8 +9,10 @@ import {
   INSPECTOR_MIN,
   NAV_MAX,
   NAV_MIN,
+  RAIL_WIDTH,
   effectiveWidths,
   filterSelection,
+  isRail,
   normalizeUi,
   selectedFilterId,
   selectionAfter,
@@ -56,10 +58,26 @@ eq(filterSelection("x1"), "filter:x1", "the selection of a filter");
 // ---- widths ----
 const at = (w: number, nav: number | null = null, insp: number | null = null) => effectiveWidths(w, nav, insp);
 // Auto widths: nav clamp(200, 17vw, 260), inspector clamp(340, 25vw, 460); the centre gets the rest minus two hairlines.
+// Below 1100 px the navigator is the 52 px icon rail, so the preview keeps the room.
 const w900 = at(900);
-eq(w900.nav, 200, "900: navigator 200");
-eq(w900.inspector, 338, "900: inspector gives way to keep the centre at 360");
-eq(w900.center, CENTER_MIN, "900: centre is its minimum");
+eq(w900.nav, RAIL_WIDTH, "900: the navigator is the rail");
+eq(w900.rail, true, "900: rail flag");
+eq(w900.inspector, 340, "900: inspector 340");
+eq(w900.center, 506, "900: centre 506");
+eq(at(1099).nav, RAIL_WIDTH, "1099: rail");
+eq(at(1099).rail, true, "1099: rail flag");
+eq(at(1099).center, 1097 - 52 - 340, "1099: centre is the rest");
+eq(at(1100).rail, false, "1100: the full navigator");
+eq(at(1100).nav, 200, "1100: navigator 200");
+eq(isRail(1099, false), true, "isRail: 1099");
+eq(isRail(1100, false), false, "isRail: 1100");
+eq(isRail(1920, true), true, "isRail: collapsed at any width");
+// A collapsed navigator at a wide window: the rail, and the inspector keeps its width.
+eq(effectiveWidths(1400, null, null, true).nav, RAIL_WIDTH, "1400 collapsed: rail");
+eq(effectiveWidths(1400, null, null, true).inspector, 350, "1400 collapsed: inspector auto");
+eq(effectiveWidths(1400, 260, null, true).nav, RAIL_WIDTH, "a saved navigator width does not change the rail");
+eq(effectiveWidths(1400, 260, null, false).nav, 260, "... and is back when the navigator is full");
+eq(widthRange("inspector", 900, w900.nav).max, 486, "900: the inspector may take the room the rail leaves");
 const w1100 = at(1100);
 eq(w1100.nav, 200, "1100: navigator 200");
 eq(w1100.inspector, 340, "1100: inspector 340");
@@ -75,15 +93,19 @@ eq(w1920.center, 1198, "1920: centre 1198");
 // Saved widths are used and clamped to the room; the saved value itself is not changed (the function is pure).
 eq(at(1200, 240, 420).nav, 240, "a saved navigator width is used");
 eq(at(1200, 240, 420).inspector, 420, "a saved inspector width is used");
-eq(at(900, 320, 560).nav, 238, "900: a wide saved navigator is held to the room");
-eq(at(900, 320, 560).inspector, INSPECTOR_MIN, "900: ... and leaves the inspector its minimum");
-eq(at(900, 320, 560).center, 898 - 238 - 300, "900: ... so the centre is more than its minimum");
-eq(at(1000, null, 560).inspector, 1000 - 2 - 200 - CENTER_MIN, "1000: a wide saved inspector is held to the room");
+eq(at(1100, 320, 560).nav, 320, "1100: a wide saved navigator fits");
+eq(at(1100, 320, 560).inspector, 1098 - 320 - CENTER_MIN, "1100: ... and the saved inspector gives way to keep the centre");
+eq(at(1100, 320, 560).center, CENTER_MIN, "1100: ... at its minimum");
+eq(at(1100, 400, null).nav, 320, "1100: a navigator above its range is held to the range");
+eq(at(900, 320, 560).inspector, 486, "900: a wide saved inspector is held to the room the rail leaves");
+eq(at(1000, null, 560).inspector, 560, "1000: the rail leaves room for the widest inspector");
+eq(at(800, null, 560).inspector, 800 - 2 - RAIL_WIDTH - CENTER_MIN, "800: a wide saved inspector is held to the room");
 eq(at(1400, null, 560).inspector, 560, "1400: a wide saved inspector fits");
 for (const w of [900, 1000, 1099, 1100, 1200, 1400, 1920, 2560]) {
   for (const [n, i] of [[null, null], [NAV_MAX, INSPECTOR_MAX], [NAV_MIN, INSPECTOR_MIN]] as const) {
     const r = at(w, n, i);
-    if (r.nav < NAV_MIN || r.nav > NAV_MAX) throw new Error(`${w}: navigator ${r.nav} outside its range`);
+    if (r.rail && r.nav !== RAIL_WIDTH) throw new Error(`${w}: the rail is ${r.nav}`);
+    if (!r.rail && (r.nav < NAV_MIN || r.nav > NAV_MAX)) throw new Error(`${w}: navigator ${r.nav} outside its range`);
     if (r.inspector < INSPECTOR_MIN || r.inspector > INSPECTOR_MAX) throw new Error(`${w}: inspector ${r.inspector} outside its range`);
     if (r.center < CENTER_MIN) throw new Error(`${w}: centre ${r.center} below its minimum`);
     eq(r.nav + r.inspector + r.center + 2, w, `${w}: the three regions and two hairlines fill the window`);
@@ -94,11 +116,11 @@ for (const w of [900, 1000, 1099, 1100, 1200, 1400, 1920, 2560]) {
 const navRange = widthRange("nav", 1200, 340);
 eq(navRange.min, NAV_MIN, "navigator range: min");
 eq(navRange.max, NAV_MAX, "navigator range: max at 1200");
-eq(widthRange("nav", 900, 338).max, 200, "navigator range at 900: the room left");
+eq(widthRange("nav", 1100, 538).max, 200, "navigator range at 1100: the room left");
 const inspRange = widthRange("inspector", 1200, 204);
 eq(inspRange.min, INSPECTOR_MIN, "inspector range: min");
 eq(inspRange.max, INSPECTOR_MAX, "inspector range: max at 1200");
-eq(widthRange("inspector", 900, 200).max, 338, "inspector range at 900: the room left");
+eq(widthRange("inspector", 1100, 200).max, 538, "inspector range at 1100: the room left");
 
 eq(widthFromDrag("inspector", 340, -80, inspRange), 420, "dragging the inspector line 80 px left widens it by 80");
 eq(widthFromDrag("inspector", 340, 80, inspRange), 300, "dragging it right narrows it, to the minimum");

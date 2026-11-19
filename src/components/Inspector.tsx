@@ -1,6 +1,7 @@
-import { useLayoutEffect, useRef } from "react";
+import { useLayoutEffect, useRef, type KeyboardEvent } from "react";
 import { useStore } from "../store";
 import { selectedFilterId } from "../ui/layout";
+import { focusSelectedRow } from "../ui/navFocus";
 import type { ChainHandlers, DragView } from "../ui/useChainDrag";
 import { ControlsCard } from "./ControlsCard";
 import { FilterInspector } from "./FilterInspector";
@@ -35,8 +36,17 @@ export function Inspector({ drag, reorder }: Props) {
     if (scroll) scroll.scrollTop = 0;
   }, [shows]);
 
+  // Escape and Shift+F6 take the focus back to the selected navigator row. Not an Escape that something else uses: a menu that
+  // is open, a preview tool that runs, a lift on the grip, a number being edited (those handle it, or stop it first).
+  const back = (e: KeyboardEvent<HTMLElement>) => {
+    const escape = e.key === "Escape" && !e.defaultPrevented && !document.querySelector(".pop-menu") && useStore.getState().previewTool === null;
+    if (!escape && !(e.key === "F6" && e.shiftKey)) return;
+    e.preventDefault();
+    focusSelectedRow();
+  };
+
   return (
-    <aside className="inspector" data-region="inspector" data-shows={shows} aria-label="Inspector" ref={root}>
+    <aside className="inspector" data-region="inspector" data-shows={shows} aria-label="Inspector" ref={root} onKeyDown={back}>
       {id !== null ? (
         <FilterInspector key={id} id={id} dragMode={drag?.id === id ? drag.mode : null} reorder={reorder} />
       ) : shows === "controls" ? (

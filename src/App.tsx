@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from
 import { useStore } from "./store";
 import { useChainDrag } from "./ui/useChainDrag";
 import { cancelInsertDrag, useInsertView } from "./ui/insertDragSession";
-import { effectiveWidths } from "./ui/layout";
+import { RAIL_BELOW, effectiveWidths } from "./ui/layout";
 import { useFileDrop } from "./ui/useFileDrop";
 import { DropChooser } from "./components/DropChooser";
 import { EngineBanner } from "./components/EngineBanner";
@@ -23,6 +23,7 @@ export default function App() {
   const vcamBanner = useStore((s) => s.vcam?.state === "missing" || s.vcam?.state === "outdated" || !!s.vcam?.problem);
   const navWidth = useStore((s) => s.ui.navWidth);
   const inspectorWidth = useStore((s) => s.ui.inspectorWidth);
+  const navRail = useStore((s) => s.ui.navRail);
   const workspaceRef = useRef<HTMLDivElement>(null);
   const [total, setTotal] = useState(() => window.innerWidth);
   const reorder = useChainDrag();
@@ -51,7 +52,7 @@ export default function App() {
   }, []);
 
   const waiting = state === "reconnecting";
-  const widths = effectiveWidths(total, navWidth, inspectorWidth);
+  const widths = effectiveWidths(total, navWidth, inspectorWidth, navRail);
 
   return (
     <>
@@ -63,15 +64,16 @@ export default function App() {
           <EngineBanner />
         </div>
       )}
-      {/* Three docked regions: the navigator (sections and the filter chain), the preview (always in view) and the inspector (the
-          one selected item). The widths are CSS variables, so a splitter drag does not render the app (see Splitter). */}
+      {/* Three docked regions: the navigator (sections and the filter chain; the 52 px icon rail below 1100 px), the preview
+          (always in view) and the inspector (the one selected item). The widths are CSS variables, so a splitter drag does not
+          render the app (see Splitter). */}
       <div
         className="workspace"
         ref={workspaceRef}
-        data-nav-mode="full"
+        data-nav-mode={widths.rail ? "rail" : "full"}
         style={{ "--nav": `${widths.nav}px`, "--insp": `${widths.inspector}px` } as CSSProperties}
       >
-        <Navigator reorder={reorder} fileLineTop={fileDrop.lineTop} />
+        <Navigator reorder={reorder} fileLineTop={fileDrop.lineTop} rail={widths.rail} canDock={total >= RAIL_BELOW} />
         <Splitter side="nav" total={total} workspaceRef={workspaceRef} />
         <main className="center" data-region="center">
           <Preview />
@@ -81,7 +83,7 @@ export default function App() {
       </div>
       {fileDrop.chooser && <DropChooser chooser={fileDrop.chooser} onChoose={fileDrop.choose} />}
       {reorder.lift && (
-        <div className="reorder-lift" ref={reorder.liftRef} style={{ left: reorder.lift.left, width: Math.min(reorder.lift.width, 300) }} aria-hidden>
+        <div className="reorder-lift" ref={reorder.liftRef} style={{ left: reorder.lift.left, width: Math.min(Math.max(reorder.lift.width, 180), 300) }} aria-hidden>
           <Icon name="grip" />
           <span className="lift-title">{reorder.lift.label}</span>
           {reorder.lift.bypassed && <span className="tag">Bypassed</span>}

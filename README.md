@@ -25,7 +25,12 @@ React, and runs on Windows 11 only.
   built yet.
 - Presets: save and load the whole look of the camera by name: the filter chain, the camera and its capture settings, the camera controls with their Manual / Camera auto / Better Cam auto modes, Better Cam auto's settings, and the output. Loading is one step you can undo; the title bar marks unsaved changes (`Name*`). Save, Save as, rename, delete and Reset to defaults are in the Preset menu. Presets from older versions (filters only) still load and change only the filters. App settings (autostart, tray, extensions, window layout) are not part of a preset.
 - Live preview and a line of stats (capture and output size and frame rate, latency, dropped and repeated frames).
-  The preview stays in view while the settings scroll, and a splitter sets the width of the two columns.
+  The window has three docked regions: a navigator on the left (Camera, Camera controls, Output, then the filter chain as
+  rows with a status dot or spinner), the preview in the middle (always in view, 16:9) and the inspector on the right (the
+  settings of the one selected item). Splitters set the widths of the navigator and the inspector. Below 1100 px the navigator
+  is a 52 px icon rail (its » button opens the full list over the preview; the button at the top of the navigator also
+  collapses it at any width). The navigator works from the keyboard: arrows select, Space bypasses a filter, Delete removes
+  it, Enter or F6 goes to the inspector, Escape comes back.
 - Preview tools: show the picture as it enters a chosen filter, and hold Compare to see the camera picture. An
   eyedropper picks key colours from the preview (Chroma Key, Color Key). Crop/Pad can be edited on the picture: drag to
   pan, mouse wheel to zoom.
