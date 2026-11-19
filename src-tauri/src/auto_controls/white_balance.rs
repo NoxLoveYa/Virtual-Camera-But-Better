@@ -7,16 +7,23 @@
 //! until a frame captured 0.3 s after the write has been measured.
 //!
 //! `e_wb` comes from the shared light estimator (`fx::awb`, docs/AUTO-WHITE-BALANCE.md 3.3): under a strong cast the
-//! loop has a confident, unbiased reading and walks toward the light. It still holds when the confidence is low, and
-//! the estimator's reason (dark, or mostly one colour) picks the text. What is left at the end of the range goes to
-//! Auto Adjust, which measures this loop's output.
+//! loop has a confident, unbiased reading and walks toward the light. It holds when the picture is dark or mostly one
+//! colour (a closed loop on a biased reading goes all the way to the wrong answer), and the estimator's reason picks
+//! the text. A picture with two answers (a bright face beside the walls, two lights) does not hold: the slow lane
+//! follows the middle of the two answers with a confidence-weighted average (time constant 8 s, 32 s with no
+//! confidence left) and writes only when that average passes the band (10.4.2). What is left at the end of the range
+//! goes to Auto Adjust, which measures this loop's output.
+//!
+//! A change of the Warmth setting is not a measurement and is never held back (docs/AUTO-WHITE-BALANCE.md 10.4.3): it
+//! is turned into one move (`ΔM = Δc*/α_ff`) that the next tick writes whatever the reading says, then the loop
+//! measures from the narrow band and finishes the rest when the picture can be measured.
 //!
 //! Pure like the exposure loop; the watchdog (`watchdog.rs`) is part of it.
 
 use std::collections::VecDeque;
 
 use super::exposure::ExposureView;
-use super::meter::{measure_white_balance, Reason};
+use super::meter::{measure_white_balance, warmth_target, Reason};
 use super::status::{white_balance_message, WhiteBalanceFacts};
 use super::watchdog::{
     Drift, Fault, Halt, Moved, Unit, Watchdog, NO_EFFECT_RATIO, NO_EFFECT_SPAN, NO_PICTURE_AFTER,
@@ -33,6 +40,24 @@ use crate::fx::auto_adjust::Stats;
 
 /// `α`: colour signal per mired, until learned. Unverified.
 const ALPHA_INITIAL: f64 = 0.006;
+/// The blackbody slope near 5000 K (docs/AUTO-WHITE-BALANCE.md 2.1): the `α` a warmth change is turned into a move
+/// with, whenever the loop's own `α` is smaller (a move that is too small is finished by the loop, one that is too
+/// large would have to be taken back).
+const ALPHA_FF: f64 = 0.0105;
+/// The slow lane (docs/AUTO-WHITE-BALANCE.md 10.4.2): the time constant of its average at full weight.
+const SLOW_TAU: f64 = 8.0;
+/// The weight of a sample whose doubt took all its confidence: a time constant of `SLOW_TAU / SLOW_FLOOR` = 32 s.
+const SLOW_FLOOR: f64 = 0.25;
+/// A gap between samples (a write, `D_APPLY`, a dropped frame) counts as at most this much evidence.
+const SLOW_DT_MAX: f64 = 0.5;
+/// The lane survives this long without evidence, so the card does not flicker between texts.
+const SLOW_KEEP: f64 = 2.0;
+/// The feed-forward writes at most this often (measured from the end of the last write): the slider sends a value
+/// every 80 ms and a camera takes a write of this kind badly at 10 a second. `warmth_shift` keeps adding up in
+/// between, so nothing of the drag is lost; the next write carries it.
+const FF_GAP: f64 = 0.25;
+/// A feed-forward is stored as the resume point once no feed-forward has written for this long (the drag is over).
+const FF_STORE_QUIET: f64 = 1.0;
 const ALPHA_MIN: f64 = 0.002;
 const ALPHA_MAX: f64 = 0.02;
 /// A sample is valid when captured this long after the write returned.
@@ -141,6 +166,19 @@ struct Sample {
     e: f64,
     conf: f64,
     reason: Reason,
+    /// The estimator's confidence before the doubt of two answers (`WhiteBalanceReading::light_conf`).
+    light_conf: f64,
+}
+
+/// The slow lane's state: a confidence-weighted average of the middle of the two answers (10.4.2).
+#[derive(Clone, Copy, Debug)]
+struct Slow {
+    /// The average error `e_wb`, kept as it will be once the moves already written have taken effect.
+    e: f64,
+    /// Capture time of the last sample it took in.
+    t: f64,
+    /// Loop time of the last sample that was evidence.
+    evidence_at: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -148,6 +186,11 @@ struct Pending {
     prev: i32,
     issued_at: f64,
     seed: bool,
+    /// The `Δc*` of the user's warmth change this write carries (`feed_forward`): given back to `warmth_shift` when
+    /// the write fails, so the change is not lost.
+    ff: f64,
+    /// What the slow lane's average is to be shifted by once the write has succeeded (`α·ΔM` of its move).
+    lane_shift: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,6 +228,8 @@ struct Reading {
     conf: f64,
     /// The latest reason a recent sample gave for a low confidence (`Ok` when none did).
     reason: Reason,
+    /// The median of the last samples' `light_conf`.
+    light_conf: f64,
 }
 
 pub struct WhiteBalanceLoop {
@@ -220,6 +265,17 @@ pub struct WhiteBalanceLoop {
     retake: Option<i32>,
     /// Why the last hold (`NoSignal`) was made: picks its text.
     hold_reason: Reason,
+    /// The change of the aim `c*` the user made with the Warmth setting that the Kelvin has not followed yet
+    /// (docs/AUTO-WHITE-BALANCE.md 10.4.3). Written by `feed_forward` whatever the picture says.
+    warmth_shift: f64,
+    /// A feed-forward has written and its Kelvin is not stored as the resume point yet (`FF_STORE_QUIET`,
+    /// `RESUME_EVERY`).
+    ff_store: bool,
+    /// The stored resume point is a feed-forward's: reported in `no_signal` and `slow` too, where the loop stores
+    /// nothing of its own. Ends with the next write of the loop.
+    ff_resume: bool,
+    /// The slow lane, while the picture has two answers (`WhiteBalanceState::Slow`).
+    slow: Option<Slow>,
     watchdog: Watchdog,
 }
 
@@ -255,6 +311,10 @@ impl WhiteBalanceLoop {
             no_picture: None,
             retake: None,
             hold_reason: Reason::Dark,
+            warmth_shift: 0.0,
+            ff_store: false,
+            ff_resume: false,
+            slow: None,
             watchdog: Watchdog::new(Unit::Mired),
         }
     }
@@ -273,6 +333,17 @@ impl WhiteBalanceLoop {
             // The error of the samples was measured against the old warmth.
             self.samples.clear();
             self.batch = None;
+            self.slow = None;
+            if self.engaged() && self.started {
+                // A warmth change always moves the camera (10.4.3): the move is made by the next tick, whatever the
+                // reading says, and the loop then measures from the narrow band.
+                self.warmth_shift += warmth_target(cfg.warmth) - warmth_target(self.cfg.warmth);
+                self.band = Band::Adjusting;
+                self.limit_since = None;
+                if matches!(self.state, WhiteBalanceState::Holding | WhiteBalanceState::Slow) {
+                    self.state = WhiteBalanceState::Adjusting;
+                }
+            }
         }
         self.cfg = cfg;
     }
@@ -319,6 +390,11 @@ impl WhiteBalanceLoop {
         self.resumed_at = f64::NEG_INFINITY;
         self.last_arrival = f64::NEG_INFINITY;
         self.no_picture = None;
+        // A new session measures against the new warmth anyway.
+        self.warmth_shift = 0.0;
+        self.ff_store = false;
+        self.ff_resume = false;
+        self.slow = None;
         self.watchdog.reset();
     }
 
@@ -336,6 +412,7 @@ impl WhiteBalanceLoop {
             e: r.error,
             conf: r.confidence,
             reason: r.reason,
+            light_conf: r.light_conf,
         });
         while self.samples.len() > MAX_SAMPLES {
             self.samples.pop_front();
@@ -354,8 +431,17 @@ impl WhiteBalanceLoop {
         }
         if w.ok {
             self.k = w.readback.unwrap_or(w.requested);
+            // The lane's average is kept as it will be once the move has taken effect: only a move that was made.
+            if let Some(l) = &mut self.slow {
+                l.e += p.lane_shift;
+            }
+            if p.ff != 0.0 {
+                self.ff_store = true;
+            }
         } else {
             self.k = p.prev;
+            // The user's warmth change was not made: it is still to be written.
+            self.warmth_shift += p.ff;
             if p.seed {
                 self.started = false;
             }
@@ -465,6 +551,7 @@ impl WhiteBalanceLoop {
             self.paused = false;
             self.samples.clear();
             self.batch = None;
+            self.slow = None;
             self.watchdog.touch(now);
         }
         self.resumed_at = facts.resumed_at;
@@ -481,8 +568,17 @@ impl WhiteBalanceLoop {
         let quiet = self.watchdog.quiet(now, self.last_arrival);
         self.no_picture = (quiet >= NO_PICTURE_AFTER).then_some(quiet);
         self.track_limit(now);
+        self.store_feed_forward(now);
         if self.pending.is_some() || now < self.watchdog.retry_at() || self.no_picture.is_some() {
             return Vec::new();
+        }
+        // A warmth change is the user's move, not a measurement: it waits only for a write of the exposure loop that
+        // is in flight, not for its quiet time, the gap or the reading (10.4.3).
+        if self.warmth_shift != 0.0 && !(exposure.engaged && exposure.busy) {
+            let actions = self.feed_forward(learned);
+            if !actions.is_empty() {
+                return actions;
+            }
         }
         // Exposure first (2.6): one write in flight, none within 0.3 s of its batch, none while it is far off.
         if exposure.engaged
@@ -492,6 +588,7 @@ impl WhiteBalanceLoop {
         }
         if let Some(k) = self.retake.take() {
             self.batch = None;
+            self.slow = None;
             return self.issue(k, false);
         }
         if self.watchdog.readback_due(now, self.t_done) {
@@ -524,6 +621,8 @@ impl WhiteBalanceLoop {
         self.state = WhiteBalanceState::Starting;
         self.band = Band::Adjusting;
         self.batch = None;
+        self.warmth_shift = 0.0;
+        self.slow = None;
         if self.hub_seeded {
             self.k = k0;
             self.t_done = now;
@@ -533,11 +632,18 @@ impl WhiteBalanceLoop {
     }
 
     fn issue(&mut self, k: i32, seed: bool) -> Vec<Action> {
+        self.issue_with(k, seed, 0.0, 0.0)
+    }
+
+    /// `ff` and `lane_shift` ride the write: see `Pending`.
+    fn issue_with(&mut self, k: i32, seed: bool, ff: f64, lane_shift: f64) -> Vec<Action> {
         let prev = std::mem::replace(&mut self.k, k);
         self.pending = Some(Pending {
             prev,
             issued_at: self.now,
             seed,
+            ff,
+            lane_shift,
         });
         vec![Action::Write {
             key: ControlKey::WhiteBalance,
@@ -572,6 +678,7 @@ impl WhiteBalanceLoop {
             e: median(|s| s.e),
             sigma,
             conf: median(|s| s.conf),
+            light_conf: median(|s| s.light_conf),
             reason: valid
                 .iter()
                 .rev()
@@ -603,17 +710,28 @@ impl WhiteBalanceLoop {
                 return Vec::new();
             }
         }
-        if r.conf < HOLD_BELOW {
-            // Nothing to measure: keep the Kelvin and say so (it is not `holding`: nothing was checked).
+        if r.conf >= HOLD_BELOW {
+            if matches!(self.state, WhiteBalanceState::NoSignal | WhiteBalanceState::Slow) {
+                // The signal is back: measure from the wide band again, as after a write.
+                self.state = WhiteBalanceState::Adjusting;
+                self.band = Band::Adjusting;
+            }
+            self.slow = None;
+        } else if (r.reason != Reason::Dark && r.light_conf >= HOLD_BELOW)
+            || self.slow.is_some_and(|l| now - l.evidence_at < SLOW_KEEP)
+        {
+            // Two answers, each sure: follow their middle slowly (10.4.2).
+            return self.decide_slow(now, pace, learned, &valid);
+        } else {
+            // Dark, or one colour: keep the Kelvin and say so (it is not `holding`: nothing was checked). A closed
+            // loop on a biased reading goes all the way to the wrong answer (D4). `r.reason` may be `TwoAnswers`
+            // here (the median `light_conf` is low while a recent sample was doubtful): the text treats every reason
+            // but `Dark` as one colour (`white_balance_message`).
+            self.slow = None;
             self.state = WhiteBalanceState::NoSignal;
             self.hold_reason = r.reason;
             self.limit_since = None;
             return Vec::new();
-        }
-        if self.state == WhiteBalanceState::NoSignal {
-            // The signal is back: measure from the wide band again, as after a write.
-            self.state = WhiteBalanceState::Adjusting;
-            self.band = Band::Adjusting;
         }
         let alpha = learned.wb_alpha.unwrap_or(ALPHA_INITIAL).clamp(ALPHA_MIN, ALPHA_MAX);
         let bands = self.watchdog.band_scale(now);
@@ -651,7 +769,154 @@ impl WhiteBalanceLoop {
         });
         self.state = WhiteBalanceState::Adjusting;
         self.band = Band::Adjusting;
+        // This move was measured against the new aim already: what is left of the user's move is in `e`.
+        self.warmth_shift = 0.0;
+        self.ff_store = false;
+        self.ff_resume = false;
         self.issue(k2, false)
+    }
+
+    /// The slow lane (10.4.2): a picture with two answers does not hold the loop, it slows it. The lane is a
+    /// confidence-weighted average of the middle of the two answers; the loop writes when the average passes the
+    /// narrow band, then shifts it by the move's expected effect, so the next samples correct it. A sample that is
+    /// dark or has no light of its own is no evidence (D4).
+    fn decide_slow(&mut self, now: f64, pace: &WbPace, learned: &Learned, valid: &[Sample]) -> Vec<Action> {
+        let mut lane = self.slow.unwrap_or(Slow {
+            e: 0.0,
+            t: valid[0].t,
+            evidence_at: now,
+        });
+        // Whether this call took in evidence: the lane writes only on a fresh sample, not on what it kept for
+        // `SLOW_KEEP`.
+        let mut fresh = false;
+        for s in valid {
+            if s.t <= lane.t {
+                continue;
+            }
+            let dt = (s.t - lane.t).min(SLOW_DT_MAX);
+            lane.t = s.t;
+            if s.reason == Reason::Dark || s.light_conf < HOLD_BELOW {
+                continue;
+            }
+            fresh = true;
+            lane.evidence_at = now;
+            let w = SLOW_FLOOR + (1.0 - SLOW_FLOOR) * s.conf.clamp(0.0, 1.0);
+            lane.e += (1.0 - (-w * dt / SLOW_TAU).exp()) * (s.e - lane.e);
+        }
+        self.slow = Some(lane);
+        self.state = WhiteBalanceState::Slow;
+        self.hold_reason = Reason::TwoAnswers;
+        let bands = self.watchdog.band_scale(now);
+        if lane.e.abs() <= OUT_MIN * bands {
+            self.limit_since = None;
+            return Vec::new();
+        }
+        // On a doubtful picture the lane under-moves rather than overshoots: the larger of the loop's `α` and the
+        // blackbody slope, as the feed-forward does.
+        let alpha = learned.wb_alpha.unwrap_or(ALPHA_INITIAL).max(ALPHA_FF);
+        let k = pace.k * self.watchdog.k_scale(now);
+        let dm = (-k * lane.e / alpha).clamp(-pace.dm_max, pace.dm_max);
+        let k2 = self.caps.snap(1e6 / (mired(self.k) + dm).max(1.0));
+        if (k2 - self.k).abs() < self.caps.k_step {
+            // At an end of the range: `at_limit` after `LIMIT_AFTER`, else stay slow. Never `holding` here: that
+            // means "checked and fine".
+            let at_limit = if dm < 0.0 {
+                self.k >= self.caps.k_max
+            } else {
+                self.k <= self.caps.k_min
+            };
+            if at_limit {
+                let since = *self.limit_since.get_or_insert(now);
+                if now - since >= LIMIT_AFTER {
+                    self.state = WhiteBalanceState::AtLimit;
+                }
+            } else {
+                self.limit_since = None;
+            }
+            return Vec::new();
+        }
+        if !fresh {
+            return Vec::new();
+        }
+        self.limit_since = None;
+        let applied = mired(k2) - mired(self.k);
+        if self.watchdog.moved(now, applied) == Moved::Hunting {
+            self.raise(Fault::Hunting);
+            return Vec::new();
+        }
+        // A doubtful move teaches nothing and is not judged by W3.
+        self.batch = None;
+        self.ff_store = false;
+        self.ff_resume = false;
+        // `warmth_shift` stays: the lane starts from 0 at a warmth change and has not seen the user's move, so the
+        // part of it not written yet (less than a camera step, or held back by `FF_GAP`) is still to be written.
+        // The lane's average is shifted by this move's expected effect when the write has succeeded
+        // (`Pending::lane_shift`).
+        self.issue_with(k2, false, 0.0, alpha * applied)
+    }
+
+    /// The Kelvin the user's warmth change asks for, written at once: `ΔM = Δc*/α_ff` (a warmer aim lowers `c*`, so
+    /// the move is toward a lower mired, a higher Kelvin). `α_ff` is the larger of the loop's `α` and the blackbody
+    /// slope, so the move under-shoots rather than overshoots; a picture that can be measured finishes the rest from
+    /// the narrow band. The move is not judged by W3 and is not a swing for W4: it is the user's.
+    fn feed_forward(&mut self, learned: &Learned) -> Vec<Action> {
+        if self.now < self.t_done + FF_GAP {
+            // A drag of the slider: `warmth_shift` keeps adding up and the next write carries it.
+            return Vec::new();
+        }
+        let alpha = learned.wb_alpha.unwrap_or(ALPHA_INITIAL).max(ALPHA_FF);
+        let dm = self.warmth_shift / alpha;
+        let k2 = self.caps.snap(1e6 / (mired(self.k) + dm).max(1.0));
+        if k2 == self.k {
+            // A drag in steps of 0.01 adds up until it is a step of the camera; at its end there is nothing more
+            // the camera can do (the state `at_limit` says so when the picture can be measured).
+            let at_end = if dm < 0.0 {
+                self.k >= self.caps.k_max
+            } else {
+                self.k <= self.caps.k_min
+            };
+            if at_end {
+                self.warmth_shift = 0.0;
+            }
+            return Vec::new();
+        }
+        // What the write carries leaves `warmth_shift`; the part the camera's step rounds away stays in it, so a drag
+        // in many small writes adds up to the whole change. A failed write gives it back (`on_write_done`).
+        let carried = alpha * (mired(k2) - mired(self.k));
+        self.warmth_shift -= carried;
+        self.batch = None;
+        self.retake = None;
+        self.slow = None;
+        self.band = Band::Adjusting;
+        self.limit_since = None;
+        if matches!(
+            self.state,
+            WhiteBalanceState::Holding | WhiteBalanceState::AtLimit | WhiteBalanceState::Slow
+        ) {
+            self.state = WhiteBalanceState::Adjusting;
+        }
+        self.watchdog.forget_direction();
+        self.issue_with(k2, false, carried, 0.0)
+    }
+
+    /// A warmth change made while the picture is held (`no_signal`, `slow`) is not stored by the loop's own rules, and
+    /// would be lost when the camera reopens. Once the feed-forward has been quiet for `FF_STORE_QUIET` (the drag is
+    /// over) and `RESUME_EVERY` allows, its Kelvin becomes the resume point.
+    fn store_feed_forward(&mut self, now: f64) {
+        if !self.ff_store
+            || self.pending.is_some()
+            || now < self.t_done + FF_STORE_QUIET
+            || now - self.last_resume_at < RESUME_EVERY
+        {
+            return;
+        }
+        self.ff_store = false;
+        self.ff_resume = true;
+        self.last_resume_at = now;
+        self.resume_out = Some(Resume {
+            white_balance: Some(self.k),
+            ..Resume::default()
+        });
     }
 
     /// The move rounds to nothing: at the end of the range (`at_limit` after 3 s) or fine enough already.
@@ -776,6 +1041,8 @@ impl WhiteBalanceLoop {
         let reportable = match self.state {
             WhiteBalanceState::Holding => true,
             WhiteBalanceState::AtLimit => self.limit_stored,
+            // The Kelvin of a warmth change on a held picture (`store_feed_forward`).
+            WhiteBalanceState::NoSignal | WhiteBalanceState::Slow => self.ff_resume,
             _ => false,
         };
         if self.engaged() && reportable {
@@ -813,7 +1080,7 @@ impl WhiteBalanceLoop {
             kelvin: self.k,
             warm_limit: self.k <= (self.caps.k_min + self.caps.k_max) / 2,
             no_picture_for: self.no_picture.unwrap_or(0.0),
-            one_colour: self.hold_reason == Reason::OneColour,
+            reason: self.hold_reason,
             fault: halted.map(|h| h.fault),
             handed_back,
         });
@@ -823,5 +1090,75 @@ impl WhiteBalanceLoop {
             message,
             handed_back,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caps() -> WhiteBalanceCaps {
+        WhiteBalanceCaps {
+            k_min: 2800,
+            k_max: 6500,
+            k_step: 1,
+            k_default: 4600,
+            can_auto: true,
+        }
+    }
+
+    fn done(ok: bool, value: i32) -> WriteDone {
+        WriteDone {
+            key: ControlKey::WhiteBalance,
+            requested: value,
+            readback: ok.then_some(value),
+            ok,
+            started: 1.0,
+            done: 1.01,
+        }
+    }
+
+    fn pending(ff: f64, lane_shift: f64) -> Pending {
+        Pending {
+            prev: 4600,
+            issued_at: 1.0,
+            seed: false,
+            ff,
+            lane_shift,
+        }
+    }
+
+    fn lane() -> Slow {
+        Slow {
+            e: 0.1,
+            t: 1.0,
+            evidence_at: 1.0,
+        }
+    }
+
+    #[test]
+    fn a_failed_write_gives_back_the_warmth_change_and_does_not_shift_the_lane() {
+        let mut w = WhiteBalanceLoop::new(caps(), WhiteBalanceCfg::default());
+        w.slow = Some(lane());
+        w.warmth_shift = 0.01;
+        w.pending = Some(pending(-0.03, -0.05));
+        w.on_write_done(done(false, 4700));
+        assert_eq!(w.k, 4600);
+        assert!((w.warmth_shift - (0.01 - 0.03)).abs() < 1e-12, "{}", w.warmth_shift);
+        assert!((w.slow.unwrap().e - 0.1).abs() < 1e-12);
+        assert!(!w.ff_store);
+    }
+
+    #[test]
+    fn a_successful_write_shifts_the_lane_and_keeps_the_warmth_change_written() {
+        let mut w = WhiteBalanceLoop::new(caps(), WhiteBalanceCfg::default());
+        w.slow = Some(lane());
+        w.warmth_shift = 0.01;
+        w.pending = Some(pending(-0.03, -0.05));
+        w.on_write_done(done(true, 4700));
+        assert_eq!(w.k, 4700);
+        assert!((w.warmth_shift - 0.01).abs() < 1e-12);
+        assert!((w.slow.unwrap().e - 0.05).abs() < 1e-12);
+        assert!(w.ff_store);
     }
 }

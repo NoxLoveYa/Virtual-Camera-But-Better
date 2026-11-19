@@ -4,6 +4,7 @@
 //!
 //! The buttons of 4.2 (`[Resume]`, `[Try again]`) are not part of a text: the card draws them from the state.
 
+use super::meter::Reason;
 use super::watchdog::Fault;
 use super::{CapReason, ExposureState, HandBackKind, NoOffer, WhiteBalanceState};
 use crate::capture::controls::ControlKey;
@@ -77,8 +78,8 @@ pub struct WhiteBalanceFacts {
     pub warm_limit: bool,
     /// How long there has been no picture, in seconds.
     pub no_picture_for: f64,
-    /// `NoSignal` because the picture is mostly one colour (not because it is dark).
-    pub one_colour: bool,
+    /// Why the picture is held or followed slowly: picks the text of `NoSignal` (`Dark` or `OneColour`) and of `Slow`.
+    pub reason: Reason,
     pub fault: Option<Fault>,
     pub handed_back: Option<HandBackKind>,
 }
@@ -98,11 +99,19 @@ pub fn white_balance_message(f: &WhiteBalanceFacts) -> Option<String> {
             kelvin(f.kelvin),
             if f.warm_limit { "warmer" } else { "cooler" }
         )),
-        WhiteBalanceState::NoSignal if f.one_colour => Some(format!(
-            "The picture is mostly one colour (a face or a wall): keeping {}.",
+        // "Too dark" only when it was the dark: a hold with any other reason (`TwoAnswers` among them, when the
+        // doubtful samples were too few for the slow lane) is a picture that is bright but has nothing to measure.
+        WhiteBalanceState::NoSignal if f.reason == Reason::Dark => {
+            Some(format!("Nothing to measure (too dark). Keeping {}.", kelvin(f.kelvin)))
+        }
+        WhiteBalanceState::NoSignal => Some(format!(
+            "Mostly one colour (a face or a wall): nothing neutral to measure. Staying at {}; Warmth still applies.",
             kelvin(f.kelvin)
         )),
-        WhiteBalanceState::NoSignal => Some(format!("Nothing to measure (too dark). Keeping {}.", kelvin(f.kelvin))),
+        WhiteBalanceState::Slow => Some(format!(
+            "Unsure of the light (a bright face or two lights): adjusting slowly · {}",
+            kelvin(f.kelvin)
+        )),
         WhiteBalanceState::NoPicture => (f.no_picture_for > super::watchdog::NO_PICTURE_TEXT_AFTER)
             .then(|| "No picture to measure.".to_string()),
         WhiteBalanceState::Paused => Some("Paused.".to_string()),
@@ -327,7 +336,7 @@ mod tests {
             kelvin: 4650,
             warm_limit: true,
             no_picture_for: 0.0,
-            one_colour: false,
+            reason: Reason::Dark,
             fault: None,
             handed_back: None,
         }
@@ -346,10 +355,23 @@ mod tests {
             Some("Nothing to measure (too dark). Keeping 4650 K.")
         );
         let mut f = wb(WhiteBalanceState::NoSignal);
-        f.one_colour = true;
+        f.reason = Reason::OneColour;
         assert_eq!(
             white_balance_message(&f).as_deref(),
-            Some("The picture is mostly one colour (a face or a wall): keeping 4650 K.")
+            Some("Mostly one colour (a face or a wall): nothing neutral to measure. Staying at 4650 K; Warmth still applies.")
+        );
+        // A hold whose newest reason is two answers is not "too dark" (a bright face with too few doubtful samples).
+        let mut f = wb(WhiteBalanceState::NoSignal);
+        f.reason = Reason::TwoAnswers;
+        assert_eq!(
+            white_balance_message(&f).as_deref(),
+            Some("Mostly one colour (a face or a wall): nothing neutral to measure. Staying at 4650 K; Warmth still applies.")
+        );
+        let mut f = wb(WhiteBalanceState::Slow);
+        f.reason = Reason::TwoAnswers;
+        assert_eq!(
+            white_balance_message(&f).as_deref(),
+            Some("Unsure of the light (a bright face or two lights): adjusting slowly · 4650 K")
         );
         let mut f = wb(WhiteBalanceState::AtLimit);
         f.kelvin = 2800;

@@ -339,6 +339,12 @@ impl Watchdog {
         }
     }
 
+    /// The next move is not compared with the one before: a move the user asked for (a warmth change) is not a
+    /// reversal of the loop, and the loop's next move is not a reversal of the user's.
+    pub fn forget_direction(&mut self) {
+        self.last_sign = None;
+    }
+
     pub fn damped(&self, now: f64) -> bool {
         now < self.damped_until
     }
@@ -418,6 +424,18 @@ mod tests {
             started,
             done: started + took,
         }
+    }
+
+    #[test]
+    fn forget_direction_ends_the_reversal_count() {
+        let mut w = Watchdog::new(Unit::Mired);
+        assert_eq!(w.moved(1.0, 10.0), Moved::Ok);
+        w.forget_direction();
+        assert_eq!(w.moved(2.0, -10.0), Moved::Ok);
+        assert!(w.reversals.is_empty());
+        // Without it the turn counts.
+        assert_eq!(w.moved(3.0, 10.0), Moved::Ok);
+        assert_eq!(w.reversals.len(), 1);
     }
 
     #[test]

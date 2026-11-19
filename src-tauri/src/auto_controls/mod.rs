@@ -374,6 +374,9 @@ pub enum WhiteBalanceState {
     AtLimit,
     /// Too little colour to measure (a dark picture, one colour): the Kelvin is kept.
     NoSignal,
+    /// The picture has two answers (a bright face beside the walls, two lights): the Kelvin follows their middle
+    /// slowly (docs/AUTO-WHITE-BALANCE.md 10.4.2).
+    Slow,
     NoPicture,
     Paused,
     Closed,

@@ -348,6 +348,8 @@ same(autoAction("holding"), null, "no button while it works");
 same(autoTone("holding"), "neutral", "tone: working");
 same(autoTone("limit_gain"), "warn", "tone: limit");
 same(autoTone("hunting"), "error", "tone: stopped");
+same(autoTone("slow"), "neutral", "tone: slow lane (it is working)");
+same(autoAction("slow"), null, "no button on the slow lane");
 
 // limits on the sliders and the "Longest exposure" list
 const stops = longestOptions({ min: -13, max: -1 }, 30);
