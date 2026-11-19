@@ -1439,6 +1439,81 @@ fn b8_noise_does_not_make_the_loop_hunt() {
     }
 }
 
+/// The recorded room (`fx::awb::real`: a face in a dim room, a bright window, 6 s of frames at the camera's own rate)
+/// played to the loop on a camera that starts at the Kelvin the recording had.
+fn real_room(speed: Speed, seconds: f64) -> (Sim, AutoController) {
+    real_room_with(speed, 0.009, 6261, seconds)
+}
+
+fn real_room_with(speed: Speed, alpha_true: f64, start_k: i32, seconds: f64) -> (Sim, AutoController) {
+    let cfg = SimCfg {
+        wb: Some(WbSim { alpha_true, start_k, can_auto: true }),
+        start_e: -5,
+        start_g: 33,
+        slow_first_write: false,
+        replay: Some(Replay::new(crate::fx::awb::real::between(108.0, 116.0))),
+        ..SimCfg::default()
+    };
+    let mut sim = Sim::new(cfg, dim(-4.0));
+    let mut autocfg = AutoCfg::default();
+    autocfg.white_balance.speed = speed;
+    let mut ctrl = AutoController::new(&sim.caps(), autocfg, Learned::default(), wb_modes(start_k, true));
+    sim.run(&mut ctrl, seconds);
+    (sim, ctrl)
+}
+
+/// The moves after `settled` seconds (2 mired and more) and the direction changes among them.
+fn wb_after(sim: &Sim, start_k: i32, settled: f64) -> (usize, usize) {
+    let writes = wb_writes(sim);
+    let mut k = writes.iter().rev().find(|w| w.started < settled).map_or(start_k, |w| w.value);
+    let mut signs = Vec::new();
+    for w in writes.iter().filter(|w| w.started >= settled) {
+        let dm = mired(w.value) - mired(k);
+        if dm.abs() >= 2.0 {
+            signs.push(dm.signum());
+        }
+        k = w.value;
+    }
+    (signs.len(), signs.windows(2).filter(|s| s[0] != s[1]).count())
+}
+
+#[test]
+fn a_face_in_a_dim_room_does_not_make_the_loop_hunt_or_hand_back() {
+    // The owner's desk (a W4GS on Better Cam auto white balance, 2026-11-19): 8 s of real frames played forward and
+    // back for 3 minutes. For about a second of each pass the estimator has two answers on frames that look alike
+    // (the walls, `t` 0, or the face with half of the walls, -0.27 and -0.55), and the loop followed each one, turned
+    // around and, after the damping, handed back to Camera auto: Normal at 43 s, Fast at 28 s; Slow wrote 160 times
+    // in 3 minutes. Now it reads the doubt (`LightEstimate::apart`), measures with both starts and holds.
+    for speed in [Speed::Slow, Speed::Normal, Speed::Fast] {
+        let (sim, ctrl) = real_room(speed, 180.0);
+        let (writes, reversals) = wb_after(&sim, 6261, 20.0);
+        assert!(sim.handbacks.is_empty(), "{speed:?}: {:?}", sim.handbacks);
+        assert!(at_or_holding(&ctrl), "{speed:?}: {:?}", wb_state(&ctrl));
+        assert!(writes <= 1 && reversals == 0, "{speed:?}: {writes} writes, {reversals} reversals after 20 s");
+        assert!(wb_writes(&sim).len() <= 3, "{speed:?}: {} writes in all", wb_writes(&sim).len());
+        // Where it ended is the room's: neutral to within the band.
+        let est = crate::fx::awb::estimate_light(&sim.picture());
+        assert!(est.t.abs() <= 0.08, "{speed:?}: {} K, t {:+.3}", sim.device_k(), est.t);
+    }
+}
+
+#[test]
+fn the_real_room_with_a_camera_that_answers_stronger_or_weaker_than_expected_stays_calm() {
+    // alpha_true 0.006 / 0.012 against the loop's 0.006 start, and cameras that start far from the light.
+    for speed in [Speed::Slow, Speed::Normal, Speed::Fast] {
+        for (alpha, start) in [(0.006, 6261), (0.012, 6261), (0.009, 5200), (0.009, 6500), (0.009, 4600)] {
+            let (sim, ctrl) = real_room_with(speed, alpha, start, 180.0);
+            let (writes, reversals) = wb_after(&sim, start, 30.0);
+            let what = format!("{speed:?}, alpha {alpha}, from {start} K");
+            assert!(sim.handbacks.is_empty(), "{what}: {:?}", sim.handbacks);
+            assert!(!matches!(wb_state(&ctrl), WhiteBalanceState::Hunting), "{what}");
+            // At most three moves a minute once it has settled, and never a run of turns.
+            assert!(writes <= 8, "{what}: {writes} writes in 150 s");
+            assert!(reversals <= 6, "{what}: {reversals} reversals");
+        }
+    }
+}
+
 #[test]
 fn the_white_balance_resume_point_is_stored_after_three_seconds_at_its_limit() {
     // F2 for white balance: a light the camera cannot correct sits in `at_limit`.

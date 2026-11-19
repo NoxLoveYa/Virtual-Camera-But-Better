@@ -15,6 +15,11 @@
 //! 3. Three times: correct every cell by the estimate, keep the cells that are near neutral *after* that correction
 //!    (saturated objects drop out in both directions) and average them again. The neutral surfaces come back into the
 //!    average as soon as the estimate has moved toward the light.
+//!    The same re-selection is also run from a second start, the weighted median of the cells instead of the
+//!    shades-of-gray mean. Where the two ends differ the picture has two answers (a face brighter than the walls
+//!    pulls the mean start, not the median); the estimate stays the first start's (so Auto Adjust is unchanged) and
+//!    [`LightEstimate::apart`] and [`LightEstimate::t_alt`] carry the other answer for the device loop, which does
+//!    not move on a doubtful picture.
 //! 4. The result is read as a light with a blackbody-locus prior: `t = ln(B/R)` (the temperature axis) is kept as it
 //!    is, the tint is limited to what real lamps show, and an estimate on the magenta side of the locus (skin, wood,
 //!    a red wall are there, lights are not) lowers the confidence instead of being corrected away.
@@ -27,6 +32,9 @@ use super::auto_adjust::{Stats, GRID};
 /// Also used by `auto_controls::sim` (W3) for the device loop's coloured scenes.
 #[cfg(test)]
 pub(crate) mod scenes;
+/// Frames recorded from a real camera, for the stability tests here and in `auto_controls`.
+#[cfg(test)]
+pub(crate) mod real;
 #[cfg(test)]
 mod tests;
 
@@ -88,6 +96,12 @@ pub struct LightEstimate {
     pub conf: f64,
     /// The share of the picture (by centre weight and coverage) the final average rests on.
     pub share: f64,
+    /// How far (in `t`) the answer lies from the one a second start gives (the median of the cells instead of the
+    /// shades-of-gray mean): `0` when the picture has one answer, large when it has two (a bright face beside the
+    /// walls, two lights). The estimate itself is the first start's; the device loop reads this as doubt.
+    pub apart: f64,
+    /// The `t` the second start's answer has (`t` itself when there is none).
+    pub t_alt: f64,
     /// `Ok`, or why `conf` is below [`LOW_CONFIDENCE`].
     pub reason: Reason,
     /// The light as linear RGB with the luma 1 (what `t` and `g` say, as colour).
@@ -102,6 +116,8 @@ impl LightEstimate {
             g: 0.0,
             conf: 0.0,
             share: 0.0,
+            apart: 0.0,
+            t_alt: 0.0,
             reason,
             light: [1.0; 3],
         }
@@ -164,6 +180,75 @@ fn mean(cells: &[[f64; 3]], w: &[f64]) -> Option<[f64; 3]> {
     (y > 0.0 && y.is_finite()).then(|| m.map(|c| c / y))
 }
 
+/// The value below which half of the weight `w` lies.
+fn weighted_median(mut v: Vec<(f64, f64)>) -> f64 {
+    v.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let half = 0.5 * v.iter().map(|x| x.1).sum::<f64>();
+    let mut acc = 0.0;
+    for (x, w) in &v {
+        acc += w;
+        if acc >= half {
+            return *x;
+        }
+    }
+    v.last().map_or(0.0, |x| x.0)
+}
+
+/// The neutral re-selection (step 3): from the estimate `est`, correct every cell, keep the near neutral ones and
+/// average them again, `PASSES` times. Returns the estimate and the weights of the last pass.
+///
+/// `tgs` are the cells' `(t, g)`: the logs are linear, so a cell corrected by `est` has `(t - t_est, g - g_est)`.
+fn reselect(rgb: &[[f64; 3]], tgs: &[(f64, f64)], base: &[f64], start: [f64; 3]) -> ([f64; 3], Vec<f64>) {
+    let (mut est, mut w) = (start, base.to_vec());
+    for _ in 0..PASSES {
+        let (te, ge) = tg(est);
+        let next: Vec<f64> = tgs
+            .iter()
+            .zip(base)
+            .map(|((t, g), b)| {
+                if *b <= 0.0 {
+                    return 0.0;
+                }
+                let d = ((t - te).powi(2) + (2.0 * (g - ge)).powi(2)).sqrt();
+                b * (1.0 - smoothstep(GATE.0, GATE.1, d))
+            })
+            .collect();
+        let sum: f64 = next.iter().sum();
+        w = next;
+        if sum <= MIN_WEIGHT {
+            break;
+        }
+        match mean(rgb, &w) {
+            Some(e) => est = e,
+            None => break,
+        }
+    }
+    (est, w)
+}
+
+/// The second start of the neutral re-selection: the weighted median of the cells' `(t, g)`, as a light of luma 1.
+/// The shades-of-gray mean (the first start) leans on the brightest cells, and a face or a window that is 2-3 times
+/// brighter than the walls pulls the start to its own colour; the re-selection then has two stable answers (the
+/// walls, or the face with half of the walls) and a picture that did not change flipped between them frame to frame
+/// (a real 0 / -0.27 / -0.55 in `t`, docs/AUTO-WHITE-BALANCE.md 9). The median follows what most of the picture
+/// agrees on. `None` when no cell has weight.
+fn median_start(tgs: &[(f64, f64)], w: &[f64]) -> Option<[f64; 3]> {
+    let (mut ts, mut gs) = (Vec::new(), Vec::new());
+    for ((t, g), w) in tgs.iter().zip(w) {
+        if *w > 0.0 {
+            ts.push((*t, *w));
+            gs.push((*g, *w));
+        }
+    }
+    if ts.is_empty() {
+        return None;
+    }
+    let (t, g) = (weighted_median(ts), weighted_median(gs));
+    let light = [(-t / 2.0).exp(), g.exp(), (t / 2.0).exp()];
+    let y = luma(light);
+    (y > 0.0 && y.is_finite()).then(|| light.map(|c| c / y))
+}
+
 /// The cells' gate factors in the last pass (`0..=1`; `0` for a cell that is skipped or whose base weight is 0), for
 /// the tests that check *which* cells the estimate rests on.
 #[cfg(test)]
@@ -207,34 +292,14 @@ fn estimate_core(stats: &Stats) -> (LightEstimate, Vec<f64>) {
         return (LightEstimate::none(Reason::Dark), vec![0.0; n]);
     }
     let dark_or_one = if lit / total < LIT_MIN { Reason::Dark } else { Reason::OneColour };
-    let Some(mut est) = mean(&rgb, &base) else {
+    let Some(start) = mean(&rgb, &base) else {
         return (LightEstimate::none(dark_or_one), vec![0.0; n]);
     };
-
-    let mut w = base.clone();
-    for _ in 0..PASSES {
-        let next: Vec<f64> = rgb
-            .iter()
-            .zip(&base)
-            .map(|(c, b)| {
-                if *b <= 0.0 {
-                    return 0.0;
-                }
-                let (t, g) = tg([c[0] / est[0], c[1] / est[1], c[2] / est[2]]);
-                let d = (t * t + (2.0 * g).powi(2)).sqrt();
-                b * (1.0 - smoothstep(GATE.0, GATE.1, d))
-            })
-            .collect();
-        let sum: f64 = next.iter().sum();
-        w = next;
-        if sum <= MIN_WEIGHT {
-            break;
-        }
-        match mean(&rgb, &w) {
-            Some(e) => est = e,
-            None => break,
-        }
-    }
+    let tgs: Vec<(f64, f64)> = rgb.iter().map(|c| tg(*c)).collect();
+    let (est, w) = reselect(&rgb, &tgs, &base, start);
+    // A second start, from the median (see `median_start`): how far its answer lies from this one.
+    let t_alt = median_start(&tgs, &base).map_or(tg(est).0, |start2| tg(reselect(&rgb, &tgs, &base, start2).0).0);
+    let apart = (tg(est).0 - t_alt).abs();
     let share = w.iter().sum::<f64>() / total;
     let conf0 = smoothstep(SHARE.0, SHARE.1, share);
 
@@ -257,7 +322,7 @@ fn estimate_core(stats: &Stats) -> (LightEstimate, Vec<f64>) {
         Reason::Ok
     };
     let gate = gates(&w);
-    (LightEstimate { t, g: g_out, conf, share, reason, light }, gate)
+    (LightEstimate { t, g: g_out, conf, share, apart, t_alt, reason, light }, gate)
 }
 
 /// The per-channel gains (linear light) that take an estimated `light` (linear RGB, luma 1) to `aim` (the colour a

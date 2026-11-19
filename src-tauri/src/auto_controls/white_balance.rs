@@ -40,7 +40,7 @@ const D_APPLY: f64 = 0.3;
 /// Hold (no move) while the confidence is below this: a scene of one colour, a dark scene.
 const HOLD_BELOW: f64 = 0.3;
 /// Band: `B_out = max(OUT_MIN, OUT_SIGMA·σ)`, `B_in = max(IN_MIN, IN_SIGMA·σ)`.
-const OUT_MIN: f64 = 0.04;
+const OUT_MIN: f64 = 0.06;
 const OUT_SIGMA: f64 = 3.0;
 const IN_MIN: f64 = 0.015;
 const IN_SIGMA: f64 = 1.5;

@@ -1,5 +1,6 @@
 //! Cases A1-A12 of docs/AUTO-WHITE-BALANCE.md 5.2 on the estimator, with the scene kit of `scenes.rs`.
 
+use super::real;
 use super::scenes::*;
 use super::{centre_weight, estimate_light, estimate_with_gate, gains, Reason, LOW_CONFIDENCE};
 use crate::fx::auto_adjust::Stats;
@@ -226,6 +227,39 @@ fn a12_mixed_light_follows_the_light_on_most_neutral_surfaces() {
     let day = neutral_out(g, 5500.0, CAM);
     assert!(residual(day, NEUTRAL).abs() <= 15.0, "daylight side {:+.1} mired", residual(day, NEUTRAL));
     assert!(estimate_light(&stats).conf >= LOW_CONFIDENCE);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Frames from a real camera (`real.rs`): a dim room, a bright window, a face in the lower middle, then a lamp.
+
+#[test]
+fn a_real_room_with_a_bright_face_says_when_it_has_two_answers() {
+    // 112.4 - 113.6 s: the picture hardly changes, and the shades-of-gray start lands on `t` -0.55, -0.27 or -0.18
+    // (the face pulls it) where the median start stays at 0 (docs/AUTO-WHITE-BALANCE.md 9).
+    let calm: Vec<_> = real::between(108.0, 112.4).into_iter().chain(real::between(40.0, 44.0)).collect();
+    assert!(calm.len() > 40);
+    for f in &calm {
+        let est = estimate_light(&f.stats);
+        assert!(est.apart < 0.02 && est.conf > 0.9, "{:.3} s: apart {:.3}, conf {:.2}", f.t, est.apart, est.conf);
+    }
+    let doubt = real::between(112.4, 113.6);
+    assert!(doubt.len() > 8);
+    for f in &doubt {
+        let est = estimate_light(&f.stats);
+        assert!(est.apart > 0.15, "{:.3} s: apart {:.3}", f.t, est.apart);
+        // The alternative answer is the room's: neutral.
+        assert!(est.t_alt.abs() < 0.05, "{:.3} s: the median start says {:+.3}", f.t, est.t_alt);
+    }
+}
+
+#[test]
+fn a_real_lamp_coming_on_is_one_answer() {
+    // 164.0 - 165.4 s: the whole picture turns orange (`t` about -1); nothing to doubt, it is the light.
+    for f in real::between(164.0, 165.4) {
+        let est = estimate_light(&f.stats);
+        let ok = est.t < -0.8 && est.conf > 0.9 && est.apart < 0.02;
+        assert!(ok, "{:.3} s: t {:+.3}, conf {:.2}, apart {:.3}", f.t, est.t, est.conf, est.apart);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------

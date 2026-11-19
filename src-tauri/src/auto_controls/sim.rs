@@ -26,7 +26,7 @@ use std::collections::VecDeque;
 use super::meter::{measure_exposure, srgb_decode, srgb_encode, warmth_target, GRID};
 use super::*;
 use crate::capture::controls::AccessPath;
-use crate::fx::awb::scenes;
+use crate::fx::awb::{real, scenes};
 
 pub type Light = Box<dyn Fn(f64) -> f64>;
 
@@ -117,6 +117,49 @@ pub struct SimCfg {
     pub exposure_auto: bool,
     /// A coloured scene of the kit `fx::awb::scenes` (`None`: the grey wall).
     pub scene: Option<&'static str>,
+    /// Frames recorded from a real camera replace the scene (white balance only: the exposure meter is not fed).
+    pub replay: Option<Replay>,
+}
+
+/// Recorded frames (`fx::awb::real`) played to the controller, forward and back so the loop has no cut.
+#[derive(Clone)]
+pub struct Replay {
+    frames: std::sync::Arc<Vec<real::Frame>>,
+}
+
+impl Replay {
+    pub fn new(frames: Vec<real::Frame>) -> Replay {
+        assert!(frames.len() > 1, "a replay needs frames");
+        Replay { frames: std::sync::Arc::new(frames) }
+    }
+
+    /// The picture at sim time `t` that a camera at `k` would have made (`alpha_true` colour signal per mired): the
+    /// recorded frame, its cells moved along the blue-red axis by the difference between `k` and the Kelvin the
+    /// camera had when it was recorded, each cell keeping its luma.
+    fn shot(&self, t: f64, k: i32, alpha_true: f64) -> Stats {
+        let (t0, t1) = (self.frames[0].t, self.frames[self.frames.len() - 1].t);
+        let span = t1 - t0;
+        let phase = t.rem_euclid(2.0 * span);
+        let pos = t0 + if phase < span { phase } else { 2.0 * span - phase };
+        let at = self.frames.partition_point(|f| f.t <= pos).saturating_sub(1);
+        let f = &self.frames[at];
+        let dc = alpha_true * (1e6 / f64::from(k) - 1e6 / f64::from(f.k));
+        let m = [(-0.5 * dc).exp(), (LOCUS_SLOPE * dc).exp(), (0.5 * dc).exp()];
+        let cells = f
+            .stats
+            .cells
+            .iter()
+            .map(|c| {
+                let rgb = [0, 1, 2].map(|i| f64::from(c[i]));
+                let moved = [0, 1, 2].map(|i| rgb[i] * m[i]);
+                let n = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2])
+                    / (0.2126 * moved[0] + 0.7152 * moved[1] + 0.0722 * moved[2]).max(1e-9);
+                let v = [0, 1, 2].map(|i| (moved[i] * n).min(1.0) as f32);
+                [v[0], v[1], v[2], c[3]]
+            })
+            .collect();
+        Stats { cells }
+    }
 }
 
 impl Default for SimCfg {
@@ -139,6 +182,7 @@ impl Default for SimCfg {
             wb: None,
             exposure_auto: true,
             scene: None,
+            replay: None,
         }
     }
 }
@@ -326,6 +370,8 @@ struct Capture {
     t: f64,
     e: i32,
     g: i32,
+    /// The white balance the frame was made with.
+    k: i32,
     light: f64,
     cast: Option<[f64; 3]>,
 }
@@ -553,6 +599,9 @@ impl Sim {
 
     /// The noiseless statistics image of the landed state now: what Auto Adjust would measure after this loop.
     pub fn picture(&self) -> Stats {
+        if let (Some(r), Some(w)) = (&self.cfg.replay, self.cfg.wb) {
+            return r.shot(self.t, self.eff_k, w.alpha_true);
+        }
         let cast = self.cast(self.eff_k, (self.temp)(self.t));
         self.scene
             .render(self.eff_e, self.eff_g, (self.light)(self.t), cast, None)
@@ -778,6 +827,7 @@ impl Sim {
                     t: start,
                     e: self.eff_e,
                     g: self.eff_g,
+                    k: self.eff_k,
                     light,
                     cast: self.cast(self.eff_k, (self.temp)(start)),
                 },
@@ -791,7 +841,10 @@ impl Sim {
             if self.paused || self.no_samples {
                 continue;
             }
-            let stats = self.scene.render(c.e, c.g, c.light, c.cast, Some(&mut self.rng));
+            let stats = match (&self.cfg.replay, self.cfg.wb) {
+                (Some(r), Some(w)) => r.shot(c.t, c.k, w.alpha_true),
+                _ => self.scene.render(c.e, c.g, c.light, c.cast, Some(&mut self.rng)),
+            };
             ctrl.on_sample(
                 &MeterSample {
                     token: 1,

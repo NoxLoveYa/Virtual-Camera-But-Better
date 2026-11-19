@@ -169,6 +169,10 @@ pub fn warmth_target(warmth: f64) -> f64 {
 /// 25 of 255; the exposure loop aims at 0.45, so only a picture that is dark for good ends here.
 pub const MIN_MEAN_LUMA: f64 = 0.10;
 
+/// `LightEstimate::apart` (in `t`) from which the loop doubts the reading: no doubt below the first edge, none of
+/// the confidence left at the second.
+pub const TWO_ANSWERS: (f64, f64) = (0.02, 0.06);
+
 /// The centre weighted mean coded luma of the cells that have a picture, `None` when there are none.
 fn mean_coded_luma(stats: &Stats) -> Option<f64> {
     let (mut total, mut sum) = (0.0, 0.0);
@@ -195,16 +199,25 @@ pub fn measure_white_balance(stats: &Stats, warmth: f64) -> WhiteBalanceReading 
             reason: Reason::Dark,
         };
     }
+    // A picture with two answers (a bright face beside the walls: the estimator's two starts end `apart` from each
+    // other) is not measured: the loop would follow whichever the next frame lands on (docs/AUTO-WHITE-BALANCE.md 9).
+    let confidence = est.conf * (1.0 - smoothstep(TWO_ANSWERS.0, TWO_ANSWERS.1, est.apart));
+    let reason = if est.reason == Reason::Ok && confidence < crate::fx::awb::LOW_CONFIDENCE {
+        Reason::OneColour
+    } else {
+        est.reason
+    };
     WhiteBalanceReading {
-        error: est.t - warmth_target(warmth),
-        confidence: est.conf,
-        reason: est.reason,
+        error: 0.5 * (est.t + est.t_alt) - warmth_target(warmth),
+        confidence,
+        reason,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fx::awb::real;
 
     fn tinted(c: f64) -> Stats {
         // Luma 0.25 everywhere, blue over red `e^c`.
@@ -294,6 +307,27 @@ mod tests {
             cells: vec![[0.0, 0.0, 0.0, 1.0]; GRID * GRID],
         };
         assert_eq!(measure_white_balance(&black, 0.0).reason, Reason::Dark);
+    }
+
+    #[test]
+    fn a_real_room_is_read_calmly_or_not_at_all() {
+        // Frames of the owner's desk at a constant 6261 K (a bright face in a dim room): the neutral walls read about
+        // 0. A reading is either held (confidence under 0.3) or within 0.06 of that; it used to be -0.27 with a full
+        // confidence for a second.
+        let frames = real::between(108.0, 113.7);
+        assert!(frames.len() > 40);
+        let mut sure = 0;
+        for f in &frames {
+            let r = measure_white_balance(&f.stats, 0.0);
+            assert!(r.confidence < 0.3 || r.error.abs() <= 0.06, "{:.3} s: {r:?}", f.t);
+            sure += usize::from(r.confidence >= 0.3);
+        }
+        assert!(sure * 10 >= frames.len() * 7, "{sure} of {} frames read", frames.len());
+        // A lamp coming on is read at once and in full.
+        for f in real::between(164.0, 165.4) {
+            let r = measure_white_balance(&f.stats, 0.0);
+            assert!(r.error < -0.8 && r.confidence > 0.9, "{:.3} s: {r:?}", f.t);
+        }
     }
 
     #[test]

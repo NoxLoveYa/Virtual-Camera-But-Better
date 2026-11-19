@@ -334,7 +334,14 @@ of the status while the state lasts (not before the 3 s are over).
   wrong. The hold itself (`conf_wb < 0.3`) is unchanged, but under a strong orange cast the confidence is no longer
   low: `a_cast_with_nothing_neutral_to_trust_is_held` (6.2, the 0.012 camera at 3000 K) is reversed into
   `a_strong_cast_is_followed`.
-- Band: `B_out = max(0.04, 3σ_wb)`, `B_in = max(0.015, 1.5σ_wb)`, same holding/adjusting states.
+- Band: `B_out = max(0.06, 3σ_wb)`, `B_in = max(0.015, 1.5σ_wb)`, same holding/adjusting states. **Note (live finding,
+  constant changed): `B_out` floor 0.04 → 0.06.** The estimate of a person at a desk wanders by ±0.03-0.05 on its own;
+  with 0.04 the loop followed it, reversed, and W4 handed back. See AUTO-WHITE-BALANCE.md 9.
+- **Note (live finding, rule changed): the loop's `ê_wb` is the mean of the estimator's two answers and a picture with
+  two answers holds.** `e_wb = (t + t_alt)/2 − c*`, and `conf_wb = conf · (1 − smoothstep(0.02, 0.06, apart))`, where
+  `apart` is how far the median-start answer lies from the shades-of-gray one (`fx::awb`, 3.1 step 3). A bright face
+  beside dim walls has two stable answers; before, the loop took whichever the frame landed on (`t` 0, −0.27, −0.55
+  within a second on a still picture). Texts: the hold says "mostly one colour" (`conf < 0.3`, reason `OneColour`).
 - Move: `ΔM = clamp(−k_wb · ê_wb / α, −ΔM_max, +ΔM_max)`; `K' = round_to_step(10⁶ / (M + ΔM))`, clamped to
   `K_min..K_max`; skip if `|K' − K| < step`.
 - White balance never writes in the same 0.3 s as an exposure batch, and waits while the exposure loop is

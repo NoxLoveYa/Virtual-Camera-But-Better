@@ -737,3 +737,107 @@ picker, then Edit colours shows Red, Green, Blue (0-255). "R − B" is Red minus
 | D2 | Mixed light: **the light on most neutral surfaces wins** (the recommendation). | A12 as written. |
 | D3 | Largest Auto Adjust gain per channel: **4** (limits `0.25 ..= 4`). | Used in W2. |
 | D4 | A face filling the frame under warm light: **hold** (the recommendation). | The skin guard as designed. See the W1 note: the hold is partial under tungsten. |
+
+---
+
+## 9. Live finding: the loop jitters and hands back on a real picture (2026-11-19)
+
+**Report (owner, W4GS):** Camera controls → White balance → Better Cam auto "jitters a lot and goes back to the cam
+default".
+
+### 9.1 Evidence
+
+- **The owner's record (read-only copy of the WebView2 localStorage):** speed `slow`, warmth 0, `learned.wb_alpha`
+  0.0080 (0.0051 earlier); no `blocked` entry (so W2 `ignored` never fired for white balance); a stored white balance
+  of 2800 K at one point (the loop had reached the warm end once). The app writes no log file: `[auto]` lines go to
+  stderr, which the owner's instance does not keep. So the cause was reproduced, not read.
+- **The W4GS reports a Kelvin step of 1** (`get_camera_controls`: `white_balance` 2800..6500, step 1). Writes are not
+  quantised: not the cause, and W2 (read-back ≠ request) cannot fire from rounding.
+- **Live, before the fix** (debug build, Better Cam auto white balance, Normal, the owner's desk: a dim room, a bright
+  window in the top left, a face in the lower middle, a lamp that came on; 16 x 16 stats of every frame logged):
+  in a still scene the loop was quiet (25-60 s: 0 writes, `|e|` < 0.02). Whenever the face moved the loop wrote:
+  `K` 6261 → 5672 → 6102 → 6233 within 3 s at 112-115 s (a 16 mired excursion and back), 14 writes in 150 s. A warm
+  lamp coming on at 164 s was followed correctly (6233 → 3538 K in 4.5 s, neutral again) and, when it went off, back to
+  6334 K in 6 s: the loop itself is sound.
+- **Cause in the estimator, per frame (112.3-113.6 s, the picture hardly changes, `K` constant 6261):**
+
+  | t (s) | 112.32 | 112.44 | 112.56 | 112.68 | 112.80 | 113.04 | 113.28 | 113.52 |
+  |---|---|---|---|---|---|---|---|---|
+  | `t` (shades-of-gray start) | −0.004 | −0.549 | −0.524 | −0.401 | −0.271 | −0.309 | −0.252 | −0.176 |
+  | confidence | 1.00 | 0.00 | 0.00 | 0.02 | 1.00 | 0.97 | 1.00 | 1.00 |
+  | `t` (median start) | −0.004 | −0.004 | −0.004 | −0.003 | +0.002 | +0.007 | +0.007 | +0.009 |
+
+  The room is walls at luma 0.1-0.3 and a face at 0.5-0.75 with `ln(B/R)` about −0.7, plus a clipped window. The
+  mean of the brightest cells (`p = 4`, step 2 of 3.1) starts at the face's colour; the re-selection (step 3) then has
+  two stable answers, the walls alone (`t` 0) or the face with the lower half of the walls (−0.2 to −0.5), and which
+  one it lands on changes from one frame to the next with no visible change in the picture. Confidence is 1.0 on the
+  wrong one (the face is not on the magenta side of the locus on this camera, so the skin guard does not fire).
+- **Which watchdog rule fires: W4.** The loop follows each answer (`e_wb` −0.27 is a 5 to 16 mired move), turns round
+  when the other answer returns, and counts reversals of 2 mired and more. Replaying the recorded frames through the
+  loop and the simulated camera (9.3): `Normal` damped and then handed back to Camera auto ("kept swinging") at 43 s,
+  `Fast` at 28 s; `Slow` moves too little per decision to hand back but wrote 160 times in 3 minutes (40 reversals).
+  W2, W3 and W6 did not fire anywhere (read-backs matched, the picture answered, nobody else wrote).
+
+### 9.2 Fix
+
+1. **`fx/awb.rs`: a second start.** The re-selection runs again from the weighted median of the cells' `(t, g)` (new
+   `median_start`, `reselect`; the per-cell logs are now computed once, the estimate costs 19 µs, budget 50). The
+   estimate (`t`, `g`, `conf`, `light`) is still the first start's, so Auto Adjust and A1-A12 are unchanged. Two new
+   fields: `apart = |t_first − t_second|` (0 in 95 % of the real frames, 0.54 at worst) and `t_alt` (the second's `t`).
+   A pure median start was tried and rejected: it breaks A5 (closeup at 2700 K), A6 (blue wall at 3000 K) and A12 (two
+   lights), and so did every rule that picked the second answer in the estimator itself (smaller `|t|`, a coherence
+   test): the two answers are equally good by every picture measure on frames like these (tight-area 36 against 36).
+2. **`auto_controls/meter.rs`: the loop measures with both and doubts the rest.** `e_wb` is now the mean of the two
+   starts' `t` minus the aim (the second start was steady at ±0.015 over the whole clip where the first jumped by
+   0.5, and the mean halves what is left); the confidence is multiplied by `1 − smoothstep(0.02, 0.06, apart)`, so a
+   picture with two answers holds (`no_signal`, the one-colour text) instead of moving. New constant
+   `TWO_ANSWERS = (0.02, 0.06)`.
+3. **`auto_controls/white_balance.rs`: `OUT_MIN` 0.04 → 0.06.** The real picture of a person at a desk moves the
+   estimate by ±0.03-0.05 on its own (the face, the hair, the window); a band of 0.04 sat on that noise. 0.06 is 5.7 mired
+   (the office B7 allows 10). Replay writes at `Normal` with the second start already in and a camera of `α_true`
+   0.006: 21 → 1.
+   `IN_MIN` (0.015), `OUT_SIGMA`, `k`, `ΔM_max`, the watchdog and `α` learning are unchanged.
+
+| Constant | Old | New | Why |
+|---|---|---|---|
+| `OUT_MIN` (`white_balance.rs`) | 0.04 | 0.06 | The estimate of a moving person wanders ±0.05; the band sat inside it. |
+| `TWO_ANSWERS` (`meter.rs`) | — | (0.02, 0.06) | Doubt from `apart`: `apart` is 0 on 95 % of lit frames, 0.05 on the rest of the quiet ones, and 0.2-0.55 on the bad frames. |
+| `e_wb` of the loop | `t − c*` | `(t + t_alt)/2 − c*` | The second start is steadier; averaging halves the rest. |
+| estimator output | `t` of the mean start | unchanged (`t_alt`, `apart` added) | Auto Adjust and A1-A12 keep their behaviour. |
+
+### 9.3 Tests
+
+- **Fixture** `fx/awb/fixtures/real_room.txt` (144 kB, 93 frames of the 16 x 16 stats, 12-bit coded, from the recording
+  above: 108-116 s (the face, 6261 → 5672 → 6102 → 6233 K), 40-44 s (still), 163-165.4 s (the lamp); `real.rs` loads it;
+  `k` is the Kelvin the *picture* was made with: the camera applies a write about 0.2 s after it returns).
+- `fx::awb` `a_real_room_with_a_bright_face_says_when_it_has_two_answers` (the frames of 112.4-113.6 s have `apart` > 0.15
+  and the second answer within 0.05 of neutral; the quiet frames have `apart` < 0.02), `a_real_lamp_coming_on_is_one_answer`.
+- `auto_controls::meter` `a_real_room_is_read_calmly_or_not_at_all` (held or within 0.06 on every frame; the lamp read
+  in full: it failed with `conf 1.0, e −0.27`).
+- `auto_controls::tests` `a_face_in_a_dim_room_does_not_make_the_loop_hunt_or_hand_back` (the recording played forward and
+  back through the loop and the sim for 180 s, `Slow`, `Normal`, `Fast`: no hand-back, at most 1 write after 20 s, no
+  reversal) and `the_real_room_with_a_camera_that_answers_stronger_or_weaker_than_expected_stays_calm` (`α_true` 0.006,
+  0.012, cameras starting at 4600-6500 K: no hand-back, no `hunting`, at most 8 moves in 150 s). Both fail on the old
+  meter and band (`Slow`: 53 writes, 22 reversals after 20 s). The sim (`SimCfg::replay`) moves each recorded frame by
+  `α_true · ΔM` along the blue-red axis for the camera's Kelvin, each cell keeping its luma.
+- Replay, before → after (`α_true` 0.009, start 6261 K, 180 s):
+
+  | Speed | Writes (before) | Hand-back (before) | Writes (after) | Hand-back (after) |
+  |---|---|---|---|---|
+  | Slow | 160 (40 reversals) | none | 1 | none |
+  | Normal | 32 | `hunting` at 42.9 s | 1 | none |
+  | Fast | 15 | `hunting` at 27.5 s | 1 | none |
+
+- Checks: `cargo test -p better-cam --lib fx::awb` 21 passed, `auto_controls` 99, `fx::auto_adjust` 55; clippy clean.
+
+### 9.4 Not covered, to know
+
+- The replay is the owner's desk at one moment. A different room may have another pair of answers; `apart` is the
+  general detector, the band the general cushion.
+- **Auto Adjust still has the first start's flips** (it uses `t`, `light` and `conf`, unchanged on purpose: A1-A12). Its
+  output smoothing is 0.5 s; if the owner sees the *picture* (not the Kelvin) shift when the face moves, the next step is
+  to give `gains` the same doubt (`conf × (1 − smoothstep(0.02, 0.06, apart))` and `t_alt` in the light), which A12
+  (two lights) has to be re-decided for.
+- The live after-fix run (about 8 minutes, `Slow`, on the desk with nobody in front of the camera and the room dark or
+  lit by coloured lamps) held 6500 K, 0 white balance writes and no hand-back; it could not reproduce the face in
+  front. The evidence for the fix is the recorded frames.
