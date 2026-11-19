@@ -157,6 +157,15 @@ impl Shared {
         })
     }
 
+    /// `(signal_seq, writer_frames)`, `signal_seq` first, each loaded with acquire ordering: the two counters a pump
+    /// that waits on the frame event compares after a wake-up, without loading the whole header. The order is the same
+    /// as in [`Shared::header`] (see `RawHeader::load`).
+    pub fn signal_counters(&self) -> (u64, u64) {
+        let seq = self.a64(off::SIGNAL_SEQ).load(Ordering::Acquire);
+        let frames = self.a64(off::WRITER_FRAMES).load(Ordering::Acquire);
+        (seq, frames)
+    }
+
     /// Descriptor of slot `i` (unvalidated, not checked for tearing).
     pub fn slot_meta(&self, i: usize) -> SlotMeta {
         let so = slot_off(i.min(SLOT_COUNT - 1));
@@ -217,9 +226,29 @@ impl Shared {
         before_wipe();
         // The frame event fields are read through atomics by readers that do not look at `magic` first (the DLL polls
         // them while the file is being started over), so they are wiped with atomic stores, not by the plain
-        // `write_bytes` below (a non-atomic write that races an atomic read is a data race). Bytes 448..528 are whole
-        // `u64`s: `features` (with its padding), nonce `.0`, `signal_seq`, the DLL's `wake_*` and nonce `.1`.
-        for o in (off::FEATURES..off::EVENT_NONCE1_HI + 8).step_by(8) {
+        // `write_bytes` below (a non-atomic write that races an atomic read is a data race). Every location is wiped
+        // with an atomic of the size it is accessed with everywhere else: `features` (448) and its padding (452),
+        // `wake_mode` (480) and its padding (484) are 32-bit fields (two 32-bit stores each, never one 64-bit store over
+        // both: a mixed-size access to the same bytes is not defined for atomics); the nonces, `signal_seq` and the
+        // counters are 64-bit.
+        for o in [
+            off::FEATURES,
+            off::FEATURES + 4,
+            off::WAKE_MODE,
+            off::WAKE_MODE + 4,
+        ] {
+            self.a32(o).store(0, Ordering::Relaxed);
+        }
+        for o in [
+            off::EVENT_NONCE_LO,
+            off::EVENT_NONCE_HI,
+            off::SIGNAL_SEQ,
+            off::WAKE_EVENTS,
+            off::WAKE_MISSED,
+            off::WAKE_SPURIOUS,
+            off::EVENT_NONCE1_LO,
+            off::EVENT_NONCE1_HI,
+        ] {
             self.a64(o).store(0, Ordering::Relaxed);
         }
         // SAFETY: the rest of the header is inside the mapping; atomics are not used on these bytes while we are the

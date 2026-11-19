@@ -7,6 +7,7 @@
 //! its presentation descriptor starts nothing.
 
 use std::collections::VecDeque;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,9 +15,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use windows::Win32::Foundation::{CloseHandle, E_UNEXPECTED, HANDLE, S_OK};
-use windows::Win32::Media::timeBeginPeriod;
-use windows::Win32::Media::timeEndPeriod;
+use windows::Win32::Foundation::{E_UNEXPECTED, HANDLE, S_OK};
 use windows::Win32::Media::KernelStreaming::{
     IKsControl, IKsControl_Impl, KSIDENTIFIER, PINNAME_VIDEO_CAPTURE,
 };
@@ -32,17 +31,15 @@ use windows::Win32::Media::MediaFoundation::{
     MF_STREAM_STATE_RUNNING, MF_STREAM_STATE_STOPPED,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
-use windows::Win32::System::Threading::{
-    CreateWaitableTimerExW, SetWaitableTimer, WaitForSingleObject,
-    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
-};
+use windows::Win32::System::Threading::{CreateEventW, SetEvent};
 use windows_core::{implement, ComObject, Error, IUnknown, Interface, Ref, Result, GUID, HRESULT};
 
 use crate::attrs::delegate_attributes;
-use crate::frames::{FrameSource, Poll, Wait};
+use crate::frames::{FrameSource, Poll};
 use crate::guard::{guard, LockExt};
 use crate::mediatype::{advertised_types, FrameFormat, PixelFormat};
 use crate::samples::{PoolStats, SampleSink};
+use crate::wake::{Os, Wake};
 use crate::{object_created, object_dropped, pump_thread_spawned, vlog};
 
 /// Media Foundation event queues and sample tokens are free-threaded (they are handed to arbitrary MF work
@@ -62,6 +59,29 @@ struct PumpInner {
 struct PumpShared {
     inner: Mutex<PumpInner>,
     cv: Condvar,
+    /// Set by [`Pump::stop`] after the `stop` flag: the pump's kernel waits (the frame event and the timer) watch it, so a
+    /// stop never waits for a signal or a deadline. Manual-reset: once set it stays set, and the pump ends. `None` when
+    /// it could not be made: the waits are then short steps that look at the flag.
+    stop_event: Option<OwnedHandle>,
+}
+
+impl PumpShared {
+    fn signal_stop(&self) {
+        if let Some(h) = &self.stop_event {
+            let _ = unsafe { SetEvent(HANDLE(h.as_raw_handle())) };
+        }
+    }
+
+    fn stop_handle(&self) -> Option<HANDLE> {
+        self.stop_event.as_ref().map(|h| HANDLE(h.as_raw_handle()))
+    }
+}
+
+/// An unnamed manual-reset event, not signalled.
+fn make_stop_event() -> Option<OwnedHandle> {
+    let h = unsafe { CreateEventW(None, true, false, windows_core::PCWSTR::null()) }.ok()?;
+    // SAFETY: a new handle that nothing else owns.
+    Some(unsafe { OwnedHandle::from_raw_handle(h.0) })
 }
 
 /// Set when the pump thread has finished, whatever way it ended.
@@ -87,31 +107,6 @@ struct Pump {
     shared: Arc<PumpShared>,
     thread: Option<JoinHandle<()>>,
     done: Arc<Done>,
-}
-
-/// `timeBeginPeriod(1)` for the life of the value, ended on every path out of the pump, a panic included.
-struct TimerPeriod;
-
-#[cfg(test)]
-thread_local! {
-    static OPEN_PERIODS: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
-}
-
-impl TimerPeriod {
-    fn begin() -> TimerPeriod {
-        unsafe { timeBeginPeriod(1) };
-        #[cfg(test)]
-        OPEN_PERIODS.with(|c| c.set(c.get() + 1));
-        TimerPeriod
-    }
-}
-
-impl Drop for TimerPeriod {
-    fn drop(&mut self) {
-        unsafe { timeEndPeriod(1) };
-        #[cfg(test)]
-        OPEN_PERIODS.with(|c| c.set(c.get() - 1));
-    }
 }
 
 /// Tell the consumer the stream has failed: it gets an `MEError` instead of silence.
@@ -153,6 +148,7 @@ impl Pump {
                 stop: false,
             }),
             cv: Condvar::new(),
+            stop_event: make_stop_event(),
         });
         let done = Arc::new(Done {
             flag: Mutex::new(false),
@@ -203,6 +199,8 @@ impl Pump {
             g.stop = true;
         }
         self.shared.cv.notify_all();
+        // after the flag: a wait that ends on the event finds the flag set
+        self.shared.signal_stop();
         let Some(t) = self.thread.take() else {
             return;
         };
@@ -227,42 +225,6 @@ impl Pump {
 /// overflowing, whatever the inputs.
 pub(crate) fn next_timestamp(sample_qpc: u64, prev_ts: i64) -> i64 {
     vcam_protocol::qpc_to_hns(sample_qpc).max(prev_ts.saturating_add(1))
-}
-
-/// A high-resolution waitable timer for the 1 ms polls (falls back to `sleep` when the OS lacks one).
-struct HiResTimer(Option<HANDLE>);
-
-impl HiResTimer {
-    fn new() -> HiResTimer {
-        let h = unsafe {
-            CreateWaitableTimerExW(
-                None,
-                windows_core::PCWSTR::null(),
-                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                TIMER_ALL_ACCESS.0,
-            )
-        };
-        HiResTimer(h.ok())
-    }
-
-    fn wait_1ms(&self) {
-        if let Some(h) = self.0 {
-            let due: i64 = -10_000; // 1 ms, relative, in 100 ns units
-            if unsafe { SetWaitableTimer(h, &due, 0, None, None, false) }.is_ok() {
-                unsafe { WaitForSingleObject(h, 50) };
-                return;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-}
-
-impl Drop for HiResTimer {
-    fn drop(&mut self) {
-        if let Some(h) = self.0.take() {
-            let _ = unsafe { CloseHandle(h) };
-        }
-    }
 }
 
 fn is_stopped(shared: &PumpShared) -> bool {
@@ -326,9 +288,10 @@ fn pump_loop_with(
     path: PathBuf,
     mut sink: SampleSink,
 ) -> PoolStats {
-    let _period = TimerPeriod::begin();
-    let timer = HiResTimer::new();
-    let freq = vcam_protocol::qpc_frequency();
+    // How this pump waits ([`crate::wake`]): the stop event, a high-resolution timer, and the writer's frame events when
+    // there are events it can trust. It holds the 1 ms timer resolution (as this pump always did) while it polls, and
+    // gives it back in event mode; it and everything it holds end with the pump, a panic included.
+    let mut wake = Wake::new(Os::new(shared.stop_handle(), path.clone()));
     let mut src = FrameSource::new(path, fmt);
     src.start();
     let mut prev_ts: i64 = 0;
@@ -358,13 +321,9 @@ fn pump_loop_with(
             let now = vcam_protocol::qpc_now();
             match src.poll(now, &mut sink) {
                 Poll::Ready(e) => break e,
-                Poll::Wait(Wait::Soon) => timer.wait_1ms(),
-                Poll::Wait(Wait::Until(t)) => {
-                    let ns = (t.saturating_sub(now) as u128 * 1_000_000_000 / freq as u128) as u64;
-                    let g = shared.inner.lock_safe();
-                    let _ = shared
-                        .cv
-                        .wait_timeout_while(g, Duration::from_nanos(ns), |i| !i.stop);
+                // the wait ends early for the stop event; the loop looks at the stop flag again
+                Poll::Wait(w) => {
+                    wake.wait(w, &mut src);
                 }
             }
         };
@@ -380,7 +339,8 @@ fn pump_loop_with(
                         prev_ts = ts;
                         src.finish_emit(emit, vcam_protocol::qpc_now());
                         let n = frames_out.fetch_add(1, Ordering::Relaxed) + 1;
-                        #[allow(clippy::manual_is_multiple_of)] // MSRV 1.87: unsigned `is_multiple_of` is stable only from 1.90
+                        #[allow(clippy::manual_is_multiple_of)]
+                        // MSRV 1.87: unsigned `is_multiple_of` is stable only from 1.90
                         if n <= 3 || n % 900 == 0 {
                             vlog!("sample #{n} {:?} ts={ts}", emit.kind);
                         }
@@ -397,6 +357,7 @@ fn pump_loop_with(
             }
         }
     }
+    wake.finish(&mut src);
     src.stop();
     let stats = sink.stats();
     vlog!(
@@ -794,6 +755,7 @@ const _: Option<PixelFormat> = None;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wake::{TimerPeriod, OPEN_PERIODS};
     use std::sync::mpsc;
     use std::time::Instant;
     use windows::Win32::Media::MediaFoundation::{
@@ -996,6 +958,117 @@ mod tests {
             "a sample was posted after the stop"
         );
         pump.stop_within(Duration::from_secs(2));
+    }
+
+    /// Start and stop the pump 200 times on a live feed in event mode: nothing it opens stays open (the frame events,
+    /// the stop event, the timer, the log and file handles), the 1 ms timer resolution is balanced, and every cycle
+    /// really went through the events (a pump that never opened them would pass the other checks).
+    #[test]
+    fn start_and_stop_200_times_leaks_no_handle_and_balances_the_timer_period() {
+        use crate::wake::probe;
+        use std::sync::atomic::AtomicBool;
+        use vcam_protocol::{qpc_now, SlotFormat, Writer, WriterState, SUBTYPE_NV12};
+        use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+
+        let q = queue();
+        let path = crate::test_dir("stream").join("cycles.bin");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        probe::reset(&path);
+        let fmt = FrameFormat {
+            pixel: PixelFormat::Nv12,
+            width: 320,
+            height: 180,
+            fps: 120,
+        };
+        let writer = Arc::new(Writer::create(&path).unwrap());
+        writer.set_advertised(&vcam_protocol::advertised_for_output(320, 180, 120));
+        writer.set_state(WriterState::Live);
+        let stop = Arc::new(AtomicBool::new(false));
+        let feeder = {
+            let (w, stop) = (writer.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let began = Instant::now();
+                let mut n = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    let f = SlotFormat {
+                        width: 320,
+                        height: 180,
+                        stride: 320,
+                        subtype: SUBTYPE_NV12,
+                    };
+                    let _ = w.publish(f, qpc_now(), |d| d.fill(n as u8));
+                    n += 1;
+                    let due = began + Duration::from_micros(8_333) * n;
+                    std::thread::sleep(due.saturating_duration_since(Instant::now()));
+                }
+            })
+        };
+        let count = || {
+            let mut n = 0u32;
+            let _ = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut n) };
+            n as i64
+        };
+        let one_cycle = || {
+            let p = path.clone();
+            let mut pump = Pump::spawn_with(q.clone(), move |shared, queue| {
+                pump_loop(shared, queue, fmt, &AtomicU64::new(0), p);
+            })
+            .unwrap();
+            // two requests: the second makes the pump wait for the next frame, which is when it opens the events
+            pump.add_token(None);
+            pump.add_token(None);
+            let began = Instant::now();
+            let mut samples = 0;
+            while samples < 2 {
+                match unsafe { q.GetEvent(MF_EVENT_FLAG_NO_WAIT.0) } {
+                    Ok(e) if unsafe { e.GetType() }.unwrap() == MEMediaSample.0 as u32 => {
+                        samples += 1
+                    }
+                    Ok(_) => {}
+                    Err(_) => std::thread::sleep(Duration::from_micros(300)),
+                }
+                assert!(began.elapsed() < Duration::from_secs(5), "no sample");
+            }
+            pump.stop_within(Duration::from_secs(2));
+            assert!(*pump.done.flag.lock_safe(), "the pump did not end");
+        };
+        // the first cycles make the one-time things (the log, the decoded slates, the work queue of the sample pool)
+        for _ in 0..5 {
+            one_cycle();
+        }
+        let before = count();
+        for _ in 0..200 {
+            one_cycle();
+        }
+        let after = count();
+        stop.store(true, Ordering::Relaxed);
+        feeder.join().unwrap();
+        let p = probe::get(&path);
+        assert!(
+            p.opens >= 200,
+            "{} opens: the cycles did not go through the events",
+            p.opens
+        );
+        assert_eq!(p.events_live, 0, "a pair of events stayed open");
+        assert_eq!(
+            p.waiters_live, 0,
+            "a pump's timer or timer period stayed open"
+        );
+        assert_eq!(p.waiters, 205);
+        assert_eq!(p.periods_held, 0, "timeBeginPeriod was not balanced");
+        assert!(
+            p.period_begins >= 205,
+            "{} timeBeginPeriod calls",
+            p.period_begins
+        );
+        // The tests of this process run side by side and open handles of their own (up to about 60 were seen), so
+        // this is a net: a leak of even one handle a cycle is 200. The exact counts above are what pins each handle.
+        assert!(
+            after - before < 150,
+            "{before} handles before, {after} after 200 start/stop cycles"
+        );
+        drop(writer);
     }
 
     #[test]

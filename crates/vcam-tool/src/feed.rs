@@ -18,6 +18,7 @@ use vcam_protocol::{
     WriterState, SUBTYPE_NV12, SUBTYPE_RGB32,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(not(test))]
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
 use windows::Win32::System::Threading::{
     CreateWaitableTimerExW, SetWaitableTimer, WaitForSingleObject,
@@ -94,6 +95,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
 
 static CTRL_C: AtomicBool = AtomicBool::new(false);
 
+#[cfg(not(test))]
 unsafe extern "system" fn ctrl_handler(_kind: u32) -> windows_core::BOOL {
     CTRL_C.store(true, Ordering::SeqCst);
     windows_core::BOOL(1)
@@ -166,6 +168,19 @@ fn subtype_name(s: u32) -> &'static str {
     }
 }
 
+/// What to print when the frame file could not be made. The hint is about the installer's folder, so it is given only
+/// for the default path: for a scratch file somebody typed (`scratch`) it would send them to the wrong place.
+fn create_failure(path: &std::path::Path, e: &std::io::Error, scratch: bool) -> String {
+    if scratch {
+        format!("cannot create {}: {e}", path.display())
+    } else {
+        format!(
+            "cannot create {}: {e}\n(run 'vcam-tool register' once so the folder has the right ACL)",
+            path.display()
+        )
+    }
+}
+
 pub fn run(args: &[String]) -> i32 {
     let a = match parse_args(args) {
         Ok(a) => a,
@@ -187,13 +202,12 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
         Err(e) => {
-            eprintln!(
-                "cannot create {}: {e}\n(run 'vcam-tool register' once so the folder has the right ACL)",
-                path.display()
-            );
+            eprintln!("{}", create_failure(&path, &e, a.file.is_some()));
             return 1;
         }
     };
+    // a test that runs the feed in its process must not leave a process-wide Ctrl-C handler behind
+    #[cfg(not(test))]
     unsafe {
         let _ = SetConsoleCtrlHandler(Some(ctrl_handler), true);
     }
@@ -411,6 +425,20 @@ mod tests {
             std::fs::metadata(&fresh).unwrap().len(),
             vcam_protocol::FILE_SIZE
         );
+    }
+
+    /// The "run vcam-tool register" hint belongs to the installer's folder only.
+    #[test]
+    fn the_register_hint_is_for_the_default_path_only() {
+        let e = std::io::Error::from_raw_os_error(3);
+        let p = std::path::Path::new(r"Q:\nowhere\frames.bin");
+        assert!(create_failure(p, &e, false).contains("vcam-tool register"));
+        let scratch = create_failure(p, &e, true);
+        assert!(!scratch.contains("register"), "{scratch}");
+        assert!(scratch.contains(r"Q:\nowhere\frames.bin"), "{scratch}");
+        // through `run`: a scratch path that cannot be made reports without the hint and fails
+        let args = s(&["--seconds", "0.2", "--file", r"Q:\nowhere\frames.bin"]);
+        assert_eq!(run(&args), 1);
     }
 
     #[test]

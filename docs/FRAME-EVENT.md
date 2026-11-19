@@ -1,6 +1,7 @@
 # FRAME-EVENT: wake the camera service's pump on a new frame instead of polling
 
-Status 2026-11-19: phase 1 (`feed98c`) and phase 2 (app and tool side) are built; phase 3 (the DLL pump) is not. Phase 1's
+Status 2026-11-19: phases 1 (`feed98c`), 2 (`29d1c6e`) and 3 are built; phase 3 (the DLL pump, uncommitted, **awaiting its
+audit**) is described under "Phase 3 as built" below, and phase 4 (live) has not run. Phase 1's
 review fixes: public names (no secret nonce), a second nonce for `.1`, `ERROR_INVALID_HANDLE` as a taken name, `features`
 cleared before the header wipe. The rest of this document is the design as first written on 2026-11-18 against the working
 tree on top of `ce45acc`. That tree includes the
@@ -356,7 +357,7 @@ reads it once a frame.
 | new | old | The old DLL ignores bytes 448..528 and polls. The new app signals events that nobody waits on (two syscalls per frame). |
 | new app restarts while a new DLL streams | | `init_writer` zeroes the advert, so the pump falls back to polling. The new nonce appears, the pump closes the old handles and opens the new ones (at most once per 500 ms). |
 | two DLL builds loaded after an "Update virtual camera" | | Each pump has its own handles; manual-reset wakes both. |
-| `vcam-tool feed` while the app runs (two writers; unsupported today too) | | The last `init_writer` owns the nonce. The other writer's signals bump `signal_seq` without setting the awaited event, which counts as missed and leads to polling: correct and bounded. |
+| `vcam-tool feed` while the app runs (two writers; unsupported today too) | | Nobody owns the advert: each `init_writer` wipes the header and each writer then advertises its own events, so interleaved `advertise_frame_event` calls can leave `.0` of one writer next to `.1` of the other, and both writers store their own count into `signal_seq`. A pump that opens such a mixed pair (both events exist and pass the owner check, both are the user's) sees the count jump between two sequences: wake-ups with no signal behind them (spurious) or frames with no wake-up (missed). Either way the demotion rule ends in polling for 30 s: correct and bounded, not repaired (two writers stay unsupported). |
 
 No `PROTOCOL_VERSION` change, no HKLM `Protocol` change, and no change to the app's "outdated" check: a changed DLL
 build is already "outdated" by its content tag, so Update brings the new DLL.
@@ -535,7 +536,7 @@ phase needs an independent audit session afterwards, before the next phase build
 | 0 | **Measure first** (gate) | none in the product; harness scripts in `%TEMP%\opencode\perf*`; results added to `docs/PERF.md` | none | PERF method at 1080p60 and 4K30 (3 runs each) plus the live 14 fps run; per-thread split of the FrameServer svchost; WPR trace (elevated) of one 1080p60 run: pump wake-ups/s, CPU per wake-up, copy share, Frame Server's own share. Report whether 1 % is reachable and what the event can save. | no |
 | 1 | **Protocol and writer** | `crates/vcam-protocol/src/header.rs` (fields, offsets, layout asserts, `FEATURE_FRAME_EVENT`), `validate.rs` (`WakeAdvert`, `writer_frames` in `ValidHeader`, double nonce read), `seqlock.rs` (loads, writer setters, DLL diagnostic setters; `init_writer` clears `features` and fences first, wipes 448..528 with atomic stores and the rest with `write_bytes`; `advertise_frame_event` clears `features` and fences first), new `signal.rs` (name formatting, `FrameSignal` create/notify/close with the SD (LOCAL SERVICE `SYNCHRONIZE | READ_CONTROL`), nonce source with a test hook, reader `open_frame_events(nonces)` with `SYNCHRONIZE`, the in-memory model and its test), `RawHeader::from_bytes` (a plain read never carries the advert: `features` is 0), `map.rs` (`Writer` holds `Option<FrameSignal>`; notify in `publish`/`set_state`/`close`; `features = 0` on close; `WriterOptions { signal, scratch }` for tools and tests; a path other than the default one never opens a file in `%ProgramData%\BetterCam`, and `scratch` takes an existing file only if it is empty or already a frame file), `lib.rs`, `Cargo.toml` (two `windows` features) | SD exactly as above; 3 attempts, two nonces each; notify under a mutex | `cargo test -p vcam-protocol` (all the protocol tests above), `cargo clippy -p vcam-protocol --all-targets` 0 warnings, `cargo fmt -p vcam-protocol --check`, `cargo check -p vcam-source -p vcam-tool -p better-cam` | **yes**: header parsing and `open_frame_events` run in the service; the writer half does not, but lives in the same crate. **Audit after.** |
 | 2 | **App and tool** | `crates/vcam-tool/src/stats.rs` (print the new fields), `feed.rs` (`--no-signal`), new dev subcommand `signal-storm` (opens the live events with the user's rights and sets them in a loop for N seconds; refuses without a live advert), `src-tauri/src/engine.rs` (one log line at writer creation: events on or off and why; no behaviour change) | `signal-storm` ships in the dev tool only | `cargo test -p vcam-tool`, `cargo test -p better-cam` (the engine's writer tests create real events in temp-file writers), clippy, fmt | no |
-| 3 | **DLL pump** | `crates/vcam-source/src/frames.rs` (`Wait::Frame`, the Live/advert/`signal_seq`/`writer_frames` report, diagnostics written only while `header_ok`), new `wake.rs` (modes, constants, stop event, high-resolution timer for every timed wait, `timeBeginPeriod` only in polling mode, the owner check of the opened events), `stream.rs` (pump loop uses `Wake`; `Pump::stop` sets the stop event), `log.rs` (two sampled slots), `tests.rs` (rig tests above) | the constants table; events only while Live | `cargo test -p vcam-source` 7 runs with no flake; the "old behaviour put back" runs; clippy, fmt; `cargo test -p vcam-protocol` again | **yes**, the whole phase. **Audit after.** |
+| 3 | **DLL pump** (built 2026-11-19, uncommitted, awaiting audit; also `vcam-protocol` `signal/owner.rs`, `secure.rs`, `seqlock.rs`, `map.rs`, one `vcam-install` test) | `crates/vcam-source/src/frames.rs` (`Wait::Frame`, the Live/advert/`signal_seq`/`writer_frames` report, diagnostics written only while `header_ok`), new `wake.rs` (modes, constants, stop event, high-resolution timer for every timed wait, `timeBeginPeriod` only in polling mode, the owner check of the opened events), `stream.rs` (pump loop uses `Wake`; `Pump::stop` sets the stop event), `log.rs` (two sampled slots), `tests.rs` (rig tests above) | the constants table; events only while Live | `cargo test -p vcam-source` 7 runs with no flake; the "old behaviour put back" runs; clippy, fmt; `cargo test -p vcam-protocol` again | **yes**, the whole phase. **Audit after.** |
 | 4 | **Live, measure, document** | `docs/SPIKE-VCAM.md` (new section "P-frame-event": what changed, live results, machine state), `docs/PERF.md` (after-numbers next to Phase 0), `docs/PLAN.md` 2.5 "Sync" paragraph (now: event plus polling fallback) | none; reports against the gate | Update from the app (one UAC prompt); the live checks above; the measurement plan; nothing left running | no new code; touches the machine's registration |
 
 Phases 1 and 3 can only be audited separately if Phase 1 keeps the reader half of `signal.rs` small (format a name,
@@ -546,6 +547,49 @@ writer is Live with a fresh heartbeat (never from a slate state, never at activa
 (spurious and missed wake-ups) and the open pacing (one attempt per 500 ms per changed pair, 30 s for the same pair); it
 never lets an event replace the seqlock check; and it opens exactly the two names built from the two nonces in the file.
 They hold against other users and low-integrity processes as much as against the installing user's own processes.
+
+**Phase 3 as built** (details of the DLL's `wake.rs`; the tables above are the design, this is what the code does):
+
+* **States.** `Poll` (no advert, writer not Live, no high-resolution timer, or between open attempts), `Event`, `Demoted`
+  (30 s, then an open is tried again) and `OpenFailed` (retry at a changed nonce pair after 500 ms, at the same pair after
+  30 s). `wake_mode` in the header: 0 while the pump polls or the writer is not Live, 1 only while it waits on the events,
+  2 and 3 while demoted for spurious or missed wake-ups, 4 after a failed open or an owner check that failed (**also
+  when the DACL of `frames.bin` names no single user: then no open is made at all**).
+* **Wait set.** `Frame(t)` in `Event`: `[stop event, E[awaited_event(signal_seq)], high-resolution timer]` with the timer at
+  `min(t, now + 100 ms)`; `Until(t)` in `Event` is `[stop, timer]` only (decimation, slate pacing and the no-buffer
+  back-off are never woken by a frame). `Soon` and, in polling, `Frame` are one millisecond, as the pump always waited.
+  `Until` in polling is the timer to `t` (it was the condvar). The stop event is **manual-reset** (the design said
+  auto-reset): once set it stays set, and `Pump::stop` sets it after the flag. Without a stop event no wait lasts over 20 ms.
+* **Gates.** The report that the source gives the wait (`Live`, the advert, `signal_seq` and `writer_frames` of the very
+  header the poll loaded) is empty in every slate state, for a stale heartbeat, a writer that is not Live, a read-only file
+  and a header that does not validate. `update()` opens only from a non-empty report, so the only call to the DACL read and
+  to `OpenEventW` is made from the pump thread, from a wait, with a Live writer.
+* **Gap and demotion.** After an event wake-up the next wait leaves the event out for 1 ms (`EVENT_MIN_GAP`: at most 1000
+  event-driven polls a second). Spurious wake-ups (the count is where the poll loaded it) are counted in a rolling window of
+  the last 9 (more than 8 within 1 s demotes); missed wake-ups in the last 3 (3 within 10 s demotes). A timer wake-up with
+  a newer frame and the awaited event not set gets one more millisecond (`MISS_SETTLE`: the writer bumps the frame count a
+  few microseconds before it sets the event) and counts as missed only if the event is still not set.
+* **Timer resolution.** `Wake::new` takes `timeBeginPeriod(1)` (the pump always did); it is given back while the mode is
+  `Event` and taken again on every other mode. It lives in `Os` (`TimerPeriod`), so a panic ends it.
+* **Diagnostics.** `set_wake_stats` is called from the source, only while the last header validated: at once on a change
+  of `wake_mode`, otherwise at most four times a second, and again whenever the file is reopened and when the pump ends.
+* **Reading `frames.bin`'s DACL.** A second handle on the path with exactly `READ_CONTROL | FILE_READ_ATTRIBUTES` (the
+  pinned, link-refusing open of `secure`, one attempt per open attempt), whose `FileIdentity` must equal the mapped
+  handle's: a file that was replaced since the mapping is refused. LOCAL SERVICE has both rights in `0x12008f`.
+
+**Owner check as built** (`vcam_protocol::signal::owner`): the expected owner is `expected_owner(sids of the access-allowed
+ACEs)`: the single trustee that is none of `S-1-5-18`, `S-1-5-32-544`, `S-1-5-19` (the same SID twice counts once), and only
+if it has the installer's `valid_sid` shape (`S-1-5-21-` or `S-1-12-1-`, four plain 32-bit parts); else no event is trusted.
+`vcam-install` has a test that runs it on `acl::expected(FramesFile, machine(Some(u)))` (gives `u`) and on `machine(None)`
+(gives none) and compares the two shape tests, so an installer ACL change cannot silently turn events off. Each event is
+opened with `SYNCHRONIZE | READ_CONTROL` and read through the handle with `GetSecurityInfo(SE_KERNEL_OBJECT)`: the **owner
+must equal the expected user** and the SACL must hold **exactly one explicit mandatory label of medium integrity or
+higher** (`S-1-16-8192` and up; none, one below medium, or two labels all fail). Why the label and not the whole descriptor
+compared with `descriptor_text(expected)`: a process cannot give an object a label above its own integrity level, so the
+label is what a low-integrity process of the same user (which can make an event owned by the user) cannot imitate, and the
+DACL adds nothing against a medium-integrity creator, who can write exactly that DACL (the demotion rule answers that case).
+A whole-descriptor comparison would also turn every later change of the descriptor into "every older DLL polls". Both
+events must pass; either failing is `OpenFailed`.
 
 It also **checks the owner of each event it opened**, with `SYNCHRONIZE | READ_CONTROL`: the owner must be the single
 non-system user ACE in the DACL of `frames.bin` (the installer's), else `OpenFailed` and polling. The names can be taken

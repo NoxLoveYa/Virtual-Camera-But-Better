@@ -2,6 +2,7 @@
 //! MediaStream -> samples exactly as Frame Server would, without Frame Server. A writer thread feeds a temporary
 //! `frames.bin` (the path is overridden for the test thread only; see `frames::set_test_path`).
 
+use std::os::windows::io::OwnedHandle;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -11,7 +12,8 @@ use std::time::{Duration, Instant};
 use vcam_protocol::pattern::{self, Analysis};
 use vcam_protocol::slate::SlateKind;
 use vcam_protocol::{
-    off, qpc_now, Format, SlotFormat, Writer, WriterState, SUBTYPE_NV12, SUBTYPE_RGB32,
+    off, qpc_now, Format, SlotFormat, Writer, WriterOptions, WriterState, SUBTYPE_NV12,
+    SUBTYPE_RGB32,
 };
 use windows::Win32::Foundation::{CLASS_E_CLASSNOTAVAILABLE, E_UNEXPECTED, S_FALSE};
 use windows::Win32::Media::KernelStreaming::{IKsControl, KSIDENTIFIER, PINNAME_VIDEO_CAPTURE};
@@ -56,7 +58,7 @@ fn activate_source() -> (IMFActivate, IMFMediaSource) {
 
 /// A temporary frame file path for this test, set as the override of the calling thread.
 fn test_file(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("bettercam-dll-tests-{}", std::process::id()));
+    let dir = crate::test_dir("dll-tests");
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join(name);
     let _ = std::fs::remove_file(&p);
@@ -157,8 +159,31 @@ struct Feeder {
 
 impl Feeder {
     fn start(path: &std::path::Path, width: u32, height: u32, fps: u32) -> Feeder {
-        let writer = Arc::new(Writer::create(path).unwrap());
-        writer.set_advertised(&vcam_protocol::advertised_for_output(width, height, fps));
+        Feeder::start_with(
+            path,
+            &WriterOptions::default(),
+            (width, height),
+            (fps, fps),
+            |_| {},
+        )
+    }
+
+    /// A feeder that publishes `publish_fps` frames a second while it advertises types of `advertised_fps`
+    /// (`prepare` runs on the new writer before it goes Live).
+    fn start_with(
+        path: &std::path::Path,
+        opts: &WriterOptions,
+        (width, height): (u32, u32),
+        (advertised_fps, fps): (u32, u32),
+        prepare: impl FnOnce(&Writer),
+    ) -> Feeder {
+        let writer = Arc::new(Writer::create_with(path, opts).unwrap());
+        writer.set_advertised(&vcam_protocol::advertised_for_output(
+            width,
+            height,
+            advertised_fps,
+        ));
+        prepare(&writer);
         writer.set_state(WriterState::Live);
         let stop = Arc::new(AtomicBool::new(false));
         let (w2, s2) = (writer.clone(), stop.clone());
@@ -232,6 +257,15 @@ struct Running {
 impl Running {
     /// Start the source with the advertised type matching `pixel`/`width`/`height` (first one if several).
     fn start(pixel: PixelFormat, width: u32, height: u32) -> Running {
+        Running::start_at(pixel, width, height, None)
+    }
+
+    /// [`Running::start`] with the type of that frame rate.
+    fn start_fps(pixel: PixelFormat, width: u32, height: u32, fps: u32) -> Running {
+        Running::start_at(pixel, width, height, Some(fps))
+    }
+
+    fn start_at(pixel: PixelFormat, width: u32, height: u32, fps: Option<u32>) -> Running {
         let (activate, source) = activate_source();
         let pd: IMFPresentationDescriptor =
             unsafe { source.CreatePresentationDescriptor().unwrap() };
@@ -247,13 +281,15 @@ impl Running {
         for i in 0..count {
             let t = unsafe { handler.GetMediaTypeByIndex(i).unwrap() };
             let f = FrameFormat::from_media_type(&t).unwrap();
-            if (f.pixel, f.width, f.height) == (pixel, width, height) {
+            if (f.pixel, f.width, f.height) == (pixel, width, height)
+                && fps.is_none_or(|r| r == f.fps)
+            {
                 chosen = Some((t, f));
                 break;
             }
         }
-        let (mt, fmt) =
-            chosen.unwrap_or_else(|| panic!("type {pixel:?} {width}x{height} not advertised"));
+        let (mt, fmt) = chosen
+            .unwrap_or_else(|| panic!("type {pixel:?} {width}x{height} {fps:?} not advertised"));
         unsafe { handler.SetCurrentMediaType(&mt).unwrap() };
         unsafe {
             source
@@ -913,3 +949,5 @@ fn sample_timestamps_share_the_mf_system_time_base() {
         "MFGetSystemTime and QPC differ by {diff_ms} ms"
     );
 }
+
+mod wake_rig;

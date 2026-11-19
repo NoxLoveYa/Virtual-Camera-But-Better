@@ -75,10 +75,79 @@ fn win_err(e: windows::core::Error) -> io::Error {
     io::Error::from_raw_os_error(e.code().0 & 0xFFFF)
 }
 
-/// True when `path` names the production frame file (compared without case).
+/// True when `path` names the production frame file: `%ProgramData%\BetterCam\frames.bin`, compared component by
+/// component without regard to ASCII case, the rule [`secure::expected_path`] applies to the same path.
 fn is_default_path(path: &Path) -> bool {
-    path.to_string_lossy()
-        .eq_ignore_ascii_case(&frames_path().to_string_lossy())
+    secure::strip_prefix_ignore_case(path, &frames_path())
+        .is_some_and(|rest| rest.as_os_str().is_empty())
+}
+
+/// Refuse a scratch path before anything is made for it (`create_dir_all`, `OPEN_ALWAYS`, a named stream), when it
+/// could lead into the folder `keep_out` (the production call passes [`data_dir`]):
+///
+/// 1. a `:` anywhere but in the drive prefix (`file:stream`, `C::x`): a named stream or a device-like name;
+/// 2. the absolute path (`std::path::absolute`: no file system access, no links followed) is at or below `keep_out`,
+///    compared by whole components without regard to ASCII case;
+/// 3. the deepest *existing* folder on the way, with every link followed ([`secure::canonical_dir`]), is at or below the
+///    folder `keep_out` really is (a junction in a parent, which only exists once the folder does).
+///
+/// [`refuse_inside`] stays as the last check, on the opened handle: this one only keeps the pre-open steps from
+/// creating things in, or next to the way into, the folder of the real file. A refusal is [`secure::refused`].
+fn refuse_scratch_path(path: &Path, keep_out: &Path) -> io::Result<()> {
+    use std::path::Component;
+    for c in path.components() {
+        if let Component::Normal(n) = c {
+            if n.to_string_lossy().contains(':') {
+                return Err(secure::refused(format!(
+                    "{}: a ':' after the drive (a named stream?) is not accepted in a scratch path",
+                    path.display()
+                )));
+            }
+        }
+    }
+    let abs = std::path::absolute(path)?;
+    if secure::strip_prefix_ignore_case(&abs, keep_out).is_some() {
+        return Err(secure::refused(format!(
+            "{} is in {}, the folder of the real frame file: only its own path opens it",
+            abs.display(),
+            keep_out.display()
+        )));
+    }
+    // the folder the data folder really is; one that is not there holds nothing
+    let Some(mut prefix) = (match secure::canonical_dir(keep_out) {
+        Ok(d) => Some(d.to_lowercase()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    }) else {
+        return Ok(());
+    };
+    while prefix.ends_with('\\') {
+        prefix.pop();
+    }
+    for ancestor in abs.ancestors() {
+        match secure::canonical_dir(ancestor) {
+            Ok(real) => {
+                let real = real.to_lowercase();
+                let real = real.trim_end_matches('\\');
+                if real == prefix || real.starts_with(&format!("{prefix}\\")) {
+                    return Err(secure::refused(format!(
+                        "{} leads into {}, the folder of the real frame file: only its own path opens it",
+                        abs.display(),
+                        keep_out.display()
+                    )));
+                }
+                return Ok(());
+            }
+            // not there (or not a folder): look one level up
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Refuse the file behind `file` when it really lies in `dir` or below it. `dir` is resolved with every link followed
@@ -288,6 +357,12 @@ impl MappedFile {
         &self.shared
     }
 
+    /// Who the mapped file is on its volume (the handle that was opened for the mapping is asked, not the path). Another
+    /// handle opened by path is the same file exactly when its identity is equal.
+    pub fn identity(&self) -> io::Result<secure::FileIdentity> {
+        secure::file_identity(self.file)
+    }
+
     /// Length of the mapped file in bytes.
     pub fn len(&self) -> usize {
         self.len
@@ -473,16 +548,18 @@ impl Writer {
             };
             return Self::open_precreated_with(path, Some(&secure::program_data_dir()), &opts);
         }
+        Self::create_scratch(path, opts, &data_dir())
+    }
+
+    /// A path that is not the production one: refused before anything is made when it could lead into `keep_out`
+    /// ([`refuse_scratch_path`]), then created with its folders, then checked once more on the opened handle
+    /// ([`refuse_inside`]).
+    fn create_scratch(path: &Path, opts: &WriterOptions, keep_out: &Path) -> io::Result<Writer> {
+        refuse_scratch_path(path, keep_out)?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        Self::open_file(
-            path,
-            secure::DISP_OPEN_ALWAYS,
-            None,
-            opts,
-            Some(&data_dir()),
-        )
+        Self::open_file(path, secure::DISP_OPEN_ALWAYS, None, opts, Some(keep_out))
     }
 
     /// Open the file the installer made at `path` (it must exist), as [`Writer::create`] does for the default path.
@@ -1131,6 +1208,177 @@ mod tests {
         let _ = std::fs::remove_dir(&by_junction);
         let _ = std::fs::remove_dir(&by_junction_in_parent);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a refused `--file` may leave behind: nothing. The refusal after the open ([`refuse_inside`]) comes too late
+    /// for what happens before it: the parent folders that `create_dir_all` makes, a file that `OPEN_ALWAYS` creates,
+    /// a named stream that is created by the open itself. [`refuse_scratch_path`] refuses first.
+    #[test]
+    fn a_scratch_path_that_could_lead_into_the_kept_out_folder_makes_nothing_before_it_is_refused()
+    {
+        let (_root, dir) = sandbox("keep-out-pre");
+        let keep = dir.join("BetterCam");
+        std::fs::create_dir_all(&keep).unwrap();
+        let real = keep.join("frames.bin");
+        let w = Writer::open_file(&real, secure::DISP_OPEN_ALWAYS, None, &scratch(), None).unwrap();
+        w.set_state(WriterState::Live);
+        let before = w.header();
+        let listing = |d: &Path| {
+            let mut v: Vec<String> = std::fs::read_dir(d)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        let keep_before = listing(&keep);
+        let dir_before = listing(&dir);
+
+        let by_junction = dir.join("alias");
+        junction(&by_junction, &keep);
+        let dir_before_alias = listing(&dir);
+        assert_ne!(dir_before, dir_before_alias);
+        let refused_paths = [
+            // a named stream of the real file and of a file next to it, in the folder and by every spelling
+            (
+                "a stream of the real file",
+                PathBuf::from(format!("{}:evil", real.display())),
+            ),
+            (
+                "a stream of a new file",
+                PathBuf::from(format!("{}:evil", keep.join("new.bin").display())),
+            ),
+            (
+                "the default stream by name",
+                PathBuf::from(format!("{}::$DATA", real.display())),
+            ),
+            (
+                "a stream of a scratch file",
+                PathBuf::from(format!("{}:evil", dir.join("scratch.bin").display())),
+            ),
+            // (not `join("a:b")`: a component that parses as a drive prefix replaces the whole path)
+            (
+                "a stream in a folder name",
+                PathBuf::from(format!(r"{}\a:b\f.bin", dir.display())),
+            ),
+            (
+                "a second colon after the drive",
+                PathBuf::from(format!(r"{}::x", dir.display())),
+            ),
+            // inside the folder, not yet there: the parents must not be created
+            (
+                "a new folder inside",
+                keep.join("new-folder").join("frames.bin"),
+            ),
+            (
+                "a new deep folder inside",
+                keep.join("x").join("y").join("z.bin"),
+            ),
+            (
+                "another case",
+                PathBuf::from(
+                    keep.join("New")
+                        .join("f.bin")
+                        .to_string_lossy()
+                        .to_uppercase(),
+                ),
+            ),
+            (
+                "the verbatim form of a new folder inside",
+                PathBuf::from(format!(
+                    r"\\?\{}",
+                    keep.join("vnew").join("f.bin").display()
+                )),
+            ),
+            // a junction to the folder, new folders below it
+            (
+                "below the junction",
+                by_junction.join("made").join("frames.bin"),
+            ),
+            ("the junction itself", by_junction.join("f.bin")),
+        ];
+        for (what, p) in &refused_paths {
+            for opts in [WriterOptions::default(), scratch()] {
+                let e = Writer::create_scratch(p, &opts, &keep)
+                    .err()
+                    .unwrap_or_else(|| panic!("{what}: opened"));
+                assert!(secure::is_refused(&e), "{what}: {e}");
+            }
+        }
+        // nothing was made anywhere: no folder, no file, no stream
+        assert_eq!(listing(&keep), keep_before, "the kept-out folder changed");
+        assert_eq!(listing(&dir), dir_before_alias, "the sandbox changed");
+        assert_eq!(std::fs::metadata(&real).unwrap().len(), FILE_SIZE);
+        assert_eq!(w.header(), before, "a refused path touched the real file");
+        assert!(!keep.join("new-folder").exists());
+        assert!(!keep.join("vnew").exists());
+        assert!(!dir.join("a:b").exists());
+
+        // the neighbours of the folder are not in it: a folder of the same prefix, a file next to it
+        for p in [
+            dir.join("BetterCam2").join("f.bin"),
+            dir.join("scratch.bin"),
+            dir.join("fresh").join("deeper").join("f.bin"),
+        ] {
+            let v = Writer::create_scratch(&p, &scratch(), &keep);
+            assert!(v.is_ok(), "{}: {:?}", p.display(), v.err());
+        }
+        // a kept-out folder that is not there holds nothing
+        let v = Writer::create_scratch(
+            &dir.join("fine").join("f.bin"),
+            &scratch(),
+            &dir.join("no-such-folder"),
+        );
+        assert!(v.is_ok(), "{:?}", v.err());
+        drop(w);
+        let _ = std::fs::remove_dir(&by_junction);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_production_path_test_and_the_pin_use_one_case_rule() {
+        let p = frames_path();
+        let upper = PathBuf::from(p.to_string_lossy().to_uppercase());
+        let lower = PathBuf::from(p.to_string_lossy().to_lowercase());
+        for spelling in [&p, &upper, &lower] {
+            assert!(is_default_path(spelling), "{}", spelling.display());
+            // the same spelling is accepted as below the trusted root by the pin
+            let rel = secure::strip_prefix_ignore_case(spelling, &secure::program_data_dir());
+            assert_eq!(
+                rel.map(|r| r.to_string_lossy().to_lowercase()),
+                Some(r"bettercam\frames.bin".to_string())
+            );
+        }
+        // whole components only
+        assert!(!is_default_path(&PathBuf::from(format!(
+            "{}2",
+            p.display()
+        ))));
+        assert!(!is_default_path(&data_dir()));
+        assert!(
+            secure::strip_prefix_ignore_case(Path::new(r"C:\Data2\x"), Path::new(r"C:\Data"))
+                .is_none()
+        );
+        assert_eq!(
+            secure::strip_prefix_ignore_case(Path::new(r"C:\DATA\x\y"), Path::new(r"c:\data")),
+            Some(PathBuf::from(r"x\y"))
+        );
+        assert_eq!(
+            secure::strip_prefix_ignore_case(Path::new(r"C:\data"), Path::new(r"C:\Data")),
+            Some(PathBuf::new())
+        );
+        // `expected_path` takes the spelling the production test takes
+        let root = secure::program_data_dir();
+        let want = secure::expected_path(&root, &p).unwrap().to_lowercase();
+        assert_eq!(
+            secure::expected_path(&root, &upper).unwrap().to_lowercase(),
+            want
+        );
+        assert_eq!(
+            secure::expected_path(&root, &lower).unwrap().to_lowercase(),
+            want
+        );
     }
 
     #[test]

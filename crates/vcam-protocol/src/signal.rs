@@ -75,8 +75,10 @@
 //!
 //! # Reader half (runs in the camera service)
 //!
-//! [`event_name`], [`awaited_event`] and [`open_frame_events`]: format a name from a `u128`, open the two events with
-//! `SYNCHRONIZE` and nothing else. The reader never takes a name from the file and never creates an object.
+//! [`event_name`], [`awaited_event`] and [`owner::open_checked_events`]: format a name from a `u128`, open the two
+//! events with `SYNCHRONIZE | READ_CONTROL` and check who made each ([`owner`]: the owner and the mandatory label).
+//! The reader never takes a name from the file and never creates an object. [`open_frame_events`] is the plain open
+//! with `SYNCHRONIZE` only, without the owner check: for tools and tests, never for a pump that trusts the events.
 
 use std::ffi::c_void;
 use std::io;
@@ -202,7 +204,7 @@ pub fn descriptor_text(user_sid: &str) -> String {
 }
 
 /// `S-1-...` text of the SID of this process's token user. The process token is used, not a thread's impersonation.
-fn current_user_sid_text() -> io::Result<String> {
+pub fn current_user_sid_text() -> io::Result<String> {
     let mut token = HANDLE::default();
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.map_err(win_err)?;
     // SAFETY: `token` is a new handle that nothing else owns.
@@ -474,6 +476,61 @@ pub fn open_frame_events(nonces: [u128; 2]) -> io::Result<[OwnedHandle; 2]> {
     let e1 = open(1)?;
     Ok([e0, e1])
 }
+
+/// An event under the name of `nonce` and `parity` made by somebody other than a [`FrameSignal`]: with the security
+/// descriptor `sddl` (`None`: the default one of the calling token). For tests of a reader against an object that is not
+/// the writer's (an impostor that took a name over, or an old or hostile writer). The handle owns the object: it lives
+/// while the handle does.
+#[cfg(any(test, feature = "test-support"))]
+pub fn make_event_for_test(
+    nonce: u128,
+    parity: usize,
+    sddl: Option<&str>,
+) -> io::Result<OwnedHandle> {
+    let name = event_name_wide(nonce, parity);
+    let h = match sddl {
+        None => unsafe {
+            CreateEventExW(
+                None,
+                PCWSTR(name.as_ptr()),
+                CREATE_EVENT_MANUAL_RESET,
+                WRITER_ACCESS,
+            )
+        },
+        Some(text) => {
+            let w: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut psd = PSECURITY_DESCRIPTOR::default();
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    PCWSTR(w.as_ptr()),
+                    SDDL_REVISION_1,
+                    &mut psd,
+                    None,
+                )
+            }
+            .map_err(win_err)?;
+            let psd = LocalSd(psd);
+            let sa = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: psd.0 .0,
+                bInheritHandle: false.into(),
+            };
+            unsafe {
+                CreateEventExW(
+                    Some(&sa),
+                    PCWSTR(name.as_ptr()),
+                    CREATE_EVENT_MANUAL_RESET,
+                    WRITER_ACCESS,
+                )
+            }
+        }
+    }
+    .map_err(win_err)?;
+    // SAFETY: a new handle that nothing else owns.
+    Ok(unsafe { OwnedHandle::from_raw_handle(h.0) })
+}
+
+pub mod owner;
 
 #[cfg(test)]
 pub(crate) mod tests;

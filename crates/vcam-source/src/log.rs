@@ -399,6 +399,12 @@ pub mod slot {
     pub const POOL_FALLBACK: usize = 6;
     /// A sample that could not be made at all.
     pub const SAMPLE_FAILED: usize = 7;
+    /// The frame events were opened, or were not used (and why).
+    pub const WAKE_OPEN: usize = 8;
+    /// The pump went back to polling after spurious or missed wake-ups, or may try the events again.
+    pub const WAKE_DEMOTE: usize = 9;
+    /// The user the frame events must belong to could not be read from the frame file.
+    pub const WAKE_OWNER: usize = 10;
 }
 
 #[cfg(test)]
@@ -412,8 +418,7 @@ mod tests {
     }
 
     fn sandbox(name: &str) -> Sandbox {
-        let root =
-            std::env::temp_dir().join(format!("bettercam-log-{}-{name}", std::process::id()));
+        let root = crate::test_dir("log").join(name);
         let _ = std::fs::remove_dir_all(&root);
         let dir = root.join("BetterCam").join("logs");
         std::fs::create_dir_all(&dir).unwrap();
@@ -469,8 +474,7 @@ mod tests {
 
     #[test]
     fn missing_folders_are_never_created() {
-        let root =
-            std::env::temp_dir().join(format!("bettercam-log-{}-missing", std::process::id()));
+        let root = crate::test_dir("log").join("missing");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         // neither BetterCam nor logs exists

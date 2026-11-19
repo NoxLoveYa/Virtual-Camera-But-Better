@@ -49,6 +49,7 @@ use vcam_protocol::{
 
 use crate::mediatype::{FrameFormat, PixelFormat};
 use crate::vlog;
+use crate::wake::{Diag, WakeReport, WakeSource};
 
 #[cfg(test)]
 thread_local! {
@@ -303,9 +304,14 @@ impl Emit {
 /// When to call [`FrameSource::poll`] again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wait {
-    /// Not before this QPC.
+    /// Not before this QPC, whatever the writer does: a timer only. Decimation (`next_ok`), slate pacing and the
+    /// no-buffer back-off. A frame that arrives earlier cannot qualify, so it must not wake the pump.
     Until(u64),
-    /// In about a millisecond.
+    /// A new frame or state from the writer can change the answer; otherwise ask again at this QPC (the next
+    /// time-based decision: the repeat deadline, the repeat gate, the "starting" point). With the writer's frame event
+    /// the pump waits for it; without, it polls every millisecond, as it always did ([`crate::wake`]).
+    Frame(u64),
+    /// In about a millisecond: a torn repeat is tried again.
     Soon,
 }
 
@@ -401,6 +407,12 @@ pub struct FrameSource {
     repeated: u64,
     live_since_stats: u32,
     shown: Shown,
+
+    /// What the last poll saw of the header for the pump's wait: Live or not, and the frame event advert.
+    report: WakeReport,
+    /// The pump's wait diagnostics as last given ([`WakeSource::publish_diag`]), written into the file while its
+    /// header validates (and again whenever the file is reopened).
+    wake_diag: Diag,
 }
 
 impl FrameSource {
@@ -435,6 +447,8 @@ impl FrameSource {
             repeated: 0,
             live_since_stats: 0,
             shown: Shown::Nothing,
+            report: WakeReport::default(),
+            wake_diag: Diag::default(),
         }
     }
 
@@ -534,6 +548,20 @@ impl FrameSource {
             s.set_consumer_active(self.running);
             s.set_consumer_heartbeat(vcam_protocol::qpc_now());
             s.set_stats(0, 0, self.delivered, self.repeated);
+            self.write_wake_diag();
+        }
+    }
+
+    /// The pump's wait diagnostics into the header: only into a file whose header validated at the last poll (like
+    /// every other write of the DLL).
+    fn write_wake_diag(&self) {
+        if !self.header_ok {
+            return;
+        }
+        if let Some(m) = &self.map {
+            let d = &self.wake_diag;
+            m.shared()
+                .set_wake_stats(d.mode, d.events, d.missed, d.spurious);
         }
     }
 
@@ -855,6 +883,7 @@ impl FrameSource {
             Ok(p) => p,
             Err(_) => {
                 vlog!("PANIC contained in FrameSource::poll");
+                self.report = WakeReport::default();
                 self.map = None;
                 self.leave_live();
                 self.not_running = true;
@@ -867,11 +896,19 @@ impl FrameSource {
         self.ensure_map(now);
         let v = match self.status(now) {
             Status::Slate(kind) => {
+                self.report = WakeReport::default();
                 self.not_running = kind == SlateKind::NotRunning;
                 self.leave_live();
                 return self.slate_poll(kind, now, sink);
             }
             Status::Live(v) => v,
+        };
+        // what the pump waits by: events are used only for a Live writer (with a fresh heartbeat, a writable file), and
+        // `signal_seq` and `writer_frames` are the ones this very header load saw
+        self.report = WakeReport {
+            live: true,
+            advert: v.wake,
+            writer_frames: v.writer_frames,
         };
         self.not_running = false;
         if self.live_since == 0 {
@@ -949,11 +986,38 @@ impl FrameSource {
         } else {
             next_ok
         };
-        Poll::Wait(if now >= wake {
-            Wait::Soon
-        } else {
+        Poll::Wait(if now < wake {
             Wait::Until(wake)
+        } else {
+            self.frame_wait(now, deadline)
         })
+    }
+
+    /// What to wait for when a frame could be taken now but there is none: the writer's next frame or state change,
+    /// or the next time-based decision `t`, whichever comes first. Where the old code said "a millisecond":
+    ///
+    /// * frames on show, before the repeat deadline: the deadline (also the take of a frame past it);
+    /// * frames on show, past the deadline, before the repeat may go out (`last_emit + period`): that time;
+    /// * no frame yet: the "starting" slate's point, `live_since + 1.5 periods`.
+    ///
+    /// A torn repeat is the one case with no time to wait for: the same slot is tried again in a millisecond.
+    fn frame_wait(&self, now: u64, deadline: u64) -> Wait {
+        let t = if self.have_frame {
+            if now < deadline {
+                deadline
+            } else if now < self.last_emit.saturating_add(self.period) {
+                self.last_emit.saturating_add(self.period)
+            } else {
+                return Wait::Soon;
+            }
+        } else {
+            self.live_since.saturating_add(self.period * 3 / 2)
+        };
+        if t > now {
+            Wait::Frame(t)
+        } else {
+            Wait::Soon
+        }
     }
 
     /// A live frame (in the sink) captured at `capture_qpc` is on its way.
@@ -1038,6 +1102,75 @@ impl Drop for FrameSource {
 }
 
 #[cfg(test)]
+pub(crate) mod test_owner {
+    //! The user the frame events must belong to, per frame file, for the tests that need another answer than the real
+    //! DACL of a file in `%TEMP%` gives.
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static OWNERS: Mutex<Vec<(PathBuf, Option<String>)>> = Mutex::new(Vec::new());
+
+    /// Make `expected_owner` answer `owner` for `path` (`None`: no single user).
+    pub fn set(path: &Path, owner: Option<String>) {
+        let mut g = OWNERS.lock().unwrap_or_else(|e| e.into_inner());
+        g.retain(|e| e.0 != path);
+        g.push((path.to_path_buf(), owner));
+    }
+
+    pub fn get(path: &Path) -> Option<Option<String>> {
+        let g = OWNERS.lock().unwrap_or_else(|e| e.into_inner());
+        g.iter().find(|e| e.0 == path).map(|e| e.1.clone())
+    }
+}
+
+impl WakeSource for FrameSource {
+    fn report(&self) -> WakeReport {
+        self.report
+    }
+
+    fn counters(&self) -> Option<(u64, u64)> {
+        self.map.as_ref().map(|m| m.shared().signal_counters())
+    }
+
+    fn expected_owner(&mut self) -> Option<String> {
+        #[cfg(test)]
+        if let Some(o) = test_owner::get(&self.path) {
+            return o;
+        }
+        let map = self.map.as_ref()?;
+        let id = match map.identity() {
+            Ok(id) => id,
+            Err(e) => {
+                crate::log::log_sampled(crate::log::slot::WAKE_OWNER, 20, || {
+                    format!("frames: cannot identify the mapped frame file: {e}")
+                });
+                return None;
+            }
+        };
+        match vcam_protocol::signal::owner::frames_expected_owner(&self.path, &trusted_root(), id) {
+            Ok(Some(owner)) => Some(owner),
+            Ok(None) => {
+                crate::log::log_sampled(crate::log::slot::WAKE_OWNER, 20, || {
+                    "frames: the DACL of the frame file names no single user".into()
+                });
+                None
+            }
+            Err(e) => {
+                crate::log::log_sampled(crate::log::slot::WAKE_OWNER, 20, || {
+                    format!("frames: cannot read the DACL of the frame file: {e}")
+                });
+                None
+            }
+        }
+    }
+
+    fn publish_diag(&mut self, d: &Diag) {
+        self.wake_diag = *d;
+        self.write_wake_diag();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
@@ -1045,7 +1178,7 @@ mod tests {
     use vcam_protocol::{qpc_now, SlotFormat, Writer, SUBTYPE_NV12, SUBTYPE_RGB32};
 
     fn temp_path(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("bettercam-frames-{}", std::process::id()));
+        let dir = crate::test_dir("frames");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
     }
@@ -2744,14 +2877,21 @@ mod tests {
             took_a_frame_captured_after_the_take("stamp-monotonic.bin", true);
         let freq = qpc_frequency();
         let gap = freq / 60 * 3 / 4;
-        assert_eq!(first.sample_qpc(), t0 + freq / 25, "frame 5: its own capture time");
+        assert_eq!(
+            first.sample_qpc(),
+            t0 + freq / 25,
+            "frame 5: its own capture time"
+        );
         let now7 = t0 + freq * 26 / 1000;
         let Poll::Ready(e7) = src.poll(now7) else {
             panic!("frame 7 was not taken at the deadline");
         };
         src.finish_emit(e7, now7);
         assert_eq!(e7.kind, Kind::Live);
-        assert!(e7.sample_qpc() >= first.sample_qpc() + gap, "frame 7 overlaps frame 5");
+        assert!(
+            e7.sample_qpc() >= first.sample_qpc() + gap,
+            "frame 7 overlaps frame 5"
+        );
         // frame 8: captured 20 ms after the take of frame 5, polled 45 ms after it
         publish_at(&w, 320, 180, 8, t0 + freq / 50);
         let now8 = t0 + freq * 45 / 1000;
@@ -2759,8 +2899,15 @@ mod tests {
             panic!("frame 8 was not taken");
         };
         assert_eq!(e8.kind, Kind::Live);
-        assert!(src.data() == pattern_frame(8, 320, 180).as_slice(), "setup: not frame 8");
-        assert_eq!(e8.capture_qpc, t0 + freq / 50, "setup: frame 8's capture time");
+        assert!(
+            src.data() == pattern_frame(8, 320, 180).as_slice(),
+            "setup: not frame 8"
+        );
+        assert_eq!(
+            e8.capture_qpc,
+            t0 + freq / 50,
+            "setup: frame 8's capture time"
+        );
         assert!(
             e8.sample_qpc() >= e7.sample_qpc() + gap,
             "frame 8 is stamped {} ticks after frame 7 (a gap is {gap}): the sample times ran backwards or overlap",
@@ -2847,7 +2994,11 @@ mod tests {
             publish_at(&w, 320, 180, 3, src.attach - freq * before_ms / 1000);
             w.heartbeat();
             let e = next_ready(&mut src, Duration::from_secs(2));
-            assert_eq!(e.kind == Kind::Live, shown, "{before_ms} ms before the attach");
+            assert_eq!(
+                e.kind == Kind::Live,
+                shown,
+                "{before_ms} ms before the attach"
+            );
         }
     }
 
@@ -2947,5 +3098,340 @@ mod tests {
             sink.0.iter().all(|&b| b == 7),
             "the short buffer was written"
         );
+    }
+
+    // ---- Wait::Frame: where "a millisecond" used to be ----------------------------------------------------------
+
+    /// The wait the pump made before this change, recomputed from the state the poll left (the end of `poll_inner`):
+    /// `Soon` when the earliest time a frame could qualify has passed, else `Until` it.
+    fn old_wait(src: &FrameSource, now: u64) -> Wait {
+        let next_ok = match src.last_capture {
+            Some(c) => c
+                .saturating_add(src.min_capture_gap())
+                .min(now.saturating_add(src.period)),
+            None => 0,
+        };
+        let deadline = src.last_new_seen.saturating_add(src.period * 3 / 2);
+        let wake = if src.have_frame {
+            next_ok.min(deadline)
+        } else {
+            next_ok
+        };
+        if now >= wake {
+            Wait::Soon
+        } else {
+            Wait::Until(wake)
+        }
+    }
+
+    /// A pump on a simulated clock for `secs` seconds: the writer publishes `writer_fps` frames a second, the stream
+    /// runs at `stream_fps`, and the pump polls the way polling mode does (`Soon` and `Frame` are a millisecond, `Until`
+    /// sleeps to its time). Returns every wait the source asked for, with the time and the oracle's answer, and the
+    /// kinds of what was emitted.
+    fn simulate(
+        name: &str,
+        writer_fps: u32,
+        stream_fps: u32,
+        secs: f64,
+    ) -> (Vec<(u64, Wait, Wait)>, Vec<Kind>) {
+        let path = temp_path(name);
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        let (fw, fh) = (320u32, 180u32);
+        let mut src = Rig::new(path, nv12(fw, fh, stream_fps));
+        src.start();
+        let freq = qpc_frequency();
+        let t0 = qpc_now();
+        let end = t0 + (freq as f64 * secs) as u64;
+        let step = freq / 1000;
+        let mut next_pub = 0u32;
+        let mut now = t0;
+        let (mut waits, mut kinds) = (Vec::new(), Vec::new());
+        // the writer's frames are on the same clock: published when the simulated time reaches them
+        while now < end {
+            // (with its own capture time: a writer's frames are not bunched up because the pump slept)
+            loop {
+                let due = t0 + (freq as u128 * next_pub as u128 / writer_fps as u128) as u64;
+                if due > now {
+                    break;
+                }
+                publish_at(&w, fw, fh, next_pub as u64, due);
+                next_pub += 1;
+            }
+            w.heartbeat();
+            match src.poll(now) {
+                Poll::Ready(e) => {
+                    src.finish_emit(e, now);
+                    kinds.push(e.kind);
+                    now += 1;
+                }
+                Poll::Wait(got) => {
+                    waits.push((now, got, old_wait(&src, now)));
+                    now = match got {
+                        Wait::Until(t) => t.max(now + 1),
+                        Wait::Frame(_) | Wait::Soon => now + step,
+                    };
+                }
+            }
+        }
+        (waits, kinds)
+    }
+
+    /// `Frame(t)` is returned exactly where `Soon` was, and never past the next time-based decision; `Until` is
+    /// untouched. Writers at the stream's rate, slower and faster.
+    #[test]
+    fn frame_replaces_soon_exactly_and_never_waits_past_a_decision_time() {
+        for (name, writer, stream) in [
+            ("wf-60-60", 60u32, 60u32),
+            ("wf-30-30", 30, 30),
+            ("wf-14-30", 14, 30),
+            ("wf-60-30", 60, 30),
+            ("wf-5-60", 5, 60),
+        ] {
+            let (waits, kinds) = simulate(name, writer, stream, 0.8);
+            assert!(!waits.is_empty() && !kinds.is_empty(), "{name}");
+            let (mut frame, mut soon, mut until) = (0, 0, 0);
+            for (now, got, old) in &waits {
+                match (got, old) {
+                    // the old pump slept until this time: unchanged
+                    (Wait::Until(a), Wait::Until(b)) => {
+                        assert_eq!(a, b, "{name}: Until changed");
+                        until += 1;
+                    }
+                    // the old pump polled again in a millisecond: the new one says what it waits for
+                    (Wait::Frame(t), Wait::Soon) => {
+                        assert!(*t > *now, "{name}: Frame({t}) is not after now ({now})");
+                        // never more than one and a half frame periods ahead: the repeat deadline, the repeat gate
+                        // and the "starting" point are all at most that far
+                        let period = qpc_frequency() / stream as u64;
+                        assert!(
+                            *t - *now <= period * 3 / 2 + 1,
+                            "{name}: waits {} ticks",
+                            t - now
+                        );
+                        frame += 1;
+                    }
+                    // the torn repeat, and the slate pacing a live stream shows before its first frame
+                    (Wait::Soon, Wait::Soon) => soon += 1,
+                    (Wait::Until(_), _) => {} // slate pacing (`Until` the next slate), not the end of `poll_inner`
+                    other => panic!(
+                        "{name}: the old pump waited {:?}, the new one {:?}",
+                        other.1, other.0
+                    ),
+                }
+            }
+            // a writer faster than the stream always has a frame when one qualifies: it never waits for one
+            assert!(
+                frame > 0 || writer > stream,
+                "{name}: no Frame wait at all ({until} until, {soon} soon)"
+            );
+            assert_eq!(soon, 0, "{name}: a Soon without a torn repeat");
+        }
+    }
+
+    /// With the polling mapping of [`crate::wake`], a stream makes the polls it always made: the emitted kinds over a
+    /// run are the same whether `Frame(t)` is mapped to a millisecond or the source were to answer `Soon` there.
+    #[test]
+    fn polling_mode_emits_what_the_old_pump_emitted() {
+        for (name, writer, stream) in [
+            ("pe-60-60", 60u32, 60u32),
+            ("pe-14-30", 14, 30),
+            ("pe-60-30", 60, 30),
+        ] {
+            let (_, kinds) = simulate(name, writer, stream, 0.8);
+            let live = kinds.iter().filter(|k| **k == Kind::Live).count();
+            let repeats = kinds.iter().filter(|k| **k == Kind::Repeat).count();
+            let want = (0.8 * writer.min(stream) as f64) as usize;
+            assert!(
+                live + 2 >= want && live <= want + 2,
+                "{name}: {live} live, wanted about {want}"
+            );
+            if writer >= stream {
+                assert!(repeats <= 2, "{name}: {repeats} repeats");
+            } else {
+                // a slower writer is filled up to the stream's rate with repeats
+                assert!(
+                    repeats + live + 3 >= (0.8 * stream as f64) as usize,
+                    "{name}: {} emitted",
+                    live + repeats
+                );
+            }
+        }
+    }
+
+    /// The three places `Frame(t)` can point at, one by one.
+    #[test]
+    fn frame_points_at_the_repeat_deadline_the_repeat_gate_and_the_starting_slate() {
+        let freq = qpc_frequency();
+        let period = freq / 30;
+        // no frame yet: the "starting" slate's point, 1.5 periods after the stream went live
+        let path = temp_path("wf-starting.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        let mut src = Rig::new(path, nv12(320, 180, 30));
+        src.start();
+        let t0 = qpc_now();
+        assert_eq!(src.poll(t0), Poll::Wait(Wait::Frame(t0 + period * 3 / 2)));
+        // later polls keep the same point
+        let t1 = t0 + period / 2;
+        assert_eq!(src.poll(t1), Poll::Wait(Wait::Frame(t0 + period * 3 / 2)));
+
+        // a frame on show: past `next_ok`, before the deadline: the deadline (1.5 periods after the take)
+        let path = temp_path("wf-deadline.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        let mut src = Rig::new(path, nv12(320, 180, 30));
+        src.start();
+        let t0 = qpc_now();
+        publish_at(&w, 320, 180, 1, t0);
+        let Poll::Ready(e) = src.poll(t0) else {
+            panic!("no frame")
+        };
+        src.finish_emit(e, t0);
+        // a decimated wait first: Until the earliest next frame (3/4 of a period)
+        assert_eq!(
+            src.poll(t0 + 1),
+            Poll::Wait(Wait::Until(t0 + period * 3 / 4))
+        );
+        let now = t0 + period * 3 / 4 + 10;
+        w.heartbeat();
+        assert_eq!(src.poll(now), Poll::Wait(Wait::Frame(t0 + period * 3 / 2)));
+        // at the deadline the last frame goes out again, and until `last_emit + period` allows another the wait is
+        // for that time
+        let at = t0 + period * 3 / 2;
+        w.heartbeat();
+        let Poll::Ready(r) = src.poll(at) else {
+            panic!("no repeat at the deadline")
+        };
+        assert_eq!(r.kind, Kind::Repeat);
+        src.finish_emit(r, at);
+        w.heartbeat();
+        assert_eq!(
+            src.poll(at + 5),
+            Poll::Wait(Wait::Frame(at + period)),
+            "the repeat gate"
+        );
+    }
+
+    /// A torn repeat is the one case with nothing to wait for: it is asked again at once.
+    #[test]
+    fn a_torn_repeat_is_asked_again_in_a_millisecond() {
+        use vcam_protocol::{off, slot_off};
+        let path = temp_path("wf-torn.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = std::rc::Rc::new(Writer::create(&path).unwrap());
+        w.set_state(WriterState::Live);
+        let (fw, fh) = (320u32, 180u32);
+        let mut src = Rig::new(path, nv12(fw, fh, 30));
+        src.start();
+        publish_pattern(&w, fw, fh, 5);
+        assert_eq!(
+            next_ready(&mut src, Duration::from_secs(1)).kind,
+            Kind::Live
+        );
+        let w2 = w.clone();
+        COPY_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let sh = w2.shared();
+                let slot = sh.header().latest_slot as usize;
+                let meta = sh.slot_meta(slot);
+                sh.poke64(slot_off(slot) + off::SLOT_SEQ, meta.seq + 1);
+            }))
+        });
+        let mut saw_soon = false;
+        let began = Instant::now();
+        while began.elapsed() < Duration::from_millis(300) {
+            w.heartbeat();
+            if let Poll::Wait(Wait::Soon) = src.poll(qpc_now()) {
+                saw_soon = true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        COPY_HOOK.with(|h| *h.borrow_mut() = None);
+        assert!(saw_soon, "a torn repeat gave no Soon");
+    }
+
+    /// The source reports what the pump waits by: Live with the advert and counts of the very header it read, nothing
+    /// outside Live, and the counters now.
+    #[test]
+    fn the_source_reports_the_advert_only_while_the_writer_is_live() {
+        let path = temp_path("wf-report.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        let mut src = Rig::new(path, nv12(320, 180, 30));
+        src.start();
+        w.set_state(WriterState::Paused);
+        let _ = src.poll(qpc_now());
+        assert_eq!(src.report(), WakeReport::default(), "paused");
+        w.set_state(WriterState::Live);
+        publish_pattern(&w, 320, 180, 1);
+        let _ = src.poll(qpc_now());
+        let r = src.report();
+        assert!(r.live);
+        let want = w.header();
+        assert_eq!(r.advert.map(|a| a.nonces), w.frame_event_nonces());
+        assert_eq!(r.advert.unwrap().signal_seq, want.signal_seq);
+        assert_eq!(r.writer_frames, want.writer_frames);
+        assert_eq!(src.counters(), Some((want.signal_seq, want.writer_frames)));
+        w.set_state(WriterState::Closed);
+        let _ = src.poll(qpc_now());
+        assert_eq!(src.report(), WakeReport::default(), "closed");
+        // a header that does not validate
+        w.set_state(WriterState::Live);
+        w.shared().poke32(vcam_protocol::off::PROTOCOL, 9);
+        let _ = src.poll(qpc_now());
+        assert_eq!(src.report(), WakeReport::default(), "foreign protocol");
+    }
+
+    /// The diagnostics go into the header only while it validates (like every other write of the DLL).
+    #[test]
+    fn the_wait_diagnostics_are_written_only_into_a_valid_header() {
+        let path = temp_path("wf-diag.bin");
+        let _ = std::fs::remove_file(&path);
+        let w = Writer::create(&path).unwrap();
+        w.set_state(WriterState::Live);
+        let mut src = Rig::new(path, nv12(320, 180, 30));
+        src.start();
+        publish_pattern(&w, 320, 180, 1);
+        let _ = src.poll(qpc_now());
+        let d = Diag {
+            mode: 1,
+            events: 7,
+            missed: 2,
+            spurious: 3,
+        };
+        src.publish_diag(&d);
+        let h = w.header();
+        assert_eq!(
+            (h.wake_mode, h.wake_events, h.wake_missed, h.wake_spurious),
+            (1, 7, 2, 3)
+        );
+        // a foreign protocol version: the next poll sees it, and nothing is written
+        w.shared().poke32(vcam_protocol::off::PROTOCOL, 9);
+        let _ = src.poll(qpc_now());
+        src.publish_diag(&Diag {
+            mode: 4,
+            events: 99,
+            missed: 99,
+            spurious: 99,
+        });
+        let h = w.header();
+        assert_eq!(
+            (h.wake_mode, h.wake_events),
+            (1, 7),
+            "written into a header that did not validate"
+        );
+        // a file that is not a frame file at all (the magic is wrong): the same
+        w.shared().poke32(vcam_protocol::off::PROTOCOL, 1);
+        w.shared().poke32(vcam_protocol::off::MAGIC, 0xBAD0_BAD0);
+        let _ = src.poll(qpc_now());
+        src.publish_diag(&Diag { mode: 3, ..d });
+        assert_eq!(w.header().wake_mode, 1);
+        // a read-only mapping cannot be written at all
+        w.shared()
+            .poke32(vcam_protocol::off::MAGIC, vcam_protocol::MAGIC);
     }
 }

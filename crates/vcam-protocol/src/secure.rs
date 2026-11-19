@@ -1413,9 +1413,8 @@ pub fn canonical_dir(dir: &Path) -> io::Result<String> {
 /// The final path a file at `path` must have when `root` is trusted: the canonical `root` followed by the
 /// components of `path` below it. Refuses a `path` that is not below `root` or that contains `..`.
 pub fn expected_path(root: &Path, path: &Path) -> io::Result<String> {
-    let rel = path
-        .strip_prefix(root)
-        .map_err(|_| refused("path is not below the trusted root"))?;
+    let rel = strip_prefix_ignore_case(path, root)
+        .ok_or_else(|| refused("path is not below the trusted root"))?;
     let mut s = canonical_dir(root)?;
     while s.ends_with('\\') {
         s.pop();
@@ -1509,6 +1508,41 @@ pub fn open_existing(path: &Path, write: bool, pin: Option<&Path>) -> io::Result
     let h = open_no_follow(path, write, false, SHARE_ALL)?;
     verify_file(raw(&h), expect.as_deref())?;
     Ok(h)
+}
+
+/// [`open_existing`] with exactly the access mask `access` instead of the data rights: for a handle that only asks about
+/// the file (`READ_CONTROL | FILE_READ_ATTRIBUTES` to read its permissions).
+pub fn open_existing_for(path: &Path, access: u32, pin: Option<&Path>) -> io::Result<OwnedHandle> {
+    let expect = match pin {
+        Some(root) => Some(expected_path(root, path)?),
+        None => None,
+    };
+    let h = open_with(path, access, SHARE_ALL, OPEN_EXISTING, false, 0)?;
+    verify_file(raw(&h), expect.as_deref())?;
+    Ok(h)
+}
+
+/// `FILE_READ_ATTRIBUTES`, for [`open_existing_for`] (with [`file_identity`]).
+pub const ACCESS_ATTRIBUTES_ONLY: u32 = ACCESS_READ_ATTRIBUTES;
+
+/// `path` below `root`, the components compared without regard to ASCII case (the file system does not tell
+/// `ProgramData` from `PROGRAMDATA`), as the components after `root` (empty when `path` is `root`). `None` when `path`
+/// is not at or below `root` (a component of `root` differs, or `path` is shorter). Whole components only: `C:\Data2`
+/// is not below `C:\Data`. One rule for every caller: [`expected_path`] and the writer's test for "this is the
+/// production path" and "this is inside the data folder".
+pub fn strip_prefix_ignore_case(path: &Path, root: &Path) -> Option<PathBuf> {
+    let mut p = path.components();
+    for r in root.components() {
+        let c = p.next()?;
+        if !c
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&r.as_os_str().to_string_lossy())
+        {
+            return None;
+        }
+    }
+    Some(p.as_path().to_path_buf())
 }
 
 #[cfg(test)]

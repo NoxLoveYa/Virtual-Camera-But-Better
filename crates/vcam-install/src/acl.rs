@@ -825,6 +825,67 @@ mod tests {
         );
     }
 
+    /// The DLL (`vcam-source`, in the camera service) trusts the frame events of exactly one user: the single trustee of
+    /// the frame file's DACL that is not SYSTEM, Administrators or LOCAL SERVICE
+    /// (`vcam_protocol::signal::owner::expected_owner`). This ties that reading to what this installer writes: if the
+    /// ACL ever gains another trustee, loses the user, or names the user in a shape the DLL does not accept, the pump
+    /// would silently poll, and this test says so first.
+    #[test]
+    fn the_dll_finds_the_installing_user_in_the_frame_file_acl() {
+        use vcam_protocol::signal::owner::{expected_owner, is_user_sid_shape};
+        let trustees = |p: &Principals| -> Vec<String> {
+            expected(Object::FramesFile, p)
+                .into_iter()
+                .map(|a| a.sid)
+                .collect()
+        };
+        // the user the installer was given is the one the DLL expects, for every account shape the installer accepts
+        for user in [
+            USER,
+            "S-1-5-21-1-2-3-500",
+            "S-1-5-21-4294967295-0-3-4294967295",
+            "S-1-12-1-1-2-3-4",
+        ] {
+            assert!(valid_sid(user));
+            assert_eq!(
+                expected_owner(&trustees(&Principals::machine(Some(user)))).as_deref(),
+                Some(user),
+                "{user}"
+            );
+        }
+        // an install without a user: nobody is trusted
+        assert_eq!(expected_owner(&trustees(&Principals::machine(None))), None);
+        // the two shape tests (installer and DLL) agree, in both directions
+        let me = crate::current_user_sid().unwrap();
+        for sid in [
+            USER,
+            me.as_str(),
+            "S-1-5-21-1-2-3-500",
+            "S-1-12-1-1-2-3-4",
+            "S-1-1-0",
+            "S-1-5-18",
+            "S-1-5-19",
+            "S-1-5-32-544",
+            "S-1-5-32-545",
+            "S-1-5-21-1-2-3",
+            "S-1-12-1-1-2-3",
+            "S-1-5-21-1-2-3-4294967296",
+            "S-1-5-21-1-2-3-04",
+            "S-1-5-21-1-2-3-+4",
+            "S-1-5-21-1-2-3-4-5",
+            "S-1-5-21-1-2-3-1)(A;;FA;;;WD",
+            "s-1-5-21-1-2-3-4",
+            "",
+        ] {
+            assert_eq!(valid_sid(sid), is_user_sid_shape(sid), "'{sid}'");
+        }
+        // every trustee the installer names besides the user is one the DLL skips
+        let p = Principals::machine(Some(USER));
+        let others: Vec<String> = trustees(&p).into_iter().filter(|s| s != USER).collect();
+        assert_eq!(others.len(), 3);
+        assert_eq!(expected_owner(&others), None);
+    }
+
     /// The reviewer's reproduction on a real file: with the old mask (`0x12019f`) the user could hard-link the file
     /// from a folder of their own and set it read-only; with the new one both are denied while a read-write
     /// mapping, the way the app and the DLL use the file, still works.
