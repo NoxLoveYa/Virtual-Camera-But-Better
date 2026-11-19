@@ -10,6 +10,13 @@
 //! normalised to the luma of the grey, so the exposure meter does not see the white balance. A linear model in
 //! mired: the doc's three-point table is only a way to make such a signal; this is the signal.
 //!
+//! Coloured scenes (`SimCfg::scene`, docs/AUTO-WHITE-BALANCE.md 5.2, W3): a scene of the kit `fx::awb::scenes` (an
+//! office, a grey room, a face filling the frame, ...) replaces the grey wall. Each cell keeps its reflectance
+//! colour, and the cast is `(bb(T_light) / bb(K_set))^(α_true / 0.0105)` per channel (a blackbody ratio, so
+//! `α_true = 0.0105` is the physical camera and the `α_true` variants stay). Each cell is normalised to its own luma,
+//! so the exposure meter still does not see the colour. The true `e_wb` is the blue-red signal of that cast (what a
+//! neutral surface shows) minus the aim.
+//!
 //! Faults (6.1) are public fields of [`Faults`], set by the test at any time: `ignore` (accepted, the read-back
 //! shows the old value), `no_effect` (the read-back shows the new value, the picture stays), `fail` (every write and
 //! read errors), `slow` (every write after the first takes this long), `meddles` (another program writes).
@@ -19,6 +26,7 @@ use std::collections::VecDeque;
 use super::meter::{measure_exposure, srgb_decode, srgb_encode, warmth_target, GRID};
 use super::*;
 use crate::capture::controls::AccessPath;
+use crate::fx::awb::scenes;
 
 pub type Light = Box<dyn Fn(f64) -> f64>;
 
@@ -107,6 +115,8 @@ pub struct SimCfg {
     pub wb: Option<WbSim>,
     /// The camera has Camera auto for exposure.
     pub exposure_auto: bool,
+    /// A coloured scene of the kit `fx::awb::scenes` (`None`: the grey wall).
+    pub scene: Option<&'static str>,
 }
 
 impl Default for SimCfg {
@@ -128,6 +138,7 @@ impl Default for SimCfg {
             seed: 7,
             wb: None,
             exposure_auto: true,
+            scene: None,
         }
     }
 }
@@ -167,16 +178,25 @@ const LAND_S: f64 = 0.1;
 const SUBMIT_EVERY: f64 = 0.066;
 const SUB: usize = 16;
 
-/// The channel multipliers of a picture whose blue over red is `e^c`, with the luma of the grey kept at 1.
+/// The tint of a real light: green over the mean of red and blue is `e^(-0.14 c)` for a blue over red of `e^c` (the
+/// blackbody locus, `fx::awb`'s line). A cast with no green shift would sit off the locus, on the side the skin guard
+/// reads as skin, and a strong one would be held for that.
+const LOCUS_SLOPE: f64 = -0.14;
+
+/// The channel multipliers of a picture whose blue over red is `e^c`, on the locus, with the luma of the grey kept
+/// at 1.
 fn tint(c: f64) -> [f64; 3] {
-    let (r, b) = ((-0.5 * c).exp(), (0.5 * c).exp());
-    let n = 1.0 / (0.2126 * r + 0.7152 + 0.0722 * b);
-    [r * n, n, b * n]
+    let (r, g, b) = ((-0.5 * c).exp(), (LOCUS_SLOPE * c).exp(), (0.5 * c).exp());
+    let n = 1.0 / (0.2126 * r + 0.7152 * g + 0.0722 * b);
+    [r * n, g * n, b * n]
 }
 
 /// The scene: reflectances, in-cell texture and the calibrated scale.
 struct Scene {
+    /// The brightness of each cell (its luma), what the exposure meter sees.
     refl: Vec<f64>,
+    /// The colour of each cell (the reflectance; white for the grey wall).
+    rho: Vec<[f64; 3]>,
     tex: [f64; SUB],
     scale: f64,
     s_true: f64,
@@ -184,21 +204,33 @@ struct Scene {
 }
 
 impl Scene {
-    fn new(s_true: f64, bent: bool) -> Scene {
+    fn new(s_true: f64, bent: bool, kit: Option<&str>) -> Scene {
         let mut refl = vec![1.0; GRID * GRID];
-        for y in 0..GRID {
-            for x in 0..GRID {
-                let i = y * GRID + x;
-                if (5..=10).contains(&x) && (3..=9).contains(&y) {
-                    refl[i] = 1.6; // the face
-                }
-                if x >= 12 && y >= 12 {
-                    refl[i] = 0.05; // the dark corner
+        let mut rho = vec![[1.0; 3]; GRID * GRID];
+        if let Some(name) = kit {
+            for (i, c) in scenes::scene(name).iter().enumerate() {
+                rho[i] = c.rho;
+                refl[i] = scenes::luma(c.rho);
+            }
+            for i in scenes::HIGHLIGHTS {
+                rho[i] = [1.0; 3]; // a lamp or a specular spot: white, clipped
+                refl[i] = 2.0;
+            }
+        } else {
+            for y in 0..GRID {
+                for x in 0..GRID {
+                    let i = y * GRID + x;
+                    if (5..=10).contains(&x) && (3..=9).contains(&y) {
+                        refl[i] = 1.6; // the face
+                    }
+                    if x >= 12 && y >= 12 {
+                        refl[i] = 0.05; // the dark corner
+                    }
                 }
             }
+            refl[2 * GRID + 3] = 5.0; // two bright cells
+            refl[3 * GRID + 12] = 5.0;
         }
-        refl[2 * GRID + 3] = 5.0; // two bright cells
-        refl[3 * GRID + 12] = 5.0;
         let mut tex = [0.0; SUB];
         for (s, t) in tex.iter_mut().enumerate() {
             *t = 1.0 + 0.2 * (((s * 7) % 5) as f64 - 2.0) / 2.0;
@@ -209,6 +241,7 @@ impl Scene {
         }
         let mut scene = Scene {
             refl,
+            rho,
             tex,
             scale: 1.0,
             s_true,
@@ -219,7 +252,7 @@ impl Scene {
         for _ in 0..40 {
             let mid = 0.5 * (lo + hi);
             scene.scale = mid.exp2();
-            let e = measure_exposure(&scene.render(0, 0, 1.0, 0.0, None), 0.45).error;
+            let e = measure_exposure(&scene.render(0, 0, 1.0, None, None), 0.45).error;
             if e > 0.0 {
                 lo = mid;
             } else {
@@ -245,14 +278,13 @@ impl Scene {
         }
     }
 
-    /// The statistics image of a frame exposed with `2^e` s, gain setting `g`, at light factor `l`, with the blue-red
-    /// signal `c`.
-    fn render(&self, e: i32, g: i32, l: f64, c: f64, mut rng: Option<&mut Rng>) -> Stats {
+    /// The statistics image of a frame exposed with `2^e` s, gain setting `g`, at light factor `l`, under the colour
+    /// cast `cast` (per channel; `None` is neutral). Each cell keeps its own luma.
+    fn render(&self, e: i32, g: i32, l: f64, cast: Option<[f64; 3]>, mut rng: Option<&mut Rng>) -> Stats {
         let gain = self.gs(g).exp2();
         let base = self.scale * l * f64::from(e).exp2() * gain;
-        let colour = (c != 0.0).then(|| tint(c));
         let mut cells = Vec::with_capacity(GRID * GRID);
-        for r in &self.refl {
+        for (r, rho) in self.refl.iter().zip(&self.rho) {
             let mut sum = 0.0;
             for t in &self.tex {
                 let lin = base * r * t;
@@ -270,14 +302,19 @@ impl Scene {
                 sum += v;
             }
             let m = sum / SUB as f64;
-            cells.push(match colour {
+            cells.push(match cast {
                 None => [m as f32, m as f32, m as f32, 1.0],
-                Some(f) => [
-                    (m * f[0]).min(1.0) as f32,
-                    (m * f[1]).min(1.0) as f32,
-                    (m * f[2]).min(1.0) as f32,
-                    1.0,
-                ],
+                Some(c) => {
+                    // The cell's colour under the cast, scaled back to the cell's own luma.
+                    let f = [rho[0] * c[0], rho[1] * c[1], rho[2] * c[2]];
+                    let n = m / (0.2126 * f[0] + 0.7152 * f[1] + 0.0722 * f[2]);
+                    [
+                        (f[0] * n).min(1.0) as f32,
+                        (f[1] * n).min(1.0) as f32,
+                        (f[2] * n).min(1.0) as f32,
+                        1.0,
+                    ]
+                }
             });
         }
         Stats { cells }
@@ -290,7 +327,7 @@ struct Capture {
     e: i32,
     g: i32,
     light: f64,
-    c: f64,
+    cast: Option<[f64; 3]>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -381,7 +418,7 @@ pub struct Sim {
 
 impl Sim {
     pub fn new(cfg: SimCfg, light: Light) -> Sim {
-        let scene = Scene::new(cfg.s_true, cfg.bent);
+        let scene = Scene::new(cfg.s_true, cfg.bent, cfg.scene);
         let k0 = cfg.wb.map_or(4600, |w| w.start_k);
         Sim {
             rng: Rng::new(cfg.seed),
@@ -488,25 +525,42 @@ impl Sim {
         self.dev_k
     }
 
-    /// The blue-red signal of a picture made with `k` under `t_light` Kelvin.
-    fn colour(&self, k: i32, t_light: f64) -> f64 {
-        self.cfg
-            .wb
-            .map_or(0.0, |w| w.alpha_true * (1e6 / f64::from(k) - 1e6 / t_light))
+    /// The colour cast of a picture made with `k` under `t_light` Kelvin (`None` without white balance). A grey
+    /// scene: a blue-red signal `α_true·(M_set − M_light)` with the luma kept. A kit scene: a blackbody ratio to the
+    /// power `α_true / 0.0105`.
+    fn cast(&self, k: i32, t_light: f64) -> Option<[f64; 3]> {
+        let w = self.cfg.wb?;
+        if self.cfg.scene.is_some() {
+            let (light, set) = (scenes::blackbody_rgb(t_light), scenes::blackbody_rgb(f64::from(k)));
+            let p = w.alpha_true / 0.0105;
+            Some([0, 1, 2].map(|i| (light[i] / set[i]).powf(p)))
+        } else {
+            Some(tint(w.alpha_true * (1e6 / f64::from(k) - 1e6 / t_light)))
+        }
     }
 
     fn oracle(&self, target: f64, warmth: f64) -> (meter::ExposureReading, f64) {
-        let c = self.colour(self.eff_k, (self.temp)(self.t));
+        let cast = self.cast(self.eff_k, (self.temp)(self.t));
         let stats = self
             .scene
-            .render(self.eff_e, self.eff_g, (self.light)(self.t), c, None);
-        let wb = if self.cfg.wb.is_some() {
-            // Not `measure_white_balance` (its weights): the true `e_wb` is the signal minus the aim.
-            c - warmth_target(warmth)
-        } else {
-            0.0
-        };
+            .render(self.eff_e, self.eff_g, (self.light)(self.t), cast, None);
+        let wb = cast.map_or(0.0, |c| {
+            // Not `measure_white_balance`: the true `e_wb` is the blue-red signal of the cast minus the aim.
+            (c[2] / c[0]).ln() - warmth_target(warmth)
+        });
         (measure_exposure(&stats, target), wb)
+    }
+
+    /// The noiseless statistics image of the landed state now: what Auto Adjust would measure after this loop.
+    pub fn picture(&self) -> Stats {
+        let cast = self.cast(self.eff_k, (self.temp)(self.t));
+        self.scene
+            .render(self.eff_e, self.eff_g, (self.light)(self.t), cast, None)
+    }
+
+    /// The colour a neutral surface has in the landed state now (the cast, linear RGB; white without white balance).
+    pub fn neutral_now(&self) -> [f64; 3] {
+        self.cast(self.eff_k, (self.temp)(self.t)).unwrap_or([1.0; 3])
     }
 
     /// The true stops of gain at a setting.
@@ -725,7 +779,7 @@ impl Sim {
                     e: self.eff_e,
                     g: self.eff_g,
                     light,
-                    c: self.colour(self.eff_k, (self.temp)(start)),
+                    cast: self.cast(self.eff_k, (self.temp)(start)),
                 },
             ));
         }
@@ -737,7 +791,7 @@ impl Sim {
             if self.paused || self.no_samples {
                 continue;
             }
-            let stats = self.scene.render(c.e, c.g, c.light, c.c, Some(&mut self.rng));
+            let stats = self.scene.render(c.e, c.g, c.light, c.cast, Some(&mut self.rng));
             ctrl.on_sample(
                 &MeterSample {
                     token: 1,

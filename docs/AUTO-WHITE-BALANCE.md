@@ -1,6 +1,6 @@
 # Auto white balance under warm light — analysis and plan
 
-Status: design; W1 (the shared estimator and the scene kit, section 6) built, nothing else. Date: 2026-11-19. Owner report: "if I have an orange light, auto colouring does not
+Status: design; W1 (the shared estimator and the scene kit) and W3 (the device loop on it) built, section 6. Date: 2026-11-19. Owner report: "if I have an orange light, auto colouring does not
 compensate well." Covers both places Better Cam balances colour:
 
 1. **Auto Adjust** (the filter): `src-tauri/src/fx/auto_adjust.rs`, `gpu/shaders/auto_adjust.hlsl`,
@@ -516,6 +516,56 @@ of 100, the test allows 50 µs). Mixed 5500 | 2700 K at split 8: daylight side �
 - **Depends on:** W1, and **the F1-F6 follow-ups merged** (same files are being edited now).
 - **Check:** `cargo test -p better-cam auto_controls` passes all 24 cases of AUTO-CONTROLS.md 6.2 (case 16 with the new
   text) and B1-B8; clippy clean.
+
+**W3 built (2026-11-19).** Files: `auto_controls/{meter.rs, white_balance.rs, status.rs, sim.rs, tests.rs}`,
+`fx/awb.rs` (only `pub(crate) mod scenes;`, no algorithm change), `docs/AUTO-CONTROLS.md` (notes in 2.4, 2.6, 4.2, 6.1,
+6.2, 9.5). `measure_white_balance` is `estimate_light` with `e_wb = t − c*(warmth)` and the estimator's `conf` and
+`reason`; the loop keeps its bands, `ΔM_max`, `k`, watchdog and `α` seed (0.006) unchanged and holds at `conf < 0.3`.
+Results of B1-B8 (the sim: kit scenes, `α_true = 0.0105`, camera seeded as stated, `Normal` speed):
+
+| # | Case | Threshold | Measured |
+|---|---|---|---|
+| B1 | office, 6500 → 2700 K at 5 s, seed 6500 K | device ≤ 2850 K, `holding`/`at_limit` ≤ 10 s; after Auto Adjust ≤ 2° | device 2800 K, state ok 8.6 s after the change, 1.13° |
+| B2 | office, 2200 K, seed 4600 K | `at_limit` at 2800 K ≤ 10 s; ≤ 2° | `at_limit` at 7.4 s, 1.13° (device alone +135 mired) |
+| B3 | warm_room, grey_room, 2700 K, seed 4600 K | device ≤ 2900 K ≤ 10 s | both 2800 K at 4.1 s (device alone +15 mired); after Auto Adjust grey_room 1.47°, warm_room 12.8° (beige = grey under 4400 K, 3.6) |
+| B4 | the 0.012 camera, 3000 K on the grey wall and in the office | `\|e_wb\| < 0.03` (office: + the estimator's 0.042) or `at_limit` | follows to 2978 K (office), `\|e_wb\|` 0.032 |
+| B5 | face_fill, red_wall, 5500 K, seed 4600 K | `NoSignal`, `OneColour`, ≤ 1 write, text of 4 | `no_signal`, 0 writes, the text of 4 |
+| B6 | cases 15-17 in the office | their criteria | pass, with the office allowances below |
+| B7 | office, 5500 K, seed 4600 K | `holding` ≤ 6 s, `\|residual\|` ≤ 10 mired | `holding` at 2.3 s, −4.6 mired (K 5356) |
+| B8 | office, sensor noise + 0.1 stop light jitter, 60 s | ≤ 1 write per 10 s, no reversals | 0 writes in 60 s, at 2700 K (`at_limit` at 2800 K) and 3000 K (`holding`, 2975 K) |
+
+Changes to the tests of the doc, each old → new:
+
+| Case | Old | New | Why |
+|---|---|---|---|
+| B4 | converges, `\|e_wb\|` < 0.03 | the grey wall: as written; the office: `\|e_wb\|` < 0.03 + 0.042, or `at_limit` | The estimator's own error on the office is a constant 4 mired (0.042 in `ln(B/R)`, section 3.5 "proposed"). The loop settles where the *estimate* is on the aim, so the true error is that 4 mired, not 0. |
+| B6, case 15 in the office | no write before the light changes; `\|e_wb\|` < 0.03 | at most 12 mired of settling before the change; `\|e_wb\|` < 0.03 + 0.042 | The same constant error: a matched light still reads 4 mired off in the office, and the loop corrects it once. |
+| `a_cast_with_nothing_neutral_to_trust_is_held` | held (no write in 20 s) | renamed `a_strong_cast_is_followed` (B4) | The premise was the old gate. Reversed per the doc. |
+| case 16 (text) | "…at its limit (2800 K)… Auto Adjust can finish it." | "White balance at its warmest (2800 K): the light is warmer than this camera can correct." (and "coolest (6500 K)… cooler…") | Section 4. The Auto Adjust line is the card's (W4). |
+| `white_balance_holds_on_a_picture_of_one_colour` | no write | no write and the one-colour text | New text by reason. |
+
+Other changes:
+
+- **The grey wall's cast in the sim now lies on the locus** (`tint(c)`: green `e^(−0.14 c)`). A cast with no green shift
+  sits on the magenta side of the locus, where the skin guard (3.1, step 5) lowers the confidence: cases 15 and 16
+  then held instead of following the 3000 K light. That is the estimator working as designed on an unphysical cast, so
+  the sim was made physical rather than the estimator loosened.
+- **F4's leftover: mean-luma gate.** `MIN_MEAN_LUMA = 0.10` on the centre weighted mean coded luma in
+  `measure_white_balance` (not in `estimate_light`): below it `conf = 0` and the reason is `Dark`. A flat black lifted by
+  gain 75 (luma 17 of 255) has a lit share of 15 %, above the estimator's `Dark` edge (12 %), and flat grey is a
+  neutral light; it read `Holding`. Tests `a_lifted_black_is_dark_not_a_neutral_grey` (meter) and
+  `a_lifted_black_says_too_dark_not_holding` (loop) fail without the gate (checked: `Holding`, `conf 1.0`).
+- **Status texts** (`status.rs`): `NoSignal` with the reason `OneColour` says "The picture is mostly one colour (a face
+  or a wall): keeping 4600 K."; `AtLimit` says "White balance at its warmest (2800 K): the light is warmer than this
+  camera can correct." or "… coolest (6500 K): … cooler …". The reason shown is the latest non-`Ok` reason among the last
+  3 samples.
+- **Not done (W4):** the frontend line under the `at_limit` text ("Auto Adjust finishes the colour." or the **Add Auto
+  Adjust** button). Until W4 the card shows the backend text only, so the hint that Auto Adjust can finish it is
+  missing; no frontend file was touched.
+- **For W2/W4:** the loop writes the device only; Auto Adjust still has to correct what is left. B1-B3 check the
+  hand-off with the estimator and gains of W1 (`est.gains(aim, (0.25, 4.0))`, the limits of D3), not with W2's code.
+  The device warmth reaches the estimator only through `c*`, so a device warmth ≠ 0 shifts where the loop settles
+  and Auto Adjust's own warmth then decides the final colour (section 4, the hint).
 
 ### W4 — Card and defaults
 

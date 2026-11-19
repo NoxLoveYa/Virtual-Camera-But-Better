@@ -77,6 +77,8 @@ pub struct WhiteBalanceFacts {
     pub warm_limit: bool,
     /// How long there has been no picture, in seconds.
     pub no_picture_for: f64,
+    /// `NoSignal` because the picture is mostly one colour (not because it is dark).
+    pub one_colour: bool,
     pub fault: Option<Fault>,
     pub handed_back: Option<HandBackKind>,
 }
@@ -89,10 +91,16 @@ pub fn white_balance_message(f: &WhiteBalanceFacts) -> Option<String> {
     match f.state {
         WhiteBalanceState::Starting | WhiteBalanceState::Adjusting => Some("Adjusting…".to_string()),
         WhiteBalanceState::Holding => Some(format!("Holding · {}", kelvin(f.kelvin))),
+        // The card adds the line about Auto Adjust under it (it knows whether the filter is in the chain).
         WhiteBalanceState::AtLimit => Some(format!(
-            "White balance at its limit ({}): the light is {} than this camera can correct. Auto Adjust can finish it.",
+            "White balance at its {} ({}): the light is {} than this camera can correct.",
+            if f.warm_limit { "warmest" } else { "coolest" },
             kelvin(f.kelvin),
             if f.warm_limit { "warmer" } else { "cooler" }
+        )),
+        WhiteBalanceState::NoSignal if f.one_colour => Some(format!(
+            "The picture is mostly one colour (a face or a wall): keeping {}.",
+            kelvin(f.kelvin)
         )),
         WhiteBalanceState::NoSignal => Some(format!("Nothing to measure (too dark). Keeping {}.", kelvin(f.kelvin))),
         WhiteBalanceState::NoPicture => (f.no_picture_for > super::watchdog::NO_PICTURE_TEXT_AFTER)
@@ -319,6 +327,7 @@ mod tests {
             kelvin: 4650,
             warm_limit: true,
             no_picture_for: 0.0,
+            one_colour: false,
             fault: None,
             handed_back: None,
         }
@@ -336,17 +345,23 @@ mod tests {
             t(WhiteBalanceState::NoSignal).as_deref(),
             Some("Nothing to measure (too dark). Keeping 4650 K.")
         );
+        let mut f = wb(WhiteBalanceState::NoSignal);
+        f.one_colour = true;
+        assert_eq!(
+            white_balance_message(&f).as_deref(),
+            Some("The picture is mostly one colour (a face or a wall): keeping 4650 K.")
+        );
         let mut f = wb(WhiteBalanceState::AtLimit);
         f.kelvin = 2800;
         assert_eq!(
             white_balance_message(&f).as_deref(),
-            Some("White balance at its limit (2800 K): the light is warmer than this camera can correct. Auto Adjust can finish it.")
+            Some("White balance at its warmest (2800 K): the light is warmer than this camera can correct.")
         );
         f.kelvin = 6500;
         f.warm_limit = false;
         assert_eq!(
             white_balance_message(&f).as_deref(),
-            Some("White balance at its limit (6500 K): the light is cooler than this camera can correct. Auto Adjust can finish it.")
+            Some("White balance at its coolest (6500 K): the light is cooler than this camera can correct.")
         );
         let mut f = wb(WhiteBalanceState::NoPicture);
         f.no_picture_for = 12.0;

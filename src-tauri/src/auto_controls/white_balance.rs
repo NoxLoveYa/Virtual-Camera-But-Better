@@ -6,12 +6,17 @@
 //! Auto Adjust's scale, see `meter::warmth_target`), moves `ΔM = -k·e_wb/α` at most `ΔM_max` per decision and waits
 //! until a frame captured 0.3 s after the write has been measured.
 //!
+//! `e_wb` comes from the shared light estimator (`fx::awb`, docs/AUTO-WHITE-BALANCE.md 3.3): under a strong cast the
+//! loop has a confident, unbiased reading and walks toward the light. It still holds when the confidence is low, and
+//! the estimator's reason (dark, or mostly one colour) picks the text. What is left at the end of the range goes to
+//! Auto Adjust, which measures this loop's output.
+//!
 //! Pure like the exposure loop; the watchdog (`watchdog.rs`) is part of it.
 
 use std::collections::VecDeque;
 
 use super::exposure::ExposureView;
-use super::meter::measure_white_balance;
+use super::meter::{measure_white_balance, Reason};
 use super::status::{white_balance_message, WhiteBalanceFacts};
 use super::watchdog::{
     Drift, Fault, Halt, Moved, Unit, Watchdog, NO_EFFECT_RATIO, NO_EFFECT_SPAN, NO_PICTURE_AFTER,
@@ -135,6 +140,7 @@ struct Sample {
     t: f64,
     e: f64,
     conf: f64,
+    reason: Reason,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -177,6 +183,8 @@ struct Reading {
     e: f64,
     sigma: f64,
     conf: f64,
+    /// The latest reason a recent sample gave for a low confidence (`Ok` when none did).
+    reason: Reason,
 }
 
 pub struct WhiteBalanceLoop {
@@ -210,6 +218,8 @@ pub struct WhiteBalanceLoop {
     limit_stored: bool,
     no_picture: Option<f64>,
     retake: Option<i32>,
+    /// Why the last hold (`NoSignal`) was made: picks its text.
+    hold_reason: Reason,
     watchdog: Watchdog,
 }
 
@@ -244,6 +254,7 @@ impl WhiteBalanceLoop {
             limit_stored: false,
             no_picture: None,
             retake: None,
+            hold_reason: Reason::Dark,
             watchdog: Watchdog::new(Unit::Mired),
         }
     }
@@ -324,6 +335,7 @@ impl WhiteBalanceLoop {
             t: capture_time,
             e: r.error,
             conf: r.confidence,
+            reason: r.reason,
         });
         while self.samples.len() > MAX_SAMPLES {
             self.samples.pop_front();
@@ -560,6 +572,13 @@ impl WhiteBalanceLoop {
             e: median(|s| s.e),
             sigma,
             conf: median(|s| s.conf),
+            reason: valid
+                .iter()
+                .rev()
+                .take(MEDIAN_SAMPLES)
+                .map(|s| s.reason)
+                .find(|r| *r != Reason::Ok)
+                .unwrap_or(Reason::Ok),
         })
     }
 
@@ -587,6 +606,7 @@ impl WhiteBalanceLoop {
         if r.conf < HOLD_BELOW {
             // Nothing to measure: keep the Kelvin and say so (it is not `holding`: nothing was checked).
             self.state = WhiteBalanceState::NoSignal;
+            self.hold_reason = r.reason;
             self.limit_since = None;
             return Vec::new();
         }
@@ -793,6 +813,7 @@ impl WhiteBalanceLoop {
             kelvin: self.k,
             warm_limit: self.k <= (self.caps.k_min + self.caps.k_max) / 2,
             no_picture_for: self.no_picture.unwrap_or(0.0),
+            one_colour: self.hold_reason == Reason::OneColour,
             fault: halted.map(|h| h.fault),
             handed_back,
         });

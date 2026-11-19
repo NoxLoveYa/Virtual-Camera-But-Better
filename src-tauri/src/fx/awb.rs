@@ -24,8 +24,9 @@
 
 use super::auto_adjust::{Stats, GRID};
 
+/// Also used by `auto_controls::sim` (W3) for the device loop's coloured scenes.
 #[cfg(test)]
-mod scenes;
+pub(crate) mod scenes;
 #[cfg(test)]
 mod tests;
 

@@ -913,6 +913,11 @@ fn a_loop_is_not_built_for_a_control_that_is_not_offered() {
 // --- white balance ---
 
 fn wb_sim(alpha_true: f64, start_k: i32, temp: Light) -> Sim {
+    wb_sim_in(None, alpha_true, start_k, temp)
+}
+
+/// The same in a coloured scene of the kit (`None`: the grey wall).
+fn wb_sim_in(scene: Option<&'static str>, alpha_true: f64, start_k: i32, temp: Light) -> Sim {
     let cfg = SimCfg {
         wb: Some(WbSim {
             alpha_true,
@@ -923,6 +928,7 @@ fn wb_sim(alpha_true: f64, start_k: i32, temp: Light) -> Sim {
         start_g: 33,
         // These runs start seeded: `apply_on_open` has made the first (slow, 200-700 ms) write already.
         slow_first_write: false,
+        scene,
         ..SimCfg::default()
     };
     Sim::new(cfg, dim(-4.0)).with_temperature(temp)
@@ -968,16 +974,28 @@ fn mired(k: i32) -> f64 {
     1e6 / f64::from(k)
 }
 
-fn wb_step_check(alpha_true: f64, to: f64) -> AutoController {
+/// The estimator's constant error on the kit's office scene, in `ln(B/R)` (4 mired: docs/AUTO-WHITE-BALANCE.md 3.5).
+const ESTIMATOR_BIAS: f64 = 0.042;
+
+fn wb_step_check_in(scene: Option<&'static str>, alpha_true: f64, to: f64) -> AutoController {
     // 6500 K light, matched; at t = 5 s the light turns to `to` Kelvin.
     let temp: Light = Box::new(move |t| if t < 5.0 { 6500.0 } else { to });
-    let mut sim = wb_sim(alpha_true, 6500, temp);
+    let mut sim = wb_sim_in(scene, alpha_true, 6500, temp);
     let mut ctrl = wb_ctrl(&sim, 6500, true);
     sim.run(&mut ctrl, 25.0);
-    assert!(wb_writes(&sim).iter().all(|w| w.started >= 5.0), "wrote before the light changed");
-    let at = wb_settled_at(&sim, 5.0, 25.0, 0.03)
+    // A scene with colours has the estimator's own bias (the office reads 4 mired too orange, `ESTIMATOR_BIAS`): the
+    // loop may settle that before the light changes, by a few mired, and ends within it.
+    let bias = if scene.is_some() { ESTIMATOR_BIAS } else { 0.0 };
+    let before: Vec<WriteRec> = wb_writes(&sim).into_iter().filter(|w| w.started < 5.0).collect();
+    if scene.is_none() {
+        assert!(before.is_empty(), "wrote before the light changed");
+    } else {
+        let moved = before.last().map_or(0.0, |w| (mired(w.value) - mired(6500)).abs());
+        assert!(moved <= 12.0, "moved {moved} mired before the light changed: {before:?}");
+    }
+    let at = wb_settled_at(&sim, 5.0, 25.0, 0.03 + bias)
         .unwrap_or_else(|| panic!("α_true {alpha_true}: never settled: {:?}", sim.history.last()));
-    assert!(at - 5.0 <= 6.0, "α_true {alpha_true}: |e_wb| < 0.03 only after {} s", at - 5.0);
+    assert!(at - 5.0 <= 6.0, "α_true {alpha_true}: |e_wb| < {} only after {} s", 0.03 + bias, at - 5.0);
     let writes = wb_writes(&sim);
     let mut k = 6500;
     let mut signs = Vec::new();
@@ -994,38 +1012,57 @@ fn wb_step_check(alpha_true: f64, to: f64) -> AutoController {
     ctrl
 }
 
-#[test]
-fn case_15_white_balance_step() {
-    let ctrl = wb_step_check(0.008, 3000.0);
+fn case_15(scene: Option<&'static str>) {
+    let ctrl = wb_step_check_in(scene, 0.008, 3000.0);
     // The text of 4.2 with the Kelvin the loop holds.
     let st = ctrl.status().white_balance.unwrap();
     assert_eq!(st.message, Some(format!("Holding · {} K", st.kelvin)));
     assert!((2900..=3100).contains(&st.kelvin), "{}", st.kelvin);
-    // Learned α within 30 % of the truth, for a camera half as sensitive and one 1.5 times as sensitive. At 0.012 a
-    // 3000 K light would be a cast of ln(B/R) = -2.15 (blue a tenth of red): every cell saturated, nothing neutral to
-    // trust, and the loop rightly holds (conf_wb < 0.3). That camera gets a 4000 K light.
+    // Learned α within 30 % of the truth, for a camera half as sensitive and one 1.5 times as sensitive. At 0.012 the
+    // cast of a 3000 K light is so strong that W3 follows it (B4), and the 4000 K light keeps this case as it was.
     for (alpha_true, to) in [(0.004, 3000.0), (0.012, 4000.0)] {
-        let ctrl = wb_step_check(alpha_true, to);
+        let ctrl = wb_step_check_in(scene, alpha_true, to);
         let a = ctrl.learned().wb_alpha.expect("nothing learned");
         assert!((a - alpha_true).abs() <= 0.3 * alpha_true, "learned α {a} for a true {alpha_true}");
     }
 }
 
 #[test]
-fn a_cast_with_nothing_neutral_to_trust_is_held() {
-    // The 3000 K light on a very sensitive camera: ln(B/R) = -2.15. The loop does not guess.
-    let temp: Light = Box::new(|t| if t < 5.0 { 6500.0 } else { 3000.0 });
-    let mut sim = wb_sim(0.012, 6500, temp);
-    let mut ctrl = wb_ctrl(&sim, 6500, true);
-    sim.run(&mut ctrl, 20.0);
-    assert!(wb_writes(&sim).is_empty(), "{:?}", wb_writes(&sim));
-    assert!(sim.handbacks.is_empty());
+fn case_15_white_balance_step() {
+    case_15(None);
 }
 
 #[test]
-fn case_16_light_warmer_than_the_camera_can_correct() {
+fn case_15_white_balance_step_in_the_office() {
+    // B6: the same criteria with colours in the picture.
+    case_15(Some("office"));
+}
+
+#[test]
+fn a_strong_cast_is_followed() {
+    // B4, reversed from `a_cast_with_nothing_neutral_to_trust_is_held`: the 3000 K light on a very sensitive camera
+    // is a cast of ln(B/R) = -2.15 (blue a tenth of red). The old meter judged its cells before the correction, found
+    // everything saturated and held; the shared estimator judges them after it, and the loop walks to the light.
+    for scene in [None, Some("office")] {
+        let temp: Light = Box::new(|t| if t < 5.0 { 6500.0 } else { 3000.0 });
+        let mut sim = wb_sim_in(scene, 0.012, 6500, temp);
+        let mut ctrl = wb_ctrl(&sim, 6500, true);
+        sim.run(&mut ctrl, 25.0);
+        let k = sim.device_k();
+        let bias = if scene.is_some() { ESTIMATOR_BIAS } else { 0.0 };
+        assert!(
+            wb_settled_at(&sim, 5.0, 25.0, 0.03 + bias).is_some() || wb_state(&ctrl) == WhiteBalanceState::AtLimit,
+            "{scene:?}: not followed: device {k} K, {:?}",
+            sim.history.last()
+        );
+        assert!((2800..=3300).contains(&k), "{scene:?}: device at {k} K");
+        assert!(sim.handbacks.is_empty());
+    }
+}
+
+fn case_16_warm(scene: Option<&'static str>) {
     // A 2000 K lamp: the camera's warmest setting (2800 K) is still too cool for it.
-    let mut sim = wb_sim(0.008, 3500, kelvin(2000.0));
+    let mut sim = wb_sim_in(scene, 0.008, 3500, kelvin(2000.0));
     let mut ctrl = wb_ctrl(&sim, 3500, true);
     let mut limit_at = None;
     while sim.t < 14.0 {
@@ -1039,43 +1076,69 @@ fn case_16_light_warmer_than_the_camera_can_correct() {
     assert_eq!(sim.device_k(), 2800);
     assert!(wb_writes(&sim).iter().all(|w| w.started < at), "writes after at_limit");
     assert_eq!(wb_state(&ctrl), WhiteBalanceState::AtLimit);
+    // W3: the text names the end of the range; the card says what finishes the colour.
     assert_eq!(
         ctrl.status().white_balance.unwrap().message.as_deref(),
-        Some("White balance at its limit (2800 K): the light is warmer than this camera can correct. Auto Adjust can finish it.")
+        Some("White balance at its warmest (2800 K): the light is warmer than this camera can correct.")
+    );
+}
+
+#[test]
+fn case_16_light_warmer_than_the_camera_can_correct() {
+    case_16_warm(None);
+}
+
+#[test]
+fn case_16_light_warmer_than_the_camera_can_correct_in_the_office() {
+    case_16_warm(Some("office"));
+}
+
+fn case_16_cool(scene: Option<&'static str>) {
+    let mut sim = wb_sim_in(scene, 0.008, 5500, kelvin(12_000.0));
+    let mut ctrl = wb_ctrl(&sim, 5500, true);
+    sim.run(&mut ctrl, 14.0);
+    assert_eq!(sim.device_k(), 6500);
+    assert_eq!(wb_state(&ctrl), WhiteBalanceState::AtLimit);
+    assert_eq!(
+        ctrl.status().white_balance.unwrap().message.as_deref(),
+        Some("White balance at its coolest (6500 K): the light is cooler than this camera can correct.")
     );
 }
 
 #[test]
 fn case_16_light_cooler_than_the_camera_can_correct() {
-    let mut sim = wb_sim(0.008, 5500, kelvin(12_000.0));
-    let mut ctrl = wb_ctrl(&sim, 5500, true);
-    sim.run(&mut ctrl, 14.0);
-    assert_eq!(sim.device_k(), 6500);
-    assert_eq!(wb_state(&ctrl), WhiteBalanceState::AtLimit);
-    assert!(ctrl
-        .status()
-        .white_balance
-        .unwrap()
-        .message
-        .unwrap()
-        .contains("the light is cooler than this camera can correct"));
+    case_16_cool(None);
+}
+
+#[test]
+fn case_16_light_cooler_than_the_camera_can_correct_in_the_office() {
+    case_16_cool(Some("office"));
 }
 
 #[test]
 fn case_17_white_balance_waits_for_exposure() {
+    case_17(None);
+}
+
+#[test]
+fn case_17_white_balance_waits_for_exposure_in_the_office() {
+    case_17(Some("office"));
+}
+
+fn case_17(scene: Option<&'static str>) {
     // One stop brighter and a 3500 K light at t = 8 s: exposure has to move twice; white balance must wait for it.
     let base = (4.0f64).exp2();
     let light: Light = Box::new(move |t| if t < 8.0 { base } else { base * 4.0 });
     let temp: Light = Box::new(|t| if t < 8.0 { 6500.0 } else { 3500.0 });
     let cfg = SimCfg {
-        wb: Some(WbSim::default()),
+        wb: Some(WbSim {
+            start_k: 6500,
+            ..WbSim::default()
+        }),
         start_e: -5,
         start_g: 33,
+        scene,
         ..SimCfg::default()
-    };
-    let cfg = SimCfg {
-        wb: cfg.wb.map(|w| WbSim { start_k: 6500, ..w }),
-        ..cfg
     };
     let mut sim = Sim::new(cfg, light).with_temperature(temp);
     let mut ctrl = AutoController::new(
@@ -1157,20 +1220,16 @@ fn white_balance_holds_on_a_picture_of_one_colour() {
     let red = Stats {
         cells: vec![[0.4, 0.02, 0.02, 1.0]; 256],
     };
-    for i in 0..60 {
-        ctrl.on_sample(
-            &MeterSample {
-                token: 1,
-                capture_qpc: 0,
-                stats: red.clone(),
-            },
-            0.5 + f64::from(i) * 0.066,
-        );
-    }
-    let actions = ctrl.tick(2.0, &sim.facts());
+    let actions = drive(&mut ctrl, &sim, &red, 0.5, 4.0);
     assert!(
         !actions.iter().any(|a| matches!(a, Action::Write { .. })),
         "{actions:?}"
+    );
+    // W3: the text says why (it is not the dark).
+    assert_eq!(wb_state(&ctrl), WhiteBalanceState::NoSignal);
+    assert_eq!(
+        ctrl.status().white_balance.unwrap().message.as_deref(),
+        Some("The picture is mostly one colour (a face or a wall): keeping 5000 K.")
     );
 }
 
@@ -1205,6 +1264,179 @@ fn white_balance_on_a_black_picture_says_nothing_to_measure() {
         ctrl.status().white_balance.unwrap().message.as_deref(),
         Some("Holding · 4600 K")
     );
+}
+
+/// Drive the controller from `from` for `secs` s on a picture that never changes, as the runner does: a sample every
+/// 66 ms, a tick every 100 ms. Returns everything it asked for.
+fn drive(ctrl: &mut AutoController, sim: &Sim, stats: &Stats, from: f64, secs: f64) -> Vec<Action> {
+    let mut actions = Vec::new();
+    for ms in 0..(secs * 1000.0) as u64 {
+        let t = from + ms as f64 / 1000.0;
+        if ms % 66 == 0 {
+            ctrl.on_sample(
+                &MeterSample {
+                    token: 1,
+                    capture_qpc: 0,
+                    stats: stats.clone(),
+                },
+                t,
+            );
+        }
+        if ms % 100 == 0 {
+            actions.extend(ctrl.tick(t, &sim.facts()));
+        }
+    }
+    actions
+}
+
+#[test]
+fn a_lifted_black_says_too_dark_not_holding() {
+    // F4's leftover: gain 75 on a black picture is a flat grey around 17 of 255. Flat grey looks like a neutral
+    // light, so the loop said "Holding". A picture this dark has nothing to measure.
+    let mut sim = wb_sim(0.008, 4600, kelvin(4600.0));
+    let mut ctrl = wb_ctrl(&sim, 4600, true);
+    sim.run(&mut ctrl, 0.5);
+    let lin = meter::srgb_decode(17.0 / 255.0) as f32;
+    let grey = Stats {
+        cells: vec![[lin, lin, lin, 1.0]; 256],
+    };
+    let actions = drive(&mut ctrl, &sim, &grey, 0.5, 4.0);
+    assert!(!actions.iter().any(|a| matches!(a, Action::Write { .. })), "{actions:?}");
+    assert_eq!(wb_state(&ctrl), WhiteBalanceState::NoSignal);
+    assert_eq!(
+        ctrl.status().white_balance.unwrap().message.as_deref(),
+        Some("Nothing to measure (too dark). Keeping 4600 K.")
+    );
+}
+
+// --- W3: coloured scenes (docs/AUTO-WHITE-BALANCE.md 5.2, cases B1-B8) ---
+
+/// A coloured scene on a camera with the physical sensitivity (`α_true = 0.0105`, the blackbody slope).
+fn kit(scene: &'static str, start_k: i32, temp: Light) -> (Sim, AutoController) {
+    let sim = wb_sim_in(Some(scene), 0.0105, start_k, temp);
+    let ctrl = wb_ctrl(&sim, start_k, true);
+    (sim, ctrl)
+}
+
+/// What Auto Adjust makes of the picture the loop leaves it (it measures the loop's output): the angle of a neutral
+/// surface to its aim, in degrees, with its gains `0.25 ..= 4`.
+fn after_auto_adjust(sim: &Sim) -> f64 {
+    let aim = crate::fx::auto_adjust::white_aim(0.0, 0.0);
+    let est = crate::fx::awb::estimate_light(&sim.picture());
+    let g = est.gains(aim, (0.25, 4.0));
+    let n = sim.neutral_now();
+    let out = [g[0] * n[0], g[1] * n[1], g[2] * n[2]];
+    crate::fx::awb::scenes::angle(out, aim.map(f64::from))
+}
+
+/// The true residual of the landed state in mired, + is too orange (what `wb_err` says, in the doc's unit).
+fn residual_mired(sim: &Sim) -> f64 {
+    -sim.history.last().expect("ran").wb_err / 0.0105
+}
+
+fn at_or_holding(ctrl: &AutoController) -> bool {
+    matches!(wb_state(ctrl), WhiteBalanceState::Holding | WhiteBalanceState::AtLimit)
+}
+
+#[test]
+fn b1_the_office_follows_a_light_that_turns_orange() {
+    // 6500 K matched, then a 2700 K lamp at 5 s: the device goes to its warm end within 10 s.
+    let temp: Light = Box::new(|t| if t < 5.0 { 6500.0 } else { 2700.0 });
+    let (mut sim, mut ctrl) = kit("office", 6500, temp);
+    sim.run(&mut ctrl, 15.0);
+    assert!(sim.device_k() <= 2850, "device at {} K", sim.device_k());
+    assert!(at_or_holding(&ctrl), "{:?}", wb_state(&ctrl));
+    let a = after_auto_adjust(&sim);
+    assert!(a <= 2.0, "{a}° after Auto Adjust");
+}
+
+#[test]
+fn b2_a_2200_k_light_ends_at_the_limit_and_auto_adjust_finishes_it() {
+    let (mut sim, mut ctrl) = kit("office", 4600, kelvin(2200.0));
+    sim.run(&mut ctrl, 10.0);
+    assert_eq!(sim.device_k(), 2800);
+    assert_eq!(wb_state(&ctrl), WhiteBalanceState::AtLimit);
+    let a = after_auto_adjust(&sim);
+    assert!(a <= 2.0, "{a}° after Auto Adjust");
+}
+
+#[test]
+fn b3_a_warm_light_is_not_held_at_the_seed() {
+    // Today these hold at 4600 K (+158 mired): nothing neutral to trust under the old gate.
+    for scene in ["warm_room", "grey_room"] {
+        let (mut sim, mut ctrl) = kit(scene, 4600, kelvin(2700.0));
+        sim.run(&mut ctrl, 10.0);
+        assert!(sim.device_k() <= 2900, "{scene}: device at {} K", sim.device_k());
+        assert!(!wb_writes(&sim).is_empty());
+    }
+}
+
+#[test]
+fn b5_a_face_or_a_wall_filling_the_frame_is_held_with_its_own_text() {
+    for scene in ["face_fill", "red_wall"] {
+        let (mut sim, mut ctrl) = kit(scene, 4600, kelvin(5500.0));
+        sim.run(&mut ctrl, 10.0);
+        assert_eq!(wb_state(&ctrl), WhiteBalanceState::NoSignal, "{scene}");
+        assert!(wb_writes(&sim).len() <= 1, "{scene}: {:?}", wb_writes(&sim));
+        assert_eq!(
+            ctrl.status().white_balance.unwrap().message.as_deref(),
+            Some("The picture is mostly one colour (a face or a wall): keeping 4600 K."),
+            "{scene}"
+        );
+    }
+}
+
+#[test]
+fn b7_an_office_in_daylight_holds_close_to_neutral() {
+    // Today's meter ends 28 mired too blue here (the face pulls the gray world).
+    let (mut sim, mut ctrl) = kit("office", 4600, kelvin(5500.0));
+    let mut holding_at = None;
+    while sim.t < 6.0 {
+        sim.run(&mut ctrl, sim.t + 0.1);
+        if holding_at.is_none() && wb_state(&ctrl) == WhiteBalanceState::Holding {
+            holding_at = Some(sim.t);
+        }
+    }
+    assert!(holding_at.is_some(), "not holding within 6 s: {:?}", wb_state(&ctrl));
+    let r = residual_mired(&sim);
+    assert!(r.abs() <= 10.0, "residual {r} mired at {} K", sim.device_k());
+}
+
+#[test]
+fn b8_noise_does_not_make_the_loop_hunt() {
+    // 60 s of holding in an office with sensor noise and a flickering light level: at most one write per 10 s and no
+    // reversal pattern. 2700 K sits at the device's warm end; 3000 K is inside its range.
+    for (light, seed) in [(2700.0, 3200), (3000.0, 3400)] {
+        let cfg = SimCfg {
+            wb: Some(WbSim {
+                alpha_true: 0.0105,
+                start_k: seed,
+                can_auto: true,
+            }),
+            start_e: -5,
+            start_g: 33,
+            slow_first_write: false,
+            scene: Some("office"),
+            jitter: 0.1,
+            ..SimCfg::default()
+        };
+        let mut sim = Sim::new(cfg, dim(-4.0)).with_temperature(kelvin(light));
+        let mut ctrl = wb_ctrl(&sim, seed, true);
+        sim.run(&mut ctrl, 20.0);
+        assert!(at_or_holding(&ctrl), "{light} K: {:?}", wb_state(&ctrl));
+        let n = wb_writes(&sim).len();
+        sim.run(&mut ctrl, 80.0);
+        let later: Vec<WriteRec> = wb_writes(&sim).into_iter().skip(n).collect();
+        assert!(later.len() <= 6, "{light} K: {} writes in 60 s: {later:?}", later.len());
+        let mut k = sim.writes.iter().rev().find(|w| w.started < 20.0 && w.key == ControlKey::WhiteBalance).map_or(seed, |w| w.value);
+        let mut signs = Vec::new();
+        for w in &later {
+            signs.push((mired(w.value) - mired(k)).signum());
+            k = w.value;
+        }
+        let reversals = signs.windows(2).filter(|s| s[0] != s[1]).count();
+        assert!(reversals <= 1, "{light} K: {reversals} reversals: {later:?}");
+    }
 }
 
 #[test]

@@ -136,6 +136,16 @@ not strongly saturated; same smooth weights). `m` = weighted mean linear RGB of 
 `conf_wb = smoothstep(0.02, 0.12, Σw / Σc)`. Signal `c = ln(m_B / m_R)` (the blue-red axis; colour temperature moves
 along it). Target `c*(warmth)`, warmth in −1..+1 (+1 = warmer). Error `e_wb = c − c*`.
 
+> **Note W3 (2026-11-19, rule changed: old → new).** Old: the gray world above, with the cells judged by their
+> saturation *before* any correction. New: the shared estimator `fx::awb::estimate_light` (docs/AUTO-WHITE-BALANCE.md
+> 3.1) judges them *after* a correction, so under an orange light the neutral surfaces count and the loop has an
+> unbiased reading. `c` is its `t`, `conf_wb` its `conf`, and `e_wb = t − c*(warmth)` as before. The estimator's
+> reason (`dark`, `one_colour`) picks the hold text (2.6). **Mean-luma gate (F4's leftover):** a picture whose centre
+> weighted mean coded luma is below `MIN_MEAN_LUMA = 0.10` (about 25 of 255) has `conf_wb = 0` and the reason `dark`,
+> whatever its cells look like. Why: a black picture lifted by gain (gain 75, display luma 17) is a flat grey, flat
+> grey is a neutral light, and the loop said `holding` on it. The exposure loop aims at 0.45, so only a picture that is
+> dark for good ends here.
+
 **Warmth scale (A2, constant changed: old → new).** Old: `c* = −0.25 · warmth` (B/R ≈ 0.78 at +1). New: Auto Adjust's
 scale (`fx::auto_adjust::white_aim`, commit da34514, which merged first), so "warmth +0.3" is the same colour in the
 filter and on the device. The aim is the colour of a blackbody whose temperature is linear in **mired** from 5500 K at
@@ -318,13 +328,21 @@ of the status while the state lasts (not before the 3 s are over).
 - Hold when `conf_wb < 0.3` (a scene of one colour, a dark scene). **Follow-up F4:** the state is then `no_signal`
   ("Nothing to measure (too dark). Keeping 4600 K."), not `holding`: nothing was checked. It leaves the state when the
   confidence is back and measures from the wide band (`adjusting`) like after a write.
+  **Note W3 (text by reason, rule changed):** the state stays `no_signal`, the text follows the estimator's reason:
+  `dark` (also the mean-luma gate of 2.4) "Nothing to measure (too dark). Keeping 4650 K."; `one_colour` "The picture
+  is mostly one colour (a face or a wall): keeping 4650 K." Before W3 the second case also said "too dark", which was
+  wrong. The hold itself (`conf_wb < 0.3`) is unchanged, but under a strong orange cast the confidence is no longer
+  low: `a_cast_with_nothing_neutral_to_trust_is_held` (6.2, the 0.012 camera at 3000 K) is reversed into
+  `a_strong_cast_is_followed`.
 - Band: `B_out = max(0.04, 3σ_wb)`, `B_in = max(0.015, 1.5σ_wb)`, same holding/adjusting states.
 - Move: `ΔM = clamp(−k_wb · ê_wb / α, −ΔM_max, +ΔM_max)`; `K' = round_to_step(10⁶ / (M + ΔM))`, clamped to
   `K_min..K_max`; skip if `|K' − K| < step`.
 - White balance never writes in the same 0.3 s as an exposure batch, and waits while the exposure loop is
   `adjusting` with `|ê| > 1` stop: confounded measurements would teach `α` wrong and gray world is unreliable in a
   badly exposed picture. Exposure has priority.
-- Saturation: `K` at `K_min` or `K_max` and `|ê_wb| > B_out` for 3 s → `at_limit`.
+- Saturation: `K` at `K_min` or `K_max` and `|ê_wb| > B_out` for 3 s → `at_limit`. **Note W3:** what is left goes to
+  Auto Adjust, which measures this loop's output and (W2) corrects up to a gain of 4 per channel; the text names the
+  end of the range (4.2) and the card says whether Auto Adjust is there (W4).
 - Tint (green-magenta) has no device control; it stays with Auto Adjust.
 - **Learning `α` (A2 note, constant added).** The doc says "like `S`" but `S` learns from moves of at least 0.2 stop;
   in `ln(B/R)` that is 0.14, which a 20 mired step (0.12 at the initial `α`) never reaches. The loop learns from
@@ -511,7 +529,8 @@ Focus                                         512                      Auto (○
 | `holding` (exposure) | "Holding 30 fps · gain 48 of 75" (whole stops: "Holding 30 fps · 1/32 s") |
 | `holding` (exposure, gain off, F1) | "Holding 30 fps · 1/32 s · gain off" |
 | `holding` (WB) | "Holding · 4650 K" |
-| `no_signal` (WB, F4) | "Nothing to measure (too dark). Keeping 4650 K." |
+| `no_signal` (WB, F4, reason `dark`) | "Nothing to measure (too dark). Keeping 4650 K." |
+| `no_signal` (WB, W3, reason `one_colour`) | "The picture is mostly one colour (a face or a wall): keeping 4650 K." |
 | `limit_exposure`, gain off (F1) | "Exposure at the 30 fps limit and gain is off. Add light, allow more gain, or allow a longer exposure." |
 | `limit_gain` | "Gain at its maximum (75). Add light, allow more gain, or allow a longer exposure." |
 | `limit_exposure` | "Exposure at the 30 fps limit and this camera has no gain. Add light or allow a longer exposure." |
@@ -519,7 +538,7 @@ Focus                                         512                      Auto (○
 | learned cap | "The camera dropped to 24 fps at 1/32 s, so Better Cam keeps exposure at 1/64 s or shorter." |
 | `no_signal` | "Nothing to measure (lens covered?). Brightening slowly." |
 | `no_picture` (> 10 s) | "No picture to measure." |
-| `at_limit` (WB) | "White balance at its limit (2800 K): the light is warmer than this camera can correct. Auto Adjust can finish it." |
+| `at_limit` (WB, W3: was "…at its limit (2800 K)… Auto Adjust can finish it.") | "White balance at its warmest (2800 K): the light is warmer than this camera can correct." / "White balance at its coolest (6500 K): the light is cooler than this camera can correct." The line about Auto Adjust moves to the card (W4). |
 | `conflict` | "Another program keeps changing Exposure. Better Cam auto paused. [Resume]" |
 | `ignored` | "The camera ignored Better Cam auto for Exposure. Back to Camera auto. [Try again]" |
 | `no_response` | "The picture does not change when Better Cam changes Exposure. Back to Camera auto." |
@@ -747,6 +766,12 @@ A discrete-event model that implements `CameraControls` (so it also plugs into t
 - **Faults:** `ignore_writes` (accepts, read-back shows the old value), `no_effect` (read-back shows the new value,
   picture unchanged), `fail` (writes error), `stale_auto` (while its Auto flag is on, reads report a stale value),
   `meddle(t, key, value)` (another program writes).
+- **Coloured scenes (W3, `SimCfg::scene`):** a scene of the kit `fx::awb::scenes` (office, warm room, grey room, a face
+  or a wall filling the frame, ...) replaces the grey wall. Every cell keeps its reflectance colour and its own luma
+  (the exposure meter does not see colour); the cast is `(bb(T_light) / bb(K_set))^(α_true / 0.0105)` per channel, so
+  `α_true = 0.0105` is the physical camera. The true `e_wb` is the blue-red signal of that cast minus the aim. The
+  grey wall's own cast (`tint`) now lies on the blackbody locus (green `e^(−0.14 c)`), as a real light does: without
+  the green shift a strong cast sits off the locus and the skin guard of the estimator rightly distrusts it.
 - **Clock:** the test loop advances simulated time frame by frame and calls `tick` every 100 ms.
 
 ### 6.2 Cases the controller must pass (`cargo test -p better-cam auto_controls`)
@@ -777,6 +802,12 @@ A discrete-event model that implements `CameraControls` (so it also plugs into t
 | 22 | `slow` writes | Never more than 1 batch per `2 ×` write time; converges in ≤ 6 s. |
 | 23 | Paused for 5 s mid-adjustment | No writes while paused; samples before resume ignored; converges after. |
 | 24 | Engagement from `stale_auto` | Seed from resume/default, not from the stale read; first write is the exposure manual write. |
+
+Notes W3 (2026-11-19): cases 15-17 run twice, on the grey wall and in the coloured office (B6). Case 15's text of the
+`at_limit` state (case 16) is the new one of 4.2. In the office the estimator has a constant error of 4 mired
+(`ESTIMATOR_BIAS = 0.042` in `ln(B/R)`, AUTO-WHITE-BALANCE.md 3.5): case 15 there allows a settle of up to 12 mired
+before the light changes and judges `|e_wb| < 0.03 + 0.042`. New cases B1-B8 and the lifted black: AUTO-WHITE-BALANCE.md
+5.2 and the W3 note in 6.
 
 Hub integration (`cargo test -p better-cam camera_controls`), with `FakeControls` wrapped by the sim response:
 
@@ -1016,7 +1047,7 @@ No other constant is contradicted by the live data. `E_rate`'s `0.95` stays (cha
 | F1 | Most gain "Off" drives the device gain to `G_min`; status "gain is off" | 2.5.2, 4.2 | Most gain → 0 with the loop at gain 75: device gain read **0** in 3.5 s, one gain write; after 9 s `limit_exposure` "Exposure at the 30 fps limit and gain is off. Add light, allow more gain, or allow a longer exposure."; Most gain back to 75 → gain 75, `limit_gain` |
 | F2 | The resume point is also stored 3 s into `limit_gain` / `limit_exposure` / `too_bright` / `at_limit`, once per 10 s | 2.5.11 | The stored record read `exposure -5, gain 75` (A6: the seed -6 / 0). Stop → Start: LIVE in 0.77 s, `stored controls applied after open: exposure=-5, gain=75`, **0 `[auto]` writes** after the reopen (A6: a 1.7 s climb), `limit_gain` shown 4.4 s after the click (3 s of saturation, as before) |
 | F3 | Longest exposure text is `min(F, 1/τ)`: "1/16 s (camera drops to ≈ 16 fps)" | 2.5.2, 4.1 | Unit test (the measured 16.2 fps of 9.5) |
-| F4 | White balance with `conf_wb < 0.3` is `no_signal`: "Nothing to measure (too dark). Keeping 4600 K." (warning dot) | 2.6, 4.2 | Exposure Manual -13, gain 0 (the camera's black level): `no_signal`, the card shows the text with the warning dot. **Not changed:** the A6 picture (E -5, gain 75: a flat lifted black, display luma 17) still reads `Holding · 4600 K`, because `conf_wb` is high there (computed, not logged: the trusted-cell weight at coded luma 0.067 is 15 % of the total, above the 12 % where `conf_wb` is 1) and the gray-world error of a flat grey is 0. Whether a flat lifted black should count as "too dark" (a mean-luma gate in `measure_white_balance`) is left open: it changes the 2.4 meter |
+| F4 | White balance with `conf_wb < 0.3` is `no_signal`: "Nothing to measure (too dark). Keeping 4600 K." (warning dot) | 2.6, 4.2 | Exposure Manual -13, gain 0 (the camera's black level): `no_signal`, the card shows the text with the warning dot. **Not changed:** the A6 picture (E -5, gain 75: a flat lifted black, display luma 17) still reads `Holding · 4600 K`, because `conf_wb` is high there (computed, not logged: the trusted-cell weight at coded luma 0.067 is 15 % of the total, above the 12 % where `conf_wb` is 1) and the gray-world error of a flat grey is 0. Whether a flat lifted black should count as "too dark" (a mean-luma gate in `measure_white_balance`) was left open: it changes the 2.4 meter. **Done in W3** (2026-11-19, `MIN_MEAN_LUMA = 0.10`, 2.4): the lifted black is `no_signal` "too dark" (tests `a_lifted_black_is_dark_not_a_neutral_grey` and `a_lifted_black_says_too_dark_not_holding`, which fail without the gate) |
 | F5 | One `[apply] t=… <key> <value> -> <read-back> (… ms)` line per write of `apply_on_open` (`t` = seconds since the re-apply began; also `auto on/off` and `failed`) | `camera_controls.rs` | After the reopen: `[apply] t=0.0 exposure auto off -> -5 (17 ms)`, `exposure -5 -> -5 (5 ms)`, `gain auto off -> 75 (22 ms)`, `gain 75 -> 75 (2 ms)` (the camera was warm; the 200-700 ms first write did not recur in this run) |
 | F6 | Slow-camera hint under the exposure row in Camera auto, with a button to Better Cam auto | 4.1 | Camera auto at the saved 30 fps (1280×720 MJPEG Custom 30): hint "Camera auto is slowing the camera to 17 fps in this light. Better Cam auto keeps 30 fps." with "Use Better Cam auto"; the button switched exposure to Better Cam auto and the hint went. The 60 fps case was not run (the saved format was kept); the same code path with `requestedFps` = 60 |
 

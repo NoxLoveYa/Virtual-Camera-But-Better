@@ -5,10 +5,12 @@
 //! copies of the private ones in `fx/auto_adjust.rs` (`srgb_encode`, `luma`, `smoothstep`, `centre_weight`), copied
 //! because that file is changed in parallel. Phase A3 unifies them.
 //!
-//! The white balance meter (gray world on the trusted cells, 2.4 "White balance error", A2) sits next to
+//! The white balance meter (the shared light estimator of `fx::awb`, 2.4 "White balance error", W3) sits next to
 //! [`measure_exposure`]: [`measure_white_balance`] and the warmth scale [`warmth_target`].
 
 use crate::fx::auto_adjust::Stats;
+pub use crate::fx::awb::Reason;
+use crate::fx::awb::estimate_light;
 
 /// Cells per side of the statistics image.
 pub const GRID: usize = 16;
@@ -145,8 +147,10 @@ pub fn measure_exposure(stats: &Stats, target: f64) -> ExposureReading {
 pub struct WhiteBalanceReading {
     /// `e_wb = c - c*`: the blue-red signal minus the signal the warmth setting aims at. Negative = too orange.
     pub error: f64,
-    /// `0..=1`: how much of the picture has colour worth trusting (a scene of one colour, a dark scene: 0).
+    /// `0..=1`: how much of the picture looks like a lit scene with a cast rather than one colour or nothing.
     pub confidence: f64,
+    /// Why the confidence is low (`Ok` when it is not): picks the text of the hold.
+    pub reason: Reason,
 }
 
 /// `c*`: the blue-red signal `ln(B/R)` a neutral surface should have for `warmth` (`-1..=1`, +1 = warmer).
@@ -160,48 +164,41 @@ pub fn warmth_target(warmth: f64) -> f64 {
     (f64::from(aim[2]) / f64::from(aim[0])).ln()
 }
 
-/// 2.4 "White balance error": gray world on the cells Auto Adjust's white balance trusts (not near black, not near
-/// white, not strongly saturated; the same smooth weights).
-pub fn measure_white_balance(stats: &Stats, warmth: f64) -> WhiteBalanceReading {
-    let (mut total, mut weight_sum) = (0.0, 0.0);
-    let mut sum = [0.0f64; 3];
+/// Below this mean coded luma (centre weighted) the picture is too dark for colour, whatever its cells look like: a
+/// black picture lifted by gain is flat grey noise, and flat grey reads as a neutral light (F4's leftover). About
+/// 25 of 255; the exposure loop aims at 0.45, so only a picture that is dark for good ends here.
+pub const MIN_MEAN_LUMA: f64 = 0.10;
+
+/// The centre weighted mean coded luma of the cells that have a picture, `None` when there are none.
+fn mean_coded_luma(stats: &Stats) -> Option<f64> {
+    let (mut total, mut sum) = (0.0, 0.0);
     for (i, c) in stats.cells.iter().enumerate() {
         if c[3] < MIN_COVERAGE {
             continue;
         }
         let cw = centre_weight(i) * f64::from(c[3]);
         total += cw;
-        let rgb = [f64::from(c[0]), f64::from(c[1]), f64::from(c[2])];
-        let y = srgb_encode(luma([c[0], c[1], c[2]]));
-        let (mx, mn) = (
-            rgb[0].max(rgb[1]).max(rgb[2]),
-            rgb[0].min(rgb[1]).min(rgb[2]),
-        );
-        let saturation = if mx > 1e-4 { (mx - mn) / mx } else { 1.0 };
-        let w = cw
-            * smoothstep(0.04, 0.15, y)
-            * (1.0 - smoothstep(0.85, 0.97, y))
-            * (1.0 - smoothstep(0.55, 0.9, saturation));
-        weight_sum += w;
-        for k in 0..3 {
-            sum[k] += w * rgb[k];
-        }
+        sum += cw * srgb_encode(luma([c[0], c[1], c[2]]));
     }
-    let none = WhiteBalanceReading {
-        error: 0.0,
-        confidence: 0.0,
-    };
-    if total <= 0.0 || weight_sum <= 0.0 {
-        return none;
-    }
-    let confidence = smoothstep(0.02, 0.12, weight_sum / total);
-    let mean = sum.map(|s| s / weight_sum);
-    if mean.iter().any(|m| *m < 1e-5) {
-        return none;
+    (total > 0.0).then(|| sum / total)
+}
+
+/// 2.4 "White balance error": the shared estimator (`fx::awb::estimate_light`, docs/AUTO-WHITE-BALANCE.md 3.1) reads
+/// the light the picture is lit by; the error is its blue-red signal `t` minus the signal the warmth aims at. A
+/// picture that is too dark for colour has no confidence, whatever the estimator makes of it.
+pub fn measure_white_balance(stats: &Stats, warmth: f64) -> WhiteBalanceReading {
+    let est = estimate_light(stats);
+    if mean_coded_luma(stats).is_none_or(|y| y < MIN_MEAN_LUMA) {
+        return WhiteBalanceReading {
+            error: 0.0,
+            confidence: 0.0,
+            reason: Reason::Dark,
+        };
     }
     WhiteBalanceReading {
-        error: (mean[2] / mean[0]).ln() - warmth_target(warmth),
-        confidence,
+        error: est.t - warmth_target(warmth),
+        confidence: est.conf,
+        reason: est.reason,
     }
 }
 
@@ -266,6 +263,37 @@ mod tests {
         Stats {
             cells: vec![[lin, lin, lin, 1.0]; GRID * GRID],
         }
+    }
+
+    #[test]
+    fn a_lifted_black_is_dark_not_a_neutral_grey() {
+        // F4's leftover: gain 75 on a black picture is a flat grey around 17 of 255, which reads as a neutral light.
+        let r = measure_white_balance(&flat(srgb_decode(17.0 / 255.0) as f32), 0.0);
+        assert_eq!((r.confidence, r.reason), (0.0, Reason::Dark), "{r:?}");
+        // Brighter than the gate it is a neutral picture again.
+        let r = measure_white_balance(&flat(srgb_decode(0.30) as f32), 0.0);
+        assert!(r.confidence > 0.99 && r.reason == Reason::Ok && r.error.abs() < 1e-3, "{r:?}");
+        // The gate is on the mean, not on the cast: a warm picture as dark is dark too.
+        let mut warm = tinted(-0.5);
+        for c in &mut warm.cells {
+            for v in c.iter_mut().take(3) {
+                *v *= 0.02;
+            }
+        }
+        assert_eq!(measure_white_balance(&warm, 0.0).reason, Reason::Dark);
+    }
+
+    #[test]
+    fn a_picture_of_one_colour_says_so() {
+        let red = Stats {
+            cells: vec![[0.4, 0.02, 0.02, 1.0]; GRID * GRID],
+        };
+        let r = measure_white_balance(&red, 0.0);
+        assert!(r.confidence < 0.3 && r.reason == Reason::OneColour, "{r:?}");
+        let black = Stats {
+            cells: vec![[0.0, 0.0, 0.0, 1.0]; GRID * GRID],
+        };
+        assert_eq!(measure_white_balance(&black, 0.0).reason, Reason::Dark);
     }
 
     #[test]
