@@ -6,14 +6,18 @@
  */
 
 /**
- * Seven little-endian `u32`: width, height, stride, frame, source width, source height, format. Then the pixels. The one format
- * is `FORMAT_NV12` (BT.709 limited range, see `yuv.ts`): the Y plane, `height` rows of `stride` bytes, then the UV plane,
- * `height / 2` rows of `stride` bytes (`width / 2` interleaved Cb, Cr pairs).
+ * Seven little-endian `u32`: width, height, stride, frame, source width, source height, format. Then the pixels. A picture is
+ * `FORMAT_NV12` (BT.709 limited range, see `yuv.ts`): the Y plane, `height` rows of `stride` bytes, then the UV plane,
+ * `height / 2` rows of `stride` bytes (`width / 2` interleaved Cb, Cr pairs). `FORMAT_NV12_PAIR` (the split-wipe Compare) is
+ * two such pictures of the header's size one after the other: the camera picture before the chain, then the output.
  */
 export const HEADER_BYTES = 28;
 
 /** The `format` word of an NV12 frame. */
 export const FORMAT_NV12 = 1;
+
+/** The `format` word of a Compare frame: two NV12 pictures, the camera picture first, the output second. */
+export const FORMAT_NV12_PAIR = 2;
 
 export interface FrameHeader {
   width: number;
@@ -24,19 +28,28 @@ export interface FrameHeader {
   /** The full size of the tapped picture before the downscale: what a point on the canvas maps back to. */
   sourceWidth: number;
   sourceHeight: number;
+  /** Present (true) on a Compare frame: two pictures, see `pictureOffset`. */
+  pair?: true;
 }
 
-/** Where the UV plane starts in a frame buffer (after the header and the Y plane). */
-export const chromaOffset = (h: FrameHeader): number => HEADER_BYTES + h.stride * h.height;
+/** Bytes of one NV12 picture of the frame: the Y plane and the half height UV plane. */
+export const pictureBytes = (h: FrameHeader): number => (h.stride * h.height * 3) / 2;
 
-/** The header of a frame, or `null` when the frame is shorter than its header says, a field is impossible or the format is not NV12. */
+/** Where picture `index` of the frame (0, or 1 on a Compare frame: the output) starts in the buffer, after the header. */
+export const pictureOffset = (h: FrameHeader, index: 0 | 1 = 0): number => HEADER_BYTES + index * pictureBytes(h);
+
+/** Where the UV plane of picture `index` starts in a frame buffer (after the header and its Y plane). */
+export const chromaOffset = (h: FrameHeader, index: 0 | 1 = 0): number => pictureOffset(h, index) + h.stride * h.height;
+
+/** The header of a frame, or `null` when the frame is shorter than its header says, a field is impossible or the format is not NV12 (one picture or a pair). */
 export function readHeader(buf: ArrayBuffer): FrameHeader | null {
   if (buf.byteLength < HEADER_BYTES) return null;
   const v = new DataView(buf);
   const [width, height, stride, frame, sourceWidth, sourceHeight, format] = [0, 4, 8, 12, 16, 20, 24].map((at) => v.getUint32(at, true));
+  const pictures = format === FORMAT_NV12 ? 1 : format === FORMAT_NV12_PAIR ? 2 : 0;
   // 4:2:0 needs whole 2 x 2 blocks, and the chroma rows are read as `stride / 2` texels of 2 bytes
   const complete =
-    format === FORMAT_NV12 &&
+    pictures > 0 &&
     width > 0 &&
     height > 0 &&
     width % 2 === 0 &&
@@ -45,12 +58,15 @@ export function readHeader(buf: ArrayBuffer): FrameHeader | null {
     sourceHeight > 0 &&
     stride >= width &&
     stride % 2 === 0 &&
-    buf.byteLength >= HEADER_BYTES + (stride * height * 3) / 2;
-  return complete ? { width, height, stride, frame, sourceWidth, sourceHeight } : null;
+    buf.byteLength >= HEADER_BYTES + pictures * ((stride * height * 3) / 2);
+  return complete ? { width, height, stride, frame, sourceWidth, sourceHeight, ...(pictures === 2 && { pair: true as const }) } : null;
 }
 
-/** What `set_preview_point` takes: `null` the output (what apps get), `"input"` the camera before the chain, or the picture entering a filter. */
-export type PreviewPoint = null | "input" | { filter: string };
+/**
+ * What `set_preview_point` takes: `null` the output (what apps get), `"input"` the camera before the chain, `"compare"` both of
+ * those in one frame (the split-wipe Compare), or the picture entering a filter.
+ */
+export type PreviewPoint = null | "input" | "compare" | { filter: string };
 
 export function samePoint(a: PreviewPoint, b: PreviewPoint): boolean {
   if (a === null || b === null || typeof a === "string" || typeof b === "string") return a === b;
@@ -67,7 +83,7 @@ export function pointFilter(point: PreviewPoint): string | null {
  * caption of a filter says which one, as "Crop/Pad · step 2 · showing the picture before this filter".
  */
 export function pointLabel(point: PreviewPoint, steps: readonly { id: string; label: string }[]): string | null {
-  if (point === null) return null;
+  if (point === null || point === "compare") return null; // Compare labels its two sides itself
   if (point === "input") return "Before";
   const at = steps.findIndex((s) => s.id === point.filter);
   if (at < 0) return null;

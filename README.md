@@ -26,9 +26,11 @@ React, and runs on Windows 11 only.
 - Presets: save and load a filter chain by name. A preset holds the filters only, not the device controls.
 - Live preview and a line of stats (capture and output size and frame rate, latency, dropped and repeated frames).
   The preview stays in view while the settings scroll, and a splitter sets the width of the two columns.
-- Preview tools: show the picture as it enters a chosen filter, and hold Compare to see the camera picture. An
-  eyedropper picks key colours from the preview (Chroma Key, Color Key). Crop/Pad can be edited on the picture: drag to
-  pan, mouse wheel to zoom.
+- Preview tools: show the picture as it enters a chosen filter. Compare is a toggle: a bar appears over the preview
+  with the camera picture (before the filters) on one side and the result (what apps get) on the other; drag it, or
+  drag anywhere on the picture, to wipe between them. Arrow keys move the bar (Shift for big steps), `O` turns it
+  from left-right to up-down, Esc turns Compare off. An eyedropper picks key colours from the preview (Chroma Key,
+  Color Key). Crop/Pad can be edited on the picture: drag to pan, mouse wheel to zoom.
 - Drop files from Explorer: a LUT, a picture or a preset (`.json`) onto a field, the chain or the window.
 - Output: resolution, frame rate, aspect, background color, and an option to also offer 720p and 360p.
 - Errors in plain words (codes stay in tooltips), and accessibility basics: a clear focus ring, larger switch targets

@@ -364,6 +364,13 @@ pub struct SourceUpdate {
 pub trait FrameTap: Send {
     fn on_frame(&mut self, renderer: &Renderer, frame: &RgbaTexture, capture_qpc: u64);
 
+    /// Instead of `on_frame` while the preview point is [`PreviewPoint::Compare`]: `before` is the camera picture and
+    /// `after` the output frame, both fitted to the output size by the output stage. A tap that does not know the two
+    /// picture mode takes the output, which is what `on_frame` gets in every other mode.
+    fn on_compare(&mut self, renderer: &Renderer, _before: &RgbaTexture, after: &RgbaTexture, capture_qpc: u64) {
+        self.on_frame(renderer, after, capture_qpc);
+    }
+
     /// Called once per rendered frame after the engine's own readback of it. `wait` says the engine may block on the
     /// GPU for this frame (its readback just did, or nothing is read back): a tap that queued a copy in `on_frame`
     /// maps it here, so what it shows is the frame the apps get, not the one before.
@@ -3868,6 +3875,15 @@ fn tap_frame(shared: &Shared, stop: &AtomicBool, renderer: &Renderer, frame: &Rg
     }
 }
 
+/// [`tap_frame`] for [`PreviewPoint::Compare`]: both pictures of the frame.
+fn tap_compare(shared: &Shared, stop: &AtomicBool, renderer: &Renderer, before: &RgbaTexture, after: &RgbaTexture, capture_qpc: u64) {
+    if let Some(tap) = lock(&shared.tap).as_mut() {
+        if !stop.load(Ordering::Acquire) {
+            tap.on_compare(renderer, before, after, capture_qpc);
+        }
+    }
+}
+
 /// Tell the tap (the preview) the frame's readback is done ([`FrameTap::frame_done`]), under the same lock and stop rule
 /// as [`tap_frame`].
 fn tap_done(shared: &Shared, stop: &AtomicBool, wait: bool) {
@@ -4376,22 +4392,28 @@ fn render_session(ctx: &SessionCtx) -> Result<(), Failure> {
             chain.set_canvas((target.width, target.height));
             // The preview shows the picture at its point while a gesture runs; the frame goes on unchanged.
             let mut tapped = false;
+            let out_params = OutputParams {
+                width: target.width,
+                height: target.height,
+                fit: out_settings.fit,
+                background: out_settings.background.map(|c| c as f32 / 255.0),
+            };
+            // Compare: the camera picture, fitted the way the output is, before the chain takes the frame.
+            let before = if point == PreviewPoint::Compare {
+                Some(stage.run(&rgba, &out_params)?)
+            } else {
+                None
+            };
             let rgba = chain.run_tapped(renderer, rgba, Instant::now(), &point, &mut |tex| {
                 tapped = true;
                 tap_frame(shared, stop, renderer, tex, capture_qpc);
             })?;
-            let fitted = stage.run(
-                &rgba,
-                &OutputParams {
-                    width: target.width,
-                    height: target.height,
-                    fit: out_settings.fit,
-                    background: out_settings.background.map(|c| c as f32 / 255.0),
-                },
-            )?;
+            let fitted = stage.run(&rgba, &out_params)?;
             // The output frame is the preview's picture unless a point showed it another one this frame.
-            if !tapped {
-                tap_frame(shared, stop, renderer, &fitted, capture_qpc);
+            match &before {
+                Some(before) => tap_compare(shared, stop, renderer, before, &fitted, capture_qpc),
+                None if !tapped => tap_frame(shared, stop, renderer, &fitted, capture_qpc),
+                None => {}
             }
             if skip.is_none() {
                 output.submit(
@@ -4969,6 +4991,101 @@ mod tests {
         rig.engine.set_window_visible(true);
         rig.engine.set_preview_point(PreviewPoint::Input);
         point_is(&rig, PreviewPoint::Input);
+        rig.engine.set_window_visible(false);
+        point_is(&rig, PreviewPoint::Output);
+        assert!(file_spread(&rig).is_some_and(|s| s <= 4));
+        assert_eq!(rig.opens(), 1, "no reopen");
+    }
+
+    /// What a tap saw in Compare: `(pairs, plain pictures, size of the last pair's halves, spread before, spread after)`.
+    type Pairs = Arc<Mutex<(u64, u64, ((u32, u32), (u32, u32)), u8, u8)>>;
+
+    struct PairTap(Pairs);
+
+    fn spread_of(r: &Renderer, f: &RgbaTexture) -> u8 {
+        crate::gpu::pipeline_tests::read_rgba(r, f)
+            .chunks(4)
+            .map(|p| p[..3].iter().max().unwrap() - p[..3].iter().min().unwrap())
+            .max()
+            .unwrap_or(0)
+    }
+
+    impl FrameTap for PairTap {
+        fn on_frame(&mut self, _: &Renderer, _: &RgbaTexture, _: u64) {
+            self.0.lock().unwrap().1 += 1;
+        }
+
+        fn on_compare(&mut self, r: &Renderer, before: &RgbaTexture, after: &RgbaTexture, _: u64) {
+            let (b, a) = (spread_of(r, before), spread_of(r, after));
+            let mut g = self.0.lock().unwrap();
+            *g = (g.0 + 1, g.1, ((before.width, before.height), (after.width, after.height)), b, a);
+        }
+    }
+
+    /// The split-wipe Compare: while the point is `Compare` the tap gets the camera picture and the output, both at the
+    /// output's size, one pair per frame; apps get the same grey output as without it; and the point resets like the
+    /// others do (the window hidden).
+    #[test]
+    fn compare_gives_the_tap_both_pictures_and_apps_still_get_the_output() {
+        let rig = Rig::new("sm-compare.bin", fast());
+        let _consumer = rig.consumer("sm-compare.bin");
+        let seen: Pairs = Arc::new(Mutex::new((0, 0, ((0, 0), (0, 0)), 0, 0)));
+        rig.engine.send(Msg::SetTap(Some(Box::new(PairTap(seen.clone())))));
+        let chain = crate::fx::parse_chain(&serde_json::json!([
+            { "id": "g", "kind": "color_filter", "enabled": true, "params": { "saturation": -1 } }
+        ]))
+        .unwrap();
+        let file_spread = |rig: &Rig| -> Option<u8> {
+            let (w, h, _, buf) = latest(&rig.file)?;
+            let rgb = nv12_to_rgb(&buf, w, h, w as usize, ColorSpace::Bt709, ColorRange::Limited);
+            rgb.chunks(3).map(|p| p.iter().max().unwrap() - p.iter().min().unwrap()).max()
+        };
+        let point_is = |rig: &Rig, p: PreviewPoint| rig.wait("the point", Duration::from_secs(10), |r| r.engine.preview_point() == p);
+
+        rig.engine.set_chain(chain);
+        rig.engine.start(settings(bars(30), false));
+        rig.engine.wait_live(Duration::from_secs(20)).unwrap();
+        rig.wait("grey output in the file and plain pictures in the tap", Duration::from_secs(10), |r| {
+            file_spread(r).is_some_and(|s| s <= 4) && seen.lock().unwrap().1 > 0
+        });
+        assert_eq!(seen.lock().unwrap().0, 0, "no pair outside Compare");
+        let plain0 = seen.lock().unwrap().1;
+
+        rig.engine.set_preview_point(PreviewPoint::Compare);
+        point_is(&rig, PreviewPoint::Compare);
+        rig.wait("a pair: colour before the chain, grey after it", Duration::from_secs(10), |_| {
+            let g = seen.lock().unwrap();
+            g.0 > 0 && g.3 > 100 && g.4 <= 4
+        });
+        {
+            let g = seen.lock().unwrap();
+            assert_eq!(g.2 .0, g.2 .1, "both halves have the output's size");
+        }
+        assert!(file_spread(&rig).is_some_and(|s| s <= 4), "apps still get the grey output");
+        // One pair per frame and no plain picture meanwhile.
+        // (the counters are read in one lock: two guards in one statement would wait for each other)
+        let counts = || {
+            let g = seen.lock().unwrap();
+            (g.0, g.1)
+        };
+        let ((p0, plain1), rendered0) = (counts(), rig.engine.stats().rendered);
+        rig.wait("frames", Duration::from_secs(10), |r| r.engine.stats().rendered >= rendered0 + 15);
+        let ((p1, plain2), rendered1) = (counts(), rig.engine.stats().rendered);
+        assert!(p1 - p0 <= rendered1 - rendered0 + 1, "{} pairs for {} frames", p1 - p0, rendered1 - rendered0);
+        assert!(plain2 <= plain1 + 1, "plain pictures went on during Compare: {plain1} -> {plain2}");
+        assert!(plain1 >= plain0);
+
+        // Another point replaces it, and the output is plain again.
+        rig.engine.set_preview_point(PreviewPoint::Output);
+        point_is(&rig, PreviewPoint::Output);
+        let pairs = seen.lock().unwrap().0;
+        rig.wait("plain pictures again", Duration::from_secs(10), |_| seen.lock().unwrap().1 > plain2 + 3);
+        assert!(seen.lock().unwrap().0 <= pairs + 1, "pairs went on after Compare ended");
+
+        // The window is hidden: Compare is over, like any other point.
+        rig.engine.set_window_visible(true);
+        rig.engine.set_preview_point(PreviewPoint::Compare);
+        point_is(&rig, PreviewPoint::Compare);
         rig.engine.set_window_visible(false);
         point_is(&rig, PreviewPoint::Output);
         assert!(file_spread(&rig).is_some_and(|s| s <= 4));

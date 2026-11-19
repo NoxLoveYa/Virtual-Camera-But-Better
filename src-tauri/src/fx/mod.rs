@@ -112,19 +112,24 @@ pub enum PreviewPoint {
     Input,
     /// The picture entering the filter with this card id, whether that filter is switched on or not.
     Filter(String),
+    /// Both at once, for the split-wipe Compare: the camera picture before the chain and the output, each fitted to the
+    /// output size the way the output stage does it, in one preview frame (`preview::FORMAT_NV12_PAIR`). The chain taps
+    /// nothing for it; [`Chain::run_tapped`] treats it like `Output`.
+    Compare,
 }
 
 impl PreviewPoint {
-    /// The `set_preview_point` argument: `null`, `"input"` or `{ "filter": "<id>" }`.
+    /// The `set_preview_point` argument: `null`, `"input"`, `"compare"` or `{ "filter": "<id>" }`.
     pub fn parse(value: &Value) -> Result<PreviewPoint, String> {
         match value {
             Value::Null => Ok(PreviewPoint::Output),
             Value::String(s) if s == "input" => Ok(PreviewPoint::Input),
+            Value::String(s) if s == "compare" => Ok(PreviewPoint::Compare),
             Value::Object(o) if o.len() == 1 => match o.get("filter") {
                 Some(Value::String(id)) if !id.is_empty() => Ok(PreviewPoint::Filter(id.clone())),
                 _ => Err("invalid preview point: `filter` must be a card id".into()),
             },
-            _ => Err("invalid preview point: expected null, \"input\" or { filter: id }".into()),
+            _ => Err("invalid preview point: expected null, \"input\", \"compare\" or { filter: id }".into()),
         }
     }
 }
@@ -430,7 +435,7 @@ impl Chain {
         tap: &mut dyn FnMut(&RgbaTexture),
     ) -> GpuResult<Pooled> {
         let tap_at = match point {
-            PreviewPoint::Output => None,
+            PreviewPoint::Output | PreviewPoint::Compare => None,
             PreviewPoint::Input => {
                 tap(&image);
                 None

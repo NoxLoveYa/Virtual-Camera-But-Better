@@ -777,3 +777,21 @@ body.file-drag::after { content: ""; position: fixed; inset: 0; z-index: 40; bor
 @media (prefers-reduced-motion: no-preference) {
   .step { transition: opacity 0.12s; }
 }
+
+/* Compare (split-wipe): a layer over the picture's own rectangle (the canvas is letterboxed), under the preview bar. The page draws the two pictures; this is the bar, its grip and the two corner labels. */
+.compare-layer { position: absolute; touch-action: none; user-select: none; }
+.compare-layer.is-vertical { cursor: ew-resize; }
+.compare-layer.is-horizontal { cursor: ns-resize; }
+.compare-bar { position: absolute; outline: none; background: var(--accent); box-shadow: 0 0 0 1px rgba(5, 7, 10, 0.55), var(--glow-soft); }
+.compare-layer.is-vertical .compare-bar { top: 0; bottom: 0; width: 2px; margin-left: -1px; }
+.compare-layer.is-horizontal .compare-bar { left: 0; right: 0; height: 2px; margin-top: -1px; }
+.compare-grip { position: absolute; left: 50%; top: 50%; width: 22px; height: 22px; margin: -11px 0 0 -11px; box-sizing: border-box; border: 2px solid var(--accent); border-radius: 50%; background: rgba(9, 11, 14, 0.82); box-shadow: 0 0 0 1px rgba(5, 7, 10, 0.55); }
+.compare-layer.is-vertical .compare-grip::before { content: ""; position: absolute; inset: 5px 6px; border-left: 2px solid var(--accent); border-right: 2px solid var(--accent); }
+.compare-layer.is-horizontal .compare-grip::before { content: ""; position: absolute; inset: 6px 5px; border-top: 2px solid var(--accent); border-bottom: 2px solid var(--accent); }
+.compare-bar:focus-visible .compare-grip { box-shadow: 0 0 0 2px var(--accent); }
+.compare-label { position: absolute; padding: 2px 8px; color: var(--text); font-size: 11px; background: rgba(9, 11, 14, 0.72); border: 1px solid var(--line-strong); border-radius: var(--r); pointer-events: none; }
+.compare-layer.is-vertical .compare-label { bottom: 8px; }
+.compare-layer.is-vertical .is-before { left: 8px; }
+.compare-layer.is-vertical .is-after { right: 8px; }
+.compare-layer.is-horizontal .compare-label { left: 8px; }
+button.compare-orient { display: inline-flex; align-items: center; justify-content: center; width: 24px; padding: 0; }
