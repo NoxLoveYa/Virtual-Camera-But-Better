@@ -1,86 +1,50 @@
-# Release readiness: Better Cam 0.1.2
+# Release readiness: Better Cam 0.1.3
 
-Latest build: 2026-11-20 from commit `4c0b37f` (`chore(release): version 0.1.2`), on top of `90757d4` (`feat(presets): the
-owner's look is the new default`), which follows `b4eb9ea`, on the development PC (Windows 11 Pro 10.0.26200). The working
-tree was clean. The tag `v0.1.2` is on the `docs(release)` commit that follows `4c0b37f`, and the GitHub pre-release
-`v0.1.2` was published from that tag. The earlier pre-release is still `v0.1.0`.
+Latest build: 2026-11-20 from commit `8aa77af` (`chore(release): version 0.1.3`), on top of `5b22f7f` (`feat(preview): Compare shows the selected filter's before and after`), which follows `0ea3d38` (`docs(release): build 0.1.2 from 4c0b37f`), on the development PC (Windows 11 Pro 10.0.26200). The working tree was clean before the build. The tag `v0.1.3` is on the `docs(release)` commit that follows `8aa77af`, and the GitHub release `v0.1.3` was published from that tag as the latest release (not a pre-release). The earlier releases are `v0.1.2` (pre-release, from `4c0b37f`) and `v0.1.0` (pre-release).
 
-Earlier builds: `758873d` (version 0.1.1; not published, no tag; its hashes are kept in `fae5659`), `42fef49` (published as
-the GitHub pre-release `v0.1.0`, tag on the release-notes commit `2ab8162` that follows `42fef49`), `f68c15a` (same day; its
-hashes are superseded and no longer listed), and `ac02150` (its install test is the one recorded below).
+Earlier builds: `4c0b37f` (version 0.1.2; published as the pre-release `v0.1.2`, tag on the release-notes commit `0ea3d38`), `758873d` (version 0.1.1; not published, no tag; its hashes are kept in `fae5659`), `42fef49` (published as the GitHub pre-release `v0.1.0`, tag on the release-notes commit `2ab8162` that follows `42fef49`), `f68c15a` (same day; its hashes are superseded and no longer listed), and `ac02150` (its install test is the one recorded below).
 
 ## Build
 
-`$env:CARGO_INCREMENTAL=0; npm run tauri build`, then `npm run portable`. Both exit 0. Version 0.1.2
+`$env:CARGO_INCREMENTAL=0; npm run tauri build`, then `npm run portable`. Both exit 0. Version 0.1.3
 (`src-tauri/tauri.conf.json`), publisher NoxLoveYa, per-machine NSIS installer.
 
 | File | Size (bytes) | SHA-256 |
 |---|---|---|
-| `target\release\bundle\nsis\Better Cam_0.1.2_x64-setup.exe` | 3,775,541 (3.60 MiB) | `CF87734FC6532ECE8D5B9236893F1E0204F240DF726CC06877EF0BF4CA5257F5` |
-| `target\release\bundle\portable\Better-Cam-0.1.2-portable.zip` | 5,134,224 | `2222513BE195D48E207016BBA215DB90AB5149C4AA560DE2D91ADF31CBC7C461` |
-| `target\release\better-cam.exe` (in the zip; the installer packs the same file) | 14,541,824 | `B447C6737C12E2A0C8AB70CDC12B1E6C61392A5DF177FA9ECE82E44C09B73900` |
-| `target\release\better_cam_vcam.dll` (in the zip; the installer packs the same file; build id `e7ddb495`) | 809,472 | `D317898ADAD90CFC9666453C5093F057C3026E74CF3A776428BCBCF52AA765C6` |
+| `target\release\bundle\nsis\Better Cam_0.1.3_x64-setup.exe` | 3,773,440 (3.60 MiB) | `AF7B0B4E16EA9E40AF758E73B93A62A5F3745FC47C2CBB21CAE6E20C4D535563` |
+| `target\release\bundle\portable\Better-Cam-0.1.3-portable.zip` | 5,138,746 | `6572D5A5B57125C989D08C838799ED7F684C1B6808F17A1EF28A35C356CBA700` |
+| `target\release\better-cam.exe` (in the zip; the installer packs the same file) | 14,551,040 | `FB84AE691E9A8A7837269C4F5D55DB15073C96395431EA382533EF146382BF0C` |
+| `target\release\better_cam_vcam.dll` (in the zip; the installer packs the same file; build id `1ff5fec3`) | 809,472 | `45558C02D3A4B4A263DDA2486BE8EE16196F00113AF163876223B99A9DB4CE1B` |
 
-The zip holds `better-cam.exe`, `vcam/better_cam_vcam.dll`, `LICENSE` and `README.txt` (entries and sizes read from the zip
-in memory, nothing extracted); the exe and the DLL in it have the same sizes as `target\release\better-cam.exe` and
-`target\release\better_cam_vcam.dll`. The virtual camera DLL is **not** the same as in the earlier build: its hash and build
-id changed (`0B5562C0…` and `225a2c97` before). The build id is the FNV-1a 64 hash of the file bytes, folded to 8 hex digits
-(`content_tag` in `crates/vcam-install/src/util.rs`); it was computed from that source method, not cross-checked against a
-known file this time (the 0.1.0 copy registered on the dev PC was not found at its usual path). The installer's inner copy
-of the exe was not extracted and compared. The zip's exe has no `--version` switch, so it was not started (it would take the
-camera).
+The zip holds `better-cam.exe`, `vcam/better_cam_vcam.dll`, `LICENSE` and `README.txt`. Entry sizes were read from the zip in memory, nothing extracted; the exe and the DLL in it have the same sizes as `target\release\better-cam.exe` and `target\release\better_cam_vcam.dll`. Their hashes inside the zip were not compared. The build id is the FNV-1a 64 hash of the file bytes, folded to 8 hex digits (`content_tag` in `crates/vcam-install/src/util.rs`). It was computed with a separate script from that method and not cross-checked against a known file. The installer's inner copy of the exe was not extracted and compared. The zip's exe has no `--version` switch, so it was not started (it would take the camera).
 
-### What this release adds (since `v0.1.0`, `2ab8162`)
+### What this release adds (since `v0.1.2`, `5b22f7f`)
 
-App code changed in several places; the version bump to 0.1.2 touched the manifests and lock files only.
+The version bump to 0.1.3 touched the manifests and lock files only.
 
-- **New defaults** (`90757d4`): a fresh install and "Reset to defaults" start with Auto Adjust (white balance only, tint
-  +0.45), Better Cam auto white balance (warmth +0.48, fast), MJPEG at the largest 16:9 size with 30 fps, buffering auto and
-  output Fill. Exposure stays on the camera's own auto; power-line frequency is left to the camera. Existing saved state and
-  presets are not changed. A stored Better Cam auto entry the camera cannot run is skipped on open, so the camera keeps its
-  own auto. **Users on the old defaults will see "Unsaved" after upgrading**: their saved state no longer matches the new
-  defaults, though nothing is changed for them.
-- **Face metering for backlight and lamp-lit dark rooms** (`b4eb9ea`): Better Cam auto meters the face when a bright window
-  or a lamp sits behind or beside the subject. See `docs/AUTO-CONTROLS.md` sections 10 to 13.
-- **Dim-room exposure** (`1e7dcd9`, first in 0.1.1): when gain is at Most gain and the picture stays more than a stop too
-  dark for 3 s, exposure may go one stop past the frame-rate limit (1/16 s at 30 fps, about 16 fps) instead of leaving the
-  picture at full gain (green and grainy on the W4GS). Never past a chosen Longest exposure; back to full frame rate when
-  the light returns. A camera that refuses the longer exposure keeps its frame rate. A `[auto] … exposure …` line goes to
-  stderr every 5 s while the loop runs.
-- **Test harness** (`a3e348e`, commit title "test: scratch dirs remove themselves"): test folders are removed after each test
-  (`vcam_protocol::testdir::TestDir`). This commit also changes files outside the tests, for example
-  `crates/vcam-source/src/frames.rs`, `crates/vcam-source/src/lib.rs`, `src-tauri/src/engine.rs` and `src-tauri/src/fx/nvidia.rs`.
-  Those hunks were **not audited** line by line for this release.
-- `README.md`, `docs/AUTO-CONTROLS.md`, `docs/PLAN.md` and `docs/UX-PASS.md` describe the changes; the new store test runs
-  in `npm run test:preset` (through `npm run test:store`).
+- **Per-filter Compare** (`5b22f7f`): with a filter selected, Compare splits the picture entering that filter from the picture leaving it, live, both fitted like the output. With anything else selected, Compare stays camera before the chain vs output. The split follows the selection; labels read "Before <filter>" / "After". Compare on the Camera controls is unchanged.
+- Preview points no longer wait behind a slider drag; only a point that names a filter the engine does not have yet waits for its chain.
 
 Build warnings (none affects the result):
 
-- Tauri: the identifier `dev.bettercam.app` ends with `.app`, which conflicts with the macOS bundle extension. Harmless
-  on Windows. Changing it would change the data folders (`%APPDATA%\dev.bettercam.app`), so it is left alone.
-- Linker: `LNK4104: export of symbol 'DllCanUnloadNow' / 'DllGetClassObject' should be PRIVATE` for the virtual camera DLL.
-  Cosmetic.
+- Tauri: the identifier `dev.bettercam.app` ends with `.app`, which conflicts with the macOS bundle extension. Harmless on Windows. Changing it would change the data folders (`%APPDATA%\dev.bettercam.app`), so it is left alone.
+- Linker: `LNK4104: export of symbol 'DllCanUnloadNow' / 'DllGetClassObject' should be PRIVATE` for the virtual camera DLL. Cosmetic.
 
 ## Tests on this PC
 
-Checked for this build:
+Checked for this build, on the tree at `8aa77af`:
 
-- `npm run test:schema` and `npm run test:preset` (includes `test:store`): both exit 0 on the defaults commit `90757d4`.
-- `npm run tauri build` and `npm run portable`: both exit 0 on `4c0b37f`.
+- `npm run test:schema`, `npm run test:preset` (includes `test:store`) and `npm run test:ui` (includes `compare.test.ts` and `previewFrame.test.ts`): all exit 0.
+- `cargo test -p better-cam preview_point`: 10 passed, 0 failed.
+- `npm run tauri build` and `npm run portable`: both exit 0.
 
-The install and uninstall tests were run on the earlier build from commit `ac02150` (`Better Cam_0.1.0_x64-setup.exe`
-with SHA-256 `73F978F9...3545A5`, virtual camera DLL build id `282bb805`), and were **not repeated** for this build from
-`4c0b37f`. Not done for this build: the install and uninstall tests, starting the installed app, a real camera check of the
-new exposure behaviour, and a real camera check of the new face metering (the metering was checked only in simulation, see
-`docs/AUTO-CONTROLS.md` sections 10 to 13, plus a short owner session).
+The new Compare was checked by automated tests only. It was **not** looked at by eye on a live camera.
 
-The installer code (`src-tauri/windows`, the `bundle` part of `src-tauri/tauri.conf.json`, `crates/vcam-install`, `scripts`)
-is no longer the same as when the 0.1.0 installer was tested: `crates/vcam-install/src/acl.rs`, `testkit.rs` and
-`datadir/tests.rs` changed in `a3e348e` (the `acl.rs` hunks checked are all in `mod tests`; the rest was not checked), and the
-version line in `src-tauri/tauri.conf.json` changed. The virtual camera DLL is **not** the tested file: build id `e7ddb495`
-instead of `282bb805`, and the vcam crates (`vcam-protocol`, `vcam-source`) changed as well. So the results below describe
-the installer's logic and the earlier DLL; they still need a repeat for this build. The installed app code is newer, and it
-has not been started from an installer. This build's DLL was not registered on the dev PC.
+Not repeated for this build: the install and uninstall tests, starting the installed app, a real camera check of the new Compare, the dim-room exposure and the face metering. The virtual camera DLL is not the file those earlier tests used (build id `1ff5fec3` now, `282bb805` in the last install test).
+
+### Install and uninstall: last run, on the 0.1.0 build from `ac02150`
+
+The results below are from the earlier installer (`Better Cam_0.1.0_x64-setup.exe`, SHA-256 `73F978F9...3545A5`, virtual camera DLL build id `282bb805`). The installer code (`src-tauri/windows`, the `bundle` part of `src-tauri/tauri.conf.json`, `crates/vcam-install`, `scripts`) has changed since, including `crates/vcam-install/src/acl.rs`, `testkit.rs` and `datadir/tests.rs` in `a3e348e` (the `acl.rs` hunks checked are all in `mod tests`; the rest was not checked). The vcam crates (`vcam-protocol`, `vcam-source`) changed too. So the results describe the installer's logic and the earlier DLL, and they still need a repeat for this build.
 
 Both the dev virtual camera and the installer use the same folder and the same DLL name
 (`C:\Program Files\Better Cam\vcam\better_cam_vcam_1.282bb805.dll`), so the dev camera was registered with the very same
