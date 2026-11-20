@@ -9,14 +9,15 @@
  * Seven little-endian `u32`: width, height, stride, frame, source width, source height, format. Then the pixels. A picture is
  * `FORMAT_NV12` (BT.709 limited range, see `yuv.ts`): the Y plane, `height` rows of `stride` bytes, then the UV plane,
  * `height / 2` rows of `stride` bytes (`width / 2` interleaved Cb, Cr pairs). `FORMAT_NV12_PAIR` (the split-wipe Compare) is
- * two such pictures of the header's size one after the other: the camera picture before the chain, then the output.
+ * two such pictures of the header's size one after the other: the camera picture before the chain, then the output (for the
+ * Compare of one filter: the picture entering it, then the one leaving it).
  */
 export const HEADER_BYTES = 28;
 
 /** The `format` word of an NV12 frame. */
 export const FORMAT_NV12 = 1;
 
-/** The `format` word of a Compare frame: two NV12 pictures, the camera picture first, the output second. */
+/** The `format` word of a Compare frame: two NV12 pictures, "before" first, "after" second (the camera picture and the output, or the pictures entering and leaving a filter). */
 export const FORMAT_NV12_PAIR = 2;
 
 export interface FrameHeader {
@@ -64,27 +65,34 @@ export function readHeader(buf: ArrayBuffer): FrameHeader | null {
 
 /**
  * What `set_preview_point` takes: `null` the output (what apps get), `"compare"` the camera picture before the chain and the
- * output in one frame (the split-wipe Compare), or the picture entering a filter. (The engine also knows `"input"`, the camera
+ * output in one frame (the split-wipe Compare), `{ compare: id }` the same split for one filter: the picture entering the card
+ * `id` and the one leaving it, or the picture entering a filter (`{ filter: id }`). (The engine also knows `"input"`, the camera
  * picture alone; nothing in the window asks for it since Compare shows both.)
  */
-export type PreviewPoint = null | "compare" | { filter: string };
+export type PreviewPoint = null | "compare" | { filter: string } | { compare: string };
 
 export function samePoint(a: PreviewPoint, b: PreviewPoint): boolean {
   if (a === null || b === null || typeof a === "string" || typeof b === "string") return a === b;
-  return a.filter === b.filter;
+  return "filter" in a ? "filter" in b && a.filter === b.filter : "compare" in b && a.compare === b.compare;
 }
 
-/** The filter card a point names, or `null` (the output and Compare name none). */
+/** The filter card whose picture a point shows alone (`{ filter }`), or `null` (the output and both Compares: the split has its own end). */
 export function pointFilter(point: PreviewPoint): string | null {
-  return point !== null && typeof point === "object" ? point.filter : null;
+  return point !== null && typeof point === "object" && "filter" in point ? point.filter : null;
 }
+
+/** The point is a split-wipe Compare: of the camera picture (`"compare"`) or of one filter (`{ compare }`). */
+export const isCompare = (point: PreviewPoint): boolean => point === "compare" || (point !== null && typeof point === "object" && "compare" in point);
+
+/** The filter card a Compare point splits (`{ compare: id }`), or `null`. */
+export const compareFilter = (point: PreviewPoint): string | null => (point !== null && typeof point === "object" && "compare" in point ? point.compare : null);
 
 /**
  * The caption on the preview while a point is set; `null` for the output. `steps` is the chain as `{ id, label }`: the
  * caption of a filter says which one, as "Crop/Pad · step 2 · showing the picture before this filter".
  */
 export function pointLabel(point: PreviewPoint, steps: readonly { id: string; label: string }[]): string | null {
-  if (point === null || point === "compare") return null; // Compare labels its two sides itself
+  if (point === null || point === "compare" || "compare" in point) return null; // Compare labels its two sides itself
   const at = steps.findIndex((s) => s.id === point.filter);
   if (at < 0) return null;
   return `${steps[at].label} · step ${at + 1} · showing the picture before this filter`;

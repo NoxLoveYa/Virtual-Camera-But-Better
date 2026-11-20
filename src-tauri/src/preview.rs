@@ -24,7 +24,8 @@
 //! `height / 2` rows of `stride` bytes (`width / 2` interleaved `Cb Cr` pairs): `stride * height * 3 / 2` bytes.
 //! While the preview point is Compare the `format` is [`FORMAT_NV12_PAIR`] and the payload is two such pictures of the
 //! header's size, one after the other: the camera picture before the chain (fitted to the output size, as the output
-//! stage does), then the output picture; the page draws both and splits them where the user put the bar. `width`
+//! stage does), then the output picture; the page draws both and splits them where the user put the bar. For
+//! [`crate::fx::PreviewPoint::CompareFilter`] the two pictures are the ones entering and leaving one filter. `width`
 //! is a multiple of 4 and `height` is even (the encoder's block). `stride` equals `width` today; it is the pitch of both
 //! planes, so the layout can change without a protocol change. The page uploads Y as an `R8` and UV as an `RG8`
 //! texture and converts in its fragment shader (`src/ui/yuv.ts` holds the one set of constants).
@@ -51,7 +52,8 @@ pub const HEADER_LEN: usize = 28;
 /// The `format` word of the header: NV12, BT.709 limited range.
 pub const FORMAT_NV12: u32 = 1;
 /// The `format` word of a Compare frame ([`crate::fx::PreviewPoint::Compare`]): two [`FORMAT_NV12`] pictures of the
-/// header's `width` x `height` one after the other, the camera picture before the chain first, then the output.
+/// header's `width` x `height` one after the other, the camera picture before the chain first, then the output (for
+/// [`crate::fx::PreviewPoint::CompareFilter`]: the picture entering the filter, then the one leaving it).
 pub const FORMAT_NV12_PAIR: u32 = 2;
 /// At most 30 frames per second.
 pub const FRAME_INTERVAL: Duration = Duration::from_micros(33_333);

@@ -28,7 +28,8 @@ import { createQueue } from "./presets/queue";
 import { settled as settleEngine } from "./presets/settle";
 import { presetNameFor, stemOf } from "./ui/fileDrop";
 import { DEFAULT_UI, filterSelection, normalizeUi, selectedFilterId, selectionAfter, selectionAfterLoad, type UiState } from "./ui/layout";
-import { pointFilter, samePoint, type PreviewPoint } from "./ui/previewFrame";
+import { retargetCompare } from "./ui/compare";
+import { compareFilter, pointFilter, samePoint, type PreviewPoint } from "./ui/previewFrame";
 import { toolBlock, toolOf, type PreviewTool } from "./ui/previewTool";
 import { keyColorOf } from "./ui/eyedropper";
 import { colorToHex, toColorInt } from "./filters/values";
@@ -326,8 +327,8 @@ interface State extends Saved {
   setCloseToTray: (on: boolean) => void;
   setPreviewOn: (on: boolean) => void;
   /**
-   * Which picture the preview shows (L1): `null` the output (what apps get), `"compare"` the camera before the chain beside the output, or the picture
-   * entering a filter. For the length of a gesture only (hold to compare, the eyedropper, the crop handles): whoever sets it puts it
+   * Which picture the preview shows (L1): `null` the output (what apps get), `"compare"` the camera before the chain beside the output,
+   * `{ compare: id }` the picture entering the filter `id` beside the one leaving it, or `{ filter: id }` the picture entering a filter. For the length of a gesture only (hold to compare, the eyedropper, the crop handles): whoever sets it puts it
    * back to `null`. It also goes back by itself when the filter leaves the chain, the preview is turned off, the engine stops or
    * the window is hidden. The output to apps never changes. Not saved.
    */
@@ -440,17 +441,37 @@ export const useStore = create<State>((set, get) => {
   let chainDirty = false;
   let chainQueued = false;
   let chainInflight = false;
+  /** The ids of the chain of the last call issued: what the backend knows (calls reach it in order). */
+  let sentIds = new Set<string>();
   const sendChain = () => {
     if (chainInflight || !chainDirty) return;
     chainDirty = false;
     chainInflight = true;
+    const chain = get().chain;
+    sentIds = new Set(chain.map((f) => f.id));
     api
-      .setChain(get().chain)
+      .setChain(chain)
       .catch(fail)
       .finally(() => {
         chainInflight = false;
         if (chainDirty) pushChain();
       });
+    // The call is issued; the held point goes right behind it (in order), whether or not the call is done or fails.
+    flushPoint();
+  };
+  // A preview point that names a filter the backend has not heard of yet waits for the chain that has it: it would fall back to
+  // the output there (a filter just added and selected while Compare is on). Any other point goes at once, so a slider drag
+  // never holds Esc or Compare off. Only the newest waits, and it goes out when that chain call is issued (`sendChain`).
+  let pendingPoint: PreviewPoint | undefined;
+  const flushPoint = () => {
+    if (pendingPoint === undefined) return;
+    const point = pendingPoint;
+    pendingPoint = undefined;
+    api.setPreviewPoint(point).catch(() => {});
+  };
+  const mustWait = (point: PreviewPoint) => {
+    const id = compareFilter(point) ?? pointFilter(point);
+    return chainDirty && id !== null && !sentIds.has(id);
   };
   const pushChain = () => {
     chainDirty = true;
@@ -495,6 +516,9 @@ export const useStore = create<State>((set, get) => {
     // The selected filter is gone: the next one takes its place, else the previous one, else Output (`selectionAfter`).
     const ui = get().ui;
     const selected = selectionAfter(before, chain, ui.selected);
+    // The new chain is not at the backend yet (`pushChain` below): a preview point that follows from this change (Compare moving
+    // to the new selection) must wait for it (`pendingPoint`).
+    chainDirty = true;
     set({
       chain,
       ...(Object.keys(kept).length !== Object.keys(errors).length && { filterErrors: kept }),
@@ -1484,7 +1508,11 @@ export const useStore = create<State>((set, get) => {
       const tool = get().previewTool;
       set({ previewPoint, ...(tool && !samePoint(previewPoint, { filter: tool.filter }) && { previewTool: null }) });
       // The calls reach the backend in order; the engine falls back to the output by itself when it cannot show the point.
-      api.setPreviewPoint(previewPoint).catch(() => {});
+      if (mustWait(previewPoint)) pendingPoint = previewPoint;
+      else {
+        pendingPoint = undefined; // a newer point replaces the held one
+        api.setPreviewPoint(previewPoint).catch(() => {});
+      }
     },
     startPreviewTool: (kind, filter) => {
       const s = get();
@@ -1710,4 +1738,12 @@ export const useStore = create<State>((set, get) => {
       });
     },
   };
+});
+
+// Compare follows the selection: with a filter selected it splits the picture entering and leaving that filter, with anything
+// else the camera picture and the output (`retargetCompare`). The selection also moves when the selected filter is removed.
+useStore.subscribe((s, prev) => {
+  if (s.ui.selected === prev.ui.selected && s.chain === prev.chain && s.previewPoint === prev.previewPoint) return;
+  const next = retargetCompare(s.previewPoint, s.ui.selected, s.chain);
+  if (next !== undefined) s.setPreviewPoint(next);
 });

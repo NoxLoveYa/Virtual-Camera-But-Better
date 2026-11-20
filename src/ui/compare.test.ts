@@ -2,7 +2,8 @@
  * Checks of the split-wipe Compare logic: the bar's position from a pointer and from keys, the clamps, the orientation switch, the
  * picture rect and the saved state. `npm run test:ui` bundles and runs it. It throws at the first failure.
  */
-import { BIG_STEP, DEFAULT_SPLIT, LABEL_PX, STEP, clampPos, isOrientKey, labelShown, pictureRect, posFromKey, posFromPointer, readSaved, swap } from "./compare";
+import { BIG_STEP, DEFAULT_SPLIT, LABEL_MAX_PX, LABEL_OFFSET_PX, LABEL_PX, STEP, clampPos, compareLabels, comparePoint, isOrientKey, labelPx, labelShown, pictureRect, posFromKey, posFromPointer, readSaved, retargetCompare, swap } from "./compare";
+import { samePoint, type PreviewPoint } from "./previewFrame";
 
 function eq<T>(actual: T, expected: T, what: string) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error(`${what}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
@@ -68,6 +69,49 @@ eq(labelShown("before", 1, 640), true, "Before fills the picture");
 eq(labelShown("after", 1, 640), false, "After is gone at 1");
 eq(labelShown("before", 0, 640), false, "Before is gone at 0");
 eq(LABEL_PX, 72, "the room a label needs");
+
+// ---- the point Compare takes from the selection
+const chain = [{ id: "a" }, { id: "b" }];
+eq(comparePoint("filter:a", chain), { compare: "a" }, "a filter selected: its own compare");
+eq(comparePoint("camera", chain), "compare", "camera selected: the camera compare");
+eq(comparePoint("controls", chain), "compare", "capture controls selected: the camera compare");
+eq(comparePoint("output", chain), "compare", "output selected: the camera compare");
+eq(comparePoint("filter:gone", chain), "compare", "a filter that is not in the chain: the camera compare");
+eq(comparePoint("filter:a", []), "compare", "an empty chain: the camera compare");
+
+// ---- Compare follows the selection while it is on, and only while it is on
+eq(retargetCompare(null, "filter:a", chain), undefined, "Compare off: nothing follows");
+eq(retargetCompare({ filter: "a" }, "filter:b", chain), undefined, "the Before hold is no Compare: nothing follows");
+eq(retargetCompare("compare", "camera", chain), undefined, "on, camera selected: already right");
+eq(retargetCompare({ compare: "a" }, "filter:a", chain), undefined, "on, the same filter: already right");
+eq(retargetCompare("compare", "filter:a", chain), { compare: "a" }, "on with the camera, a filter gets selected");
+eq(retargetCompare({ compare: "a" }, "filter:b", chain), { compare: "b" }, "on, another filter gets selected");
+eq(retargetCompare({ compare: "a" }, "output", chain), "compare", "on, a section gets selected: back to the camera compare");
+eq(retargetCompare({ compare: "a" }, "filter:b", [{ id: "b" }]), { compare: "b" }, "the compared filter was removed and the next one is selected");
+eq(retargetCompare({ compare: "a" }, "output", []), "compare", "the compared filter was removed and nothing is left");
+eq(retargetCompare({ compare: "a" }, "filter:a", [{ id: "b" }]), "compare", "a selection that names a removed filter does not compare it");
+// a run of selections with Compare on, as the store applies them
+let point: PreviewPoint = "compare";
+const seen: PreviewPoint[] = [];
+for (const selected of ["filter:a", "filter:a", "filter:b", "controls", "filter:b"]) {
+  point = retargetCompare(point, selected, chain) ?? point;
+  seen.push(point);
+}
+eq(seen, [{ compare: "a" }, { compare: "a" }, { compare: "b" }, "compare", { compare: "b" }], "the point tracks the selection");
+eq(samePoint(seen[1], seen[0]), true, "no change of selection, no new point");
+
+// ---- the labels of the two sides
+const steps = [{ id: "a", label: "Color" }, { id: "b", label: "Crop/Pad" }];
+eq(compareLabels("compare", steps), { before: "Before", after: "After" }, "the camera compare keeps its labels");
+eq(compareLabels(null, steps), { before: "Before", after: "After" }, "no compare, the plain labels");
+eq(compareLabels({ compare: "b" }, steps), { before: "Before Crop/Pad", after: "After" }, "a filter compare names the filter");
+eq(compareLabels({ compare: "gone" }, steps), { before: "Before", after: "After" }, "a filter that left: the plain labels");
+eq([labelPx("Before"), labelPx("After")], [LABEL_PX, LABEL_PX], "the short labels need the usual room");
+eq(labelPx("Before Crop/Pad") > LABEL_PX, true, "a longer label needs more room");
+eq(labelPx("Before " + "x".repeat(200)), LABEL_MAX_PX + LABEL_OFFSET_PX, "a very long label stops at the maximum and its offset");
+eq(labelShown("before", 0.2, 640, labelPx("Before Crop/Pad")), true, "128 px is room for a filter label");
+eq(labelShown("before", 0.12, 640, labelPx("Before Crop/Pad")), false, "77 px is not");
+eq(labelShown("before", 0.12, 640), true, "the plain label still shows from 72 px");
 
 // ---- the saved state
 eq(readSaved(null), DEFAULT_SPLIT, "nothing saved");

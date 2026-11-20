@@ -1,7 +1,7 @@
 /**
  * Where the Compare bar is and which way it lies, kept for the next time Compare is turned on (and the next launch: the page's own
  * `localStorage`, not the settings file: it is a viewing habit, not a camera setting). Whether Compare is on is the store's
- * `previewPoint === "compare"`, so a tool, Escape or the preview going off end it the way they end any point.
+ * `previewPoint` being a Compare point (`"compare"`, or `{ compare: id }` with a filter selected), so a tool, Escape or the preview going off end it the way they end any point.
  */
 import { create } from "zustand";
 import { DEFAULT_SPLIT, clampPos, readSaved, swap, type Orientation, type Split } from "./compare";

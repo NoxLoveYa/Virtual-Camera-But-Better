@@ -116,21 +116,49 @@ pub enum PreviewPoint {
     /// output size the way the output stage does it, in one preview frame (`preview::FORMAT_NV12_PAIR`). The chain taps
     /// nothing for it; [`Chain::run_tapped`] treats it like `Output`.
     Compare,
+    /// The split-wipe Compare of one filter: the picture entering the filter with this card id (what `Filter(id)` shows)
+    /// and the picture leaving it (what enters the next filter, or the chain's output for the last one), both fitted to
+    /// the output size by the output stage, in one pair frame like `Compare`. A switched off filter leaves what entered,
+    /// so the halves are equal. [`Chain::run_tapped`] taps both pictures, entering first.
+    CompareFilter(String),
 }
 
 impl PreviewPoint {
-    /// The `set_preview_point` argument: `null`, `"input"`, `"compare"` or `{ "filter": "<id>" }`.
+    /// The `set_preview_point` argument: `null`, `"input"`, `"compare"`, `{ "filter": "<id>" }` or
+    /// `{ "compare": "<id>" }`.
     pub fn parse(value: &Value) -> Result<PreviewPoint, String> {
         match value {
             Value::Null => Ok(PreviewPoint::Output),
             Value::String(s) if s == "input" => Ok(PreviewPoint::Input),
             Value::String(s) if s == "compare" => Ok(PreviewPoint::Compare),
-            Value::Object(o) if o.len() == 1 => match o.get("filter") {
-                Some(Value::String(id)) if !id.is_empty() => Ok(PreviewPoint::Filter(id.clone())),
-                _ => Err("invalid preview point: `filter` must be a card id".into()),
-            },
-            _ => Err("invalid preview point: expected null, \"input\", \"compare\" or { filter: id }".into()),
+            Value::Object(o) if o.len() == 1 => {
+                let (key, make): (&str, fn(String) -> PreviewPoint) = if o.contains_key("compare") {
+                    ("compare", PreviewPoint::CompareFilter)
+                } else {
+                    ("filter", PreviewPoint::Filter)
+                };
+                match o.get(key) {
+                    Some(Value::String(id)) if !id.is_empty() => Ok(make(id.clone())),
+                    _ => Err(format!("invalid preview point: `{key}` must be a card id")),
+                }
+            }
+            _ => Err(
+                "invalid preview point: expected null, \"input\", \"compare\", { filter: id } or { compare: id }".into(),
+            ),
         }
+    }
+
+    /// The card id of the filter a `Filter` or `CompareFilter` point names.
+    pub fn filter_id(&self) -> Option<&str> {
+        match self {
+            PreviewPoint::Filter(id) | PreviewPoint::CompareFilter(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// The preview gets a pair frame (`preview::FORMAT_NV12_PAIR`) at this point.
+    pub fn is_pair(&self) -> bool {
+        matches!(self, PreviewPoint::Compare | PreviewPoint::CompareFilter(_))
     }
 }
 
@@ -423,9 +451,11 @@ impl Chain {
 
     /// [`Chain::run_at`] that also shows `tap` the picture at `point` ([`PreviewPoint`]): `Input` the picture that
     /// enters the chain, `Filter(id)` the one that enters that filter (called whether the filter is on or off, and
-    /// after the filters before it have rendered). `tap` is called at most once, and not at all for `Output`, or for
-    /// a `Filter` id the chain does not have; the caller then falls back to the output. The texture is only borrowed:
-    /// the frame goes on to the filters unchanged.
+    /// after the filters before it have rendered). `CompareFilter(id)` taps twice: the picture entering that filter,
+    /// then the one leaving it (after it rendered, or the same picture when it is off). `tap` is called at most once
+    /// (twice for `CompareFilter`), and not at all for `Output` or `Compare`, or for a `Filter` / `CompareFilter` id
+    /// the chain does not have; the caller then falls back to the output. The texture is only borrowed: the frame goes
+    /// on to the filters unchanged.
     pub fn run_tapped(
         &mut self,
         r: &Renderer,
@@ -440,8 +470,9 @@ impl Chain {
                 tap(&image);
                 None
             }
-            PreviewPoint::Filter(id) => self.slots.iter().position(|s| s.id == *id),
+            PreviewPoint::Filter(id) | PreviewPoint::CompareFilter(id) => self.slots.iter().position(|s| s.id == *id),
         };
+        let tap_after = tap_at.filter(|_| matches!(point, PreviewPoint::CompareFilter(_)));
         let mut notes = Vec::new();
         let info = FrameInfo {
             time: now.saturating_duration_since(self.started).as_secs_f64(),
@@ -486,8 +517,17 @@ impl Chain {
                     Note::Error(message) => self.errors.push(FilterError { id: slot.id.clone(), message }),
                 }
             }
+            if tap_after == Some(i) {
+                tap(&image);
+            }
         }
         Ok(image)
+    }
+
+    /// Whether the picture leaving the filter with this card id is the chain's output: no enabled filter comes after
+    /// it (switched off ones pass the picture on). False for an id the chain does not have.
+    pub fn leaves_as_output(&self, id: &str) -> bool {
+        self.slots.iter().position(|s| s.id == id).is_some_and(|i| !self.slots[i + 1..].iter().any(|s| s.enabled))
     }
 
     /// The failures to report since the last call.

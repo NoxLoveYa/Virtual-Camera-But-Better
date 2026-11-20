@@ -2,7 +2,7 @@
  * Checks of the preview helpers: the 28-byte frame header, the preview point and its caption, hold to compare, and the
  * mapping from the canvas to the tapped picture. `npm run test:ui` bundles and runs it. It throws at the first failure.
  */
-import { FORMAT_NV12, FORMAT_NV12_PAIR, HEADER_BYTES, NOT_HELD, chromaOffset, pictureOffset, holdStep, isHeld, letterbox, pointFilter, pointLabel, readHeader, samePoint, toSourcePixel, type Hold, type HoldEvent } from "./previewFrame";
+import { FORMAT_NV12, FORMAT_NV12_PAIR, HEADER_BYTES, NOT_HELD, chromaOffset, compareFilter, isCompare, pictureOffset, holdStep, isHeld, letterbox, pointFilter, pointLabel, readHeader, samePoint, toSourcePixel, type Hold, type HoldEvent } from "./previewFrame";
 
 function eq<T>(actual: T, expected: T, what: string) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error(`${what}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
@@ -58,6 +58,16 @@ eq(pointLabel(null, steps), null, "no caption for the output");
 eq(pointLabel("compare", steps), null, "the split-wipe Compare labels its sides itself, no caption");
 eq(samePoint("compare", "compare"), true, "compare is compare");
 eq(pointFilter("compare"), null, "compare names no filter");
+eq(samePoint({ compare: "a" }, { compare: "a" }), true, "same filter compare");
+eq(samePoint({ compare: "a" }, { compare: "b" }), false, "other filter compare");
+eq(samePoint({ compare: "a" }, { filter: "a" }), false, "a filter compare is not the filter's picture");
+eq(samePoint({ filter: "a" }, { compare: "a" }), false, "the filter's picture is not a filter compare");
+eq(samePoint({ compare: "a" }, "compare"), false, "a filter compare is not the camera compare");
+eq(pointFilter({ compare: "a" }), null, "a filter compare is not a point that ends with its card");
+eq(compareFilter({ compare: "a" }), "a", "the filter a compare splits");
+eq([compareFilter("compare"), compareFilter(null), compareFilter({ filter: "a" })], [null, null, null], "no other point splits a filter");
+eq([isCompare("compare"), isCompare({ compare: "a" }), isCompare(null), isCompare({ filter: "a" })], [true, true, false, false], "which points are a Compare");
+eq(pointLabel({ compare: "b" }, steps), null, "a filter compare labels its sides itself, no caption");
 eq(pointLabel({ filter: "b" }, steps), "Crop/Pad · step 2 · showing the picture before this filter", "a filter caption");
 eq(pointLabel({ filter: "gone" }, steps), null, "a filter that left the chain has no caption");
 

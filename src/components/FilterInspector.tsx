@@ -30,7 +30,7 @@ const act = () => useStore.getState();
 
 const pointsAt = (id: string) => {
   const p = act().previewPoint;
-  return p !== null && typeof p === "object" && p.filter === id;
+  return p !== null && typeof p === "object" && "filter" in p && p.filter === id;
 };
 
 /**

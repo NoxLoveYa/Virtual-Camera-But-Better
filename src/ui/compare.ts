@@ -6,7 +6,8 @@
  * `pos` is the bar's place along its axis as a fraction of the picture, 0 to 1. A vertical bar is dragged left and right:
  * Before is on its left, After on its right. A horizontal bar is dragged up and down: Before above, After below.
  */
-import { letterbox, type Rect } from "./previewFrame";
+import { selectedFilterId } from "./layout";
+import { compareFilter, isCompare, letterbox, samePoint, type PreviewPoint, type Rect } from "./previewFrame";
 
 export type Orientation = "vertical" | "horizontal";
 
@@ -24,6 +25,40 @@ export const BIG_STEP = 0.1;
 
 /** A label ("Before" / "After") is hidden when the side it names is thinner than this many pixels: it would sit on the bar or the chips. */
 export const LABEL_PX = 72;
+/** The widest a label grows (a long filter name is cut with an ellipsis, `.compare-label` in `styles.css`). */
+export const LABEL_MAX_PX = 220;
+
+/**
+ * What Compare splits for a selection: the picture entering and leaving the selected filter (`{ compare: id }`), or, with
+ * anything else selected (camera, controls, output) or a filter that is not in `chain`, the camera picture against the output.
+ */
+export function comparePoint(selected: string, chain: readonly { id: string }[]): PreviewPoint {
+  const id = selectedFilterId(selected);
+  return id !== null && chain.some((f) => f.id === id) ? { compare: id } : "compare";
+}
+
+/**
+ * The point to switch to when the selection or the chain changed while `point` is showing: Compare follows the selection live
+ * (`comparePoint`). `undefined` when `point` is no Compare, or already the right one.
+ */
+export function retargetCompare(point: PreviewPoint, selected: string, chain: readonly { id: string }[]): PreviewPoint | undefined {
+  if (!isCompare(point)) return undefined;
+  const next = comparePoint(selected, chain);
+  return samePoint(point, next) ? undefined : next;
+}
+
+/** The text on the two sides: "Before" / "After", or for the Compare of a filter "Before <filter label>" / "After". */
+export function compareLabels(point: PreviewPoint, steps: readonly { id: string; label: string }[]): { before: string; after: string } {
+  const id = compareFilter(point);
+  const step = id === null ? undefined : steps.find((s) => s.id === id);
+  return { before: step ? `Before ${step.label}` : "Before", after: "After" };
+}
+
+/** Where a label sits from the picture's edge or the bar (`.compare-label` in `styles.css`). */
+export const LABEL_OFFSET_PX = 8;
+
+/** The room a label needs, in pixels along the bar's axis: `LABEL_PX` for a short one, more for a longer text, at most `LABEL_MAX_PX` plus its offset. */
+export const labelPx = (text: string): number => Math.min(LABEL_MAX_PX + LABEL_OFFSET_PX, Math.max(LABEL_PX, 32 + text.length * 6));
 
 export const swap = (o: Orientation): Orientation => (o === "vertical" ? "horizontal" : "vertical");
 
@@ -74,10 +109,10 @@ export function posFromKey(pos: number, key: string, shift: boolean): number | n
 
 /**
  * Whether the label of a side shows: `Before` is the side from 0 to `pos`, `After` the side from `pos` to 1, on a picture that is
- * `extent` pixels along the bar's axis.
+ * `extent` pixels along the bar's axis; `need` is the room the text takes (`labelPx`).
  */
-export function labelShown(side: "before" | "after", pos: number, extent: number): boolean {
-  return (side === "before" ? pos : 1 - pos) * extent >= LABEL_PX;
+export function labelShown(side: "before" | "after", pos: number, extent: number, need = LABEL_PX): boolean {
+  return (side === "before" ? pos : 1 - pos) * extent >= need;
 }
 
 /** A saved split read back: anything that is not a good position and orientation falls back to the default, field by field. */

@@ -143,8 +143,9 @@ export const api = {
   previewAck: (frame: number) => invoke<void>("preview_ack", { frame }),
   /**
    * Which picture the preview shows: `null` the output (what apps get), `"compare"` the camera before the chain
-   * and the output in one frame, `{ filter: id }` the picture entering that filter (on or off). The output to apps never changes. The engine puts it
-   * back to `null` when that filter leaves the chain or the window is hidden; the page puts it back when its gesture ends.
+   * and the output in one frame, `{ compare: id }` the picture entering that filter and the one leaving it in one frame, `{ filter: id }`
+   * the picture entering that filter (on or off). The output to apps never changes. The engine puts it back to `null` when that filter
+   * leaves the chain or the window is hidden; the page puts it back when its gesture ends.
    */
   setPreviewPoint: (point: PreviewPoint) => invoke<void>("set_preview_point", { point }),
   /** Opens Windows Settings on the camera privacy page (`ms-settings:privacy-webcam`). */

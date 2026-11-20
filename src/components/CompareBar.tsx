@@ -1,14 +1,23 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
-import { DEFAULT_SPLIT, ORIENT_KEY, labelShown, pictureRect, posFromKey, posFromPointer } from "../ui/compare";
+import { DEFAULT_SPLIT, LABEL_PX, ORIENT_KEY, labelPx, labelShown, pictureRect, posFromKey, posFromPointer } from "../ui/compare";
 import { useCompare } from "../ui/compareState";
 
 /**
  * The split-wipe Compare over the picture: a bar with a grip, "Before" (the camera, before every filter) on one side and "After"
- * (what apps get) on the other. The page draws the two pictures (`Preview.tsx`); this layer only moves the bar: drag the grip, or
+ * (what apps get) on the other; with a filter selected, "Before <filter>" and "After" for the picture entering and leaving it
+ * (`labels`). The page draws the two pictures (`Preview.tsx`); this layer only moves the bar: drag the grip, or
  * press and drag anywhere on the picture to put the bar there. With the bar focused: arrow keys move it 2 % (Shift 10 %), Home and
  * End go to the edges. A double click puts it in the middle.
  */
-export function CompareSplit({ boxRef, picture }: { boxRef: RefObject<HTMLDivElement | null>; picture: { w: number; h: number } | null }) {
+export function CompareSplit({
+  boxRef,
+  picture,
+  labels,
+}: {
+  boxRef: RefObject<HTMLDivElement | null>;
+  picture: { w: number; h: number } | null;
+  labels: { before: string; after: string };
+}) {
   const pos = useCompare((s) => s.pos);
   const orientation = useCompare((s) => s.orientation);
   const { setPos } = useCompare.getState();
@@ -37,6 +46,8 @@ export function CompareSplit({ boxRef, picture }: { boxRef: RefObject<HTMLDivEle
 
   const at = `${pos * 100}%`;
   const extent = vertical ? rect.width : rect.height;
+  // A label sits beside a vertical bar and needs room for its text; above or below a horizontal one it only needs the height.
+  const need = (text: string) => (vertical ? labelPx(text) : LABEL_PX);
   return (
     <div
       ref={layerRef}
@@ -81,14 +92,14 @@ export function CompareSplit({ boxRef, picture }: { boxRef: RefObject<HTMLDivEle
       >
         <span className="compare-grip" aria-hidden />
       </div>
-      {labelShown("before", pos, extent) && (
+      {labelShown("before", pos, extent, need(labels.before)) && (
         <span className="compare-label is-before" style={vertical ? undefined : { top: `calc(${at} - 26px)` }}>
-          Before
+          {labels.before}
         </span>
       )}
-      {labelShown("after", pos, extent) && (
+      {labelShown("after", pos, extent, need(labels.after)) && (
         <span className="compare-label is-after" style={vertical ? undefined : { top: `calc(${at} + 6px)` }}>
-          After
+          {labels.after}
         </span>
       )}
     </div>

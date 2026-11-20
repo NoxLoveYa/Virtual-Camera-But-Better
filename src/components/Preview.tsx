@@ -3,11 +3,11 @@ import { api } from "../api";
 import { CAPTURE_KEYS, effectiveSource, problemText } from "../camera/schema";
 import { useStore } from "../store";
 import { labelOf } from "../filters/schema";
-import { chromaOffset, pictureOffset, pointLabel, readHeader, type FrameHeader } from "../ui/previewFrame";
+import { chromaOffset, isCompare, pictureOffset, pointLabel, readHeader, type FrameHeader } from "../ui/previewFrame";
 import { YUV_TO_RGB_GLSL } from "../ui/yuv";
 import { lastFrame } from "../ui/lastFrame";
 import { sourceChange, type SourceSize } from "../ui/previewTool";
-import { isOrientKey, type Split } from "../ui/compare";
+import { compareLabels, comparePoint, isOrientKey, type Split } from "../ui/compare";
 import { useCompare } from "../ui/compareState";
 import { CompareOrient, CompareSplit } from "./CompareBar";
 import { CropOverlay } from "./CropOverlay";
@@ -17,7 +17,7 @@ import { PickOverlay } from "./PickOverlay";
 const PREVIEW_BLOCKED_REASON = "An administrator must turn off encryption first (see the banner above).";
 
 const COMPARE_OFF_HINT = "Turn Compare off. Esc does it when focus is in the preview or the navigator; elsewhere Esc closes what is in front first";
-const COMPARE_HINT = "Compare the camera picture before the filters with the result: drag the bar over the picture";
+const COMPARE_HINT = "Before and after: the whole chain, or the selected filter. Drag the bar over the picture";
 
 /** Whether a key press is typing into a field (the orientation key must not take it). */
 const isTyping = (t: EventTarget | null) => t instanceof HTMLElement && (t.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName));
@@ -317,7 +317,7 @@ export function Preview() {
     seenEpoch.current = vcamEpoch;
     applied.current = "";
     // A new engine starts at the output: a Compare the page still shows as on would be a bar over one picture.
-    if (useStore.getState().previewPoint === "compare") useStore.getState().setPreviewPoint(null);
+    if (isCompare(useStore.getState().previewPoint)) useStore.getState().setPreviewPoint(null);
     void sync();
   }, [vcamEpoch, sync]);
 
@@ -423,15 +423,18 @@ export function Preview() {
   const caption = showing ? pointLabel(point, chain.map((f) => ({ id: f.id, label: labelOf(f.kind, extensions) }))) : null;
 
   // Compare (L4): a toggle. While it is on the preview point is "compare": the engine sends the camera picture and the output in one
-  // frame and the bar splits them here, so a drag needs no round trip. Whatever else takes the point (a tool, the preview going
-  // off) ends it with it.
-  const compareOn = point === "compare";
+  // frame and the bar splits them here, so a drag needs no round trip. With a filter selected the point is `{ compare: id }` and
+  // the two pictures are the ones entering and leaving that filter; the store moves the point with the selection
+  // (`retargetCompare`), and the two sides are labelled for it. Whatever else takes the point (a tool, the preview going off)
+  // ends it with it.
+  const compareOn = isCompare(point);
+  const compareSides = compareLabels(point, chain.map((f) => ({ id: f.id, label: labelOf(f.kind, extensions) })));
   const { setPreviewPoint } = useStore.getState();
   const compareButton = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     const apply = () => {
       const c = useCompare.getState();
-      const next: Split = { pos: useStore.getState().previewPoint === "compare" ? c.pos : 0, orientation: c.orientation };
+      const next: Split = { pos: isCompare(useStore.getState().previewPoint) ? c.pos : 0, orientation: c.orientation };
       if (next.pos === split.current.pos && next.orientation === split.current.orientation) return;
       split.current = next;
       view.current?.redraw(next);
@@ -464,11 +467,11 @@ export function Preview() {
   // The picture stopped showing or the window is hidden (the engine already took its point back then), or this view is going
   // away: no one looks at the bar, so Compare is over.
   useEffect(() => {
-    if ((!showing || !visible) && useStore.getState().previewPoint === "compare") setPreviewPoint(null);
+    if ((!showing || !visible) && isCompare(useStore.getState().previewPoint)) setPreviewPoint(null);
   }, [showing, visible, setPreviewPoint]);
   useEffect(
     () => () => {
-      if (useStore.getState().previewPoint === "compare") useStore.getState().setPreviewPoint(null);
+      if (isCompare(useStore.getState().previewPoint)) useStore.getState().setPreviewPoint(null);
     },
     [],
   );
@@ -500,7 +503,7 @@ export function Preview() {
         )}
         {showing && tool?.kind === "pick" && <PickOverlay key={tool.filter} boxRef={boxRef} filter={tool.filter} />}
         {showing && tool?.kind === "crop" && <CropOverlay key={tool.filter} boxRef={boxRef} filter={tool.filter} />}
-        {showing && compareOn && <CompareSplit boxRef={boxRef} picture={picture} />}
+        {showing && compareOn && <CompareSplit boxRef={boxRef} picture={picture} labels={compareSides} />}
         <div className="preview-bar">
           {showing ? (
             <span className="preview-fps" title="Frames drawn per second">
@@ -518,7 +521,10 @@ export function Preview() {
               aria-pressed={compareOn}
               disabled={!showing || tool !== null}
               title={tool !== null ? "Finish the pick or the crop first" : !showing ? "Nothing to compare: the camera picture is not showing" : compareOn ? COMPARE_OFF_HINT : COMPARE_HINT}
-              onClick={() => setPreviewPoint(compareOn ? null : "compare")}
+              onClick={() => {
+                const s = useStore.getState();
+                setPreviewPoint(compareOn ? null : comparePoint(s.ui.selected, s.chain));
+              }}
             >
               Compare
             </button>

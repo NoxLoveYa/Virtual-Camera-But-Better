@@ -156,6 +156,53 @@ fn a_filter_the_chain_does_not_have_taps_nothing() {
 }
 
 #[test]
+fn a_filter_compare_point_taps_the_picture_entering_the_filter_then_the_one_leaving_it() {
+    let r = warp();
+    let mut chain = chain_of(&r, &three());
+    // "gray" is on: red in, gray out (what enters "half", which is off)
+    let (seen, _, _) = run(&r, &mut chain, &PreviewPoint::CompareFilter("gray".into()));
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0], ((64, 32), RED));
+    assert!(is_gray(seen[1].1), "leaving gray: {:?}", seen[1].1);
+    // "half" is off: the same picture on both sides
+    let (seen, _, _) = run(&r, &mut chain, &PreviewPoint::CompareFilter("half".into()));
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0], seen[1]);
+    assert!(is_gray(seen[0].1));
+    // switched on, "half" changes the size: the sides differ in size
+    let mut on = three();
+    on[1].enabled = true;
+    chain.apply(&r, &on);
+    let (seen, _, _) = run(&r, &mut chain, &PreviewPoint::CompareFilter("half".into()));
+    assert_eq!(seen.len(), 2);
+    assert_eq!((seen[0].0, seen[1].0), ((64, 32), (32, 16)));
+    // the last filter: what leaves it is the chain's output
+    let (seen, size, out) = run(&r, &mut chain, &PreviewPoint::CompareFilter("last".into()));
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].0, (32, 16));
+    assert_eq!(seen[1].0, size);
+    assert_eq!(seen[1].1, [out[0], out[1], out[2], out[3]]);
+    // a filter the chain does not have taps nothing
+    let (seen, _, _) = run(&r, &mut chain, &PreviewPoint::CompareFilter("nope".into()));
+    assert!(seen.is_empty());
+}
+
+#[test]
+fn the_picture_leaving_a_filter_is_the_output_when_no_enabled_filter_follows() {
+    let r = warp();
+    let chain = chain_of(&r, &three());
+    assert!(!chain.leaves_as_output("gray"), "\"last\" is on after it");
+    assert!(!chain.leaves_as_output("half"));
+    assert!(chain.leaves_as_output("last"));
+    assert!(!chain.leaves_as_output("nope"));
+    let mut off = three();
+    off[2].enabled = false;
+    let chain = chain_of(&r, &off);
+    assert!(chain.leaves_as_output("gray"), "the filters after it are off");
+    assert!(chain.leaves_as_output("last"));
+}
+
+#[test]
 fn every_point_gives_the_same_output() {
     let r = warp();
     let mut chain = chain_of(&r, &three());
@@ -163,6 +210,10 @@ fn every_point_gives_the_same_output() {
     for point in [
         PreviewPoint::Input,
         PreviewPoint::Compare,
+        PreviewPoint::CompareFilter("gray".into()),
+        PreviewPoint::CompareFilter("half".into()),
+        PreviewPoint::CompareFilter("last".into()),
+        PreviewPoint::CompareFilter("nope".into()),
         PreviewPoint::Filter("gray".into()),
         PreviewPoint::Filter("half".into()),
         PreviewPoint::Filter("last".into()),
@@ -175,7 +226,7 @@ fn every_point_gives_the_same_output() {
 }
 
 #[test]
-fn the_point_argument_parses_null_input_compare_and_a_filter_object() {
+fn the_point_argument_parses_null_input_compare_and_the_filter_objects() {
     assert_eq!(PreviewPoint::parse(&json!(null)), Ok(PreviewPoint::Output));
     assert_eq!(PreviewPoint::parse(&json!("input")), Ok(PreviewPoint::Input));
     assert_eq!(PreviewPoint::parse(&json!("compare")), Ok(PreviewPoint::Compare));
@@ -183,7 +234,14 @@ fn the_point_argument_parses_null_input_compare_and_a_filter_object() {
         PreviewPoint::parse(&json!({ "filter": "abc" })),
         Ok(PreviewPoint::Filter("abc".into()))
     );
+    assert_eq!(
+        PreviewPoint::parse(&json!({ "compare": "abc" })),
+        Ok(PreviewPoint::CompareFilter("abc".into()))
+    );
     for bad in [
+        json!({ "compare": "" }),
+        json!({ "compare": 3 }),
+        json!({ "compare": "a", "filter": "b" }),
         json!("output"),
         json!("Compare"),
         json!(""),

@@ -153,4 +153,117 @@ cameras = [readable];
 await store.getState().refreshCameras();
 same(store.getState().source.video_format === "mjpeg", false, "the user's format is not replaced by the factory one");
 
+// --- Compare follows the selection -----------------------------------------------------------------------------------------
+// With Compare on, a filter selected means the split of that filter's own two pictures; anything else, the camera against the
+// output. The backend hears of a point that names a filter only after the chain that has it.
+(globalThis as unknown as { requestAnimationFrame: (f: () => void) => unknown }).requestAnimationFrame = (f) => setTimeout(f, 0);
+const calls: string[] = [];
+stub.setPreviewPoint = async (p: unknown) => void calls.push(`point ${JSON.stringify(p)}`);
+stub.setChain = async (c: { id: string }[]) => void calls.push(`chain ${c.length}`);
+const settle = () => new Promise((r) => setTimeout(r, 120));
+const st = () => store.getState();
+store.setState({ chain: [], previewPoint: null, ui: { ...st().ui, selected: "camera" } });
+const a = st().addFilter("color_filter", null, undefined, { select: false });
+const b = st().addFilter("color_filter", null, undefined, { select: false });
+await settle();
+calls.length = 0;
+
+st().select(`filter:${a}`);
+same([st().previewPoint, calls], [null, []], "Compare off: selecting a filter changes no point");
+st().select("camera");
+st().setPreviewPoint("compare");
+same(st().previewPoint, "compare", "Compare on with the camera selected");
+st().select(`filter:${a}`);
+same(st().previewPoint, { compare: a }, "Compare on, a filter selected: that filter's compare");
+st().select(`filter:${b}`);
+same(st().previewPoint, { compare: b }, "Compare on, another filter selected: the point follows");
+st().select("controls");
+same(st().previewPoint, "compare", "Compare on, capture controls selected: the camera compare");
+st().select("filter:" + a);
+same(calls, ['point "compare"', `point {"compare":"${a}"}`, `point {"compare":"${b}"}`, 'point "compare"', `point {"compare":"${a}"}`], "each change reaches the backend in order");
+
+// The compared filter is removed: Compare stays on and moves to the filter that took its place, after the chain was sent.
+calls.length = 0;
+st().removeFilter(a);
+same([st().previewPoint, st().ui.selected], [{ compare: b }, `filter:${b}`], "the compared filter was removed: the next one is compared");
+await settle();
+same(calls, [`point {"compare":"${b}"}`, "chain 1"], "b is already known to the backend: its point goes at once, the removal's chain after");
+st().removeFilter(b);
+same([st().previewPoint, st().ui.selected], ["compare", "output"], "the last filter was removed: the camera compare");
+
+// A filter that is added and selected while Compare is on is compared at once, but only after the backend has the chain.
+calls.length = 0;
+const c = st().addFilter("color_filter");
+same(st().previewPoint, { compare: c }, "a filter added while Compare is on is compared");
+await settle();
+same(calls, ["chain 1", `point {"compare":"${c}"}`], "the point waits for the chain that has the new filter");
+
+// A slider drag does not hold the points that name nothing new: Esc / Compare off goes out before the drag's last chain call.
+const slow = () => new Promise((r) => setTimeout(r, 25));
+stub.setChain = async (ch: { id: string }[]) => {
+  calls.push(`chain ${ch.length}`);
+  await slow();
+};
+await settle();
+calls.length = 0;
+const drag = setInterval(() => st().setParams(c, { gamma: Math.random() }), 10);
+await new Promise((r) => setTimeout(r, 120));
+st().setPreviewPoint(null);
+await new Promise((r) => setTimeout(r, 120));
+clearInterval(drag);
+await settle();
+await settle();
+same(calls.filter((x) => x.startsWith("chain")).length > 2, true, "the drag made several chain calls");
+same(
+  calls.lastIndexOf("point null") < calls.lastIndexOf("chain 1"),
+  true,
+  "Compare off is sent during the drag, not after the last chain call",
+);
+same(calls.filter((x) => x === "point null").length, 1, "and once");
+
+// A compare of a filter the backend has not heard of waits for the chain that has it, also during a drag.
+st().setPreviewPoint("compare");
+await settle();
+calls.length = 0;
+const d = st().addFilter("color_filter");
+same(st().previewPoint, { compare: d }, "added and selected while Compare is on");
+await settle();
+await settle();
+same(calls, ["chain 2", `point {"compare":"${d}"}`], "the new filter's compare is sent behind the chain that has it");
+
+// The held point is released by the call that carries the filter: after a failed call, and after rapid edits (last call).
+let fail = true;
+stub.setChain = async (ch: { id: string }[]) => {
+  calls.push(`chain ${ch.length}`);
+  if (fail) throw new Error("no");
+};
+calls.length = 0;
+const e = st().addFilter("color_filter");
+await settle();
+same(calls, ["chain 3", `point {"compare":"${e}"}`], "a rejected set_chain still lets the held point go");
+fail = false;
+st().setPreviewPoint("compare");
+st().setPreviewPoint({ compare: e });
+await settle();
+stub.setChain = async (ch: { id: string }[]) => {
+  calls.push(`chain ${ch.length}`);
+  await slow();
+};
+calls.length = 0;
+st().addFilter("color_filter");
+const f = st().chain[st().chain.length - 1].id;
+for (let i = 0; i < 5; i++) st().setParams(f, { gamma: i });
+await settle();
+await settle();
+same(calls.filter((x) => x.startsWith("point")), [`point {"compare":"${f}"}`], "rapid edits: the held point goes out once");
+same(calls.indexOf(`point {"compare":"${f}"}`), calls.findIndex((x) => x.startsWith("chain")) + 1, "right behind the first call that carries the filter");
+
+// Not a Compare: the Before hold and Compare off are left alone by the selection.
+st().setPreviewPoint({ filter: c });
+st().select("camera");
+same(st().previewPoint, { filter: c }, "the picture before a filter is not moved by the selection");
+st().setPreviewPoint(null);
+st().select(`filter:${c}`);
+same(st().previewPoint, null, "Compare off stays off");
+
 console.log("ok");
